@@ -874,3 +874,91 @@ class TestStopHookBackgroundPoll:
             p1.wait(timeout=5)
         except Exception:
             pass
+
+
+class TestSessionEndHookLeadCleanup:
+    """Drive hooks/sessionend_lead_cleanup.py exactly as Claude Code would (JSON on stdin), under a
+    tmp HOME so it reads an isolated ~/.relay-tasks. Tests that it logs SessionEnd events and only
+    clears lead state on documented real-end reasons."""
+
+    def _run(self, home, payload):
+        import subprocess
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "sessionend_lead_cleanup.py")],
+            input=json.dumps(payload), capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)})
+        return p.returncode, p.stderr
+
+    def _read_ledger(self, root):
+        """Read all ledger lines as JSON records."""
+        ledger_path = root / "sessions.jsonl"
+        if not ledger_path.exists():
+            return []
+        return [json.loads(line) for line in ledger_path.read_text().strip().split("\n") if line]
+
+    def test_reason_logout_clears_lead(self, tmp_path):
+        """reason="logout" (a real end) → marker cleared; SessionEnd logged."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        assert (root / "lead" / "lead-1").exists()
+
+        rc, _ = self._run(tmp_path, {"session_id": "lead-1", "reason": "logout"})
+
+        # Session ended cleanly
+        assert rc == 0
+        # Marker should be cleared
+        assert not (root / "lead" / "lead-1").exists()
+        # Event logged
+        ledger = self._read_ledger(root)
+        assert any(r["event"] == "session_end" and r["session_id"] == "lead-1" and r["reason"] == "logout"
+                   for r in ledger)
+
+    def test_reason_absent_preserves_lead(self, tmp_path):
+        """reason absent (unknown) → marker SURVIVES; SessionEnd logged."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        marker_path = root / "lead" / "lead-1"
+        assert marker_path.exists()
+
+        rc, _ = self._run(tmp_path, {"session_id": "lead-1"})  # no reason field
+
+        # Session handled cleanly
+        assert rc == 0
+        # Marker should still exist (fail-safe)
+        assert marker_path.exists()
+        # Event logged with reason=None
+        ledger = self._read_ledger(root)
+        assert any(r["event"] == "session_end" and r["session_id"] == "lead-1" and r["reason"] is None
+                   for r in ledger)
+
+    def test_reason_unknown_preserves_lead(self, tmp_path):
+        """reason="unknown/junk" (not in REAL_END_REASONS) → marker SURVIVES; SessionEnd logged."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        marker_path = root / "lead" / "lead-1"
+        assert marker_path.exists()
+
+        rc, _ = self._run(tmp_path, {"session_id": "lead-1", "reason": "other_weird_reason"})
+
+        # Session handled cleanly
+        assert rc == 0
+        # Marker should still exist (fail-safe)
+        assert marker_path.exists()
+        # Event logged
+        ledger = self._read_ledger(root)
+        assert any(r["event"] == "session_end" and r["session_id"] == "lead-1"
+                   and r["reason"] == "other_weird_reason" for r in ledger)
+
+    def test_non_lead_exits_silently_but_logs(self, tmp_path):
+        """non-lead session → exits 0 silently; SessionEnd still logged (harmless)."""
+        root = tmp_path / ".relay-tasks"
+
+        rc, err = self._run(tmp_path, {"session_id": "nobody", "reason": "logout"})
+
+        # Session ended cleanly
+        assert rc == 0
+        assert err == ""
+        # Event logged with was_lead=false
+        ledger = self._read_ledger(root)
+        assert any(r["event"] == "session_end" and r["session_id"] == "nobody"
+                   and r["was_lead"] is False for r in ledger)

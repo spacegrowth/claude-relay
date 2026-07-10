@@ -161,3 +161,26 @@ symptom (dead pid, stale lock, no `surfaced_reports.json`, no wake).
 harness-enforced hook timeouts. The real test is live: a report landing more than 60s into a
 genuinely idle lead session should now still produce a wake. Its absence recurring (the
 dead-pid/stale-lock signature from this incident) over the next few live runs is the actual proof.
+
+## Addendum: SessionEnd hook safety — clearing markers only on real ends (2026-07-10)
+
+**Incident.** During a `/plugin uninstall → remove/add → install → /reload-plugins` sequence, an
+armed lead's entire `lead/<sid>/` subtree vanished — marker, surfaced_reports, all of it — without
+the session ever ending. The session itself stayed alive with the same conversation running. The
+only code that deletes that subtree is `sessionend_lead_cleanup.py`'s `clear_lead()`. Attribution to
+reload-churn (plugin reload firing spurious SessionEnd events) is the best-fit hypothesis but
+unproven; the hook had no observability. Result: the lead was silently unarmed (gate off, wakes off)
+until a human noticed a missing wake.
+
+**Fix.** `hooks/sessionend_lead_cleanup.py` now:
+1. **Always logs** every SessionEnd to the ledger with its reason, session_id, and was_lead flag —
+   permanent observability for future incident attribution.
+2. **Clears lead state ONLY on documented real-end reasons:** `{"clear", "logout",
+   "prompt_input_exit", "exit"}` (Claude Code's documented SessionEnd reasons). Any
+   unknown/missing reason → **preserves the marker** (fail-safe in favor of staying armed).
+3. **Documents the incident and policy** in a comment explaining why this defensive posture exists.
+
+**Stale markers.** A marker that outlives its session (e.g. from a missed SessionEnd) shows a stale
+`LAST ACTIVE` age in `relay list` and is cleaned up by `/relay:stop` (step-down with reason
+"clear") or `relay prune --days N --dry-run` (discovery tool). Stale markers do not block new
+packet sends or leads taking over — they're just orphaned state.
