@@ -16,6 +16,7 @@ split and waits for your go, and wakes you when an executor finishes.
   `$TERM_PROGRAM`; override with `RELAY_TERMINAL=iterm|terminal` or `"terminal_app"` in the config
   (below).
 - **Claude Code**
+- Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
 - **terminal-notifier** (`brew install terminal-notifier`) — recommended, not required: it gives
   desktop banners that name which executor finished, coalesce per lead, and **click through to the
   lead's tab**. Without it, relay falls back to macOS's built-in notification (same info, not
@@ -87,7 +88,7 @@ More examples: [`textkit`](examples/textkit/) (parallel fan-out) and [`calc`](ex
 /relay:spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL]
 /relay:send  <session_id> <packet.md>      follow-up into the SAME session (reuse > respawn)
 /relay:check [<session_id> | --all]        busy / reported / stalled / dead
-/relay:list                                leads + executors, statuses, what's reported
+/relay:list                                leads + active executors (closed hidden; --closed shows)
 /relay:close <session_id> [--supersede <new_id>]
 /relay:stop                                unarm: step down from lead mode (gate + auto-wake off)
 /relay:focus <session_id>                  jump iTerm to that session's tab (executor or lead)
@@ -102,7 +103,8 @@ Also: `relay list` hides closed/superseded/dead sessions by default; pass `--clo
 [--open] [--all]` renders an executor's `git diff --staged` to a self-contained, offline HTML page
 (side-by-side via a vendored, checksummed diff2html — see [VENDOR.md](VENDOR.md) — with a stdlib
 fallback if that bundle is missing or fails its integrity check) so you review diffs in one click
-without spending model tokens on it.
+without spending model tokens on it. Its output (and every executor's closing line) includes a
+cmd+clickable `file://` URL to the page.
 
 Type them, or just describe what you want ("check on my sessions") — the lead invokes the right one.
 
