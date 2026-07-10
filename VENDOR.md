@@ -27,3 +27,13 @@ location if it moves), overwrite the three files under `assets/vendor/`, recompu
 same commit as the file changes — `relay diff`'s integrity check compares the CURRENT file bytes
 against whatever hash is recorded here, so a stale hash after a bump makes `relay diff` silently
 degrade to the stdlib fallback renderer instead of erroring loudly.
+
+## Runtime dependencies (not vendored)
+
+These are never shipped in this repo — relay invokes them only if present on your machine:
+
+- **terminal-notifier** (optional, `brew install terminal-notifier`, BSD-licensed) — clickable,
+  coalescing desktop banners; without it relay falls back to macOS's built-in notifications.
+- **iterm2** Python package (optional, `pip3 install iterm2`) — true adjacent-tab placement via
+  iTerm2's Python API; without it (or with the API disabled) placement falls back to AppleScript.
+- **macOS system tools** — `osascript`, `ps`, `git`, and the `claude` CLI itself.
