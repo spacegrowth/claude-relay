@@ -137,6 +137,13 @@ on different projects don't cross-wake.
   executors as split panes inside the lead's own tab instead of separate tabs; `--tab` forces a
   tab for one spawn regardless of config. Falls back to a tab if the lead's iTerm session can't be
   located. `relay focus` selects the exact pane, not just the tab (Terminal.app: always a window).
+- **True adjacent-tab placement** (iTerm only, optional nicety): for `layout="tab"` spawns,
+  AppleScript alone can only put a new tab in the lead's window, never truly next to it — install
+  `pip3 install --user iterm2` and enable iTerm's Settings → General → Magic → "Enable Python API"
+  (one-time toggle) to get the executor's tab created immediately at the lead's tab index + 1.
+  Fully optional: without the package or with the API disabled, everything works exactly as
+  before (same-window-at-end placement), just not index-adjacent — a spawn never hangs or fails
+  over this being unavailable.
 
 ## Config
 

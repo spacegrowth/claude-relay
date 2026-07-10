@@ -70,7 +70,12 @@ class TestTabColor:
 
 class TestSpawnLeadWindow:
     def test_with_lead_handle_walks_sessions_and_targets_matched_window(self):
-        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run:
+        # Python-API placement explicitly disabled (returns None) so this test exercises the pure
+        # AppleScript fallback path deterministically — regardless of whether THIS machine happens
+        # to have a real, working iTerm2 Python API connection available (see TestPyApiHybrid for
+        # the Python-API-succeeds case).
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run, \
+             mock.patch.object(iterm.iterm_pyapi, "try_create_adjacent_tab", return_value=None):
             iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0,
                         lead_handle="w1t2p0:LEAD-UUID")
         script = osa_run.call_args[0][0]
@@ -119,11 +124,13 @@ class TestSpawnPaneLayout:
 
     def test_default_layout_is_byte_identical_to_tab(self):
         # layout="tab" (the default) must produce the exact same script as omitting layout entirely
-        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run:
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run, \
+             mock.patch.object(iterm.iterm_pyapi, "try_create_adjacent_tab", return_value=None):
             iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0,
                         lead_handle="w1t2p0:LEAD-UUID")
         default_script = osa_run.call_args[0][0]
-        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run2:
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run2, \
+             mock.patch.object(iterm.iterm_pyapi, "try_create_adjacent_tab", return_value=None):
             iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0,
                         lead_handle="w1t2p0:LEAD-UUID", layout="tab")
         assert osa_run2.call_args[0][0] == default_script
@@ -137,6 +144,73 @@ class TestFocusPaneSelect:
         assert "tell w to select" in script
         assert "select t" in script
         assert "tell s to select" in script
+
+
+class TestPyApiHybrid:
+    """spawn()'s hybrid placement: when iterm_pyapi.try_create_adjacent_tab succeeds (package
+    installed, API enabled, lead session found), its returned session id is handed to the
+    EXISTING AppleScript write-text/rename machinery via _target_by_session_id_block — placement
+    only, no other behavior changes. Any failure (None) falls back to _create_target_block exactly
+    as it did before this feature existed (see TestSpawnLeadWindow)."""
+
+    def test_python_path_chosen_when_pyapi_succeeds(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run, \
+             mock.patch.object(iterm.iterm_pyapi, "try_create_adjacent_tab",
+                               return_value="NEW-TAB-SESSION-ID") as try_adjacent:
+            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0,
+                        lead_handle="w1t2p0:LEAD-UUID", layout="tab")
+        try_adjacent.assert_called_once_with("w1t2p0:LEAD-UUID")
+        script = osa_run.call_args[0][0]
+        assert 'if (id of s) is "NEW-TAB-SESSION-ID" then' in script
+        assert "set targetSession to s" in script
+        # the AppleScript-only fallback machinery (window/session walk-and-branch) must NOT run
+        assert "foundLeadWindow" not in script
+        assert "leadWindow" not in script
+        assert "create tab with default profile" not in script  # pyapi already made the tab
+
+    def test_appl_script_path_unchanged_when_pyapi_returns_none(self):
+        # Mirrors TestSpawnLeadWindow's fallback shape assertions — confirms the hybrid wiring
+        # doesn't alter the fallback script AT ALL when placement fails for any reason.
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run, \
+             mock.patch.object(iterm.iterm_pyapi, "try_create_adjacent_tab", return_value=None):
+            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0,
+                        lead_handle="w1t2p0:LEAD-UUID", layout="tab")
+        script = osa_run.call_args[0][0]
+        assert "set leadWindow to w" in script
+        assert "tell leadWindow to create tab with default profile" in script
+
+    def test_pyapi_not_attempted_for_pane_layout(self):
+        # Panes are inherently adjacent — no placement problem to solve, so the (possibly slow)
+        # Python API connection attempt must not even be made.
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run, \
+             mock.patch.object(iterm.iterm_pyapi, "try_create_adjacent_tab") as try_adjacent:
+            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0,
+                        lead_handle="w1t2p0:LEAD-UUID", layout="pane")
+        try_adjacent.assert_not_called()
+
+    def test_pyapi_not_attempted_without_lead_handle(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run, \
+             mock.patch.object(iterm.iterm_pyapi, "try_create_adjacent_tab") as try_adjacent:
+            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0)
+        try_adjacent.assert_not_called()
+
+    def test_import_blocked_end_to_end_produces_unchanged_appl_script(self, monkeypatch):
+        # The real availability-gate, exercised through spawn() itself (not a mocked
+        # try_create_adjacent_tab): with the `iterm2` package import genuinely blocked,
+        # try_create_adjacent_tab degrades to None internally, and the generated AppleScript is
+        # BYTE IDENTICAL to the pre-Python-API script shape (packet 007's zero-new-hard-dependency
+        # requirement).
+        monkeypatch.setitem(sys.modules, "iterm2", None)
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run:
+            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0,
+                        lead_handle="w1t2p0:LEAD-UUID", layout="tab")
+        script = osa_run.call_args[0][0]
+        assert "set leadWindow to w" in script
+        assert "tell leadWindow to create tab with default profile" in script
+        # the pyapi-success-only assignment ("set targetSession to s", from
+        # _target_by_session_id_block) must be absent — only the fallback shape's
+        # "set targetSession to current session of leadWindow" should appear.
+        assert "set targetSession to s\n" not in script
 
 
 class TestLeadColor:

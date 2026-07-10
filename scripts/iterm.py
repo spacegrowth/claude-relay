@@ -10,6 +10,8 @@ the source of truth for aliveness and the title match as a secondary confirmatio
 import shlex
 import subprocess
 
+import iterm_pyapi
+
 NAME = "iterm"  # backend key (see scripts/backend.py)
 ITERM_APP_NAME = "iTerm"
 CLAUDE_BIN = "claude"
@@ -228,6 +230,25 @@ def _create_target_block(lead_handle=None, layout="tab"):
     )
 
 
+def _target_by_session_id_block(uuid):
+    """AppleScript fragment binding `targetSession` to the session whose id already equals `uuid`
+    — used when `iterm_pyapi.try_create_adjacent_tab` has ALREADY created the tab at the right
+    index via the Python API; this fragment just hands the resulting session over to the existing
+    write-text/rename AppleScript machinery (confirmed live: Python API session ids and
+    AppleScript's `id of session` are the same UUID space, so this lookup always matches)."""
+    return (
+        "  repeat with w in windows\n"
+        "    repeat with t in tabs of w\n"
+        "      repeat with s in sessions of t\n"
+        f'        if (id of s) is "{osa(uuid)}" then\n'
+        "          set targetSession to s\n"
+        "        end if\n"
+        "      end repeat\n"
+        "    end repeat\n"
+        "  end repeat\n"
+    )
+
+
 def _match_session_block(label, action):
     """AppleScript fragment: walk windows -> tabs -> sessions, and on the first session whose
     name matches `label` (bounded match), run `action`, set matched to true, then return."""
@@ -271,10 +292,15 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     `lead_handle` ($TERM_SESSION_ID of the spawning lead's own iTerm session, if known): when
     given, the new tab/pane is created in the LEAD'S window instead of whatever window happens to
     be current — best-effort, falls back to today's current-window behavior if the lead's session
-    can't be located (unowned spawns, lead not in iTerm, any lookup miss). See
-    `_create_target_block` for why "adjacent to the lead's tab" as a separate TAB is out of reach:
-    iTerm2's AppleScript has no working tab-reorder primitive on this machine, so same-window is
-    the deliverable for `layout="tab"`, not same-window-next-to.
+    can't be located (unowned spawns, lead not in iTerm, any lookup miss). AppleScript alone can't
+    place a new TAB truly adjacent to the lead's (see `_create_target_block`'s note — `move tab`/
+    `set index of tab` are no-ops/errors on this machine), so for `layout="tab"` this first tries
+    `iterm_pyapi.try_create_adjacent_tab` (iTerm2's Python API, which DOES support index-placed
+    tab creation) and, only if that succeeds, hands the resulting session to the existing
+    AppleScript write-text/rename machinery via `_target_by_session_id_block`. Any failure there
+    (package not installed, API not enabled, timeout, anything) silently falls back to
+    `_create_target_block`'s same-window-at-end placement — byte-identical to the pre-Python-API
+    behavior, never blocking or failing the spawn over a cosmetic nicety.
 
     `layout` ("tab" default, or "pane"): with `layout="pane"` AND a resolvable `lead_handle`, the
     executor is opened as a split pane inside the LEAD'S OWN tab instead of a new tab — see
@@ -299,10 +325,19 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
            f"&& exec {base}")
     cmd_e = osa(cmd)
     rename_e = osa("/rename " + label)
+    # Only worth attempting adjacency for a separate TAB — a "pane" layout is inherently adjacent
+    # (it's split off the lead's own session), no placement problem to solve.
+    pyapi_session_id = (
+        iterm_pyapi.try_create_adjacent_tab(lead_handle) if layout == "tab" and lead_handle else None
+    )
+    target_block = (
+        _target_by_session_id_block(pyapi_session_id) if pyapi_session_id
+        else _create_target_block(lead_handle, layout)
+    )
     script = (
         f'tell application "{ITERM_APP_NAME}"\n'
         "  activate\n"
-        f"{_create_target_block(lead_handle, layout)}"
+        f"{target_block}"
         "  tell targetSession\n"
         f'    write text "{cmd_e}"\n'
         f"    delay {rename_delay}\n"
