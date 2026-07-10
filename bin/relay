@@ -52,6 +52,8 @@ LEDGER = STATE_ROOT / "sessions.jsonl"
 
 STALL_THRESHOLD_SECONDS = 30 * 60
 
+RELAY_BIN = str(Path(__file__).resolve())
+
 TEMPLATE_FOOTER = """
 
 ---
@@ -83,6 +85,10 @@ Then include:
 - Anything you could NOT verify — name it explicitly as UNVERIFIED. An honest gap is fine; a
   hidden one is not.
 - Confirmation that your changes are staged (not committed) and ready for the lead to review.
+
+AFTER writing your report, run:
+  {diff_cmd}
+(generates your staged-diff review page; do not open it, do not attach it anywhere — just run it once)
 """
 
 
@@ -159,8 +165,8 @@ def next_packet_number(session_id):
     return int(existing[-1]) + 1 if existing else 1
 
 
-def build_packet(body, report_path):
-    return body.rstrip() + TEMPLATE_FOOTER.format(report_path=report_path)
+def build_packet(body, report_path, diff_cmd):
+    return body.rstrip() + TEMPLATE_FOOTER.format(report_path=report_path, diff_cmd=diff_cmd)
 
 
 def packet_summary(body, limit=160):
@@ -334,8 +340,9 @@ def cmd_spawn(args):
     d.mkdir(parents=True, exist_ok=True)
     n = 1
     report_path = str(d / f"{n:03d}-report.md")
+    diff_cmd = f"{RELAY_BIN} diff {session_id}"
     packet_path = d / f"{n:03d}-packet.md"
-    packet_path.write_text(build_packet(body, report_path))
+    packet_path.write_text(build_packet(body, report_path, diff_cmd))
 
     # Whether the executor runs with --dangerously-skip-permissions. Per-spawn flag wins; else the
     # config default (executor_skip_permissions, default False = safe/prompts). Skip-perms means the
@@ -590,8 +597,9 @@ def cmd_send(args):
     n = next_packet_number(args.session_id)
     body = Path(args.packet).read_text()
     report_path = str(packets_dir(args.session_id) / f"{n:03d}-report.md")
+    diff_cmd = f"{RELAY_BIN} diff {args.session_id}"
     packet_path = packets_dir(args.session_id) / f"{n:03d}-packet.md"
-    packet_path.write_text(build_packet(body, report_path))
+    packet_path.write_text(build_packet(body, report_path, diff_cmd))
 
     pointer = build_pointer_message(str(packet_path), packet_summary(body))
     ok = False if tab_gone else term_backend(s).send(s["tab_label"], pointer,

@@ -52,23 +52,25 @@ class TestTemplateFooterConsistency:
     FORMAT section must be byte-identical regardless of the task-specific packet body."""
 
     def test_footer_identical_across_different_bodies(self, relay):
-        p1 = relay.build_packet("Fix the auth bug in login.py", "/tmp/a/001-report.md")
-        p2 = relay.build_packet("Implement the new charts grid layout, multi-file", "/tmp/b/002-report.md")
+        p1 = relay.build_packet("Fix the auth bug in login.py", "/tmp/a/001-report.md", "/path/to/relay diff sess-1")
+        p2 = relay.build_packet("Implement the new charts grid layout, multi-file", "/tmp/b/002-report.md", "/path/to/relay diff sess-2")
 
         footer1 = p1.split("---\n(relay")[1]
         footer2 = p2.split("---\n(relay")[1]
-        # Strip the one legitimately-varying line (the report path) before comparing.
-        footer1_norm = footer1.replace("/tmp/a/001-report.md", "REPORT_PATH")
-        footer2_norm = footer2.replace("/tmp/b/002-report.md", "REPORT_PATH")
+        # Strip the two legitimately-varying lines (report path and diff_cmd) before comparing.
+        footer1_norm = footer1.replace("/tmp/a/001-report.md", "REPORT_PATH").replace("/path/to/relay diff sess-1", "DIFF_CMD")
+        footer2_norm = footer2.replace("/tmp/b/002-report.md", "REPORT_PATH").replace("/path/to/relay diff sess-2", "DIFF_CMD")
         assert footer1_norm == footer2_norm
 
     def test_footer_contains_required_sections(self, relay):
-        p = relay.build_packet("do the thing", "/tmp/x/001-report.md")
+        p = relay.build_packet("do the thing", "/tmp/x/001-report.md", "/path/to/relay diff sess-x")
         assert "STAGE, NEVER COMMIT" in p
         assert "ONE LOGICAL DELIVERABLE" in p
         assert "/tmp/x/001-report.md" in p
         assert "UNVERIFIED" in p
         assert "VERY FIRST LINE" in p
+        assert "relay diff" in p
+        assert "sess-x" in p
 
 
 class TestPacketNumbering:
@@ -410,6 +412,21 @@ class TestSpawnTabIdentity:
         monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)  # truly unowned
         cap, _ = self._spawn(relay, tmp_path)
         assert cap["tab_color"] is None
+
+    def test_packet_contains_diff_command_with_session_id(self, relay, tmp_path):
+        pkt = tmp_path / "p.md"
+        pkt.write_text("do the thing")
+        with mock.patch.object(relay.iterm, "spawn"), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=None), \
+             mock.patch.object(relay, "read_iterm_id", return_value=None), \
+             mock.patch.object(relay, "_ensure_tab_label", return_value=True):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt),
+                                            model=None, name="e1", scope=None, skip_perms=None,
+                                            pane=None, lead=None))
+        packet_file = relay.packets_dir("e1") / "001-packet.md"
+        packet_content = packet_file.read_text()
+        assert "relay diff e1" in packet_content
 
 
 class TestRelativeAge:
