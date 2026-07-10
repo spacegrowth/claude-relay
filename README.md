@@ -76,6 +76,19 @@ More examples: [`textkit`](examples/textkit/) (parallel fan-out) and [`calc`](ex
 
 ## Mental model
 
+The flow, in five beats:
+
+1. **Design** — tell the session what to build, or point it at a brief.
+2. **`/relay:mode`** — arm it as the lead. (Order is flexible: arm first and then describe the
+   work, or design first and arm after — both work.)
+3. **Approve the split** — the lead proposes executors + packet files and **waits for your go**.
+4. **Spawn** — executors build in parallel, each in its own tab/pane; the lead wakes you as each
+   one reports.
+5. **Review → commit → close** — diff page per executor, you approve, the lead commits, sessions
+   close (or take follow-up packets).
+
+And the three nouns:
+
 - A **session** = one executor in its own terminal tab (or window/pane), working one worktree/topic. It stays alive
   across packets — one engineer you keep assigning related work to, not a disposable one-shot.
 - A **packet** = a work order (a `.md` file). relay auto-appends the rules every executor follows
