@@ -793,8 +793,28 @@ def cmd_list(args):
         rows = [s for s in rows if s.get("owner_lead") in (None, lead_sid)]
 
     if args.json:
+        # --json: fully unfiltered (programmatic surface, filtering is human-display concern)
         print(json.dumps({"leads": leads, "executors": rows}, indent=2))
         return
+
+    # Separate live and terminal rows for filtering
+    terminal_statuses = {"closed", "superseded", "dead"}
+    live_rows = [s for s in rows if s["status"] not in terminal_statuses]
+    terminal_rows = [s for s in rows if s["status"] in terminal_statuses]
+    hidden_terminal_count = 0
+
+    # --closed: include terminal rows, cap at 15 most recent
+    if getattr(args, "closed", False):
+        # Sort terminal rows by updated (most recent first)
+        terminal_rows_sorted = sorted(terminal_rows, key=lambda s: s.get("updated", ""), reverse=True)
+        shown_terminal = terminal_rows_sorted[:15]
+        hidden_terminal = terminal_rows_sorted[15:]
+        rows = live_rows + shown_terminal
+        hidden_terminal_count = len(hidden_terminal)
+    else:
+        # Default: exclude all terminal rows
+        rows = live_rows
+        hidden_terminal_count = len(terminal_rows)
 
     if leads:
         print(c("LEADS", "bold"))
@@ -869,6 +889,16 @@ def cmd_list(args):
             rep_cell,
         ]
         print(" ".join(row_parts))
+
+    # Print footer if terminal sessions are hidden/truncated
+    if getattr(args, "closed", False) and hidden_terminal_count > 0:
+        # --closed with more than 15 terminal rows: show how many older ones exist
+        footer = f"(…and {hidden_terminal_count} older closed sessions — `relay prune --dry-run`)"
+        print(c(footer, "dim"))
+    elif not getattr(args, "closed", False) and hidden_terminal_count > 0:
+        # Default: show how many terminal rows are hidden
+        footer = f"(+{hidden_terminal_count} closed/superseded/dead hidden — `relay list --closed` to show, `relay prune --dry-run` to see what's clearable)"
+        print(c(footer, "dim"))
 
 
 def _has_staged_diff(worktree):
@@ -1171,6 +1201,8 @@ def main():
 
     ls = sub.add_parser("list")
     ls.add_argument("--json", action="store_true")
+    ls.add_argument("--closed", action="store_true", help="show closed/superseded/dead sessions "
+                    "(capped at 15 most recent)")
     ls.add_argument("--lead", help="scope EXECUTORS to this lead's project (its owned executors "
                     "plus unowned ones); LEADS are always shown in full")
     ls.add_argument("--all", action="store_true", help="show every executor regardless of owner "

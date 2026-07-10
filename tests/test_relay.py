@@ -470,10 +470,10 @@ class TestCmdList:
     def _exec(self, relay, sid, owner_lead=None, owner_project=None, status="busy"):
         relay.write_session(sid, {"session_id": sid, "current_packet": 1, "status": status,
             "topic": "t", "worktree": "/w", "scope": "", "model": "opus",
-            "busy_since": relay.now(), "owner_lead": owner_lead, "owner_project": owner_project})
+            "busy_since": relay.now(), "updated": relay.now(), "owner_lead": owner_lead, "owner_project": owner_project})
 
-    def _args(self, json=False, lead=None, all=False):
-        return SimpleNamespace(json=json, lead=lead, all=all)
+    def _args(self, json=False, lead=None, all=False, closed=False):
+        return SimpleNamespace(json=json, lead=lead, all=all, closed=closed)
 
     def test_leads_section_rendered(self, relay, capsys):
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", model="opus", project="alpha")
@@ -544,6 +544,71 @@ class TestCmdList:
         relay.cmd_list(self._args(json=True, lead="lead-1"))
         data = json.loads(capsys.readouterr().out)
         assert {m["session_id"] for m in data["leads"]} == {"lead-1", "lead-2"}
+
+    def test_default_hides_terminal_rows_and_shows_footer(self, relay, capsys):
+        # Default: closed/superseded/dead sessions hidden, footer shows count
+        self._exec(relay, "live-1", status="busy")
+        self._exec(relay, "closed-1", status="closed")
+        relay.cmd_list(self._args())
+        out = capsys.readouterr().out
+        assert "live-1" in out
+        assert "closed-1" not in out
+        assert "(+1 closed/superseded/dead hidden" in out
+        assert "--closed" in out
+        assert "prune --dry-run" in out
+
+    def test_closed_flag_shows_terminal_rows(self, relay, capsys):
+        # --closed: include terminal rows
+        self._exec(relay, "live-1", status="busy")
+        self._exec(relay, "closed-1", status="closed")
+        relay.cmd_list(self._args(closed=True))
+        out = capsys.readouterr().out
+        assert "live-1" in out
+        assert "closed-1" in out
+
+    def test_closed_flag_caps_terminal_rows_at_15_most_recent(self, relay, capsys):
+        # --closed with 17 terminal sessions: show only 15 most recent by updated time
+        self._exec(relay, "live-1", status="busy")
+        # Create 17 closed sessions with different updated times
+        for i in range(17):
+            # Use a fixed base time and offset each by i seconds to control ordering
+            base = "2024-01-01T12:00:00"
+            import time as time_module
+            t = time_module.strptime(base, "%Y-%m-%dT%H:%M:%S")
+            t_offset = time_module.mktime(t) + i  # i seconds after base
+            t_str = time_module.strftime("%Y-%m-%dT%H:%M:%S", time_module.localtime(t_offset))
+            relay.write_session(f"closed-{i:02d}", {"session_id": f"closed-{i:02d}", "current_packet": 1,
+                "status": "closed", "topic": "t", "worktree": "/w", "scope": "", "model": "opus",
+                "updated": t_str, "owner_lead": None})
+        relay.cmd_list(self._args(closed=True))
+        out = capsys.readouterr().out
+        # Should show live and the 15 most recent closed (closed-16 through closed-02)
+        assert "live-1" in out
+        assert "closed-16" in out  # most recent (highest i)
+        assert "closed-02" in out  # 15th most recent
+        assert "closed-01" not in out  # oldest, should be hidden
+        assert "closed-00" not in out  # oldest, should be hidden
+        assert "(…and 2 older closed sessions" in out
+
+    def test_json_includes_all_terminal_rows_regardless_of_flags(self, relay, capsys):
+        # --json: fully unfiltered, includes all rows regardless of --closed or default
+        self._exec(relay, "live-1", status="busy")
+        self._exec(relay, "closed-1", status="closed")
+        relay.cmd_list(self._args(json=True))
+        data = json.loads(capsys.readouterr().out)
+        ids = {e["session_id"] for e in data["executors"]}
+        assert ids == {"live-1", "closed-1"}
+
+    def test_footer_absent_when_no_terminal_rows(self, relay, capsys):
+        # No footer if there are no terminal sessions to hide
+        self._exec(relay, "live-1", status="busy")
+        self._exec(relay, "live-2", status="reported")
+        relay.cmd_list(self._args())
+        out = capsys.readouterr().out
+        assert "live-1" in out
+        assert "live-2" in out
+        assert "closed/superseded/dead hidden" not in out
+        assert "…and" not in out
 
 
 class TestListAlignment:

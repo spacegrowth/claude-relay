@@ -97,7 +97,7 @@ More examples: [`textkit`](examples/textkit/) (parallel fan-out) and [`calc`](ex
 /relay:diff <session_id>                   render staged changes to an HTML review page and open it
 ```
 
-Also: `relay report <sid>` prints a finished report in a green banner, and
+Also: `relay list` hides closed/superseded/dead sessions by default; pass `--closed` to reveal them (capped at 15 most recent). `relay report <sid>` prints a finished report in a green banner, and
 `relay prune [--days N] [--dry-run]` clears old closed/dead session state. `relay diff <sid>
 [--open] [--all]` renders an executor's `git diff --staged` to a self-contained, offline HTML page
 (side-by-side via a vendored, checksummed diff2html — see [VENDOR.md](VENDOR.md) — with a stdlib
