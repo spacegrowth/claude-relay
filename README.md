@@ -1,7 +1,8 @@
-# relay — delegate Claude Code work across iTerm tabs
+# relay — delegate Claude Code work across terminal tabs
 
-A Claude Code plugin (macOS + iTerm2) that turns one session into a **lead** — it plans, delegates,
-and reviews — and spawns **executor** sessions in their own iTerm tabs, each seeded with a work
+A Claude Code plugin for macOS (iTerm2 or Terminal.app) that turns one session into a **lead** —
+it plans, delegates, and reviews — and spawns **executor** sessions in their own terminal tabs,
+windows, or split panes, each seeded with a work
 packet. Executors **stage their work (never commit)**, write a report, and stay idle for reuse; the
 lead reviews the staged diff and commits. You stay in the loop at every gate: the lead proposes a
 split and waits for your go, and wakes you when an executor finishes.
@@ -75,7 +76,7 @@ More examples: [`textkit`](examples/textkit/) (parallel fan-out) and [`calc`](ex
 
 ## Mental model
 
-- A **session** = one executor in its own iTerm tab, working one worktree/topic. It stays alive
+- A **session** = one executor in its own terminal tab (or window/pane), working one worktree/topic. It stays alive
   across packets — one engineer you keep assigning related work to, not a disposable one-shot.
 - A **packet** = a work order (a `.md` file). relay auto-appends the rules every executor follows
   (stage-don't-commit, one deliverable per packet, required report format) — you never write those.
@@ -91,7 +92,7 @@ More examples: [`textkit`](examples/textkit/) (parallel fan-out) and [`calc`](ex
 /relay:list                                leads + active executors (closed hidden; --closed shows)
 /relay:close <session_id> [--supersede <new_id>]
 /relay:stop                                unarm: step down from lead mode (gate + auto-wake off)
-/relay:focus <session_id>                  jump iTerm to that session's tab (executor or lead)
+/relay:focus <session_id>                  jump to that session's tab/pane/window (executor or lead)
 /relay:resume <session_id>                 reopen a dead tab's conversation, context intact
 /relay:restart <session_id>                re-run a dead session's packet fresh (loses context)
 /relay:route retain "<reason>"             open a grace window when the gate blocks lead work
