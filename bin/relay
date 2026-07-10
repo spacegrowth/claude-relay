@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -68,8 +69,8 @@ GATES
 - STAY IDLE AFTER REPORTING. After you write your report, remain idle — do NOT exit, and do NOT
   commit (the lead reviews and commits). The lead may reuse this session for a follow-up packet, and
   will `relay close` it when done. Closing the tab yourself throws away the reusable context.
-  END your final turn with EXACTLY this one line, nothing after it:
-      ✅ staged + report written — idle, awaiting the lead's review.
+  After running the self-diff step, end your final turn with EXACTLY this one line, nothing after it:
+      ✅ staged + report written — diff: {diff_url} — idle, awaiting the lead's review.
 
 REPORT FORMAT
 Before you stop, write your full report to {report_path} (not just stdout/chat).
@@ -90,6 +91,11 @@ AFTER writing your report, run:
   {diff_cmd}
 (generates your staged-diff review page; do not open it, do not attach it anywhere — just run it once)
 """
+
+
+def path_to_file_url(path):
+    """Convert an absolute path to a file:// URL with proper encoding."""
+    return f"file://{urllib.parse.quote(str(path), safe='/')}"
 
 
 def slugify(text):
@@ -165,8 +171,8 @@ def next_packet_number(session_id):
     return int(existing[-1]) + 1 if existing else 1
 
 
-def build_packet(body, report_path, diff_cmd):
-    return body.rstrip() + TEMPLATE_FOOTER.format(report_path=report_path, diff_cmd=diff_cmd)
+def build_packet(body, report_path, diff_cmd, diff_url):
+    return body.rstrip() + TEMPLATE_FOOTER.format(report_path=report_path, diff_cmd=diff_cmd, diff_url=diff_url)
 
 
 def packet_summary(body, limit=160):
@@ -341,8 +347,10 @@ def cmd_spawn(args):
     n = 1
     report_path = str(d / f"{n:03d}-report.md")
     diff_cmd = f"{RELAY_BIN} diff {session_id}"
+    diff_path = d / f"{n:03d}-diff.html"
+    diff_url = path_to_file_url(diff_path)
     packet_path = d / f"{n:03d}-packet.md"
-    packet_path.write_text(build_packet(body, report_path, diff_cmd))
+    packet_path.write_text(build_packet(body, report_path, diff_cmd, diff_url))
 
     # Whether the executor runs with --dangerously-skip-permissions. Per-spawn flag wins; else the
     # config default (executor_skip_permissions, default False = safe/prompts). Skip-perms means the
@@ -598,8 +606,10 @@ def cmd_send(args):
     body = Path(args.packet).read_text()
     report_path = str(packets_dir(args.session_id) / f"{n:03d}-report.md")
     diff_cmd = f"{RELAY_BIN} diff {args.session_id}"
+    diff_path = packets_dir(args.session_id) / f"{n:03d}-diff.html"
+    diff_url = path_to_file_url(diff_path)
     packet_path = packets_dir(args.session_id) / f"{n:03d}-packet.md"
-    packet_path.write_text(build_packet(body, report_path, diff_cmd))
+    packet_path.write_text(build_packet(body, report_path, diff_cmd, diff_url))
 
     pointer = build_pointer_message(str(packet_path), packet_summary(body))
     ok = False if tab_gone else term_backend(s).send(s["tab_label"], pointer,
@@ -975,6 +985,7 @@ def cmd_diff(args):
     out_path = packets_dir(args.session_id) / f"{n:03d}-diff.html"
     out_path.write_text(page)
     print(str(out_path))
+    print(path_to_file_url(out_path))
     if args.open:
         subprocess.run(["open", str(out_path)])
 

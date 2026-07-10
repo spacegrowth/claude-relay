@@ -52,18 +52,18 @@ class TestTemplateFooterConsistency:
     FORMAT section must be byte-identical regardless of the task-specific packet body."""
 
     def test_footer_identical_across_different_bodies(self, relay):
-        p1 = relay.build_packet("Fix the auth bug in login.py", "/tmp/a/001-report.md", "/path/to/relay diff sess-1")
-        p2 = relay.build_packet("Implement the new charts grid layout, multi-file", "/tmp/b/002-report.md", "/path/to/relay diff sess-2")
+        p1 = relay.build_packet("Fix the auth bug in login.py", "/tmp/a/001-report.md", "/path/to/relay diff sess-1", "file:///tmp/a/001-diff.html")
+        p2 = relay.build_packet("Implement the new charts grid layout, multi-file", "/tmp/b/002-report.md", "/path/to/relay diff sess-2", "file:///tmp/b/002-diff.html")
 
         footer1 = p1.split("---\n(relay")[1]
         footer2 = p2.split("---\n(relay")[1]
-        # Strip the two legitimately-varying lines (report path and diff_cmd) before comparing.
-        footer1_norm = footer1.replace("/tmp/a/001-report.md", "REPORT_PATH").replace("/path/to/relay diff sess-1", "DIFF_CMD")
-        footer2_norm = footer2.replace("/tmp/b/002-report.md", "REPORT_PATH").replace("/path/to/relay diff sess-2", "DIFF_CMD")
+        # Strip the three legitimately-varying lines (report path, diff_cmd, and diff_url) before comparing.
+        footer1_norm = footer1.replace("/tmp/a/001-report.md", "REPORT_PATH").replace("/path/to/relay diff sess-1", "DIFF_CMD").replace("file:///tmp/a/001-diff.html", "DIFF_URL")
+        footer2_norm = footer2.replace("/tmp/b/002-report.md", "REPORT_PATH").replace("/path/to/relay diff sess-2", "DIFF_CMD").replace("file:///tmp/b/002-diff.html", "DIFF_URL")
         assert footer1_norm == footer2_norm
 
     def test_footer_contains_required_sections(self, relay):
-        p = relay.build_packet("do the thing", "/tmp/x/001-report.md", "/path/to/relay diff sess-x")
+        p = relay.build_packet("do the thing", "/tmp/x/001-report.md", "/path/to/relay diff sess-x", "file:///tmp/x/001-diff.html")
         assert "STAGE, NEVER COMMIT" in p
         assert "ONE LOGICAL DELIVERABLE" in p
         assert "/tmp/x/001-report.md" in p
@@ -71,6 +71,21 @@ class TestTemplateFooterConsistency:
         assert "VERY FIRST LINE" in p
         assert "relay diff" in p
         assert "sess-x" in p
+        assert "diff: file://" in p
+
+    def test_sentinel_line_contains_correct_diff_url(self, relay):
+        p = relay.build_packet("task body", "/tmp/sess-a/001-report.md", "/path/to/relay diff sess-a", "file:///tmp/sess-a/001-diff.html")
+        # Verify sentinel line contains the diff URL
+        assert "✅ staged + report written — diff: file:///tmp/sess-a/001-diff.html — idle, awaiting the lead's review." in p
+
+    def test_packet_002_diff_url_correct_packet_number(self, relay):
+        # cmd_send path: packet 002's footer must carry 002-diff.html, not 001
+        p = relay.build_packet("second packet", "/tmp/sess-b/002-report.md", "/path/to/relay diff sess-b", "file:///tmp/sess-b/002-diff.html")
+        # Verify the sentinel contains 002-diff.html
+        assert "002-diff.html" in p
+        assert "001-diff.html" not in p
+        # Verify sentinel line is present with correct URL
+        assert "diff: file:///tmp/sess-b/002-diff.html" in p
 
 
 class TestPacketNumbering:
@@ -1242,6 +1257,49 @@ class TestDiff:
     def test_unknown_session_errors(self, relay):
         with pytest.raises(SystemExit):
             relay.cmd_diff(SimpleNamespace(session_id="nope", open=False, all=False))
+
+    def test_diff_output_includes_file_url(self, relay, tmp_path, capsys):
+        import urllib.parse
+        repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a"})
+        self._mk_session(relay, "e1", repo, report_text="a.py changed.")
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=False))
+        output = capsys.readouterr().out
+        expected_path = relay.packets_dir("e1") / "001-diff.html"
+        # Both plain path and file:// URL should be in output
+        assert str(expected_path) in output
+        expected_url = f"file://{urllib.parse.quote(str(expected_path), safe='/')}"
+        assert expected_url in output
+
+    def test_diff_url_encodes_spaces_as_percent20(self, relay, tmp_path, capsys):
+        import urllib.parse
+        # Create a session with spaces in its path (via session_id with spaces)
+        repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a"})
+        self._mk_session(relay, "e1 with spaces", repo, report_text="a.py changed.")
+        relay.cmd_diff(SimpleNamespace(session_id="e1 with spaces", open=False, all=False))
+        output = capsys.readouterr().out
+        # Verify %20 is in the URL line (not raw spaces)
+        lines = output.strip().split('\n')
+        url_line = lines[1]  # second line is the file:// URL
+        assert "file://" in url_line
+        assert "%20" in url_line
+        # Check that spaces are encoded in the URL part
+        url_part = url_line.split("file://")[1]
+        assert " " not in url_part  # no raw spaces after file://
+
+    def test_diff_url_round_trip_unquote(self, relay, tmp_path, capsys):
+        import urllib.parse
+        repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a"})
+        self._mk_session(relay, "e1", repo, report_text="a.py changed.")
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=False))
+        output = capsys.readouterr().out
+        expected_path = relay.packets_dir("e1") / "001-diff.html"
+        lines = output.strip().split('\n')
+        url_line = lines[1]  # second line is the file:// URL
+        # Extract the URL part (remove "file://" prefix)
+        url_encoded_path = url_line.replace("file://", "")
+        # Unquote and verify it equals the original path
+        unquoted = urllib.parse.unquote(url_encoded_path)
+        assert unquoted == str(expected_path)
 
 
 class TestReportPointsToDiff:
