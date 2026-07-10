@@ -22,7 +22,7 @@ Open a fresh Claude Code session there (plugin loaded), then:
 1. **Serial**: one executor builds `core.py`; the lead wakes you when it reports.
 2. **Parallel + reuse**: on your go, the lead `/relay:send`s `stats.py` into the SAME executor and
    spawns a fresh one for `shout.py` — both busy at once in `relay list`, tabs sharing the lead's
-   color (iTerm).
+   color (iTerm). For a tighter cluster, executors can open as split panes (`--pane` / `"executor_layout": "pane"`, iTerm only).
 3. **Fan-in**: the lead writes `cli.py` (+`__main__.py`), runs `pytest`.
 
 Verify:

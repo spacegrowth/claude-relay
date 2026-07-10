@@ -28,13 +28,13 @@ and waits.
 ```
 /relay:mode
 ```
-✅ Tab renames `[lead] calc`; it presents the phased split (with packet paths) and waits.
+✅ Tab renames `[L] calc`; it presents the phased split (with packet paths) and waits.
 
 **3. Phase 1 — serial:**
 > go — start with tokenize
 
 ✅ One executor builds `tokenize.py`; when it reports, the wake shows a **brief of what it did**.
-Review it, then have the lead **reuse the same session** for `evaluate.py`:
+Its closing line has a clickable file:// link to the diff page — review it, then have the lead **reuse the same session** for `evaluate.py`:
 > looks good — now send it evaluate.py
 
 (demonstrates `/relay:send` — reuse over re-spawn.)
@@ -43,7 +43,7 @@ Review it, then have the lead **reuse the same session** for `evaluate.py`:
 > now fan out the three extensions
 
 ✅ Three executors (`functions`, `constants`, `ops`) build **at once**. Notifications name each
-(`relay · calc / …-functions reported`), and clicking jumps to the tab. Review each.
+(`relay · calc / …-functions reported`), and clicking jumps to the tab. Each report's closing line has a clickable diff page — review those.
 
 **5. Phase 3 — integrate (lead):**
 > wire up cli.py and run the tests

@@ -49,12 +49,14 @@ relay list
 ```
 ```
 LEADS
-  PROJECT        SESSION       MODEL   LAST ACTIVE
-  textkit-demo   4a71bfd9-…    opus    just now
+  PROJECT   SESSION           MODEL  LAST ACTIVE
+  textkit   abc1234d-…        opus   just now
+
 EXECUTORS
-  tk-slug      busy 1m   slug      textkit-demo   …
-  tk-count     busy 1m   count     textkit-demo   …
-  tk-palette   busy 1m   palette   textkit-demo   …
+  SESSION    STATUS   TOPIC     SCOPE   PROJECT   MODEL  PKT   REPORTED
+  tk-slug    busy 1m  slug      …       textkit   opus   001   no
+  tk-count   busy 1m  count     …       textkit   opus   001   no
+  tk-palette busy 1m  palette   …       textkit   opus   001   no
 ```
 
 **4. The lead auto-wakes as each executor reports** (scoped to *this* project — no cross-wake from
@@ -63,7 +65,8 @@ other leads):
 > **Claude (lead):** 🚦 [relay] — review needed: `tk-slug` reported. (…then `tk-count`, `tk-palette`.)
 
 **5. Review + integrate.** Tell the lead to review; it checks each report + staged module against
-the brief's interfaces, then writes `cli.py` (the fan-in) and runs the suite:
+the brief's interfaces — each executor's closing line includes a clickable file:// link to its diff
+page — then writes `cli.py` (the fan-in) and runs the suite:
 
 ```
 python -m pytest                       # module tests + the integrated CLI → green
