@@ -1,0 +1,1235 @@
+#!/usr/bin/env python3
+"""
+relay — delegate work packets from a Fable lead session to executor sessions in their own
+iTerm tabs, reusing a live session for related follow-up packets instead of spawning a fresh
+one each time.
+
+Commands:
+  relay spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL]
+  relay send  <session_id> <packet.md>
+  relay check [<session_id> | --all] [--json]
+  relay list [--lead <session_id> | --all] [--json]
+  relay report <session_id> [--packet N]      # print an executor's report, framed in green
+  relay close <session_id> [--supersede <new_session_id>]
+  relay close --self <session_id>            # step down from lead mode
+  relay stop <session_id>                    # step down from lead mode (alias for close --self)
+  relay lead-start <session_id> [--model N]   # mark this session a lead (from /relay:mode)
+  relay route retain "<reason>" --session <session_id>   # open the retain grace window
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import backend
+import diff_render
+import lead_guard
+
+# The terminal backend for THIS invocation ($RELAY_TERMINAL > config > $TERM_PROGRAM; see
+# scripts/backend.py). Named `iterm` because that was the only backend for most of relay's life —
+# every call site (and the test suite's mock.patch.object(relay.iterm, …)) addresses it this way.
+iterm = backend.select()
+
+
+def term_backend(s):
+    """Backend module for an EXISTING session — honors the backend recorded at its spawn (a session
+    opened in Terminal.app must keep being addressed there even if relay now runs under iTerm).
+    Pre-backend session records (no field) use this invocation's selected backend."""
+    return backend.by_name((s or {}).get("backend")) or iterm
+
+STATE_ROOT = Path.home() / ".relay-tasks"
+LEDGER = STATE_ROOT / "sessions.jsonl"
+
+STALL_THRESHOLD_SECONDS = 30 * 60
+
+TEMPLATE_FOOTER = """
+
+---
+(relay — do not remove or reword this section)
+
+GATES
+- STAGE, NEVER COMMIT. Leave your work staged (git add), uncommitted. The lead reviews the
+  staged diff and commits it. Do not run `git commit` yourself.
+- ONE LOGICAL DELIVERABLE. This packet is scoped to a single atomic, reviewable-in-one-sitting
+  change. If you find the work actually splits into unrelated concerns, stop and report that
+  instead of doing both.
+- STAY IDLE AFTER REPORTING. After you write your report, remain idle — do NOT exit, and do NOT
+  commit (the lead reviews and commits). The lead may reuse this session for a follow-up packet, and
+  will `relay close` it when done. Closing the tab yourself throws away the reusable context.
+  END your final turn with EXACTLY this one line, nothing after it:
+      ✅ staged + report written — idle, awaiting the lead's review.
+
+REPORT FORMAT
+Before you stop, write your full report to {report_path} (not just stdout/chat).
+- THE VERY FIRST LINE of the report must be ONE PLAIN SENTENCE stating the outcome — what was
+  built/fixed and its verification state. No heading marker, no "Report:" prefix, no keyword
+  label — this exact line becomes the desktop notification and the lead's wake message, so write
+  it for a human glancing at a banner, e.g.:
+      Split-pane layout works behind a config flag; 9 new tests, suite green, staged.
+Then include:
+- What changed (file:line for each substantive change).
+- What you verified, and with which command/result.
+- Acceptance-criteria outcomes, if the packet listed any.
+- Anything you could NOT verify — name it explicitly as UNVERIFIED. An honest gap is fine; a
+  hidden one is not.
+- Confirmation that your changes are staged (not committed) and ready for the lead to review.
+"""
+
+
+def slugify(text):
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return s or "task"
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def append_ledger(event, **fields):
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": now(), "event": event, **fields}
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def session_dir(session_id):
+    return STATE_ROOT / session_id
+
+
+def packets_dir(session_id):
+    return session_dir(session_id) / "packets"
+
+
+def pid_path(session_id):
+    return session_dir(session_id) / "pid"
+
+
+def iterm_id_path(session_id):
+    return session_dir(session_id) / "iterm_id"
+
+
+def read_iterm_id(session_id, timeout=5):
+    """Poll for the executor's own iTerm session id ($ITERM_SESSION_ID), which the spawned shell
+    writes before exec'ing claude. Returns None if it never appears (empty var / capture failed)."""
+    p = iterm_id_path(session_id)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if p.exists():
+            v = p.read_text().strip()
+            if v:
+                return v
+        time.sleep(0.2)
+    return None
+
+
+def read_session(session_id):
+    p = session_dir(session_id) / "session.json"
+    if not p.exists():
+        return None
+    return json.loads(p.read_text())
+
+
+def write_session(session_id, data):
+    d = session_dir(session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "session.json").write_text(json.dumps(data, indent=2))
+
+
+def all_session_ids():
+    if not STATE_ROOT.exists():
+        return []
+    return sorted(d.name for d in STATE_ROOT.iterdir() if (d / "session.json").exists())
+
+
+def next_packet_number(session_id):
+    d = packets_dir(session_id)
+    if not d.exists():
+        return 1
+    existing = sorted(p.stem.split("-")[0] for p in d.glob("*-packet.md"))
+    return int(existing[-1]) + 1 if existing else 1
+
+
+def build_packet(body, report_path):
+    return body.rstrip() + TEMPLATE_FOOTER.format(report_path=report_path)
+
+
+def packet_summary(body, limit=160):
+    """A ONE-LINE gist of a packet — its first meaningful line, markdown heading markers stripped
+    and whitespace collapsed — so the executor's first message shows WHAT the task is, not just a
+    file path. Returns "" if nothing usable (caller then omits the summary)."""
+    for raw in body.splitlines():
+        line = " ".join(raw.strip().lstrip("#").strip().split())  # de-heading + collapse whitespace
+        if line:
+            return line[: limit - 1] + "…" if len(line) > limit else line
+    return ""
+
+
+def build_pointer_message(packet_path, summary=None):
+    """A SHORT, single-line instruction pointing the executor at its packet file, rather than
+    embedding the full (often multi-page) packet text directly into a typed/`write text`
+    command. Typing a large multi-line block into an interactive shell or a running claude
+    session is fragile: a fresh shell interprets embedded newlines as real Enter presses
+    (visible as zsh's "quote> " continuation prompt while a multi-line quoted argument is still
+    being "typed" -- confirmed empirically), and typing multi-line text into an ALREADY-RUNNING
+    claude session risks the first embedded newline submitting an incomplete turn. A short
+    single-line pointer sidesteps both risks for spawn and send alike. `summary` (kept single-line
+    by packet_summary) is prepended so the executor's first line states the ask up front."""
+    gist = f"Task — {summary}. " if summary else ""
+    return (f"{gist}Read and follow the work packet at {packet_path} — it contains your task, "
+            f"GATES, and REPORT FORMAT.")
+
+
+def read_pid(session_id, timeout=5):
+    """Poll for the pidfile spawn() asked the shell to write via `echo $$`. Returns None if it
+    never appears (e.g. `claude` isn't on PATH, or the shell command failed)."""
+    p = pid_path(session_id)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if p.exists():
+            try:
+                return int(p.read_text().strip())
+            except ValueError:
+                pass
+        time.sleep(0.2)
+    return None
+
+
+def auto_trust(worktree):
+    """Pre-accept Claude Code's one-time workspace-trust dialog for `worktree`, so `relay spawn`
+    into a brand-new directory doesn't block on a human click. This writes the exact same field
+    (`hasTrustDialogAccepted`) that Claude Code itself sets when a human clicks "trust" by hand
+    (confirmed by inspecting ~/.claude.json's existing entries) -- read-merge-write, touching
+    only this one project's entry, never the rest of the file. Best-effort: any failure here
+    (missing file, unexpected schema, concurrent write) is swallowed -- worst case the user sees
+    the one-time dialog, same as without this function."""
+    config_path = Path.home() / ".claude.json"
+    worktree_abs = str(Path(worktree).resolve())
+    try:
+        config = json.loads(config_path.read_text())
+        projects = config.setdefault("projects", {})
+        entry = projects.setdefault(worktree_abs, {})
+        if entry.get("hasTrustDialogAccepted") is True:
+            return  # already trusted — don't rewrite the file at all
+        entry["hasTrustDialogAccepted"] = True
+        # Claude Code itself rewrites ~/.claude.json frequently (settings, project history, auth
+        # state), so this must be atomic: write a sibling temp file and os.replace it, never a
+        # partial in-place write. The read happens immediately above, keeping the lost-update
+        # window as small as a whole-file merge allows.
+        tmp = config_path.parent / (config_path.name + ".relay-tmp")
+        tmp.write_text(json.dumps(config, indent=2))
+        os.replace(tmp, config_path)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+def pid_alive(pid):
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just owned by someone else (won't happen for our own child)
+    return True
+
+
+def pid_start_time(pid):
+    """The process's launch timestamp (ps lstart), or None on any failure. Recorded at spawn and
+    compared later so a recycled pid — the OS reusing this exact number for an unrelated process —
+    doesn't read as 'our executor is alive' (or worse, get SIGTERMed at close)."""
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def session_pid_alive(s):
+    """pid_alive plus the pid-reuse check: alive AND (when a start time was recorded at spawn)
+    still the same process. A mismatch means the pid was recycled → treat as dead."""
+    pid = s.get("pid")
+    if not pid_alive(pid):
+        return False
+    recorded = s.get("pid_started")
+    if recorded:
+        cur = pid_start_time(pid)
+        if cur and cur != recorded:
+            return False
+    return True
+
+
+def _ensure_tab_label(bk, handle, label, attempts=3, delay=1.5):
+    """Verify the tab label actually took, retrying the rename if not. iTerm's spawn types
+    `/rename` after a FIXED startup delay; a slow claude start (cold cache, heavy MCP init) can
+    swallow it, and an unlabeled tab silently breaks everything title-based (send/close/focus,
+    stalled-vs-dead). The retry goes through rename_by_id — matched by the captured handle (iTerm
+    session id / Terminal window id), so it can't hit the wrong tab. Best-effort: without a
+    captured handle there's nothing safe to do."""
+    if not handle:
+        return False
+    for _ in range(attempts):
+        if bk.is_alive(label, handle):
+            return True
+        bk.rename_by_id(handle, label)
+        time.sleep(delay)
+    return bk.is_alive(label, handle)
+
+
+def _kill_and_wait(s, timeout=3.0):
+    """SIGTERM the session's process and WAIT until it is actually gone (escalating to SIGKILL at
+    the deadline). A fixed post-kill sleep raced the terminal's 'process still running' confirm
+    sheet — once that sheet is up, Terminal.app silently ignores every scripted close of the window
+    (observed live), so the tab could never be cleaned up again."""
+    if not session_pid_alive(s):
+        return
+    pid = s["pid"]
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.2)
+    except Exception:
+        pass
+
+
+def cmd_spawn(args):
+    body = Path(args.packet).read_text()
+    session_id = args.name or f"{slugify(args.topic)}-{time.strftime('%H%M%S')}"
+    if read_session(session_id):
+        sys.exit(f"session '{session_id}' already exists — pick a different --name or use `relay send`")
+
+    # Resolve the worktree to an ABSOLUTE, existing dir. The spawned tab opens in iTerm's default cwd
+    # (not the lead's), so the `cd <worktree>` in the launch command must be absolute — a relative or
+    # bogus path (e.g. the lead accidentally passing a session-name-like string) would `cd` into
+    # nothing, the `&&` chain would die, and `exec claude` would never run (silently broken tab).
+    # Fail loudly here instead.
+    worktree = str(Path(args.worktree).expanduser().resolve())
+    if not Path(worktree).is_dir():
+        sys.exit(f"spawn: worktree not found — '{args.worktree}' resolved to '{worktree}', which is "
+                 f"not a directory. Pass the existing project directory all executors share "
+                 f"(an absolute path, e.g. /tmp/calc).")
+
+    auto_trust(worktree)
+    label = f"[executor] {session_id}"  # role-prefixed: exec tabs and lead tabs are told apart at a glance
+    d = packets_dir(session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    n = 1
+    report_path = str(d / f"{n:03d}-report.md")
+    packet_path = d / f"{n:03d}-packet.md"
+    packet_path.write_text(build_packet(body, report_path))
+
+    # Whether the executor runs with --dangerously-skip-permissions. Per-spawn flag wins; else the
+    # config default (executor_skip_permissions, default False = safe/prompts). Skip-perms means the
+    # executor edits files / runs commands without prompting — mitigated by relay's design
+    # (executors STAGE, never commit; the lead reviews before anything lands), but a real tradeoff.
+    cfg = lead_guard.load_config(STATE_ROOT)
+    skip_perms = args.skip_perms if args.skip_perms is not None else bool(cfg.get("executor_skip_permissions", False))
+    # Same tri-state pattern as skip_perms: --pane/--tab wins; else config's executor_layout
+    # ("tab" default). "pane" only takes effect if the lead's iTerm session can be located at
+    # spawn time (see iterm.spawn's lead_handle/layout docstring) — otherwise it degrades to a tab.
+    if args.pane is not None:
+        layout = "pane" if args.pane else "tab"
+    else:
+        layout = cfg.get("executor_layout", "tab")
+    # Pin the executor's Claude Code session id so `relay resume` can reopen this exact conversation
+    # later (via `claude --resume <uuid>`) without scraping transcripts.
+    claude_session = str(uuid.uuid4())
+
+    # Stamp this executor with the lead that spawned it. --lead wins; else the calling lead's own
+    # session id from the env; else unowned (None). The human-readable project AND the lead's tab
+    # color come from the owning lead's marker — executors inherit the color so a lead's tabs group
+    # visually (iTerm only; Terminal ignores it).
+    owner_lead = getattr(args, "lead", None) or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    owner_marker = lead_guard.read_marker(STATE_ROOT, owner_lead) if owner_lead else {}
+    owner_project = owner_marker.get("project")
+    tab_color = owner_marker.get("color") if cfg.get("tab_colors", True) else None
+
+    iterm.spawn(
+        cwd=worktree,
+        prompt=build_pointer_message(str(packet_path), packet_summary(body)),
+        label=label,
+        pidfile=str(pid_path(session_id)),
+        model=args.model,
+        skip_perms=skip_perms,
+        iterm_id_file=str(iterm_id_path(session_id)),
+        session_uuid=claude_session,
+        tab_color=tab_color,
+        lead_handle=owner_marker.get("iterm_session"),
+        layout=layout,
+    )
+    pid = read_pid(session_id)
+    iterm_session = read_iterm_id(session_id)  # backend handle (iTerm session id / Terminal "twid:N")
+    label_ok = _ensure_tab_label(iterm, iterm_session, label)
+
+    write_session(session_id, {
+        "session_id": session_id,
+        "owner_lead": owner_lead,
+        "owner_project": owner_project,
+        "worktree": worktree,
+        "topic": args.topic,
+        "scope": args.scope or args.topic,
+        "tab_label": label,
+        "model": args.model,
+        "pid": pid,
+        "pid_started": pid_start_time(pid) if pid else None,  # pid-reuse guard (see session_pid_alive)
+        "iterm_session": iterm_session,
+        "backend": iterm.NAME,  # which terminal app owns this tab — ops keep addressing it there
+        "claude_session": claude_session,
+        "status": "busy",
+        "current_packet": n,
+        "busy_since": now(),
+        "busy_since_epoch": time.time(),  # DST-proof elapsed math; the ISO string stays for humans
+        "superseded_by": None,
+        "created": now(),
+        "updated": now(),
+    })
+    append_ledger("spawned", session_id=session_id, worktree=worktree, topic=args.topic, tab_label=label)
+    append_ledger("packet_sent", session_id=session_id, packet=n)
+    if pid is None:
+        print(f"spawned session '{session_id}' (tab '{label}') with packet {n:03d} — WARNING: could not read PID, aliveness/stall detection will rely on tab title only")
+    else:
+        print(f"spawned session '{session_id}' (tab '{label}', pid {pid}) with packet {n:03d}")
+    if not label_ok:
+        print(f"WARNING: tab title '{label}' didn't take — send/close/focus may not find this tab "
+              f"(retry with: relay focus {session_id})", file=sys.stderr)
+
+
+def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
+    """(Re)launch claude in a fresh tab for an existing session record and refresh its live state.
+    Shared by restart (fresh session_uuid, re-run packet) and resume (--resume the old conversation).
+    Clears the stale pid/iterm-id files first so read_pid/read_iterm_id wait for the NEW tab's."""
+    auto_trust(s["worktree"])
+    bk = term_backend(s)
+    label = s.get("tab_label") or f"[executor] {session_id}"
+    for p in (pid_path(session_id), iterm_id_path(session_id)):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    cfg = lead_guard.load_config(STATE_ROOT)
+    skip_perms = bool(cfg.get("executor_skip_permissions", False))
+    # Re-inherit the owning lead's tab color (the fresh tab starts uncolored).
+    tab_color = None
+    if cfg.get("tab_colors", True) and s.get("owner_lead"):
+        tab_color = lead_guard.read_marker(STATE_ROOT, s["owner_lead"]).get("color")
+    bk.spawn(
+        cwd=s["worktree"],
+        prompt=prompt,
+        label=label,
+        pidfile=str(pid_path(session_id)),
+        model=s.get("model"),
+        skip_perms=skip_perms,
+        iterm_id_file=str(iterm_id_path(session_id)),
+        session_uuid=session_uuid,
+        resume_id=resume_id,
+        tab_color=tab_color,
+    )
+    pid = read_pid(session_id)
+    s["pid"] = pid
+    s["pid_started"] = pid_start_time(pid) if pid else None
+    s["iterm_session"] = read_iterm_id(session_id)
+    _ensure_tab_label(bk, s["iterm_session"], label)
+    if session_uuid:  # restart minted a fresh conversation; resume keeps the existing claude_session
+        s["claude_session"] = session_uuid
+    s["status"] = "busy"
+    s["busy_since"] = now()
+    s["busy_since_epoch"] = time.time()
+    s["updated"] = now()
+    write_session(session_id, s)
+    return pid, label
+
+
+def cmd_restart(args):
+    """Re-run a session's CURRENT packet in a fresh tab as a NEW conversation. Loses the prior
+    conversation context and re-does the packet from scratch — use `relay resume` to keep context.
+    For a session whose tab was closed or whose process died."""
+    sid = args.session_id
+    s = read_session(sid)
+    if not s:
+        sys.exit(f"no such session: {sid}")
+    if session_pid_alive(s) and not args.force:
+        sys.exit(f"session '{sid}' still looks alive (pid {s.get('pid')}) — close it first or pass --force")
+    n = s.get("current_packet", 1)
+    packet_path = packets_dir(sid) / f"{n:03d}-packet.md"
+    if not packet_path.exists():
+        sys.exit(f"cannot restart '{sid}': packet {n:03d} not found at {packet_path}")
+    pointer = build_pointer_message(str(packet_path), packet_summary(packet_path.read_text()))
+    pid, label = _relaunch(sid, s, pointer, session_uuid=str(uuid.uuid4()))
+    append_ledger("restarted", session_id=sid, packet=n)
+    print(f"restarted '{sid}' (tab '{label}', pid {pid}) — re-running packet {n:03d} as a fresh session")
+
+
+def cmd_resume_lead(sid, force=False):
+    """Restore a crashed LEAD by reopening its OWN Claude Code conversation via `claude --resume
+    <sid>` (a lead's session_id IS its Claude session id). The marker survived the crash on disk;
+    the nudge tells the restored lead to re-run `relay lead-start` under its CURRENT session id —
+    idempotent if `--resume` kept the id, and the re-arm path if it minted a fresh one (in which
+    case the hooks would otherwise silently miss the old marker and lead mode would be inactive
+    while looking armed). Reopens in the marker's cwd and refreshes `last_active` so the restored
+    lead looks fresh in `relay list`. Leads live only under lead/<sid>/ — this writes NO executor
+    session.json and uses the lead's own dir for the pidfile."""
+    marker = lead_guard.read_marker(STATE_ROOT, sid)
+    project = marker.get("project")
+    cwd = marker.get("cwd") or os.getcwd()
+    model = marker.get("model")
+    # Same label scheme as lead-start — the marker's tab_label must match the actual tab title or
+    # `relay focus <lead>` breaks after a restore.
+    label = f"[lead] {slugify(project)}" if project else f"[lead] {sid}"
+    # Refuse to open a SECOND live copy of the same conversation (mirrors the executor guard).
+    # Aliveness: a pid recorded by a previous restore, else the marker's relay-controlled tab title.
+    lead_pid_file = lead_guard.lead_dir(STATE_ROOT, sid) / "pid"
+    alive = False
+    try:
+        alive = pid_alive(int(lead_pid_file.read_text().strip()))
+    except Exception:
+        alive = False
+    if not alive and marker.get("tab_label"):
+        alive = iterm.is_alive(marker["tab_label"])
+    if alive and not force:
+        sys.exit(f"lead '{sid}' still looks alive — close its tab first or pass --force "
+                 f"(two live copies of one conversation stomp on each other)")
+    relay_bin = str(Path(__file__).resolve())
+    proj_flag = f" --project {shlex.quote(project)}" if project else ""
+    nudge = (f"You are the resumed lead for project '{project}'. FIRST verify arming: run "
+             f"`{relay_bin} lead-start \"$CLAUDE_CODE_SESSION_ID\"{proj_flag}` — idempotent if your "
+             f"session id survived the resume, and it re-arms lead mode under your new id if "
+             f"`--resume` minted a fresh one. If your current session id differs from '{sid}', also "
+             f"run `{relay_bin} close --self {sid}` to clear the stale marker. Then run /relay:list "
+             "to reconstruct what's in flight and continue where you left off.")
+    cfg = lead_guard.load_config(STATE_ROOT)
+    skip_perms = bool(cfg.get("executor_skip_permissions", False))
+    color = marker.get("color") if cfg.get("tab_colors", True) else None
+    lead_pid = lead_guard.lead_dir(STATE_ROOT, sid) / "pid"
+    iterm.spawn(
+        cwd=cwd,
+        prompt=nudge,
+        label=label,
+        pidfile=str(lead_pid),
+        model=model,
+        skip_perms=skip_perms,
+        resume_id=sid,
+        tab_color=color,  # the restored tab keeps the lead's color (fresh tabs start unpainted)
+    )
+    # Refresh the marker (same project/cwd/model, PLUS tab_label and color — dropping them here
+    # used to break `relay focus <lead>` after a restore) so last_active updates and the restored
+    # lead looks fresh in `relay list`. iterm_session is left unset (not captured on restore).
+    lead_guard.write_marker(STATE_ROOT, sid, model=model, project=project, cwd=cwd,
+                            tab_label=label, color=color)
+    append_ledger("lead_resumed", session_id=sid, project=project)
+    print(f"restored lead '{project}' (session {sid}) — reopening its conversation")
+
+
+def cmd_resume(args):
+    """Reopen a session's EXISTING conversation in a fresh tab via `claude --resume` — full context
+    and the worktree's staged work intact. Routes lead-vs-executor: an executor resumes its captured
+    Claude session id; a crashed LEAD (marker present, no session.json) restores its own conversation
+    via cmd_resume_lead. For a session whose tab closed / died."""
+    sid = args.session_id
+    s = read_session(sid)
+    if not s:
+        if lead_guard.is_lead(STATE_ROOT, sid):
+            return cmd_resume_lead(sid, force=args.force)
+        sys.exit(f"no such session: {sid}")
+    cs = s.get("claude_session")
+    if not cs:
+        sys.exit(f"cannot resume '{sid}': no captured Claude session id (spawned before session-id "
+                 f"capture). Use `relay restart {sid}` to re-run its packet as a fresh session.")
+    if session_pid_alive(s) and not args.force:
+        sys.exit(f"session '{sid}' still looks alive (pid {s.get('pid')}) — close it first or pass --force")
+    nudge = ("You were resumed after your relay tab closed — your staged work in this worktree is "
+             "intact. Pick up your packet where you left off, finish it, then write your report to "
+             "the same report path as before.")
+    pid, label = _relaunch(sid, s, nudge, resume_id=cs)
+    append_ledger("resumed", session_id=sid, claude_session=cs)
+    print(f"resumed '{sid}' (tab '{label}', pid {pid}) — reopened conversation with full context")
+
+
+def cmd_send(args):
+    s = read_session(args.session_id)
+    if not s:
+        sys.exit(f"no such session: {args.session_id}")
+    # (A) Refresh REAL liveness before the guard. s["status"] is the STORED value — set to `busy`
+    # at spawn and only ever recomputed when `relay check`/`list` runs _check_one. So a session
+    # that has already reported still reads `busy` on disk and would be falsely refused. Recompute
+    # via the same mechanism check uses (it persists the fresh status), then re-read and decide on
+    # the fresh value: an idle, already-reported session becomes a valid target; a genuinely busy
+    # one (process alive, no report yet) is still correctly refused below.
+    _check_one(args.session_id)
+    s = read_session(args.session_id)
+    if s["status"] in ("busy", "stalled"):
+        sys.exit(f"session '{args.session_id}' is {s['status']} — refusing to send (would inject mid-turn). Only reported/idle sessions are safe send targets.")
+    if s["status"] == "superseded":
+        sys.exit(f"session '{args.session_id}' is superseded by {s.get('superseded_by')} — refusing to send into an abandoned session.")
+    # A dead session with a pinned Claude conversation is still deliverable — fall through and let
+    # the resume path below bring it back with the packet in one shot. Only a dead session with NO
+    # captured conversation id truly needs a fresh spawn.
+    tab_gone = s["status"] == "dead"
+    if tab_gone and not s.get("claude_session"):
+        sys.exit(f"session '{args.session_id}' is dead (tab closed / process gone) with no captured "
+                 f"Claude session to resume — use `relay spawn` for a fresh one")
+
+    n = next_packet_number(args.session_id)
+    body = Path(args.packet).read_text()
+    report_path = str(packets_dir(args.session_id) / f"{n:03d}-report.md")
+    packet_path = packets_dir(args.session_id) / f"{n:03d}-packet.md"
+    packet_path.write_text(build_packet(body, report_path))
+
+    pointer = build_pointer_message(str(packet_path), packet_summary(body))
+    ok = False if tab_gone else term_backend(s).send(s["tab_label"], pointer,
+                                                     s.get("iterm_session"), s.get("pid"))
+    if not ok:
+        # (B) The tab is gone. If we pinned this session's Claude conversation at spawn, don't
+        # force a cold spawn — RESUME the conversation and deliver the new packet in one shot via
+        # the shared relaunch path. This brings the full context back AND lands the packet.
+        cs = s.get("claude_session")
+        if cs:
+            # The old tab can still be ALIVE here (Terminal backend: send can't inject into a
+            # running process, so every follow-up takes this resume path) — kill + close it FIRST,
+            # or `--resume` would open a second live copy of the same conversation alongside the
+            # first. Only reported/idle sessions reach this point (busy/stalled were refused above),
+            # so the process is sitting at its prompt with its work staged — safe to terminate.
+            _kill_and_wait(s)
+            term_backend(s).close(s.get("tab_label", ""), s.get("iterm_session"), s.get("pid"))
+            _relaunch(args.session_id, s, pointer, resume_id=cs)  # sets status busy, pid, writes s
+            s["current_packet"] = n
+            s["updated"] = now()
+            write_session(args.session_id, s)
+            append_ledger("packet_sent", session_id=args.session_id, packet=n, via="resume")
+            print(f"tab '{s['tab_label']}' was gone — resumed session '{args.session_id}' with full "
+                  f"context and delivered packet {n:03d}")
+            return
+        # No captured Claude session (spawned before session-id capture) → today's behavior.
+        s["status"] = "dead"
+        s["updated"] = now()
+        write_session(args.session_id, s)
+        append_ledger("closed", session_id=args.session_id, reason="tab not found on send")
+        sys.exit(f"could not find live tab '{s['tab_label']}' — marked session dead. Use `relay spawn` for a fresh one.")
+
+    s["status"] = "busy"
+    s["current_packet"] = n
+    s["busy_since"] = now()
+    s["busy_since_epoch"] = time.time()
+    s["updated"] = now()
+    write_session(args.session_id, s)
+    append_ledger("packet_sent", session_id=args.session_id, packet=n)
+    print(f"sent packet {n:03d} to session '{args.session_id}' (existing tab)")
+
+
+def _busy_elapsed(s):
+    """Seconds this session has been busy, or None if unknowable. Prefers the epoch stamp (immune
+    to DST shifts); falls back to parsing the ISO string for pre-epoch records. Never throws — one
+    hand-edited or legacy session.json must not take down `relay list`/`check --all`."""
+    try:
+        e = s.get("busy_since_epoch")
+        if e:
+            return time.time() - float(e)
+        busy_since = time.strptime(s["busy_since"], "%Y-%m-%dT%H:%M:%S")
+        return time.mktime(time.localtime()) - time.mktime(busy_since)
+    except Exception:
+        return None
+
+
+def _check_one(session_id):
+    s = read_session(session_id)
+    if not s:
+        return {"session_id": session_id, "error": "no such session"}
+
+    if s["status"] not in ("dead", "superseded", "closed"):
+        n = s["current_packet"]
+        report = packets_dir(session_id) / f"{n:03d}-report.md"
+        proc_alive = session_pid_alive(s)
+        # Liveness is PROCESS-primary (recorded pid), NOT tab-title-primary. Claude Code mutates
+        # its own iTerm tab title while working (spinner/activity text), so a title-match miss does
+        # NOT mean the executor died — treating it as death falsely marked live, idle, and even
+        # already-reported sessions `dead`, which then made `relay send` refuse to reuse them. The
+        # tab title is consulted ONLY once the process is already gone, to tell "crashed but tab
+        # still open" (stalled — inspect it) from "tab closed too" (dead).
+        # SHORTCUT: pid_alive() via os.kill can be fooled by PID reuse if the OS recycles this exact
+        # pid to a different process before we poll; acceptable within a session's lifetime — revisit
+        # with a process start-time / cmdline check if it ever bites.
+        if report.exists():
+            # A written report is a completed deliverable → reported, regardless of process/tab
+            # state. Log the transition only once, not on every subsequent poll.
+            if s["status"] != "reported":
+                append_ledger("reported", session_id=session_id, packet=n)
+            s["status"] = "reported"
+        elif proc_alive:
+            elapsed = _busy_elapsed(s)
+            if s["status"] == "busy" and elapsed is not None and elapsed > STALL_THRESHOLD_SECONDS:
+                s["status"] = "stalled"
+                append_ledger("stalled", session_id=session_id, packet=n, reason=f"busy {int(elapsed/60)}min, no report")
+            # else: process alive, hasn't reported yet → still busy, no change.
+        else:
+            # Process is genuinely gone and left no report. Distinguish stalled vs dead by whether
+            # the tab is still around to look at (this is the ONLY place the tab-liveness check is
+            # used).
+            if term_backend(s).is_alive(s["tab_label"], s.get("iterm_session"), s.get("pid")):
+                s["status"] = "stalled"
+                append_ledger("stalled", session_id=session_id, packet=n, reason="process gone, no report; tab still open")
+            else:
+                s["status"] = "dead"
+                append_ledger("closed", session_id=session_id, reason="process gone and tab closed")
+        s["updated"] = now()
+        write_session(session_id, s)
+
+    return s
+
+
+# ---- terminal color (TTY-aware; respects NO_COLOR; never colors piped/--json output) -----------
+_ANSI = {"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+         "green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m"}
+# status → styles. `reported` (an executor is DONE) is bright green+bold so it pops at a glance.
+_STATUS_STYLE = {"reported": ("green", "bold"), "busy": ("yellow",), "stalled": ("red",),
+                 "dead": ("dim", "red"), "closed": ("dim",), "superseded": ("dim",)}
+
+
+def _color_on():
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, *styles):
+    if not styles or not _color_on():
+        return text
+    return "".join(_ANSI[s] for s in styles) + text + _ANSI["reset"]
+
+
+def cmd_check(args):
+    ids = all_session_ids() if args.all else [args.session_id]
+    results = [_check_one(sid) for sid in ids if sid]
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return
+    for s in results:
+        if "error" in s:
+            print(f"{s['session_id']}: {c(s['error'], 'red')}")
+            continue
+        n = s["current_packet"]
+        reported = (packets_dir(s["session_id"]) / f"{n:03d}-report.md").exists()
+        status_c = c(s["status"], *_STATUS_STYLE.get(s["status"], ()))
+        rep_c = c("✅ report ready", "green", "bold") if reported else c("not yet", "dim")
+        print(f"{s['session_id']}: status={status_c} packet={n:03d} {rep_c}")
+
+
+def _relative_age(ts):
+    """A short relative age ('30s ago' / '12m ago' / '2h ago' / '3d ago') from an ISO timestamp in
+    now()'s format. Degrades to '-' when ts is missing/None or in an unparseable/old format — a
+    stale-looking (or dashed) LAST ACTIVE is how a human spots a probably-crashed lead, so this
+    must never crash the list."""
+    if not ts:
+        return "-"
+    try:
+        then = time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return "-"
+    secs = int(time.mktime(time.localtime()) - then)
+    if secs < 0:
+        secs = 0
+    if secs < 60:
+        return f"{secs}s ago"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m ago"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+def cell(text, width):
+    """Fixed-width table cell: pad short values, truncate long ones with a trailing ellipsis
+    so a single oversized value can never shift the columns after it."""
+    s = str(text) if text not in (None, "") else "-"
+    return (s[: width - 1] + "…") if len(s) > width else s.ljust(width)
+
+
+def cmd_list(args):
+    # LEADS are ALWAYS shown in full — you always want to see/restore any project, regardless of
+    # which lead is asking. Executor scoping is separate (below).
+    leads = lead_guard.list_leads(STATE_ROOT)
+
+    lead_sid = getattr(args, "lead", None)
+    # --all (or no --lead at all) → every executor (back-compat). --lead <sid> → only executors
+    # owned by that lead, PLUS unowned ones (owner_lead is None). Unowned are always visible.
+    show_all = getattr(args, "all", False) or not lead_sid
+
+    rows = []
+    for sid in all_session_ids():
+        # Refresh REAL liveness (same mechanism as `relay check`) — list is the decision-informing
+        # and crash-recovery surface, so a dead/stalled executor must not keep showing stored `busy`.
+        s = _check_one(sid)
+        if "error" in s:
+            continue
+        n = s["current_packet"]
+        report = packets_dir(sid) / f"{n:03d}-report.md"
+        rows.append({**s, "reported": report.exists()})
+    if not show_all:
+        rows = [s for s in rows if s.get("owner_lead") in (None, lead_sid)]
+
+    if args.json:
+        print(json.dumps({"leads": leads, "executors": rows}, indent=2))
+        return
+
+    if leads:
+        print(c("LEADS", "bold"))
+        # Calculate dynamic widths for LEADS table with per-column caps.
+        lead_cols = [
+            ("PROJECT", 22, [m.get("project") or "-" for m in leads]),
+            ("SESSION", 36, [m.get("session_id") or "-" for m in leads]),
+            ("MODEL", 8, [m.get("model") or "-" for m in leads]),
+            ("LAST ACTIVE", 12, [_relative_age(m.get("last_active")) for m in leads]),
+        ]
+        lead_widths = {name: min(cap, max(len(name), max((len(str(v)) for v in vals), default=0)))
+                       for name, cap, vals in lead_cols}
+        # Header row with dynamic widths
+        header_parts = [cell(name, lead_widths[name]) for name, _, _ in lead_cols]
+        print(" ".join(header_parts))
+        # Data rows
+        for m in leads:
+            row_parts = [
+                cell(m.get("project") or "-", lead_widths["PROJECT"]),
+                cell(m.get("session_id") or "-", lead_widths["SESSION"]),
+                cell(m.get("model") or "-", lead_widths["MODEL"]),
+                cell(_relative_age(m.get("last_active")), lead_widths["LAST ACTIVE"]),
+            ]
+            print(" ".join(row_parts))
+        print()
+
+    print(c("EXECUTORS", "bold"))
+    if not rows:
+        print("(no executor sessions)")
+        return
+    # Build rendered status strings once to use both in width calc and row rendering.
+    rendered_statuses = []
+    for s in rows:
+        st = s["status"]
+        if st == "busy":
+            elapsed = _busy_elapsed(s)
+            st = f"busy {int(elapsed / 60)}m" if elapsed is not None else "busy ?"
+        rendered_statuses.append(st)
+    # Calculate dynamic widths for EXECUTORS table with per-column caps.
+    exec_cols = [
+        ("SESSION", 36, [s["session_id"] for s in rows]),
+        ("STATUS", 10, rendered_statuses),
+        ("TOPIC", 40, [s["topic"] for s in rows]),
+        ("SCOPE", 14, [s.get("scope", "") or "-" for s in rows]),
+        ("PROJECT", 14, [str(s.get("owner_project") or "-") for s in rows]),
+        ("MODEL", 8, [str(s.get("model") or "-") for s in rows]),
+        ("PKT", 4, [str(s["current_packet"]).zfill(4) for s in rows]),
+        ("REPORTED", 8, ["yes" if s["reported"] else "no" for s in rows]),
+    ]
+    exec_widths = {name: min(cap, max(len(name), max((len(str(v)) for v in vals), default=0)))
+                   for name, cap, vals in exec_cols}
+    # Header row with dynamic widths
+    header_parts = [cell(name, exec_widths[name]) for name, _, _ in exec_cols]
+    print(" ".join(header_parts))
+    # Data rows
+    for i, s in enumerate(rows):
+        base = s["status"]
+        status = rendered_statuses[i]
+        # Color the padded cell (pad first via cell(), then wrap — ANSI codes have zero display width,
+        # so padding before c() keeps the columns aligned).
+        status_cell = c(cell(status, exec_widths["STATUS"]), *_STATUS_STYLE.get(base, ()))
+        rep = "yes" if s["reported"] else "no"
+        rep_cell = c(cell(rep, exec_widths["REPORTED"]), "green", "bold") if s["reported"] else c(cell(rep, exec_widths["REPORTED"]), "dim")
+        row_parts = [
+            cell(s["session_id"], exec_widths["SESSION"]),
+            status_cell,
+            cell(s["topic"], exec_widths["TOPIC"]),
+            cell(s.get("scope", "") or "-", exec_widths["SCOPE"]),
+            cell(str(s.get("owner_project") or "-"), exec_widths["PROJECT"]),
+            cell(str(s.get("model") or "-"), exec_widths["MODEL"]),
+            cell(str(s["current_packet"]).zfill(4), exec_widths["PKT"]),
+            rep_cell,
+        ]
+        print(" ".join(row_parts))
+
+
+def _has_staged_diff(worktree):
+    """True iff `worktree` has a non-empty `git diff --staged` — cheap discoverability check for
+    cmd_report's diff-pointer line; doesn't generate anything, just asks git. Any error (not a
+    git repo, worktree gone) → False, never raises."""
+    try:
+        r = subprocess.run(["git", "-C", worktree, "diff", "--staged", "--quiet"])
+        return r.returncode == 1
+    except Exception:
+        return False
+
+
+def cmd_report(args):
+    """Print an executor's report framed in a bright green banner — so it's unmistakably THE
+    report, and done. Defaults to the session's current packet."""
+    s = read_session(args.session_id)
+    if not s:
+        sys.exit(f"no such session: {args.session_id}")
+    n = args.packet or s["current_packet"]
+    rp = packets_dir(args.session_id) / f"{n:03d}-report.md"
+    if not rp.exists():
+        sys.exit(f"no report yet for '{args.session_id}' packet {n:03d}")
+    bar = "═" * 74
+    print(c(bar, "green", "bold"))
+    print(c(f"  ✅ REPORT READY   ·   {args.session_id}   ·   packet {n:03d}", "green", "bold"))
+    print(c(f"  {rp}", "dim"))
+    print(c(bar, "green", "bold"))
+    print(rp.read_text().rstrip())
+    print(c(bar, "green", "bold"))
+    if s.get("worktree") and _has_staged_diff(s["worktree"]):
+        print(c(f"  📄 review the staged diff: relay diff {args.session_id} --open", "dim"))
+
+
+def cmd_diff(args):
+    """Render an executor's staged changes to a self-contained HTML review page (diff_render.py)
+    — one click, zero model tokens. Default scope is the files mentioned in the session's CURRENT
+    packet report (best-effort file:line / bare-path parsing); `--all` bypasses that and renders
+    the whole staged diff. If the report is missing or none of its mentions match anything
+    actually staged, this falls back to the full staged diff with a visible in-page note —
+    scoping never fails the command outright."""
+    s = read_session(args.session_id)
+    if not s:
+        sys.exit(f"no such session: {args.session_id}")
+    worktree = s.get("worktree")
+    if not worktree:
+        sys.exit(f"session '{args.session_id}' has no recorded worktree")
+    n = s.get("current_packet", 1)
+    report_path = packets_dir(args.session_id) / f"{n:03d}-report.md"
+
+    staged = subprocess.run(["git", "-C", worktree, "diff", "--staged", "--name-only"],
+                            capture_output=True, text=True)
+    staged_names = [ln.strip() for ln in staged.stdout.splitlines() if ln.strip()]
+
+    scope_note = ""
+    scope_files = None
+    if not args.all:
+        if report_path.exists():
+            mentioned = set(diff_render.parse_report_mentions(report_path.read_text()))
+            scope_files = [f for f in staged_names if f in mentioned]
+            if not scope_files:
+                scope_note = "unfiltered — report not found/parsable"
+        else:
+            scope_note = "unfiltered — report not found/parsable"
+
+    diff_cmd = ["git", "-C", worktree, "diff", "--staged"]
+    if scope_files:
+        diff_cmd += ["--", *scope_files]
+    diff_text = subprocess.run(diff_cmd, capture_output=True, text=True).stdout
+
+    meta = {"session_id": args.session_id, "packet": n, "scope_note": scope_note}
+    page = diff_render.generate_page(diff_text, meta)
+
+    out_path = packets_dir(args.session_id) / f"{n:03d}-diff.html"
+    out_path.write_text(page)
+    print(str(out_path))
+    if args.open:
+        subprocess.run(["open", str(out_path)])
+
+
+def cmd_close(args):
+    # No positional session_id → "step down from lead mode for THIS session" (needs --self, the
+    # current session's own id, since a bare CLI invocation has no ambient session identity).
+    # This is distinct from closing an EXECUTOR session, which still takes a positional session_id.
+    if not args.session_id:
+        if not args.self_session:
+            sys.exit("close: give an executor session_id to close it, or --self <session_id> to step down from lead mode")
+        lead_guard.clear_lead(STATE_ROOT, args.self_session)
+        append_ledger("lead_stepped_down", session_id=args.self_session)
+        print(f"stepped down from lead mode (session '{args.self_session}')")
+        return
+
+    s = read_session(args.session_id)
+    if not s:
+        sys.exit(f"no such session: {args.session_id}")
+    if args.supersede:
+        s["status"] = "superseded"
+        s["superseded_by"] = args.supersede
+        append_ledger("superseded", session_id=args.session_id, superseded_by=args.supersede)
+    else:
+        s["status"] = "closed"
+        append_ledger("closed", session_id=args.session_id, reason="manual close")
+    s["updated"] = now()
+    write_session(args.session_id, s)
+
+    # Close the executor's iTerm tab too (we're done with it; its report is on disk, nothing lost).
+    # Kill the process FIRST so iTerm doesn't prompt "confirm close running process", give it a beat
+    # to die, then close. Best-effort — a failure here still leaves the session marked closed.
+    tab_note = ""
+    if not getattr(args, "keep_tab", False):
+        bk = term_backend(s)
+        _kill_and_wait(s)  # start-time-checked inside: never SIGTERM an unrelated recycled pid
+        closed_tab = bk.close(s.get("tab_label", ""), s.get("iterm_session"), s.get("pid"))
+        if closed_tab:
+            tab_note = " + closed its tab"
+        elif not bk.is_alive(s.get("tab_label", ""), s.get("iterm_session"), s.get("pid")):
+            # iTerm auto-closes a session's tab when its exec'd process dies — close() then finds
+            # nothing, which is success, not a lingering tab (spurious Cmd-W note observed live).
+            tab_note = " (tab closed itself)"
+        else:
+            # Terminal.app ignores scripted window-close on some macOS versions (verified no-op,
+            # no error) — the process is dead either way; the lingering window is a Cmd-W away.
+            tab_note = " (tab not auto-closed — Cmd-W it if it lingers)"
+    print(f"closed session '{args.session_id}'"
+          + (f" (superseded by {args.supersede})" if args.supersede else "") + tab_note)
+
+
+def cmd_stop(args):
+    """Step down from lead mode for THIS session (unarm). A discoverable alias for `relay close --self`
+    — same effect, shorter name."""
+    if not args.session_id:
+        sys.exit("stop: session_id is required\nUsage: relay stop <session_id>")
+    if lead_guard.is_lead(STATE_ROOT, args.session_id) is False:
+        print(f"session '{args.session_id}' is not in lead mode — nothing to stop")
+        return
+    lead_guard.clear_lead(STATE_ROOT, args.session_id)
+    append_ledger("lead_stepped_down", session_id=args.session_id)
+    print(f"lead mode stopped for session '{args.session_id}' — gate and auto-wake are off")
+
+
+def cmd_prune(args):
+    """Delete the state dirs of terminal-status sessions (closed/superseded/dead) whose last update
+    is older than --days. Nothing else is touched: live sessions, lead state, and the sessions.jsonl
+    ledger (the durable history) all stay. Without this, ~/.relay-tasks grows forever and every
+    `check --all`/`list` iterates dead weight."""
+    cutoff = time.time() - args.days * 86400
+    removed, kept = [], 0
+    for sid in all_session_ids():
+        s = read_session(sid)
+        if s.get("status") not in ("closed", "superseded", "dead"):
+            continue
+        try:
+            updated = time.mktime(time.strptime(s.get("updated", ""), "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            updated = 0  # unparseable/missing → treat as ancient, prunable
+        if updated > cutoff:
+            kept += 1
+            continue
+        if not args.dry_run:
+            shutil.rmtree(session_dir(sid), ignore_errors=True)
+            append_ledger("pruned", session_id=sid, status=s.get("status"))
+        removed.append(f"{sid} ({s.get('status')})")
+    verb = "would prune" if args.dry_run else "pruned"
+    if removed:
+        print(f"{verb} {len(removed)} session(s):")
+        for r in removed:
+            print(f"  {r}")
+    else:
+        print(f"nothing to prune (terminal sessions newer than {args.days}d: {kept})")
+
+
+def cmd_lead_start(args):
+    """Mark THIS session as a lead (invoked by /relay:mode). The marker's existence is what every
+    hook checks to decide whether to act — so non-lead/executor sessions stay completely untouched.
+    Idempotent: re-running /relay:mode just refreshes the marker."""
+    if not args.session_id:
+        sys.exit("lead-start: session id is empty (is $CLAUDE_CODE_SESSION_ID set?)")
+    # terminal-notifier gives the GOOD banners (named source, click→focus, per-lead coalescing).
+    # Without it the Stop hook falls back to macOS's built-in `display notification` (same info,
+    # not clickable, no coalescing) — so arming proceeds with a warning rather than refusing.
+    # PATH-robust check (find_terminal_notifier probes brew dirs too) so we don't falsely warn.
+    if lead_guard.load_config(STATE_ROOT).get("notify_on_wake", True) \
+            and not lead_guard.find_terminal_notifier():
+        print("WARNING: terminal-notifier not found — desktop banners fall back to macOS's built-in\n"
+              "notifications (not clickable, no per-lead coalescing). For click-to-focus banners:\n"
+              "  brew install terminal-notifier", file=sys.stderr)
+    # The project name identifies this lead's work in `relay list` and restore; defaults to the
+    # working-directory basename when not named explicitly. cwd is where a restored lead reopens.
+    cwd = os.getcwd()
+    project = getattr(args, "project", None) or os.path.basename(cwd)
+    iterm_session = os.environ.get("TERM_SESSION_ID")  # the lead's own iTerm session ("w#t#p#:UUID")
+    # Give the lead tab a stable, relay-controlled title (like executors get) so `relay focus <lead>`
+    # and notification click-through can land on it. Rename via /rename into the lead's OWN session,
+    # matched by its iTerm id. Best-effort — if it doesn't take, focus just won't find the lead tab.
+    tab_label = f"[lead] {slugify(project)}"
+    if not getattr(args, "no_rename", False):
+        iterm.rename_by_id(iterm_session, tab_label)
+    # Stable per-lead tab color; this lead's executors inherit it at spawn so its tabs group
+    # visually. Paint the lead's OWN tab by writing the escape to its tty (found via the session
+    # id — this CLI process has no controlling terminal, so /dev/tty is unavailable). iTerm only.
+    cfg = lead_guard.load_config(STATE_ROOT)
+    color = lead_guard.pick_lead_color(STATE_ROOT, args.session_id) if cfg.get("tab_colors", True) else None
+    if color and getattr(iterm, "NAME", "") == "iterm" and not getattr(args, "no_rename", False):
+        tty = iterm.tty_by_id(iterm_session)
+        if tty:
+            try:
+                with open(tty, "w") as f:
+                    f.write(iterm.tab_color_escape(color))
+            except OSError:
+                pass  # cosmetic — never block arming on a paint failure
+    lead_guard.write_marker(STATE_ROOT, args.session_id, model=args.model,
+                            iterm_session=iterm_session, project=project, cwd=cwd,
+                            tab_label=tab_label, color=color)
+    # Record the cwd's current git HEAD as the baseline, so the Stop-hook commit-surfacing (App 2)
+    # only reports commits made AFTER lead mode began — not the repo's entire prior history.
+    lead_guard.write_head(STATE_ROOT, args.session_id, lead_guard.git_head(os.getcwd()))
+    append_ledger("lead_started", session_id=args.session_id, model=args.model)
+    print(f"lead mode active for session '{args.session_id}'"
+          + (f" (model {args.model})" if args.model else ""))
+
+
+def cmd_route(args):
+    """The retain escape hatch (invoked by /relay:route). When a legit lead-appropriate edit gets
+    gated, this opens a short grace window during which edits pass, and logs one durable `retained`
+    event to the shared ledger."""
+    if not args.session:
+        sys.exit("route: session id is empty (is $CLAUDE_CODE_SESSION_ID set?)")
+    if not lead_guard.is_lead(STATE_ROOT, args.session):
+        sys.exit(f"route: session '{args.session}' is not in lead mode — run /relay:mode first")
+    cfg = lead_guard.load_config(STATE_ROOT)
+    lead_guard.set_grace(STATE_ROOT, args.session, cfg["grace_seconds"])
+    append_ledger("retained", session_id=args.session, reason=args.reason)
+    print(f"retain window open for {cfg['grace_seconds']}s — reason: {args.reason}")
+
+
+def cmd_focus(args):
+    """Jump to a session's iTerm tab via a bounded title match on its relay label — the reliable
+    ccsessions mechanism (activate + select window + select tab). Works for executors AND leads:
+    both get a stable relay-controlled tab title (executors at spawn, leads at /relay:mode)."""
+    sid = args.session_id
+    s = read_session(sid)
+    if s:
+        if term_backend(s).focus(s.get("tab_label", ""), s.get("iterm_session"), s.get("pid")):
+            print(f"focused '{sid}' (tab '{s.get('tab_label')}')")
+            return
+        sys.exit(
+            f"could not focus '{sid}' — no live iTerm tab matched its label '{s.get('tab_label')}'. "
+            f"If its tab is closed, bring it back: `relay resume {sid}` (keeps context + staged work) "
+            f"or `relay restart {sid}` (re-runs its packet fresh).")
+    marker = lead_guard.read_marker(STATE_ROOT, sid)  # a lead session?
+    if marker:
+        label = marker.get("tab_label")
+        if label and iterm.focus(label):
+            print(f"focused lead '{marker.get('project')}' (tab '{label}')")
+            return
+        sys.exit(
+            f"could not focus lead '{sid}' — no live tab matched '{label}'. The lead tab is renamed at "
+            f"/relay:mode; if it wasn't (or was renamed since), re-run /relay:mode to reset it.")
+    sys.exit(f"no such session: {sid}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="relay")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("spawn")
+    sp.add_argument("worktree")
+    sp.add_argument("topic")
+    sp.add_argument("packet")
+    sp.add_argument("--model")
+    sp.add_argument("--name")
+    sp.add_argument("--scope")
+    sp.add_argument("--lead", help="session id of the lead spawning this executor (stamps ownership); "
+                    "defaults to $CLAUDE_CODE_SESSION_ID, else unowned")
+    # Tri-state: neither flag → None → use config's executor_skip_permissions. --skip-perms forces
+    # on for this spawn, --no-skip-perms forces off. (store_true/store_false on the same dest.)
+    sp.add_argument("--skip-perms", dest="skip_perms", action="store_true", default=None,
+                    help="run this executor with --dangerously-skip-permissions (overrides config)")
+    sp.add_argument("--no-skip-perms", dest="skip_perms", action="store_false",
+                    help="force this executor to prompt for permissions (overrides config)")
+    # Tri-state, same pattern as --skip-perms/--no-skip-perms: neither flag → None → use config's
+    # executor_layout. --pane forces a split pane in the lead's window (iTerm only, falls back to
+    # a tab if the lead's session can't be located); --tab forces a separate tab.
+    sp.add_argument("--pane", dest="pane", action="store_true", default=None,
+                    help="open this executor as a split pane in the lead's window (overrides config; iTerm only)")
+    sp.add_argument("--tab", dest="pane", action="store_false",
+                    help="open this executor as a separate tab (overrides config)")
+    sp.set_defaults(func=cmd_spawn)
+
+    sd = sub.add_parser("send")
+    sd.add_argument("session_id")
+    sd.add_argument("packet")
+    sd.set_defaults(func=cmd_send)
+
+    ck = sub.add_parser("check")
+    ck.add_argument("session_id", nargs="?")
+    ck.add_argument("--all", action="store_true")
+    ck.add_argument("--json", action="store_true")
+    ck.set_defaults(func=cmd_check)
+
+    ls = sub.add_parser("list")
+    ls.add_argument("--json", action="store_true")
+    ls.add_argument("--lead", help="scope EXECUTORS to this lead's project (its owned executors "
+                    "plus unowned ones); LEADS are always shown in full")
+    ls.add_argument("--all", action="store_true", help="show every executor regardless of owner "
+                    "(the default when --lead is absent)")
+    ls.set_defaults(func=cmd_list)
+
+    cl = sub.add_parser("close")
+    cl.add_argument("session_id", nargs="?")
+    cl.add_argument("--supersede")
+    cl.add_argument("--self", dest="self_session", help="step down from lead mode for this session id")
+    cl.add_argument("--keep-tab", action="store_true", help="mark closed but leave the iTerm tab open")
+    cl.set_defaults(func=cmd_close)
+
+    st = sub.add_parser("stop")
+    st.add_argument("session_id")
+    st.set_defaults(func=cmd_stop)
+
+    lst = sub.add_parser("lead-start")
+    lst.add_argument("session_id")
+    lst.add_argument("--model")
+    lst.add_argument("--project", help="name this lead's project (defaults to the cwd basename)")
+    lst.add_argument("--no-rename", action="store_true", help="don't rename the lead's iTerm tab")
+    lst.set_defaults(func=cmd_lead_start)
+
+    rt = sub.add_parser("route")
+    rt.add_argument("kind", choices=["retain"])
+    rt.add_argument("reason")
+    rt.add_argument("--session", required=True)
+    rt.set_defaults(func=cmd_route)
+
+    rpt = sub.add_parser("report")
+    rpt.add_argument("session_id")
+    rpt.add_argument("--packet", type=int)
+    rpt.set_defaults(func=cmd_report)
+
+    df = sub.add_parser("diff")
+    df.add_argument("session_id")
+    df.add_argument("--open", action="store_true", help="open the generated HTML page after writing it")
+    df.add_argument("--all", action="store_true", help="render the whole staged diff, unfiltered "
+                    "(default: scoped to files mentioned in the session's current packet report)")
+    df.set_defaults(func=cmd_diff)
+
+    fc = sub.add_parser("focus")
+    fc.add_argument("session_id")
+    fc.set_defaults(func=cmd_focus)
+
+    rs = sub.add_parser("restart")
+    rs.add_argument("session_id")
+    rs.add_argument("--force", action="store_true", help="restart even if the process still looks alive")
+    rs.set_defaults(func=cmd_restart)
+
+    rsm = sub.add_parser("resume")
+    rsm.add_argument("session_id")
+    rsm.add_argument("--force", action="store_true", help="resume even if the process still looks alive")
+    rsm.set_defaults(func=cmd_resume)
+
+    pr = sub.add_parser("prune")
+    pr.add_argument("--days", type=int, default=7,
+                    help="prune closed/superseded/dead sessions not updated in this many days (default 7)")
+    pr.add_argument("--dry-run", action="store_true", help="list what would be pruned without deleting")
+    pr.set_defaults(func=cmd_prune)
+
+    args = p.parse_args()
+    if args.cmd == "check" and not args.all and not args.session_id:
+        sys.exit("specify a session_id or --all")
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

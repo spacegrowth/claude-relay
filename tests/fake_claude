@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""
+Stub `claude` binary for the automated E2E harness (layer 2 of the testing strategy). Exercises
+relay's real AppleScript layer (spawn -> /rename -> send -> check -> dead detection) with zero
+tokens spent and no real model involved.
+
+Usage as a drop-in `claude`: relay invokes it (both at spawn and via `send`) with a SHORT
+single-line pointer message ("Read and follow the work packet at <path> ..."), not the full
+packet text -- so this stub mimics a real executor by extracting that path from its own argv,
+then reading the ACTUAL report-path instruction out of the packet FILE's content (same as a real
+model would). On the sentinel command `__FAKE_CLAUDE_REPORT__` typed into its stdin, it writes a
+canned report to that path and exits 0. Until then it idles reading stdin, same as the real
+`claude` sitting at an interactive prompt -- so `relay send` has a live target to write into.
+"""
+import os
+import re
+import select
+import sys
+import time
+
+PACKET_PATH_RE = re.compile(r"work packet at (\S+)")
+REPORT_PATH_RE = re.compile(r"write your full report to (\S+)")
+
+
+def find_report_path(argv):
+    """Mirrors what a real executor does: read the pointer message to find the packet file,
+    then read THAT file's content to find the report path (it lives in the packet's
+    TEMPLATE_FOOTER, not in the short pointer message itself)."""
+    for arg in argv:
+        m = PACKET_PATH_RE.search(arg)
+        if not m:
+            continue
+        packet_path = m.group(1)  # \S+ already stops before the trailing " — it contains..." text
+        try:
+            packet_text = open(packet_path).read()
+        except OSError:
+            return None
+        report_m = REPORT_PATH_RE.search(packet_text)
+        return report_m.group(1) if report_m else None
+    return None
+
+
+def main():
+    report_path = find_report_path(sys.argv[1:])
+    print(f"[fake_claude] started, report_path={report_path}", flush=True)
+    # Two report triggers: the sentinel typed into stdin (iTerm e2e — `write text` can inject into
+    # a running process), and a TRIGGER FILE next to the report (Terminal e2e — Terminal.app has no
+    # way to inject into a running process, so the harness touches a file instead).
+    trigger = (report_path + ".trigger") if report_path else None
+
+    def write_report():
+        if not report_path:
+            return
+        with open(report_path, "w") as f:
+            f.write("What changed: fake_claude wrote this canned report.\n")
+            f.write("What was verified: N/A (stub).\n")
+            f.write("UNVERIFIED: nothing, this is a test stub.\n")
+        print(f"[fake_claude] wrote report to {report_path}", flush=True)
+
+    eof = False
+    while True:
+        if trigger and os.path.exists(trigger):
+            try:
+                os.unlink(trigger)
+            except OSError:
+                pass
+            write_report()
+        if eof:
+            time.sleep(0.5)
+            continue
+        ready, _, _ = select.select([sys.stdin], [], [], 0.5)
+        if not ready:
+            continue
+        raw = sys.stdin.readline()
+        if raw == "":
+            eof = True  # stdin closed; stay alive (a real claude idles at its prompt), keep polling
+            continue
+        line = raw.strip()
+        if line == "__FAKE_CLAUDE_REPORT__":
+            write_report()
+            # Do NOT exit here -- a real claude process stays alive at its own prompt after
+            # finishing a turn (reporting != process exit). Exiting here would make the tab
+            # look "dead" (no process left in the pty) when it should read as idle/reported.
+        elif line.startswith("/rename "):
+            label = line[len("/rename "):].strip()
+            # Emit the standard OSC title-set escape directly to stdout -- this is what actually
+            # renames an iTerm tab from inside a running process (the real `claude` binary does
+            # the same thing on its own OSC title updates). Without this, the stub would never
+            # exercise real title-based addressing -- it'd just log the command and do nothing.
+            sys.stdout.write(f"\033]0;{label}\007")
+            sys.stdout.flush()
+            print(f"[fake_claude] renamed tab to {label!r}", flush=True)
+        else:
+            print(f"[fake_claude] got: {line}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

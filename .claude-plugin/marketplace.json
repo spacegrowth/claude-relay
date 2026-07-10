@@ -1,0 +1,14 @@
+{
+  "name": "claude-relay",
+  "owner": {
+    "name": "spacegrowth"
+  },
+  "plugins": [
+    {
+      "name": "relay",
+      "source": "./",
+      "description": "Delegate work packets from a lead Claude Code session to executor sessions in their own terminal tabs (iTerm2 or Terminal.app), with session reuse, a routing gate, auto-wake on reports, and per-lead tab colors."
+    }
+  ],
+  "description": "Single-plugin marketplace for relay: lead/executor orchestration for Claude Code across iTerm2/Terminal.app tabs."
+}

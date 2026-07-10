@@ -1,0 +1,34 @@
+{
+  "description": "Lead-mode discipline for /relay:mode sessions: (1) PreToolUse gate blocks large inline Edit/Write/MultiEdit so work gets delegated; (2) Stop hook wakes the idle lead when an executor reports or the lead made commits this turn, announcing them and waiting for the user (never auto-acts). Silent on non-lead and executor sessions (each hook fast-exits when the lead marker is absent). SessionEnd cleans up lead state.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretool_route_guard.py"}
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop_lead_watch.py",
+            "asyncRewake": true,
+            "timeout": 1900,
+            "rewakeMessage": "🚦 [relay] — review needed: an executor finished or you committed work while idle. Open your reply with the marker '🚦 [relay] — review needed:', surface the details below to the user, and wait for their direction — do not auto-review or auto-commit:",
+            "rewakeSummary": "🚦 [relay] — an executor finished while you were idle (details next)"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/sessionend_lead_cleanup.py"}
+        ]
+      }
+    ]
+  }
+}
