@@ -378,7 +378,7 @@ class TestSpawnOwnership:
 
 
 class TestSpawnTabIdentity:
-    """Spawned executors carry role-prefixed labels ([executor] ...), record their backend, and
+    """Spawned executors carry role-prefixed labels ([E] ...), record their backend, and
     inherit the owning lead's tab color so a lead's tabs group visually."""
     def _spawn(self, relay, tmp_path, lead=None):
         pkt = tmp_path / "p.md"
@@ -396,8 +396,8 @@ class TestSpawnTabIdentity:
 
     def test_label_role_prefixed_and_backend_recorded(self, relay, tmp_path):
         cap, s = self._spawn(relay, tmp_path)
-        assert cap["label"] == "[executor] e1"
-        assert s["tab_label"] == "[executor] e1"
+        assert cap["label"] == "[E] e1"
+        assert s["tab_label"] == "[E] e1"
         assert s["backend"] in ("iterm", "terminal")
 
     def test_executor_inherits_lead_color(self, relay, tmp_path):
@@ -648,10 +648,10 @@ class TestFocus:
     def test_lead_is_focusable_by_its_tab_label(self, relay):
         # Leads now get a stable relay-controlled tab label at /relay:mode → focusable like executors.
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="alpha",
-                                      tab_label="[lead] alpha")
+                                      tab_label="[L] alpha")
         with mock.patch.object(relay.iterm, "focus", return_value=True) as focus:
             relay.cmd_focus(SimpleNamespace(session_id="lead-1"))
-        focus.assert_called_once_with("[lead] alpha")
+        focus.assert_called_once_with("[L] alpha")
 
     def test_lead_with_no_label_errors(self, relay):
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1")  # armed before rename → no label
@@ -829,12 +829,12 @@ class TestResumeLead:
         # The restored tab must reuse the lead-start label scheme AND the marker must keep
         # tab_label/color — dropping them here used to break `relay focus <lead>` after a restore.
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd="/w",
-                                      tab_label="[lead] webapp", color=[1, 2, 3])
+                                      tab_label="[L] webapp", color=[1, 2, 3])
         cap = self._run(relay, "lead-1")
-        assert cap["label"] == "[lead] webapp"
+        assert cap["label"] == "[L] webapp"
         assert cap["tab_color"] == [1, 2, 3]
         m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
-        assert m["tab_label"] == "[lead] webapp"
+        assert m["tab_label"] == "[L] webapp"
         assert m["color"] == [1, 2, 3]
 
     def test_lead_resume_nudge_instructs_rearming(self, relay):

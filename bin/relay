@@ -329,7 +329,7 @@ def cmd_spawn(args):
                  f"(an absolute path, e.g. /tmp/calc).")
 
     auto_trust(worktree)
-    label = f"[executor] {session_id}"  # role-prefixed: exec tabs and lead tabs are told apart at a glance
+    label = f"[E] {session_id}"  # role-prefixed: exec tabs and lead tabs are told apart at a glance
     d = packets_dir(session_id)
     d.mkdir(parents=True, exist_ok=True)
     n = 1
@@ -419,7 +419,7 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     Clears the stale pid/iterm-id files first so read_pid/read_iterm_id wait for the NEW tab's."""
     auto_trust(s["worktree"])
     bk = term_backend(s)
-    label = s.get("tab_label") or f"[executor] {session_id}"
+    label = s.get("tab_label") or f"[E] {session_id}"
     for p in (pid_path(session_id), iterm_id_path(session_id)):
         try:
             p.unlink()
@@ -493,7 +493,7 @@ def cmd_resume_lead(sid, force=False):
     model = marker.get("model")
     # Same label scheme as lead-start — the marker's tab_label must match the actual tab title or
     # `relay focus <lead>` breaks after a restore.
-    label = f"[lead] {slugify(project)}" if project else f"[lead] {sid}"
+    label = f"[L] {slugify(project)}" if project else f"[L] {sid}"
     # Refuse to open a SECOND live copy of the same conversation (mirrors the executor guard).
     # Aliveness: a pid recorded by a previous restore, else the marker's relay-controlled tab title.
     lead_pid_file = lead_guard.lead_dir(STATE_ROOT, sid) / "pid"
@@ -1055,7 +1055,7 @@ def cmd_lead_start(args):
     # Give the lead tab a stable, relay-controlled title (like executors get) so `relay focus <lead>`
     # and notification click-through can land on it. Rename via /rename into the lead's OWN session,
     # matched by its iTerm id. Best-effort — if it doesn't take, focus just won't find the lead tab.
-    tab_label = f"[lead] {slugify(project)}"
+    tab_label = f"[L] {slugify(project)}"
     if not getattr(args, "no_rename", False):
         iterm.rename_by_id(iterm_session, tab_label)
     # Stable per-lead tab color; this lead's executors inherit it at spawn so its tabs group

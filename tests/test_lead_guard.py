@@ -459,7 +459,7 @@ class TestRelayLeadCommands:
     def test_lead_start_marker_records_color_and_label(self, relay, root):
         relay.cmd_lead_start(SimpleNamespace(session_id="sess-1", model=None, project="webapp"))
         m = lg.read_marker(root, "sess-1")
-        assert m["tab_label"] == "[lead] webapp"
+        assert m["tab_label"] == "[L] webapp"
         assert tuple(m["color"]) in lg.TAB_PALETTE
         assert m["color"] == lg.lead_color("sess-1")  # executors will inherit this exact color
 

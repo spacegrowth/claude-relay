@@ -238,7 +238,7 @@ class TestTerminalAppBackend:
         handle_file = tmp_path / "handle"
         with mock.patch.object(terminal_app, "run_osascript", return_value=_ok("77\n")) as osa_run, \
              mock.patch.object(terminal_app, "rename_by_id", return_value=True) as ren:
-            terminal_app.spawn(cwd="/tmp", prompt="p", label="[executor] e1",
+            terminal_app.spawn(cwd="/tmp", prompt="p", label="[E] e1",
                                pidfile=str(tmp_path / "pid"), iterm_id_file=str(handle_file))
         script = osa_run.call_args[0][0]
         assert 'tell application "Terminal"' in script and "do script" in script
@@ -246,7 +246,7 @@ class TestTerminalAppBackend:
         # any window mid-close, and tabs have no scriptable `window` property).
         assert "tty of t" in script and "id of w" in script
         assert handle_file.read_text() == "twid:77"
-        ren.assert_called_once_with("twid:77", "[executor] e1")
+        ren.assert_called_once_with("twid:77", "[E] e1")
 
     def test_spawn_ignores_tab_color(self, tmp_path):
         # Terminal.app has no tab colors — the shared kwarg must be accepted and produce no printf.
