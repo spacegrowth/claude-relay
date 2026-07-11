@@ -34,6 +34,11 @@ LEAD_DEFAULTS = {
     "poll_seconds": 1800,        # how long the idle lead's background report-watcher waits (App 1)
     "poll_interval": 5,          # how often that watcher re-checks for a report
     "notify_on_wake": True,      # pop a macOS notification when the lead is woken to review
+    "notify_via": "auto",        # notification transport. "auto" = iTerm OSC-to-tty first (native
+                                 # click→the posting session), then terminal-notifier, then osascript.
+                                 # iTerm forces a "Session …"-prefixed banner title on that OSC tier
+                                 # (no escape parameter overrides it); "terminal-notifier" SKIPS the
+                                 # OSC tier for a clean title/subtitle (falls back to osascript).
     "executor_skip_permissions": False,  # spawn executors with --dangerously-skip-permissions
     "terminal_app": "auto",      # "iterm" | "terminal" | "auto" ($TERM_PROGRAM decides; iTerm default)
     "tab_colors": True,          # iTerm only: color each lead's tab + its executors' tabs alike

@@ -163,6 +163,12 @@ first one that applies wins:
 One-time gotcha for tier 1: macOS must allow iTerm to post notifications — **System Settings →
 Notifications → iTerm → Allow Notifications** (iTerm's own in-app setting is not enough).
 
+Tier 1's banners carry a **"Session …" title that iTerm forces** — no escape parameter overrides or
+suppresses it. To get a clean, relay-set title/subtitle instead, set `"notify_via":
+"terminal-notifier"` in the config: relay then skips the OSC tier and uses terminal-notifier (or
+osascript if it's not installed). You lose the OSC tier's native click-to-the-posting-session, but
+terminal-notifier's click still runs `relay focus <lead>`.
+
 Wakes are scoped to executors the lead owns — multiple leads on different projects don't cross-wake.
 
 ## Telling tabs apart
@@ -197,6 +203,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `poll_seconds` | 1800 | How long idle lead's report-watcher waits before timing out |
 | `poll_interval` | 5 | Interval (seconds) for report-watcher to re-check for new executor reports |
 | `notify_on_wake` | true | Send macOS notification when lead wakes to review |
+| `notify_via` | "auto" | "auto" \| "terminal-notifier". "auto" uses iTerm's OSC banner first (native click→session, but iTerm forces a "Session …" title you can't override); "terminal-notifier" skips that tier for a clean title/subtitle (falls back to osascript) |
 | `executor_skip_permissions` | false | Spawn executors with `--dangerously-skip-permissions` (false = prompt before edits/commands; true = hands-off but requires careful review before landing) |
 | `terminal_app` | "auto" | "iterm" \| "terminal" \| "auto" (auto-detect via `$TERM_PROGRAM`; iTerm default) |
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |

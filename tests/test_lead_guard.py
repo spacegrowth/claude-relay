@@ -697,7 +697,7 @@ class TestNotifyFallback:
         loader.exec_module(mod)
         return mod
 
-    def _notify(self, monkeypatch, notifier_path, iterm_session=None, tty=None):
+    def _notify(self, monkeypatch, notifier_path, iterm_session=None, tty=None, cfg=None):
         mod = self._load_hook()
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)  # the suite sets it; this test mocks instead
         calls = []
@@ -707,7 +707,7 @@ class TestNotifyFallback:
         tty_calls = []
         monkeypatch.setattr(iterm, "notify_via_tty",
                              lambda path, title, body: tty_calls.append((path, title, body)) or True)
-        mod._notify({"notify_on_wake": True}, "exec-1 reported (packet 001)",
+        mod._notify(cfg or {"notify_on_wake": True}, "exec-1 reported (packet 001)",
                     project="webapp", executor="exec-1", lead_sid="lead-1", iterm_session=iterm_session)
         return calls, tty_calls
 
@@ -759,6 +759,26 @@ class TestNotifyFallback:
         calls, tty_calls = self._notify(monkeypatch, "/x/terminal-notifier", iterm_session=None)
         assert tty_calls == []
         assert calls and calls[0][0] == "/x/terminal-notifier"
+
+    def test_notify_via_terminal_notifier_skips_tty_tier(self, monkeypatch):
+        """notify_via='terminal-notifier' bypasses the iTerm OSC/tty tier even when a live tty
+        resolves (opting out of iTerm's forced 'Session …' banner title) → terminal-notifier used."""
+        calls, tty_calls = self._notify(
+            monkeypatch, "/x/terminal-notifier",
+            iterm_session="w1t1p0:some-uuid", tty="/dev/ttys004",
+            cfg={"notify_on_wake": True, "notify_via": "terminal-notifier"})
+        assert tty_calls == []                              # OSC/tty tier skipped despite a live tty
+        assert calls and calls[0][0] == "/x/terminal-notifier"
+
+    def test_notify_via_auto_still_uses_tty_tier(self, monkeypatch):
+        """The default notify_via='auto' preserves tier-1 behavior: a resolvable tty → OSC/tty used,
+        subprocess notifiers never reached. Guards the new config from regressing the default path."""
+        calls, tty_calls = self._notify(
+            monkeypatch, "/x/terminal-notifier",
+            iterm_session="w1t1p0:some-uuid", tty="/dev/ttys004",
+            cfg={"notify_on_wake": True, "notify_via": "auto"})
+        assert calls == []
+        assert len(tty_calls) == 1
 
 
 class TestNotifyViaTty:

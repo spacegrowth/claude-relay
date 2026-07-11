@@ -54,7 +54,12 @@ def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_sess
     import lead_guard as lg
     title = f"relay · {project}" if project else "relay — review needed"
     subtitle = f"{executor} reported" if executor else "review needed"
-    if iterm_session:
+    # Tier 1 is skipped when notify_via='terminal-notifier'. iTerm posts the OSC notification under a
+    # "Session …" title it controls — no escape parameter overrides or suppresses it — so a lead who
+    # wants a clean banner title opts out of this tier and takes terminal-notifier/osascript below
+    # (which set -title/-subtitle explicitly). Trade-off: the OSC tier's NATIVE click→posting-session
+    # is lost, but terminal-notifier's -execute still clicks through to `relay focus <lead>`.
+    if iterm_session and cfg.get("notify_via", "auto") != "terminal-notifier":
         try:
             import iterm
             tty = iterm.tty_by_id(iterm_session)
