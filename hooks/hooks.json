@@ -17,7 +17,7 @@
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop_lead_watch.py",
             "asyncRewake": true,
             "timeout": 1900,
-            "rewakeMessage": "**🚦 [relay] — review needed:** an executor finished or you committed work while idle. Open your reply with the marker in bold — **🚦 [relay] — review needed:** — then surface the details below to the user, and wait for their direction — do not auto-review or auto-commit:",
+            "rewakeMessage": "🚦 [relay] — review needed: an executor finished or you committed work while idle. Open your reply with the marker '🚦 [relay] — review needed:', surface the details below to the user, and wait for their direction — do not auto-review or auto-commit:",
             "rewakeSummary": "🚦 [relay] — an executor finished while you were idle (details next)"
           }
         ]

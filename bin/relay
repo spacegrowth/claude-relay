@@ -71,7 +71,7 @@ GATES
   commit (the lead reviews and commits). The lead may reuse this session for a follow-up packet, and
   will `relay close` it when done. Closing the tab yourself throws away the reusable context.
   After running the self-diff step, end your final turn with EXACTLY this one line, nothing after it:
-      **✅ [relay] — staged + report written** — diff: {diff_url} — idle, awaiting the lead's review.
+      ✅ [relay] — staged + report written — diff: {diff_url} — idle, awaiting the lead's review.
 
 REPORT FORMAT
 Before you stop, write your full report to {report_path} (not just stdout/chat).

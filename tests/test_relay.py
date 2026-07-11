@@ -76,7 +76,7 @@ class TestTemplateFooterConsistency:
     def test_sentinel_line_contains_correct_diff_url(self, relay):
         p = relay.build_packet("task body", "/tmp/sess-a/001-report.md", "/path/to/relay diff sess-a", "file:///tmp/sess-a/001-diff.html")
         # Verify sentinel line contains the diff URL
-        assert "**✅ [relay] — staged + report written** — diff: file:///tmp/sess-a/001-diff.html — idle, awaiting the lead's review." in p
+        assert "✅ [relay] — staged + report written — diff: file:///tmp/sess-a/001-diff.html — idle, awaiting the lead's review." in p
 
     def test_packet_002_diff_url_correct_packet_number(self, relay):
         # cmd_send path: packet 002's footer must carry 002-diff.html, not 001

@@ -102,12 +102,12 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg):
     # Emoji-forward banner: the model echoes this into its announcement, so 🚦 is a visible,
     # consistent "you have a relay update" marker in the lead's on-screen text.
     sys.stderr.write(
-        "**🚦 [relay] — review needed:** new activity while you were idle:\n"
+        "🚦 [relay] — review needed: new activity while you were idle:\n"
         + "\n".join(lines)
-        + "\n\nOpen your reply with the marker in bold — **🚦 [relay] — review needed:** — then "
-          "surface these to the user, and WAIT for their direction. Do NOT auto-review, auto-commit, "
-          "or otherwise act on them yourself until the user asks. If a report needs reviewing, tell "
-          "the user it's ready and ask whether to review it.\n"
+        + "\n\nOpen your reply with the marker '🚦 [relay] — review needed:', surface these to the "
+          "user, and WAIT for their direction. Do NOT auto-review, auto-commit, or otherwise act "
+          "on them yourself until the user asks. If a report needs reviewing, tell the user it's "
+          "ready and ask whether to review it.\n"
     )
     sys.exit(2)  # wake the idle lead
 
