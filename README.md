@@ -19,8 +19,7 @@ split and waits for your go, and wakes you when an executor finishes.
 - **Optional**: `pip3 install iterm2` + enable iTerm's Python API (Settings → General → Magic) —
   new executor tabs then open right next to the lead's tab instead of at the end of the tab bar.
 
-**iTerm2 vs Terminal.app** — auto-detected via `$TERM_PROGRAM` (override: `RELAY_TERMINAL` or
-`"terminal_app"` in the config):
+**iTerm2 vs Terminal.app** — auto-detected via `$TERM_PROGRAM` (see [Config](#config)):
 
 | | **iTerm2** (full experience) | **Terminal.app** |
 |---|---|---|
@@ -186,24 +185,30 @@ Wakes are scoped to executors the lead owns — multiple leads on different proj
 
 ## Config
 
-Optional `~/.relay-tasks/lead/config.json` (absent → these defaults):
+Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it with defaults; missing keys fall back to defaults; unknown keys are ignored; changes take effect on the next relay command or hook run.
 
-```json
-{"edit_line_threshold": 40, "block_on_new_file": true, "grace_seconds": 120,
- "auto_wake": true, "surface_commits": false, "poll_seconds": 1800, "poll_interval": 5,
- "notify_on_wake": true, "executor_skip_permissions": false,
- "terminal_app": "auto", "tab_colors": true, "executor_layout": "tab"}
-```
+| Setting | Default | What it does |
+|---------|---------|------|
+| `edit_line_threshold` | 40 | Block routing a single edit to executors if it adds this many lines or more |
+| `block_on_new_file` | true | Block routing to executors when creating a new file |
+| `grace_seconds` | 120 | Grace period (seconds) when lead uses `/relay:route retain` to bypass the gate |
+| `auto_wake` | true | Wake idle lead when an executor reports |
+| `surface_commits` | false | Wake idle lead to surface commits it made this turn (off by default; opt in if desired) |
+| `poll_seconds` | 1800 | How long idle lead's report-watcher waits before timing out |
+| `poll_interval` | 5 | Interval (seconds) for report-watcher to re-check for new executor reports |
+| `notify_on_wake` | true | Send macOS notification when lead wakes to review |
+| `executor_skip_permissions` | false | Spawn executors with `--dangerously-skip-permissions` (false = prompt before edits/commands; true = hands-off but requires careful review before landing) |
+| `terminal_app` | "auto" | "iterm" \| "terminal" \| "auto" (auto-detect via `$TERM_PROGRAM`; iTerm default) |
+| `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
+| `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 
-`poll_seconds` must stay under the `Stop` hook's `timeout` in `hooks/hooks.json` (currently 1900s)
-— the harness kills the hook's background poller at that timeout regardless of `poll_seconds`, so
-raising one without the other silently breaks auto-wake (see
-[async-rewake-findings.md](docs/async-rewake-findings.md#addendum-silent-auto-wake-death-2026-07-10)).
+`poll_seconds` must stay under the `Stop` hook's `timeout` in `hooks/hooks.json` (currently 1900s) — the harness kills the hook's background poller at that timeout regardless of `poll_seconds`, so raising one without the other silently breaks auto-wake (see [async-rewake-findings.md](docs/async-rewake-findings.md#addendum-silent-auto-wake-death-2026-07-10)).
 
-`executor_skip_permissions` (default `false`) controls whether executors run with
-`--dangerously-skip-permissions`. Off = executors prompt before edits/commands. Set `true` for
-hands-off runs — partly mitigated by design (executors stage, never commit; the lead reviews before
-anything lands), but a real tradeoff. Per-spawn override: `--skip-perms` / `--no-skip-perms`.
+Per-spawn override for `executor_skip_permissions`: pass `--skip-perms` or `--no-skip-perms` at `relay spawn` time.
+
+**Environment variable overrides:**
+- `RELAY_TERMINAL`: force "iterm" or "terminal" (beats `terminal_app` in config)
+- `RELAY_NO_NOTIFY`: suppress all notification banners (useful for tests, CI)
 
 ## Troubleshooting
 
