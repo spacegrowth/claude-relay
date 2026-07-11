@@ -122,7 +122,9 @@ And the three nouns:
 ```
 
 Also: `relay list` hides closed/superseded/dead sessions by default; pass `--closed` to reveal them (capped at 15 most recent). `relay report <sid>` prints a finished report in a green banner, and
-`relay prune [--days N] [--dry-run]` clears old closed/dead session state. `relay diff <sid>
+`relay prune [--days N] [--dry-run]` clears old closed/dead session state, and also clears dead
+lead markers older than `--days` ("ghost" leads from crashed/abandoned tabs — a lead you're
+actively using is never pruned). `relay diff <sid>
 [--open] [--all]` renders an executor's `git diff --staged` to a self-contained, offline HTML page
 (side-by-side via a vendored, checksummed diff2html — see [VENDOR.md](VENDOR.md) — with a stdlib
 fallback if that bundle is missing or fails its integrity check) so you review diffs in one click
@@ -238,6 +240,9 @@ Per-spawn override for `executor_skip_permissions`: pass `--skip-perms` or `--no
   each lead so its next wake poller runs the new code and its marker re-stamps — `relay list`'s
   `VER`/`WAKE` columns confirm which version each lead is actually on. (A poller already in flight
   keeps the old code until it next arms, so re-arming is the clean step.)
+- **A stale row in the LEADS table with an old LAST ACTIVE** is a dead lead (tab closed/crashed
+  without `/relay:stop`) — `relay prune` clears it once it's older than `--days`; a lead you're
+  actively using is never pruned.
 - **A brand-new worktree may ask "trust this folder"** once — relay pre-approves this when it can;
   if not, click trust once.
 - **`/plugin list` may not show relay** when loaded via `--plugin-dir` — a display quirk. If

@@ -1190,6 +1190,72 @@ class TestPrune:
         assert relay.read_session("old-closed") is not None
 
 
+class TestLeadPrune:
+    """`relay prune` also clears dead lead markers ("ghosts": tabs closed/crashed without
+    /relay:stop, so the marker is never cleaned up) older than --days. Triple guard: never the
+    calling lead, must fail the liveness probe, AND must be stale — a wrongly-dead verdict deletes
+    live lead state, worse than a stale row."""
+    OLD = "2000-01-01T00:00:00"
+
+    def _mk_lead(self, relay, sid, last_active, project="proj"):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, sid, project=project)
+        mp = relay.lead_guard.marker_path(relay.STATE_ROOT, sid)
+        m = json.loads(mp.read_text())
+        m["last_active"] = last_active
+        mp.write_text(json.dumps(m))
+
+    def _ledger_events(self, relay):
+        if not relay.LEDGER.exists():
+            return []
+        return [json.loads(l)["event"] for l in relay.LEDGER.read_text().splitlines()]
+
+    def test_prunes_stale_dead_lead(self, relay):
+        self._mk_lead(relay, "ghost-1", self.OLD)
+        with mock.patch.object(relay, "_lead_alive", return_value=False):
+            relay.cmd_prune(SimpleNamespace(days=7, dry_run=False))
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "ghost-1") == {}
+        assert "lead_pruned" in self._ledger_events(relay)
+
+    def test_keeps_alive_lead(self, relay):
+        self._mk_lead(relay, "alive-1", self.OLD)
+        with mock.patch.object(relay, "_lead_alive", return_value=True):
+            relay.cmd_prune(SimpleNamespace(days=7, dry_run=False))
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "alive-1") != {}
+
+    def test_keeps_recent_dead_lead(self, relay):
+        self._mk_lead(relay, "recent-1", relay.now())
+        with mock.patch.object(relay, "_lead_alive", return_value=False):
+            relay.cmd_prune(SimpleNamespace(days=7, dry_run=False))
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "recent-1") != {}
+
+    def test_never_prunes_calling_lead(self, relay, monkeypatch):
+        self._mk_lead(relay, "self-lead", self.OLD)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "self-lead")
+        with mock.patch.object(relay, "_lead_alive", return_value=False):
+            relay.cmd_prune(SimpleNamespace(days=7, dry_run=False))
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "self-lead") != {}
+
+    def test_dry_run_deletes_nothing(self, relay, capsys):
+        self._mk_lead(relay, "ghost-1", self.OLD, project="dry-proj")
+        with mock.patch.object(relay, "_lead_alive", return_value=False):
+            relay.cmd_prune(SimpleNamespace(days=7, dry_run=True))
+        out = capsys.readouterr().out
+        assert "would prune" in out
+        assert "dry-proj" in out
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "ghost-1") != {}
+
+    def test_absent_last_active_treated_ancient(self, relay):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "bare-lead", project="p")
+        mp = relay.lead_guard.marker_path(relay.STATE_ROOT, "bare-lead")
+        m = json.loads(mp.read_text())
+        del m["last_active"]
+        del m["started"]
+        mp.write_text(json.dumps(m))
+        with mock.patch.object(relay, "_lead_alive", return_value=False):
+            relay.cmd_prune(SimpleNamespace(days=7, dry_run=False))
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "bare-lead") == {}
+
+
 class TestDiff:
     """`relay diff <sid> [--open] [--all]`: renders the session's staged diff to
     <packets_dir>/NNN-diff.html, scoped by default to files mentioned in the current packet

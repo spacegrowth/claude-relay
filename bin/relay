@@ -1203,9 +1203,11 @@ def cmd_stop(args):
 
 def cmd_prune(args):
     """Delete the state dirs of terminal-status sessions (closed/superseded/dead) whose last update
-    is older than --days. Nothing else is touched: live sessions, lead state, and the sessions.jsonl
-    ledger (the durable history) all stay. Without this, ~/.relay-tasks grows forever and every
-    `check --all`/`list` iterates dead weight."""
+    is older than --days, AND dead lead markers ("ghosts": tabs closed/crashed without /relay:stop,
+    so the SessionEnd hook never fired to clean up) older than the same cutoff. Nothing else is
+    touched: live sessions, live leads, and the sessions.jsonl ledger (the durable history) all
+    stay. Without this, ~/.relay-tasks grows forever and every `check --all`/`list` iterates dead
+    weight, and dead leads sit in the LEADS table forever with a permanent ver? warning."""
     cutoff = time.time() - args.days * 86400
     removed, kept = [], 0
     for sid in all_session_ids():
@@ -1223,10 +1225,39 @@ def cmd_prune(args):
             shutil.rmtree(session_dir(sid), ignore_errors=True)
             append_ledger("pruned", session_id=sid, status=s.get("status"))
         removed.append(f"{sid} ({s.get('status')})")
+
+    # Lead ghosts: a wrongly-dead verdict here DELETES lead state (unarms gate + wake for that
+    # session if it ever comes back), which is worse than a stale row — hence the triple guard
+    # below (never-self, liveness probe, AND staleness window). Unlike executor adoption, where
+    # fail-toward-adoptable is the right direction, none of these three conditions may be weakened.
+    caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    removed_leads = []
+    for m in lead_guard.list_leads(STATE_ROOT):
+        sid = m.get("session_id")
+        if not sid or sid == caller:  # never prune the calling lead, even if it somehow probes dead
+            continue
+        if _lead_alive(sid):
+            continue
+        try:
+            stamp = m.get("last_active") or m.get("started") or ""
+            last_active = time.mktime(time.strptime(stamp, "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            last_active = 0  # unparseable/missing → treat as ancient, same convention as above
+        if last_active > cutoff:
+            kept += 1
+            continue
+        if not args.dry_run:
+            lead_guard.clear_lead(STATE_ROOT, sid)
+            append_ledger("lead_pruned", session_id=sid, project=m.get("project"))
+        stale_days = int((time.time() - last_active) / 86400) if last_active else "?"
+        removed_leads.append(f"[lead] {m.get('project') or sid} ({sid[:8]}…, {stale_days}d stale)")
+
     verb = "would prune" if args.dry_run else "pruned"
-    if removed:
-        print(f"{verb} {len(removed)} session(s):")
+    if removed or removed_leads:
+        print(f"{verb} {len(removed) + len(removed_leads)} session(s):")
         for r in removed:
+            print(f"  {r}")
+        for r in removed_leads:
             print(f"  {r}")
     else:
         print(f"nothing to prune (terminal sessions newer than {args.days}d: {kept})")
