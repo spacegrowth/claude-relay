@@ -1107,6 +1107,38 @@ class TestSend:
         send.assert_not_called()
         spawn.assert_not_called()
 
+    def test_send_to_closed_session_resumes(self, relay, tmp_path):
+        # A CLOSED session (deliberately retired by the lead) with a pinned conversation is revivable:
+        # send treats its tab as gone, skips the doomed live type, and RESUMES it — reopening the same
+        # conversation with the new packet, full context + staged work back. NOT a fresh spawn.
+        self._mk(relay, status="closed", pid=999999, claude_session="cs-x", report=True)
+        cap = {}
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send, \
+             mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=False), \
+             mock.patch.object(relay.iterm, "close", return_value=False), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123), \
+             mock.patch.object(relay, "read_iterm_id", return_value="w0t0p0:NEW"), \
+             mock.patch.object(relay, "_ensure_tab_label", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        send.assert_not_called()                           # closed tab known gone — no blind type
+        assert cap["resume_id"] == "cs-x"                  # resumed the pinned conversation
+        assert "002-packet.md" in cap["prompt"]            # and delivered the new packet
+        s = relay.read_session("e1")
+        assert s["status"] == "busy" and s["current_packet"] == 2
+
+    def test_send_to_closed_session_without_claude_session_refuses(self, relay, tmp_path):
+        # Closed + no pinned conversation → nothing to resume; must point to `relay spawn`.
+        self._mk(relay, status="closed", pid=999999, claude_session=None, report=True)
+        with mock.patch.object(relay.iterm, "send") as send, \
+             mock.patch.object(relay.iterm, "spawn") as spawn:
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        assert "closed" in str(ei.value) and "relay spawn" in str(ei.value)
+        send.assert_not_called()
+        spawn.assert_not_called()
+
 
 class TestSessionPidAlive:
     """The pid-reuse guard: a recorded process start time that no longer matches means the OS

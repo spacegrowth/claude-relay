@@ -626,13 +626,16 @@ def cmd_send(args):
         sys.exit(f"session '{args.session_id}' is {s['status']} — refusing to send (would inject mid-turn). Only reported/idle sessions are safe send targets.")
     if s["status"] == "superseded":
         sys.exit(f"session '{args.session_id}' is superseded by {s.get('superseded_by')} — refusing to send into an abandoned session.")
-    # A dead session with a pinned Claude conversation is still deliverable — fall through and let
-    # the resume path below bring it back with the packet in one shot. Only a dead session with NO
-    # captured conversation id truly needs a fresh spawn.
-    tab_gone = s["status"] == "dead"
+    # A session whose tab is gone — `dead` (crashed / tab closed) OR `closed` (deliberately retired by
+    # the lead, then wanted back for follow-up) — is still deliverable when we pinned its Claude
+    # conversation at spawn: skip the doomed live-tab send and RESUME it, reopening the same
+    # conversation with the new packet in one shot (full context + staged work back). Only a gone
+    # session with NO captured conversation id truly needs a fresh spawn.
+    prev_status = s["status"]
+    tab_gone = prev_status in ("dead", "closed")
     if tab_gone and not s.get("claude_session"):
-        sys.exit(f"session '{args.session_id}' is dead (tab closed / process gone) with no captured "
-                 f"Claude session to resume — use `relay spawn` for a fresh one")
+        sys.exit(f"session '{args.session_id}' is {prev_status} with no captured Claude session to "
+                 f"resume — use `relay spawn` for a fresh one")
 
     n = next_packet_number(args.session_id)
     body = Path(args.packet).read_text()
@@ -664,8 +667,10 @@ def cmd_send(args):
             s["updated"] = now()
             write_session(args.session_id, s)
             append_ledger("packet_sent", session_id=args.session_id, packet=n, via="resume")
-            print(f"tab '{s['tab_label']}' was gone — resumed session '{args.session_id}' with full "
-                  f"context and delivered packet {n:03d}")
+            note = (f"session '{args.session_id}' was {prev_status}"
+                    if prev_status in ("closed", "dead")
+                    else f"tab '{s['tab_label']}' was gone")
+            print(f"{note} — resumed with full context and delivered packet {n:03d}")
             return
         # No captured Claude session (spawned before session-id capture) → today's behavior.
         s["status"] = "dead"
