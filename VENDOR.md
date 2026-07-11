@@ -33,7 +33,9 @@ degrade to the stdlib fallback renderer instead of erroring loudly.
 These are never shipped in this repo — relay invokes them only if present on your machine:
 
 - **terminal-notifier** (optional, `brew install terminal-notifier`, BSD-licensed) — clickable,
-  coalescing desktop banners; without it relay falls back to macOS's built-in notifications.
+  coalescing desktop banners; without it, iTerm leads still get clickable banners for free (native
+  OSC 777 written to the lead's own tty, zero dependency), just without coalescing — Terminal.app
+  leads fall back to macOS's built-in, unclickable notifications.
 - **iterm2** Python package (optional, `pip3 install iterm2`) — true adjacent-tab placement via
   iTerm2's Python API; without it (or with the API disabled) placement falls back to AppleScript.
 - **macOS system tools** — `osascript`, `ps`, `git`, and the `claude` CLI itself.

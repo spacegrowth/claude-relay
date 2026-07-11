@@ -128,6 +128,32 @@ def tab_color_printf(rgb):
     return tab_color_escape(rgb).replace("\033", "\\033").replace("\a", "\\a")
 
 
+def notify_via_tty(tty_path, title, body):
+    """Write iTerm's OSC 777 'notify' escape straight to a session's tty device — the same channel
+    tab_color_escape uses, which is why it works from a controlling-terminal-less process (a hook
+    has no /dev/tty; this opens the target tty BY PATH instead, exactly like tty_by_id's caller
+    already does for tab colors). Confirmed live: clicking the resulting native macOS notification
+    focuses iTerm on the exact posting session (window+tab), even when that session isn't the
+    frontmost one and the write came from a fully detached subprocess (see
+    docs/async-rewake-findings.md). Requires macOS's own per-app notification permission for iTerm
+    to be granted (System Settings → Notifications) — iTerm's in-app "Terminal may post
+    notifications" profile setting is a separate, additional gate.
+
+    Best-effort and NEVER raises: strips \\033/\\007/newlines from title/body (would otherwise break
+    or truncate the escape sequence) and swallows any write failure (stale tty path, permission,
+    closed session) so callers can always fall through to their next notification tier. Returns
+    True/False for the write itself succeeding — NOT proof the banner rendered (that's inherently
+    unobservable from here)."""
+    def clean(s):
+        return (s or "").replace("\033", "").replace("\007", "").replace("\n", " ").replace("\r", " ")
+    try:
+        with open(tty_path, "w") as f:
+            f.write("\033]777;notify;%s;%s\007" % (clean(title), clean(body)))
+        return True
+    except Exception:
+        return False
+
+
 def _for_session_by_id(uuid, action):
     """AppleScript fragment: walk windows → tabs → sessions and, on the session whose iTerm id
     equals `uuid`, run `action` (which must `return`). Shared by rename_by_id and tty_by_id."""

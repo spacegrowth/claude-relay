@@ -184,3 +184,44 @@ until a human noticed a missing wake.
 `LAST ACTIVE` age in `relay list` and is cleaned up by `/relay:stop` (step-down with reason
 "clear") or `relay prune --days N --dry-run` (discovery tool). Stale markers do not block new
 packet sends or leads taking over — they're just orphaned state.
+
+## Addendum: iTerm native notifications (OSC 777) — live probe (2026-07-10)
+
+**Question.** Can the Stop hook post desktop notifications by writing iTerm's own OSC 9/OSC 777
+escapes straight to a session's tty, instead of depending on `terminal-notifier`? The appeal:
+clicking an iTerm-posted notification natively focuses the posting session — click-to-lead with
+zero external dependencies.
+
+**Probed live, three claims, all confirmed true — but claim 1 initially looked false:**
+
+1. **Does the OS actually show the banner?** First attempts (plain OSC 9, then OSC 777, both to
+   the session's own tty) produced no visible banner at all, even with iTerm's in-app profile
+   setting **"Terminal may post notifications"** (plist key `BM Growl`) confirmed `true` for every
+   profile. The real gate turned out to be a *separate*, macOS-level permission: **System Settings →
+   Notifications → iTerm → Allow Notifications**, which was off on this machine independent of
+   iTerm's own setting. Once flipped on, every subsequent OSC 777 write produced a real banner.
+   **Anyone hitting "nothing happens" on tier 1 should check this macOS-level toggle first** — the
+   iTerm in-app setting alone is not sufficient.
+2. **Click-to-focus.** Confirmed live, repeatedly: with the posting tab NOT focused, clicking the
+   resulting notification switched iTerm straight to that exact tab. This is the property that
+   makes the whole feature worth it, and it holds.
+3. **Posting from a non-tty process.** Confirmed via a fully detached Python subprocess
+   (`start_new_session=True`, `stdin=DEVNULL`, no `/dev/tty` access — reproduced the `[Errno 6]
+   Device not configured` a real hook process sees) opening the target tty **by path** (via
+   `iterm.tty_by_id`, the same mechanism `tab_color_escape` already uses) and writing the escape.
+   The notification posted and attributed to the correct session exactly as when written from an
+   interactive shell.
+
+**Choice: OSC 777 over OSC 9.** OSC 777 (`notify;title;body`) carries both a title and a body;
+plain OSC 9 only carries a body. OSC 777 was the escape actually exercised end-to-end across all
+three probe steps above (including the detached-process and click-to-focus tests), so it's the one
+implemented in `notify_via_tty` (`scripts/iterm.py`). Bare OSC 9 was not independently re-tested
+after the permission fix, since 777 already satisfied every probe requirement — noted here in case
+anyone later needs the narrower escape for a terminal lacking OSC 777 support.
+
+**Result.** Implemented as tier 1 in `_notify` (`hooks/stop_lead_watch.py`): if the lead's marker
+has an `iterm_session` and `iterm.tty_by_id` resolves it to a live tty, `notify_via_tty` posts and
+the function returns — terminal-notifier (tier 2) and osascript (tier 3) are skipped entirely.
+Falls through automatically when there's no `iterm_session`, the session's tty can't be resolved
+(closed/stale), or the write itself fails — all best-effort, matching the hook's fail-open
+contract.

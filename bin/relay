@@ -1088,14 +1088,22 @@ def cmd_lead_start(args):
     if not args.session_id:
         sys.exit("lead-start: session id is empty (is $CLAUDE_CODE_SESSION_ID set?)")
     # terminal-notifier gives the GOOD banners (named source, click→focus, per-lead coalescing).
-    # Without it the Stop hook falls back to macOS's built-in `display notification` (same info,
-    # not clickable, no coalescing) — so arming proceeds with a warning rather than refusing.
-    # PATH-robust check (find_terminal_notifier probes brew dirs too) so we don't falsely warn.
+    # Without it, iTerm leads still get click-to-focus for free (the Stop hook's tier-1 path writes
+    # the notification straight to this session's own tty via OSC 777 — see _notify in
+    # hooks/stop_lead_watch.py) — just no coalescing (repeated wakes stack instead of replacing).
+    # Terminal.app leads have no such fallback: without terminal-notifier they get the fully
+    # degraded osascript banner (not clickable at all). PATH-robust check (find_terminal_notifier
+    # probes brew dirs too) so we don't falsely warn.
     if lead_guard.load_config(STATE_ROOT).get("notify_on_wake", True) \
             and not lead_guard.find_terminal_notifier():
-        print("WARNING: terminal-notifier not found — desktop banners fall back to macOS's built-in\n"
-              "notifications (not clickable, no per-lead coalescing). For click-to-focus banners:\n"
-              "  brew install terminal-notifier", file=sys.stderr)
+        if iterm.NAME == "iterm" and os.environ.get("TERM_SESSION_ID"):
+            print("NOTE: terminal-notifier not found — desktop banners use iTerm's native "
+                  "click-to-focus\ninstead (no per-lead coalescing: repeated wakes stack rather "
+                  "than replace). For that too:\n  brew install terminal-notifier", file=sys.stderr)
+        else:
+            print("WARNING: terminal-notifier not found — desktop banners fall back to macOS's built-in\n"
+                  "notifications (not clickable, no per-lead coalescing). For click-to-focus banners:\n"
+                  "  brew install terminal-notifier", file=sys.stderr)
     # The project name identifies this lead's work in `relay list` and restore; defaults to the
     # working-directory basename when not named explicitly. cwd is where a restored lead reopens.
     cwd = os.getcwd()

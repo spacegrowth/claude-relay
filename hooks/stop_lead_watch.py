@@ -24,30 +24,46 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "scripts"))
 
 STATE_ROOT = os.path.join(os.path.expanduser("~"), ".relay-tasks")
 RELAY_BIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "relay")
 
 
-def _notify(cfg, message, project=None, executor=None, lead_sid=None):
-    """macOS notification via terminal-notifier — so you can tell WHICH lead/executor pinged and
-    click straight to it. Title names the project, subtitle names the executor, notifications
-    COALESCE per lead (`-group`, replace rather than stack), and CLICKING runs `relay focus <lead>`
-    → jumps to that lead's tab (title relay-controlled since /relay:mode).
+def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_session=None):
+    """Desktop notification, three tiers, first one that applies wins:
 
-    terminal-notifier is a hard dependency for OS notifications (relay is macOS+iTerm-only anyway,
-    and it's the only tool that can identify + click). If it's absent, we simply don't pop a banner —
-    the on-screen `🚦` wake still fires — and `relay lead-start` nudges you to `brew install` it.
-    Configurable via notify_on_wake; failures swallowed."""
+    1. iTerm native (OSC 777, written straight to the lead's own tty) — zero external deps, and
+       clicking it focuses the POSTING session natively (confirmed live — see
+       docs/async-rewake-findings.md). Used whenever the lead's marker recorded an iterm_session
+       AND iterm.tty_by_id can still resolve it to a live tty; RETURNs regardless of whether the
+       write itself succeeds (notify_via_tty is best-effort/never-raises — that's the point of a
+       tier system, not something to retry with a fallback).
+    2. terminal-notifier — still valuable even with tier 1 available: `-group` coalesces repeated
+       pings per lead (replace rather than stack), and `-execute` runs `relay focus <lead>` so it
+       works even if the lead's tty is gone (session moved, iTerm restarted).
+    3. osascript's built-in `display notification` — same info, NOT clickable, no coalescing.
+
+    Title names the project, subtitle/body names the executor. Configurable via notify_on_wake;
+    failures swallowed throughout."""
     if not cfg.get("notify_on_wake", True):
         return
     if os.environ.get("RELAY_NO_NOTIFY"):
         return  # kill-switch: the test suite sets this so its subprocess hook runs don't fire REAL
                 #             desktop banners (neither notifier path has a dry-run). Also usable in CI.
     import lead_guard as lg
-    tn = lg.find_terminal_notifier()  # PATH-robust — a bare `which` fails in the hook's minimal PATH
     title = f"relay · {project}" if project else "relay — review needed"
     subtitle = f"{executor} reported" if executor else "review needed"
+    if iterm_session:
+        try:
+            import iterm
+            tty = iterm.tty_by_id(iterm_session)
+            if tty:
+                iterm.notify_via_tty(tty, title, subtitle + " — " + message[:180])
+                return
+        except Exception:
+            pass  # fall through to tier 2 — tty_by_id shells out to osascript, which can misbehave
+    tn = lg.find_terminal_notifier()  # PATH-robust — a bare `which` fails in the hook's minimal PATH
     try:
         if tn:
             args = [tn, "-title", title, "-subtitle", subtitle, "-message", message[:200], "-sound", "Glass"]
@@ -73,9 +89,11 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg):
     if surfaced_keys:
         lg.mark_surfaced(STATE_ROOT, sid, surfaced_keys)
     # Identify the source so the notification says WHICH project/executor and can click to the lead.
-    project = lg.read_marker(STATE_ROOT, sid).get("project")
+    marker = lg.read_marker(STATE_ROOT, sid)
+    project = marker.get("project")
     executor = surfaced_keys[0].split(":")[0] if surfaced_keys else None  # first executor that reported
-    _notify(cfg, notify_msg, project=project, executor=executor, lead_sid=sid)
+    _notify(cfg, notify_msg, project=project, executor=executor, lead_sid=sid,
+            iterm_session=marker.get("iterm_session"))
     # Emoji-forward banner: the model echoes this into its announcement, so 📥 is a visible,
     # consistent "you have a relay update" marker in the lead's on-screen text.
     sys.stderr.write(

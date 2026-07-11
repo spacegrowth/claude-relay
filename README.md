@@ -19,9 +19,11 @@ split and waits for your go, and wakes you when an executor finishes.
 - **Claude Code**
 - Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
 - **terminal-notifier** (`brew install terminal-notifier`) — recommended, not required: it gives
-  desktop banners that name which executor finished, coalesce per lead, and **click through to the
-  lead's tab**. Without it, relay falls back to macOS's built-in notification (same info, not
-  clickable) and `/relay:mode` prints a one-line nudge.
+  desktop banners that name which executor finished, **coalesce per lead** (repeated wakes replace
+  rather than stack), and click through to the lead's tab via `relay focus`. Without it, iTerm
+  leads still get click-to-focus banners for free (iTerm's own native notification, posted straight
+  to the lead's tty — just no coalescing); Terminal.app leads fall back to macOS's built-in
+  notification (same info, not clickable). `/relay:mode` prints a one-line nudge either way.
 
 ## Install
 
@@ -138,10 +140,23 @@ the machine is untouched (the hook fast-exits, fail-open).
 
 While the lead sits idle, a Stop hook watches in the background. When an executor's report lands,
 the lead **wakes**, announces what's ready, and **waits for your direction** — it never auto-reviews
-or auto-commits. You also get a macOS notification naming the project and executor; with
-terminal-notifier installed, clicking it jumps to the lead's tab (without it, the built-in banner
-carries the same info, unclickable). Wakes are scoped to executors the lead owns — multiple leads
-on different projects don't cross-wake.
+or auto-commits. You also get a macOS notification naming the project and executor. Three tiers,
+first one that applies wins:
+
+1. **iTerm native** (no external tool needed): the hook writes the notification straight to the
+   lead's own tty using iTerm's OSC 777 escape. Clicking it **focuses the lead's session natively**
+   — iTerm's own click-to-source behavior, confirmed live. No coalescing: several wakes in a row
+   stack as separate banners rather than replacing one another.
+2. **terminal-notifier** (if installed, and tier 1 didn't apply — e.g. Terminal.app, or the lead's
+   iTerm session couldn't be resolved): clicking runs `relay focus <lead>`, and repeated wakes
+   **coalesce** per lead (replace rather than stack) via `-group`.
+3. **osascript fallback** (neither of the above): macOS's built-in `display notification`, same
+   info, **not clickable**.
+
+One-time gotcha for tier 1: macOS must allow iTerm to post notifications — **System Settings →
+Notifications → iTerm → Allow Notifications** (iTerm's own in-app setting is not enough).
+
+Wakes are scoped to executors the lead owns — multiple leads on different projects don't cross-wake.
 
 ## Telling tabs apart
 

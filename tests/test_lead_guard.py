@@ -17,7 +17,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "lib"))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import lead_guard as lg  # noqa: E402
+import iterm  # noqa: E402 — same sys.modules entry stop_lead_watch.py's own `import iterm` binds to
 
 
 def load_relay_module(state_root):
@@ -695,28 +697,34 @@ class TestNotifyFallback:
         loader.exec_module(mod)
         return mod
 
-    def _notify(self, monkeypatch, notifier_path):
+    def _notify(self, monkeypatch, notifier_path, iterm_session=None, tty=None):
         mod = self._load_hook()
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)  # the suite sets it; this test mocks instead
         calls = []
         monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: calls.append(list(a[0])))
         monkeypatch.setattr(lg, "find_terminal_notifier", lambda: notifier_path)
+        monkeypatch.setattr(iterm, "tty_by_id", lambda sid: tty)
+        tty_calls = []
+        monkeypatch.setattr(iterm, "notify_via_tty",
+                             lambda path, title, body: tty_calls.append((path, title, body)) or True)
         mod._notify({"notify_on_wake": True}, "exec-1 reported (packet 001)",
-                    project="webapp", executor="exec-1", lead_sid="lead-1")
-        return calls
+                    project="webapp", executor="exec-1", lead_sid="lead-1", iterm_session=iterm_session)
+        return calls, tty_calls
 
     def test_terminal_notifier_used_when_present(self, monkeypatch):
-        calls = self._notify(monkeypatch, "/x/terminal-notifier")
+        calls, tty_calls = self._notify(monkeypatch, "/x/terminal-notifier")
         assert calls and calls[0][0] == "/x/terminal-notifier"
         assert "-execute" in calls[0]                      # click→focus wired
         assert "-group" in calls[0]                        # per-lead coalescing
+        assert tty_calls == []                              # no iterm_session → tty tier never engaged
 
     def test_osascript_fallback_when_missing(self, monkeypatch):
-        calls = self._notify(monkeypatch, None)
+        calls, tty_calls = self._notify(monkeypatch, None)
         assert calls and calls[0][0] == "osascript"
         joined = " ".join(calls[0])
         assert "display notification" in joined
         assert "webapp" in joined                          # still names the project
+        assert tty_calls == []
 
     def test_notify_on_wake_false_sends_nothing(self, monkeypatch):
         mod = self._load_hook()
@@ -725,6 +733,55 @@ class TestNotifyFallback:
         monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: calls.append(a[0]))
         mod._notify({"notify_on_wake": False}, "msg", project="p", executor="e", lead_sid="l")
         assert calls == []
+
+    def test_tty_tier_used_when_marker_has_tty(self, monkeypatch):
+        """Marker has iterm_session AND tty_by_id resolves → notify_via_tty is used and NEITHER
+        terminal-notifier nor osascript (subprocess.run) is ever called."""
+        calls, tty_calls = self._notify(monkeypatch, "/x/terminal-notifier",
+                                         iterm_session="w1t1p0:some-uuid", tty="/dev/ttys004")
+        assert calls == []                                  # subprocess.run never invoked
+        assert len(tty_calls) == 1
+        path, title, body = tty_calls[0]
+        assert path == "/dev/ttys004"
+        assert "webapp" in title
+        assert "exec-1" in body
+
+    def test_tty_tier_skipped_when_tty_unresolved(self, monkeypatch):
+        """iterm_session present but tty_by_id can't resolve it (session closed/stale) → falls
+        through to terminal-notifier, tier 2."""
+        calls, tty_calls = self._notify(monkeypatch, "/x/terminal-notifier",
+                                         iterm_session="w1t1p0:some-uuid", tty=None)
+        assert tty_calls == []
+        assert calls and calls[0][0] == "/x/terminal-notifier"
+
+    def test_tty_tier_skipped_without_iterm_session(self, monkeypatch):
+        """No iterm_session on the marker at all → tty tier never even attempted."""
+        calls, tty_calls = self._notify(monkeypatch, "/x/terminal-notifier", iterm_session=None)
+        assert tty_calls == []
+        assert calls and calls[0][0] == "/x/terminal-notifier"
+
+
+class TestNotifyViaTty:
+    """scripts/iterm.py: notify_via_tty — escape-safe OSC 777 write, best-effort/never-raises."""
+    def test_writes_osc_777_to_tty_path(self, tmp_path):
+        fake_tty = tmp_path / "faketty"
+        fake_tty.touch()
+        ok = iterm.notify_via_tty(str(fake_tty), "a title", "a body")
+        assert ok is True
+        written = fake_tty.read_text()
+        assert written == "\033]777;notify;a title;a body\007"
+
+    def test_strips_escape_and_newline_chars(self, tmp_path):
+        """\033/\007 (would prematurely terminate or forge a second escape sequence) are stripped
+        outright; \n/\r (would visually break the single-line OSC payload) become spaces."""
+        fake_tty = tmp_path / "faketty"
+        fake_tty.touch()
+        iterm.notify_via_tty(str(fake_tty), "title\033[31m\nline2", "body\007with\rbreaks")
+        written = fake_tty.read_text()
+        assert written == "\033]777;notify;title[31m line2;bodywith breaks\007"
+
+    def test_never_raises_on_bad_path(self):
+        assert iterm.notify_via_tty("/nonexistent/path/for/real", "t", "b") is False
 
 
 # ---- Stop hook end-to-end via stdin payload ----------------------------------------------------
