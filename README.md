@@ -16,8 +16,8 @@ split and waits for your go, and wakes you when an executor finishes.
   - **iTerm2** (default): built-in, clickable, nothing to install.
   - **Terminal.app**: install `terminal-notifier` (brew) for clickable banners; without it you
     still get macOS's plain notification — it shows the info, but clicking does nothing.
-- **Optional**: `terminal-notifier` on iTerm too (coalesces repeated banners); `pip3 install
-  iterm2` + iTerm's Python API toggle (true adjacent-tab placement).
+- **Optional**: `pip3 install iterm2` + enable iTerm's Python API (Settings → General → Magic) —
+  new executor tabs then open right next to the lead's tab instead of at the end of the tab bar.
 
 **iTerm2 vs Terminal.app** — auto-detected via `$TERM_PROGRAM` (override: `RELAY_TERMINAL` or
 `"terminal_app"` in the config):
