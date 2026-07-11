@@ -9,20 +9,21 @@ split and waits for your go, and wakes you when an executor finishes.
 
 ## Requirements
 
-- macOS with **iTerm2** (the full experience) or **Terminal.app** (supported, with differences:
-  executors open as new *windows* — Terminal has no scriptable tab-create; follow-up `send`s reopen
-  the conversation via `claude --resume` in a fresh window — Terminal can't type into a running
-  session; `relay close` kills the process but the window may linger for you to Cmd-W — some macOS
-  versions ignore scripted window-close; and no tab colors or lead-tab focus). Auto-detected from
-  `$TERM_PROGRAM`; override with `RELAY_TERMINAL=iterm|terminal` or `"terminal_app"` in the config
-  (below).
-- **Claude Code**
-- Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
-- **terminal-notifier — NOT required.** iTerm leads get clickable, click-to-focus notification
-  banners with nothing installed (posted natively by iTerm). Installing it
-  (`brew install terminal-notifier`) is an optional upgrade: repeated wakes coalesce per lead
-  instead of stacking, and Terminal.app leads get clickable banners too. Without it, Terminal.app
-  banners are informational only.
+macOS, Claude Code, and either terminal — auto-detected via `$TERM_PROGRAM` (override:
+`RELAY_TERMINAL=iterm|terminal` or `"terminal_app"` in the config below):
+
+| | **iTerm2** (full experience) | **Terminal.app** |
+|---|---|---|
+| Executors open as | tabs next to the lead (or split panes) | new windows |
+| Follow-up `send` | typed into the running session | reopens via `--resume` in a fresh window |
+| Per-lead tab colors | yes | — |
+| Clickable notifications | yes, nothing to install | only with terminal-notifier |
+| `relay focus` | jumps to tab/pane, leads too | brings the window forward |
+| `relay close` | closes the tab | window may linger (Cmd-W it) |
+
+**Nothing else is required.** Optional upgrades: `brew install terminal-notifier` (notification
+coalescing; clickable banners on Terminal.app) and `pip3 install iterm2` + iTerm's Python API
+toggle (true adjacent-tab placement). Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
 
 ## Install
 
