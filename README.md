@@ -18,12 +18,11 @@ split and waits for your go, and wakes you when an executor finishes.
   (below).
 - **Claude Code**
 - Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
-- **terminal-notifier** (`brew install terminal-notifier`) — recommended, not required: it gives
-  desktop banners that name which executor finished, **coalesce per lead** (repeated wakes replace
-  rather than stack), and click through to the lead's tab via `relay focus`. Without it, iTerm
-  leads still get click-to-focus banners for free (iTerm's own native notification, posted straight
-  to the lead's tty — just no coalescing); Terminal.app leads fall back to macOS's built-in
-  notification (same info, not clickable). `/relay:mode` prints a one-line nudge either way.
+- **terminal-notifier — NOT required.** iTerm leads get clickable, click-to-focus notification
+  banners with nothing installed (posted natively by iTerm). Installing it
+  (`brew install terminal-notifier`) is an optional upgrade: repeated wakes coalesce per lead
+  instead of stacking, and Terminal.app leads get clickable banners too. Without it, Terminal.app
+  banners are informational only.
 
 ## Install
 
