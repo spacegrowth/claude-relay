@@ -28,7 +28,7 @@ and waits.
 ```
 /relay:mode
 ```
-✅ Tab renames `[L] calc`; it presents the phased split (with packet paths) and waits.
+✅ Tab renames `[Lead] calc`; it presents the phased split (with packet paths) and waits.
 
 **3. Phase 1 — serial:**
 > go — start with tokenize

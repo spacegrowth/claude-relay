@@ -69,7 +69,7 @@ def main():
     iterm.CLAUDE_BIN = str(fake_claude_dst)
 
     session_id = "e2e-term-" + str(int(time.time()))
-    label = f"[E] {session_id}"
+    label = f"[Exec] {session_id}"
     d = relay.packets_dir(session_id)
     d.mkdir(parents=True)
     report_path = str(d / "001-report.md")

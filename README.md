@@ -145,7 +145,7 @@ on different projects don't cross-wake.
 
 ## Telling tabs apart
 
-- **Role-prefixed titles**: lead tabs are `[L] <project>`, executor tabs `[E] <session>`.
+- **Role-prefixed titles**: lead tabs are `[Lead] <project>`, executor tabs `[Exec] <session>`.
 - **Per-lead tab colors** (iTerm only): each lead gets a stable color from a 6-color palette, and
   every executor it spawns inherits it — so with multiple leads running, one glance groups each
   lead with its workers. Disable with `"tab_colors": false`.

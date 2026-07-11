@@ -413,8 +413,8 @@ class TestSpawnTabIdentity:
 
     def test_label_role_prefixed_and_backend_recorded(self, relay, tmp_path):
         cap, s = self._spawn(relay, tmp_path)
-        assert cap["label"] == "[E] e1"
-        assert s["tab_label"] == "[E] e1"
+        assert cap["label"] == "[Exec] e1"
+        assert s["tab_label"] == "[Exec] e1"
         assert s["backend"] in ("iterm", "terminal")
 
     def test_executor_inherits_lead_color(self, relay, tmp_path):
@@ -745,10 +745,10 @@ class TestFocus:
     def test_lead_is_focusable_by_its_tab_label(self, relay):
         # Leads now get a stable relay-controlled tab label at /relay:mode → focusable like executors.
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="alpha",
-                                      tab_label="[L] alpha")
+                                      tab_label="[Lead] alpha")
         with mock.patch.object(relay.iterm, "focus", return_value=True) as focus:
             relay.cmd_focus(SimpleNamespace(session_id="lead-1"))
-        focus.assert_called_once_with("[L] alpha")
+        focus.assert_called_once_with("[Lead] alpha")
 
     def test_lead_with_no_label_errors(self, relay):
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1")  # armed before rename → no label
@@ -926,12 +926,12 @@ class TestResumeLead:
         # The restored tab must reuse the lead-start label scheme AND the marker must keep
         # tab_label/color — dropping them here used to break `relay focus <lead>` after a restore.
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd="/w",
-                                      tab_label="[L] webapp", color=[1, 2, 3])
+                                      tab_label="[Lead] webapp", color=[1, 2, 3])
         cap = self._run(relay, "lead-1")
-        assert cap["label"] == "[L] webapp"
+        assert cap["label"] == "[Lead] webapp"
         assert cap["tab_color"] == [1, 2, 3]
         m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
-        assert m["tab_label"] == "[L] webapp"
+        assert m["tab_label"] == "[Lead] webapp"
         assert m["color"] == [1, 2, 3]
 
     def test_lead_resume_nudge_instructs_rearming(self, relay):
