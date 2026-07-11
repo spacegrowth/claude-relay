@@ -287,8 +287,10 @@ def wake_hook_state(marker, poll_seconds):
                   enough to catch a late report.
       'stale'   — stamped timeout is None (a 0.1.0-era hook with no timeout field → killed at the
                   harness default, the original missed-wake bug) or below poll_seconds (someone
-                  raised poll_seconds past the hook timeout). This lead must be FULLY restarted;
-                  /reload-plugins does not re-point a running session's async hook.
+                  raised poll_seconds past the hook timeout). Get onto the fixed hook: /reload-plugins
+                  (re-points hooks — relay has no monitors, so no restart needed) then re-run
+                  /relay:mode to re-arm and re-stamp. The stamp only refreshes on re-arm, so an
+                  updated-but-not-re-armed lead can still read stale until it re-arms.
       'unknown' — marker predates version stamping (no key at all). Can't prove it's safe; surfaced
                   softly so an old pre-fix lead isn't hidden, without crying wolf over a fresh one.
 

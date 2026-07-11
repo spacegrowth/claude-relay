@@ -862,8 +862,9 @@ def cmd_list(args):
         print(c("LEADS", "bold"))
         # WAKE: is each lead's background wake poller safe from an early harness kill? Read from the
         # Stop-hook timeout stamped in the marker at arm time (see lead_guard.wake_hook_state). "stale"
-        # is the silent missed-wake bug made visible — a lead bound to a pre-fix hook must be fully
-        # restarted (/reload-plugins won't re-point a running session's async hook).
+        # is the silent missed-wake bug made visible — a lead bound to a pre-fix hook gets back on the
+        # fixed one by /reload-plugins then re-running /relay:mode (re-arms + re-stamps); the stamp
+        # only refreshes on re-arm, which is why an updated-but-not-re-armed lead can still read stale.
         poll_seconds = lead_guard.load_config(STATE_ROOT).get("poll_seconds", 1800)
         wake_states = {m.get("session_id"): lead_guard.wake_hook_state(m, poll_seconds) for m in leads}
         _WAKE_CELL = {"ok": ("ok", ("green",)), "stale": ("STALE", ("red", "bold")),
@@ -899,11 +900,11 @@ def cmd_list(args):
         if any(st == "stale" for st in wake_states.values()):
             print(c("  ⚠ WAKE=STALE: this lead's auto-wake hook predates the timeout fix — it will "
                     "MISS late executor reports.", "red"))
-            print(c("    Fully restart it (quit & relaunch claude); /reload-plugins does NOT re-point "
-                    "a running session's wake hook.", "red"))
+            print(c("    Fix: update relay if needed (/plugin update relay@claude-relay), /reload-plugins, "
+                    "then re-run /relay:mode to re-arm on the fixed hook (or restart the session).", "red"))
         elif any(st == "unknown" for st in wake_states.values()):
-            print(c("  ⚠ WAKE=ver?: armed before version stamping — if this lead predates your last "
-                    "relay update, restart it to be safe.", "dim"))
+            print(c("  ⚠ WAKE=ver?: armed before version stamping — re-run /relay:mode to re-stamp; if it "
+                    "predates your last relay update, /reload-plugins first (or restart).", "dim"))
         print()
 
     print(c("EXECUTORS", "bold"))
