@@ -204,9 +204,8 @@ def main():
                                                                   # nudge is silently skipped
                         lines.append(
                             f"  \U0001f501 this lead session is getting heavy (~{mb:.1f}MB transcript). "
-                            "Consider handing off: summarize state to a handoff file, run "
-                            "/relay:stop here, start a fresh session + /relay:mode — inherited "
-                            "executors re-wire automatically on your first send/resume."
+                            "Consider handing off: write a handoff md, then run /relay:handoff "
+                            "<md> — it opens a pre-armed successor and steps this session down."
                         )
                         lg.append_ledger(STATE_ROOT, "handoff_nudged", session_id=sid, mb=round(mb, 1))
             except Exception:

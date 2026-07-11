@@ -1621,3 +1621,103 @@ class TestAdoption:
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
         s = relay.read_session("e1")
         assert s["owner_lead"] == "new-lead"
+
+
+class TestHandoff:
+    """`relay handoff <handoff.md>`: pre-arm a successor lead's marker for a pinned session id,
+    spawn its tab seeded with the handoff file, then step the caller down as the final act. Mirrors
+    cmd_resume_lead's iterm_id-capture pattern (packet 002) — reused via read_iterm_id_at."""
+    def _env(self, monkeypatch, sid):
+        if sid is None:
+            monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        else:
+            monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+
+    def _md(self, tmp_path, text="what's in flight, what's done, next steps"):
+        p = tmp_path / "handoff.md"
+        p.write_text(text)
+        return p
+
+    def _leads(self, relay):
+        return {m["session_id"]: m for m in relay.lead_guard.list_leads(relay.STATE_ROOT)}
+
+    def _ledger_events(self, relay):
+        return [json.loads(l) for l in relay.LEDGER.read_text().splitlines()] if relay.LEDGER.exists() else []
+
+    def _run(self, relay, handoff_md, project=None, model=None, iterm_id="w1t1p0:NEW", spawn_side_effect=None):
+        captured = {}
+        spawn_effect = spawn_side_effect or (lambda **kw: captured.update(kw))
+        with mock.patch.object(relay.iterm, "spawn", side_effect=spawn_effect), \
+             mock.patch.object(relay, "read_iterm_id_at", return_value=iterm_id):
+            relay.cmd_handoff(SimpleNamespace(handoff_md=str(handoff_md), project=project, model=model))
+        return captured
+
+    def test_handoff_prearms_successor(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        md = self._md(tmp_path)
+        cap = self._run(relay, md)
+        leads = self._leads(relay)
+        successors = [m for sid, m in leads.items() if sid != "lead-1"]
+        assert len(successors) == 1
+        succ = successors[0]
+        assert succ["project"] == "webapp"
+        assert succ["tab_label"] == "[Lead] webapp"
+        assert succ["color"] is not None
+        assert succ["plugin_version"] is not None
+        assert "stop_hook_timeout" in succ
+        assert cap["session_uuid"] == succ["session_id"]
+        assert str(md) in cap["prompt"]
+        assert "do NOT run /relay:mode" in cap["prompt"]
+
+    def test_handoff_steps_caller_down(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        md = self._md(tmp_path)
+        self._run(relay, md)
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1") == {}
+        events = self._ledger_events(relay)
+        hoff = [e for e in events if e["event"] == "lead_handoff"]
+        assert len(hoff) == 1
+        assert hoff[0]["from_lead"] == "lead-1"
+        successors = [sid for sid in self._leads(relay) if sid != "lead-1"]
+        assert hoff[0]["to_lead"] == successors[0]
+
+    def test_handoff_spawn_failure_preserves_caller(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        md = self._md(tmp_path)
+
+        def _boom(**kw):
+            raise RuntimeError("spawn failed")
+
+        with pytest.raises(SystemExit):
+            self._run(relay, md, spawn_side_effect=_boom)
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1") != {}   # caller intact
+        successors = [sid for sid in self._leads(relay) if sid != "lead-1"]
+        assert successors == []                                                # no ghost
+
+    def test_handoff_refuses_non_lead(self, relay, tmp_path, monkeypatch):
+        self._env(monkeypatch, "not-a-lead")   # env sid set but never armed
+        md = self._md(tmp_path)
+        with mock.patch.object(relay.iterm, "spawn") as spawn_mock:
+            with pytest.raises(SystemExit):
+                relay.cmd_handoff(SimpleNamespace(handoff_md=str(md), project=None, model=None))
+            spawn_mock.assert_not_called()
+
+    def test_handoff_refuses_missing_md(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        with pytest.raises(SystemExit):
+            relay.cmd_handoff(SimpleNamespace(handoff_md=str(tmp_path / "nope.md"), project=None, model=None))
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1") != {}
+
+    def test_handoff_defaults_project_model_from_caller_marker(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", model="opus",
+                                       cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        md = self._md(tmp_path)
+        self._run(relay, md)
+        successors = [m for sid, m in self._leads(relay).items() if sid != "lead-1"]
+        assert successors[0]["project"] == "webapp"
+        assert successors[0]["model"] == "opus"

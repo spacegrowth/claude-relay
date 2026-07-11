@@ -16,6 +16,7 @@ Commands:
   relay lead-start <session_id> [--model N]   # mark this session a lead (from /relay:mode)
   relay adopt <session_id> [--force]          # re-point an executor's auto-wake ownership to this lead
   relay route retain "<reason>" --session <session_id>   # open the retain grace window
+  relay handoff <handoff.md> [--project NAME] [--model NAME]  # succeed this lead with a pre-armed fresh one
 """
 import argparse
 import json
@@ -1340,6 +1341,79 @@ def cmd_lead_start(args):
           + (f" (model {args.model})" if args.model else ""))
 
 
+def cmd_handoff(args):
+    """One-command lead succession: spawn a successor lead tab PRE-ARMED (its marker written for a
+    pinned session id before its first turn — same trick `cmd_spawn` already uses to pin an
+    executor's Claude session id via `session_uuid`), seeded with a handoff file the outgoing lead
+    wrote, then step the outgoing lead down as the final act. The successor needs no /relay:mode:
+    its gate + auto-wake are active from turn one. Inherited executors re-parent automatically on
+    the successor's first send/resume (adopt-on-claim) — nothing to wire here."""
+    caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not caller or not lead_guard.is_lead(STATE_ROOT, caller):
+        sys.exit("handoff: caller isn't an armed lead — run /relay:mode first")
+    handoff_path = Path(args.handoff_md).expanduser().resolve()
+    if not handoff_path.is_file() or handoff_path.stat().st_size == 0:
+        sys.exit(f"handoff: '{args.handoff_md}' doesn't exist or is empty — write the handoff "
+                 f"summary (what's in flight, what's reviewed/committed, open questions, next "
+                 f"steps) first, then hand off.")
+
+    caller_marker = lead_guard.read_marker(STATE_ROOT, caller)
+    project = args.project or caller_marker.get("project") or os.path.basename(os.getcwd())
+    cwd = caller_marker.get("cwd") or os.getcwd()
+    model = args.model or caller_marker.get("model")
+    successor_sid = str(uuid.uuid4())  # pinned — this IS the successor's session id
+    tab_label = f"[Lead] {slugify(project)}"
+    cfg = lead_guard.load_config(STATE_ROOT)
+    color = lead_guard.pick_lead_color(STATE_ROOT, successor_sid) if cfg.get("tab_colors", True) else None
+
+    # PRE-ARM: write the successor's marker (same stamping as cmd_lead_start) BEFORE it ever runs a
+    # turn, so its gate + auto-wake are live from the moment the tab opens — no /relay:mode needed.
+    lead_guard.write_marker(STATE_ROOT, successor_sid, model=model, project=project, cwd=cwd,
+                            tab_label=tab_label, color=color,
+                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout())
+    lead_guard.write_head(STATE_ROOT, successor_sid, lead_guard.git_head(cwd))
+
+    seed = (f"You are the successor lead for project '{project}' — pre-armed by relay handoff (do "
+            f"NOT run /relay:mode; your routing gate and auto-wake are already active). Read the "
+            f"handoff at {handoff_path}, then run /relay:list to see what's in flight. Your first "
+            f"send/resume of an inherited executor adopts it automatically.")
+
+    # never leave the project leadless; never leave a ghost on failure: a failed spawn must NOT
+    # step the caller down (it's still the only live lead), and must NOT leave the successor's
+    # pre-written marker behind as an unreachable ghost.
+    skip_perms = bool(cfg.get("executor_skip_permissions", False))
+    successor_pid = lead_guard.lead_dir(STATE_ROOT, successor_sid) / "pid"
+    iterm_id_file = lead_guard.lead_dir(STATE_ROOT, successor_sid) / "iterm_id"
+    try:
+        iterm.spawn(
+            cwd=cwd,
+            prompt=seed,
+            label=tab_label,
+            pidfile=str(successor_pid),
+            model=model,
+            skip_perms=skip_perms,
+            session_uuid=successor_sid,
+            tab_color=color,
+            iterm_id_file=str(iterm_id_file),
+        )
+    except Exception as e:
+        lead_guard.clear_lead(STATE_ROOT, successor_sid)  # best-effort — drop the pre-written ghost
+        sys.exit(f"handoff: failed to spawn successor tab ({e}) — this session remains lead; "
+                 f"nothing was stepped down.")
+
+    iterm_session = read_iterm_id_at(iterm_id_file)  # best-effort; None on timeout is non-fatal
+    lead_guard.write_marker(STATE_ROOT, successor_sid, model=model, project=project, cwd=cwd,
+                            tab_label=tab_label, color=color, iterm_session=iterm_session,
+                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout())
+
+    # Step the caller down — the FINAL act, only after the spawn call has returned successfully.
+    lead_guard.clear_lead(STATE_ROOT, caller)
+    append_ledger("lead_handoff", from_lead=caller, to_lead=successor_sid, project=project,
+                  handoff_md=str(handoff_path))
+    print(f"handoff complete — successor lead '{project}' (session {successor_sid}) opened, "
+          f"pre-armed; this session has stepped down (gate + auto-wake off here).")
+
+
 def cmd_route(args):
     """The retain escape hatch (invoked by /relay:route). When a legit lead-appropriate edit gets
     gated, this opens a short grace window during which edits pass, and logs one durable `retained`
@@ -1490,6 +1564,12 @@ def main():
                     help="prune closed/superseded/dead sessions not updated in this many days (default 7)")
     pr.add_argument("--dry-run", action="store_true", help="list what would be pruned without deleting")
     pr.set_defaults(func=cmd_prune)
+
+    hf = sub.add_parser("handoff")
+    hf.add_argument("handoff_md", help="path to the handoff summary file")
+    hf.add_argument("--project", help="successor's project name (default: caller lead's project, else cwd basename)")
+    hf.add_argument("--model", help="successor's model (default: caller lead's marker model)")
+    hf.set_defaults(func=cmd_handoff)
 
     args = p.parse_args()
     if args.cmd == "check" and not args.all and not args.session_id:

@@ -119,6 +119,7 @@ And the three nouns:
 /relay:restart <session_id>                re-run a dead session's packet fresh (loses context)
 /relay:route retain "<reason>"             open a grace window when the gate blocks lead work
 /relay:diff <session_id>                   render staged changes to an HTML review page and open it
+/relay:handoff <handoff.md>                 succeed this lead: pre-armed successor tab, then step down
 ```
 
 Also: `relay list` hides closed/superseded/dead sessions by default; pass `--closed` to reveal them (capped at 15 most recent). `relay report <sid>` prints a finished report in a green banner, and
@@ -174,9 +175,22 @@ terminal-notifier's click still runs `relay focus <lead>`.
 Wakes are scoped to executors the lead owns — multiple leads on different projects don't cross-wake.
 
 Separately, relay nudges a lead **once** (ever, per session) when its transcript file grows past
-`handoff_nudge_mb` (default 5MB) — a proxy for session weight. The suggested flow: summarize state
-to a handoff file, `/relay:stop`, start a fresh session, `/relay:mode` — inherited executors re-wire
-automatically on your first `relay send`/`resume`.
+`handoff_nudge_mb` (default 5MB) — a proxy for session weight. The suggested flow: write a handoff
+md, then `/relay:handoff <md>`.
+
+### Handing off a long-lived lead
+
+Heavy session (large transcript, or just wanting a fresh context)? Distill what matters to a
+handoff md — what's in flight, what's reviewed/committed, open questions, next steps — then run
+`/relay:handoff <handoff.md>`. It opens a **pre-armed** successor tab (gate + auto-wake already
+active, no `/relay:mode` needed), seeds it with a pointer to the handoff file, and steps this
+session down as its final act. Inherited executors adopt automatically on the successor's first
+`send`/`resume` — nothing to re-wire.
+
+This is a different tool from `relay resume`/`restart`: **resume/restart is for CRASH
+recovery** (reopens the identical conversation, same context back). **Handoff is for WEIGHT**
+(deliberately starts a fresh context on a NEW session id). Use whichever matches the problem —
+a crashed tab needs its old context back; a bloated one needs to shed it.
 
 ## Telling tabs apart
 
