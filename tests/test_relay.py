@@ -882,9 +882,10 @@ class TestRestartResume:
 class TestResumeLead:
     """cmd_resume routing a crashed LEAD (marker present, no session.json) → restores its OWN Claude
     conversation via `claude --resume <sid>`. iterm.spawn is mocked so no real iTerm/claude."""
-    def _run(self, relay, sid, force=False):
+    def _run(self, relay, sid, force=False, iterm_id=None):
         captured = {}
-        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: captured.update(kw)):
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: captured.update(kw)), \
+             mock.patch.object(relay, "read_iterm_id_at", return_value=iterm_id):
             relay.cmd_resume(SimpleNamespace(session_id=sid, force=force))
         return captured
 
@@ -953,6 +954,25 @@ class TestResumeLead:
         with pytest.raises(SystemExit) as ei:
             self._run(relay, "lead-1")
         assert "--force" in str(ei.value)
+
+    def test_lead_resume_captures_iterm_session(self, relay):
+        # The fresh tab's backend session id must be captured into the marker — without this, a
+        # restored lead permanently loses adjacent-tab placement, tier-1 tty notifications, and
+        # _lead_alive's tty probe until it happens to re-arm in-tab.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="p", cwd="/w")
+        cap = self._run(relay, "lead-1", iterm_id="w9t9p0:RESTORED")
+        assert cap["iterm_id_file"] == str(relay.lead_guard.lead_dir(relay.STATE_ROOT, "lead-1") / "iterm_id")
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert m["iterm_session"] == "w9t9p0:RESTORED"
+
+    def test_lead_resume_capture_failure_leaves_none(self, relay):
+        # Capture is best-effort: a timeout must not block the restore or raise.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="p", cwd="/w")
+        self._run(relay, "lead-1", iterm_id=None)
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert m["iterm_session"] is None
+        events = [json.loads(l)["event"] for l in relay.LEDGER.read_text().splitlines()]
+        assert "lead_resumed" in events
 
     def test_lead_resume_force_overrides_alive(self, relay):
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="p", cwd="/w")

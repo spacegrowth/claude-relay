@@ -162,18 +162,24 @@ def iterm_id_path(session_id):
     return session_dir(session_id) / "iterm_id"
 
 
-def read_iterm_id(session_id, timeout=5):
-    """Poll for the executor's own iTerm session id ($ITERM_SESSION_ID), which the spawned shell
-    writes before exec'ing claude. Returns None if it never appears (empty var / capture failed)."""
-    p = iterm_id_path(session_id)
+def read_iterm_id_at(path, timeout=5):
+    """Poll for a backend session id ($ITERM_SESSION_ID) written to `path` by a spawned shell before
+    exec'ing claude. Returns None if it never appears (empty var / capture failed). Shared polling
+    primitive for both executor spawns (via read_iterm_id below, keyed by session dir) and lead
+    restores (keyed by the lead's own dir) — one poll loop, not duplicated per caller."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if p.exists():
-            v = p.read_text().strip()
+        if path.exists():
+            v = path.read_text().strip()
             if v:
                 return v
         time.sleep(0.2)
     return None
+
+
+def read_iterm_id(session_id, timeout=5):
+    """Poll for the executor's own iTerm session id, keyed by its session dir's iterm_id file."""
+    return read_iterm_id_at(iterm_id_path(session_id), timeout)
 
 
 def read_session(session_id):
@@ -622,6 +628,15 @@ def cmd_resume_lead(sid, force=False):
     skip_perms = bool(cfg.get("executor_skip_permissions", False))
     color = marker.get("color") if cfg.get("tab_colors", True) else None
     lead_pid = lead_guard.lead_dir(STATE_ROOT, sid) / "pid"
+    # Capture the fresh tab's backend session id the same way executor spawns do (read_iterm_id_at),
+    # so a restored lead keeps its iTerm identity: adjacent-tab placement for its executors, tier-1
+    # tty desktop notifications, and _lead_alive's tty probe all key off marker.iterm_session — leaving
+    # it None silently and permanently degrades all three until the lead happens to re-arm in-tab.
+    iterm_id_file = lead_guard.lead_dir(STATE_ROOT, sid) / "iterm_id"
+    try:
+        iterm_id_file.unlink()  # drop any stale value from a prior restore before spawning the new tab
+    except FileNotFoundError:
+        pass
     iterm.spawn(
         cwd=cwd,
         prompt=nudge,
@@ -631,12 +646,15 @@ def cmd_resume_lead(sid, force=False):
         skip_perms=skip_perms,
         resume_id=sid,
         tab_color=color,  # the restored tab keeps the lead's color (fresh tabs start unpainted)
+        iterm_id_file=str(iterm_id_file),
     )
+    iterm_session = read_iterm_id_at(iterm_id_file)  # best-effort; None on timeout doesn't block the restore
     # Refresh the marker (same project/cwd/model, PLUS tab_label and color — dropping them here
     # used to break `relay focus <lead>` after a restore) so last_active updates and the restored
-    # lead looks fresh in `relay list`. iterm_session is left unset (not captured on restore).
+    # lead looks fresh in `relay list`. iterm_session is captured above; None only on a capture
+    # timeout, in which case behavior degrades to exactly what it was before this fix.
     lead_guard.write_marker(STATE_ROOT, sid, model=model, project=project, cwd=cwd,
-                            tab_label=label, color=color,
+                            tab_label=label, color=color, iterm_session=iterm_session,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout())
     append_ledger("lead_resumed", session_id=sid, project=project)
     print(f"restored lead '{project}' (session {sid}) — reopening its conversation")
