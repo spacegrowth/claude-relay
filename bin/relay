@@ -107,6 +107,37 @@ def now():
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _plugin_root():
+    """The plugin dir this bin/relay lives in (parent of bin/). Under an installed plugin this is
+    .../plugins/cache/claude-relay/relay/<version>/ — the SAME ${CLAUDE_PLUGIN_ROOT} the session's
+    hooks run from, since /relay:mode invokes us as ${CLAUDE_PLUGIN_ROOT}/bin/relay. That's the whole
+    reason stamping works: the version WE read here is exactly the version whose Stop hook will fire
+    for this session (see cmd_lead_start / wake_hook_state)."""
+    return Path(os.path.dirname(os.path.realpath(__file__))).parent
+
+
+def plugin_version():
+    """This plugin's version string from .claude-plugin/plugin.json, or None on any error (dev
+    checkouts, malformed file). Stamped into the lead marker so `relay list` can name the version a
+    lead armed under — the key fact when a stale pre-fix session keeps missing wakes."""
+    try:
+        return json.loads((_plugin_root() / ".claude-plugin" / "plugin.json").read_text()).get("version")
+    except Exception:
+        return None
+
+
+def stop_hook_timeout():
+    """The Stop hook's `timeout` (seconds) declared in THIS plugin version's hooks.json, or None if
+    absent/unparseable. None is the 0.1.0 signature — no timeout field, so the harness kills the
+    async wake poller at its short default and every late executor report is missed. Stamped at arm
+    time so the staleness check (wake_hook_state) needs no later file lookup."""
+    try:
+        d = json.loads((_plugin_root() / "hooks" / "hooks.json").read_text())
+        return d["hooks"]["Stop"][0]["hooks"][0].get("timeout")
+    except Exception:
+        return None
+
+
 def append_ledger(event, **fields):
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     rec = {"ts": now(), "event": event, **fields}
@@ -548,7 +579,8 @@ def cmd_resume_lead(sid, force=False):
     # used to break `relay focus <lead>` after a restore) so last_active updates and the restored
     # lead looks fresh in `relay list`. iterm_session is left unset (not captured on restore).
     lead_guard.write_marker(STATE_ROOT, sid, model=model, project=project, cwd=cwd,
-                            tab_label=label, color=color)
+                            tab_label=label, color=color,
+                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout())
     append_ledger("lead_resumed", session_id=sid, project=project)
     print(f"restored lead '{project}' (session {sid}) — reopening its conversation")
 
@@ -828,11 +860,21 @@ def cmd_list(args):
 
     if leads:
         print(c("LEADS", "bold"))
+        # WAKE: is each lead's background wake poller safe from an early harness kill? Read from the
+        # Stop-hook timeout stamped in the marker at arm time (see lead_guard.wake_hook_state). "stale"
+        # is the silent missed-wake bug made visible — a lead bound to a pre-fix hook must be fully
+        # restarted (/reload-plugins won't re-point a running session's async hook).
+        poll_seconds = lead_guard.load_config(STATE_ROOT).get("poll_seconds", 1800)
+        wake_states = {m.get("session_id"): lead_guard.wake_hook_state(m, poll_seconds) for m in leads}
+        _WAKE_CELL = {"ok": ("ok", ("green",)), "stale": ("STALE", ("red", "bold")),
+                      "unknown": ("ver?", ("dim",))}
         # Calculate dynamic widths for LEADS table with per-column caps.
         lead_cols = [
             ("PROJECT", 22, [m.get("project") or "-" for m in leads]),
             ("SESSION", 36, [m.get("session_id") or "-" for m in leads]),
             ("MODEL", 8, [m.get("model") or "-" for m in leads]),
+            ("VER", 8, [m.get("plugin_version") or "?" for m in leads]),
+            ("WAKE", 5, [_WAKE_CELL[wake_states[m.get("session_id")]][0] for m in leads]),
             ("LAST ACTIVE", 12, [_relative_age(m.get("last_active")) for m in leads]),
         ]
         lead_widths = {name: min(cap, max(len(name), max((len(str(v)) for v in vals), default=0)))
@@ -842,13 +884,26 @@ def cmd_list(args):
         print(" ".join(header_parts))
         # Data rows
         for m in leads:
+            wake_text, wake_styles = _WAKE_CELL[wake_states[m.get("session_id")]]
             row_parts = [
                 cell(m.get("project") or "-", lead_widths["PROJECT"]),
                 cell(m.get("session_id") or "-", lead_widths["SESSION"]),
                 cell(m.get("model") or "-", lead_widths["MODEL"]),
+                cell(m.get("plugin_version") or "?", lead_widths["VER"]),
+                c(cell(wake_text, lead_widths["WAKE"]), *wake_styles),
                 cell(_relative_age(m.get("last_active")), lead_widths["LAST ACTIVE"]),
             ]
             print(" ".join(row_parts))
+        # Footnote only when something needs action — a stale (or unknown) wake hook is exactly the
+        # silent condition that used to cost a forensic investigation to find.
+        if any(st == "stale" for st in wake_states.values()):
+            print(c("  ⚠ WAKE=STALE: this lead's auto-wake hook predates the timeout fix — it will "
+                    "MISS late executor reports.", "red"))
+            print(c("    Fully restart it (quit & relaunch claude); /reload-plugins does NOT re-point "
+                    "a running session's wake hook.", "red"))
+        elif any(st == "unknown" for st in wake_states.values()):
+            print(c("  ⚠ WAKE=ver?: armed before version stamping — if this lead predates your last "
+                    "relay update, restart it to be safe.", "dim"))
         print()
 
     print(c("EXECUTORS", "bold"))
@@ -1130,7 +1185,8 @@ def cmd_lead_start(args):
                 pass  # cosmetic — never block arming on a paint failure
     lead_guard.write_marker(STATE_ROOT, args.session_id, model=args.model,
                             iterm_session=iterm_session, project=project, cwd=cwd,
-                            tab_label=tab_label, color=color)
+                            tab_label=tab_label, color=color,
+                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout())
     # Record the cwd's current git HEAD as the baseline, so the Stop-hook commit-surfacing (App 2)
     # only reports commits made AFTER lead mode began — not the repo's entire prior history.
     lead_guard.write_head(STATE_ROOT, args.session_id, lead_guard.git_head(os.getcwd()))

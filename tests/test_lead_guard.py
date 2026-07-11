@@ -501,6 +501,38 @@ class TestRelayLeadCommands:
         relay.cmd_stop(SimpleNamespace(session_id="never-a-lead"))
         assert lg.is_lead(root, "never-a-lead") is False
 
+    def test_lead_start_stamps_plugin_version_and_timeout(self, relay, root):
+        # Arm stamps the plugin version + Stop-hook timeout of the code bin/relay itself is running —
+        # the same ${CLAUDE_PLUGIN_ROOT} the session's hooks fire from, so it names the real hook.
+        relay.cmd_lead_start(SimpleNamespace(session_id="sess-1", model=None))
+        m = lg.read_marker(root, "sess-1")
+        assert m["plugin_version"] == relay.plugin_version()      # from .claude-plugin/plugin.json
+        assert m["stop_hook_timeout"] == relay.stop_hook_timeout()  # from hooks/hooks.json Stop entry
+        assert isinstance(m["stop_hook_timeout"], int)            # repo declares a real timeout (fixed)
+
+
+class TestWakeHookState:
+    """lead_guard.wake_hook_state: is a lead's background wake poller safe from an early harness
+    kill, judged from the Stop-hook timeout stamped in its marker vs the configured poll window."""
+    def test_ok_when_timeout_ge_poll(self):
+        assert lg.wake_hook_state({"stop_hook_timeout": 1900}, 1800) == "ok"
+        assert lg.wake_hook_state({"stop_hook_timeout": 1800}, 1800) == "ok"  # boundary: equal is ok
+
+    def test_stale_when_timeout_below_poll(self):
+        assert lg.wake_hook_state({"stop_hook_timeout": 60}, 1800) == "stale"
+
+    def test_stale_when_timeout_none(self):
+        # The 0.1.0 signature: stamped, but that version's hooks.json had no timeout field at all.
+        assert lg.wake_hook_state({"stop_hook_timeout": None}, 1800) == "stale"
+
+    def test_unknown_when_field_absent(self):
+        # Marker predates version stamping → 'unknown' (surface softly), never a false 'ok'.
+        assert lg.wake_hook_state({"project": "x"}, 1800) == "unknown"
+
+    def test_defensive_bad_input_is_stale(self):
+        # Fail toward surfacing, not hiding: an unparseable stamp reads as 'stale'.
+        assert lg.wake_hook_state({"stop_hook_timeout": "not-an-int"}, 1800) == "stale"
+
 
 # ---- App 1: executor-report surfacing ---------------------------------------------------------
 

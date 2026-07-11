@@ -248,7 +248,7 @@ def is_lead(state_root, session_id):
 
 
 def write_marker(state_root, session_id, model=None, iterm_session=None, project=None, cwd=None,
-                 tab_label=None, color=None):
+                 tab_label=None, color=None, plugin_version=None, stop_hook_timeout=None):
     d = lead_dir(state_root, session_id)
     d.mkdir(parents=True, exist_ok=True)
     marker_path(state_root, session_id).write_text(json.dumps({
@@ -261,6 +261,13 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
         "started": now(),
         "model": model,
         "iterm_session": iterm_session,  # $TERM_SESSION_ID — recorded tab metadata (debugging)
+        # The plugin version this session is bound to, and the Stop-hook timeout that version
+        # declares — captured at arm time (bin/relay shares ${CLAUDE_PLUGIN_ROOT} with the hooks, so
+        # what it reads IS what will fire). wake_hook_state() reads these back to flag a lead whose
+        # wake poller will be killed early (pre-fix hook), so a silently-stale session is VISIBLE in
+        # `relay list` rather than only found by forensics after a missed wake.
+        "plugin_version": plugin_version,
+        "stop_hook_timeout": stop_hook_timeout,
     }, indent=2))
 
 
@@ -270,6 +277,29 @@ def read_marker(state_root, session_id):
         return json.loads(p.read_text()) if p.exists() else {}
     except Exception:
         return {}
+
+
+def wake_hook_state(marker, poll_seconds):
+    """Whether this lead's background wake poller will survive its full poll window — 'ok', 'stale',
+    or 'unknown' — from the Stop-hook timeout stamped in its marker at arm time.
+
+      'ok'      — stamped timeout present and >= poll_seconds: the harness lets the poller run long
+                  enough to catch a late report.
+      'stale'   — stamped timeout is None (a 0.1.0-era hook with no timeout field → killed at the
+                  harness default, the original missed-wake bug) or below poll_seconds (someone
+                  raised poll_seconds past the hook timeout). This lead must be FULLY restarted;
+                  /reload-plugins does not re-point a running session's async hook.
+      'unknown' — marker predates version stamping (no key at all). Can't prove it's safe; surfaced
+                  softly so an old pre-fix lead isn't hidden, without crying wolf over a fresh one.
+
+    Pure and defensive: any bad input degrades to 'stale' (surface, don't hide)."""
+    if "stop_hook_timeout" not in marker:
+        return "unknown"
+    t = marker.get("stop_hook_timeout")
+    try:
+        return "ok" if (t is not None and int(t) >= int(poll_seconds)) else "stale"
+    except Exception:
+        return "stale"
 
 
 def touch_lead(state_root, session_id):

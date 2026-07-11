@@ -223,9 +223,15 @@ Per-spawn override for `executor_skip_permissions`: pass `--skip-perms` or `--no
   a tab looks. `stalled` means go look at that tab.
 - **Tab died mid-build?** `relay resume <sid>` reopens the same conversation with context and staged
   work intact; `relay restart <sid>` re-runs the packet fresh.
-- **Executor finished but the lead never woke?** Check `ls ~/.relay-tasks/lead/` — if empty, arming
-  failed; re-run `/relay:mode`. A landed report surfaces on the lead's next idle either way, and
-  `relay report <sid>` pulls it by hand.
+- **Executor finished but the lead never woke?** First check `relay list` — a **`WAKE=STALE`** on the
+  lead means it's bound to a pre-fix wake hook and will keep missing late reports: **fully restart it**
+  (quit & relaunch `claude`; `/reload-plugins` does *not* re-point a running session's async wake
+  hook — only a fresh session picks up an updated relay). Otherwise check `ls ~/.relay-tasks/lead/` —
+  if empty, arming failed; re-run `/relay:mode`. A landed report surfaces on the lead's next idle
+  either way, and `relay report <sid>` pulls it by hand.
+- **After updating relay, restart any running leads.** A plugin update caches the new version but a
+  live session stays pinned to the version it loaded at start — `relay list`'s `VER`/`WAKE` columns
+  show which version each lead is actually running.
 - **A brand-new worktree may ask "trust this folder"** once — relay pre-approves this when it can;
   if not, click trust once.
 - **`/plugin list` may not show relay** when loaded via `--plugin-dir` — a display quirk. If
