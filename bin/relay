@@ -14,6 +14,7 @@ Commands:
   relay close --self <session_id>            # step down from lead mode
   relay stop <session_id>                    # step down from lead mode (alias for close --self)
   relay lead-start <session_id> [--model N]   # mark this session a lead (from /relay:mode)
+  relay adopt <session_id> [--force]          # re-point an executor's auto-wake ownership to this lead
   relay route retain "<reason>" --session <session_id>   # open the retain grace window
 """
 import argparse
@@ -504,6 +505,61 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     return pid, label
 
 
+def _lead_alive(lead_sid):
+    """Whether `lead_sid` still plausibly has a live session behind it — the gate for whether an
+    executor's ownership can be re-parented freely (dead/retired owner) or must warn instead (live
+    owner). Deliberately does NOT match on tab_label: a handoff (old lead + new lead, SAME project)
+    gives both the identical relay-controlled label, so label matching would read the dead lead's
+    recorded label as a match for the new lead's own live tab and block the exact handoff transfer
+    this exists for. pid and iterm_session are per-process/per-tab identities that can't collide
+    across a handoff. Any exception (or an unresolvable identity) fails toward False — a
+    wrongly-alive verdict silently re-kills the wake (the bug this fixes); a wrongly-dead verdict
+    just transfers ownership, which the printed adoption line makes visible."""
+    try:
+        marker = lead_guard.read_marker(STATE_ROOT, lead_sid)
+        if not marker:
+            return False
+        pid_file = lead_guard.lead_dir(STATE_ROOT, lead_sid) / "pid"
+        if pid_file.exists() and pid_alive(int(pid_file.read_text().strip())):
+            return True
+        iterm_session = marker.get("iterm_session")
+        if iterm_session and iterm.tty_by_id(iterm_session):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _maybe_adopt(session_id, s, force=False, quiet=False):
+    """Re-parent an executor's ownership to the acting lead at a claim point (send/resume/restart/
+    adopt) — sending or resuming a session is an unambiguous claim of it, so ownership should
+    follow. Fixes the silent handoff bug where `owner_lead` is stamped once at spawn and never
+    updated, permanently disabling auto-wake for every lead that inherits an executor after a
+    handoff. Returns `s` (mutated + already persisted if ownership changed)."""
+    caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not caller or not lead_guard.is_lead(STATE_ROOT, caller) or s.get("owner_lead") == caller:
+        return s
+    owner = s.get("owner_lead")
+    if owner is None or not _lead_alive(owner) or force:
+        caller_marker = lead_guard.read_marker(STATE_ROOT, caller)
+        s["owner_lead"] = caller
+        s["owner_project"] = caller_marker.get("project")
+        s["updated"] = now()
+        write_session(session_id, s)
+        append_ledger("adopted", session_id=session_id, from_lead=owner, to_lead=caller, forced=bool(force))
+        if not quiet:
+            if owner:
+                print(f"adopted '{session_id}' from retired lead {owner[:8]}…")
+            else:
+                print(f"adopted unowned '{session_id}'")
+        return s
+    if not quiet:
+        print(f"WARNING: '{session_id}' is owned by live lead {owner[:8]}… ({s.get('owner_project')}) "
+              f"— its report will wake THEM, not you. Take it with: relay adopt {session_id} --force",
+              file=sys.stderr)
+    return s
+
+
 def cmd_restart(args):
     """Re-run a session's CURRENT packet in a fresh tab as a NEW conversation. Loses the prior
     conversation context and re-does the packet from scratch — use `relay resume` to keep context.
@@ -519,6 +575,7 @@ def cmd_restart(args):
     if not packet_path.exists():
         sys.exit(f"cannot restart '{sid}': packet {n:03d} not found at {packet_path}")
     pointer = build_pointer_message(str(packet_path), packet_summary(packet_path.read_text()))
+    s = _maybe_adopt(sid, s)
     pid, label = _relaunch(sid, s, pointer, session_uuid=str(uuid.uuid4()))
     append_ledger("restarted", session_id=sid, packet=n)
     print(f"restarted '{sid}' (tab '{label}', pid {pid}) — re-running packet {n:03d} as a fresh session")
@@ -605,6 +662,7 @@ def cmd_resume(args):
     nudge = ("You were resumed after your relay tab closed — your staged work in this worktree is "
              "intact. Pick up your packet where you left off, finish it, then write your report to "
              "the same report path as before.")
+    s = _maybe_adopt(sid, s)
     pid, label = _relaunch(sid, s, nudge, resume_id=cs)
     append_ledger("resumed", session_id=sid, claude_session=cs)
     print(f"resumed '{sid}' (tab '{label}', pid {pid}) — reopened conversation with full context")
@@ -636,6 +694,10 @@ def cmd_send(args):
     if tab_gone and not s.get("claude_session"):
         sys.exit(f"session '{args.session_id}' is {prev_status} with no captured Claude session to "
                  f"resume — use `relay spawn` for a fresh one")
+
+    # Claim ownership BEFORE delivery, so the poller arms for the CALLING lead the moment the
+    # packet lands — whether it's delivered via the live-tab path or the resume-fallback below.
+    s = _maybe_adopt(args.session_id, s)
 
     n = next_packet_number(args.session_id)
     body = Path(args.packet).read_text()
@@ -687,6 +749,23 @@ def cmd_send(args):
     write_session(args.session_id, s)
     append_ledger("packet_sent", session_id=args.session_id, packet=n)
     print(f"sent packet {n:03d} to session '{args.session_id}' (existing tab)")
+
+
+def cmd_adopt(args):
+    """Explicitly re-point an executor's auto-wake ownership to this lead, without sending or
+    resuming it. Wraps the same _maybe_adopt logic send/resume/restart apply automatically — for
+    the case where a lead just wants to claim an inherited executor up front (e.g. right after
+    /relay:mode on a handoff day)."""
+    s = read_session(args.session_id)
+    if not s:
+        sys.exit(f"no such session: {args.session_id}")
+    caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not caller or not lead_guard.is_lead(STATE_ROOT, caller):
+        sys.exit("adopt: caller isn't an armed lead — run /relay:mode first (adoption re-points "
+                 "auto-wake, which only exists for leads)")
+    s = _maybe_adopt(args.session_id, s, force=args.force)
+    if s.get("owner_lead") != caller:
+        sys.exit(1)
 
 
 def _busy_elapsed(s):
@@ -839,6 +918,11 @@ def cmd_list(args):
     if not show_all:
         rows = [s for s in rows if s.get("owner_lead") in (None, lead_sid)]
 
+    # Orphans: live executors (among the rows this invocation is about to display) owned by a lead
+    # that's no longer armed (marker gone) — the wake-loss bug's blind spot.
+    orphans = [s for s in rows if s["status"] not in ("closed", "superseded", "dead")
+               and s.get("owner_lead") and not lead_guard.read_marker(STATE_ROOT, s["owner_lead"])]
+
     if args.json:
         # --json: fully unfiltered (programmatic surface, filtering is human-display concern)
         print(json.dumps({"leads": leads, "executors": rows}, indent=2))
@@ -960,6 +1044,12 @@ def cmd_list(args):
             rep_cell,
         ]
         print(" ".join(row_parts))
+
+    if orphans:
+        sids = ", ".join(s["session_id"] for s in orphans)
+        print(c(f"  ⚠ {len(orphans)} executor(s) owned by retired leads (wake won't fire): {sids} — "
+                f"reclaim with relay adopt <sid> (or just relay send/resume, which adopt "
+                f"automatically).", "yellow"))
 
     # Print footer if terminal sessions are hidden/truncated
     if getattr(args, "closed", False) and hidden_terminal_count > 0:
@@ -1307,6 +1397,12 @@ def main():
     lst.add_argument("--project", help="name this lead's project (defaults to the cwd basename)")
     lst.add_argument("--no-rename", action="store_true", help="don't rename the lead's iTerm tab")
     lst.set_defaults(func=cmd_lead_start)
+
+    ad = sub.add_parser("adopt")
+    ad.add_argument("session_id")
+    ad.add_argument("--force", action="store_true",
+                    help="take ownership even if the current owner is a live lead")
+    ad.set_defaults(func=cmd_adopt)
 
     rt = sub.add_parser("route")
     rt.add_argument("kind", choices=["retain"])

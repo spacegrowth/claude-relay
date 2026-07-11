@@ -1376,3 +1376,162 @@ class TestReportPointsToDiff:
         relay.cmd_report(SimpleNamespace(session_id="e1", packet=None))
         out = capsys.readouterr().out
         assert "relay diff" not in out
+
+
+class TestAdoption:
+    """_maybe_adopt re-parents an executor's owner_lead to the CALLING lead at each claim point
+    (send/resume/restart) and via the explicit `relay adopt` command — the fix for the handoff bug
+    where owner_lead is stamped once at spawn and never updated, silently killing auto-wake for
+    whichever lead inherits the executor. iterm.send/spawn/is_alive and the pid/iterm-id readers are
+    mocked so no real iTerm/claude is touched."""
+
+    def _mk(self, relay, sid="e1", owner_lead=None, status="reported", claude_session="cs-x"):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)  # also creates session_dir
+        relay.write_session(sid, {"session_id": sid, "worktree": "/w", "topic": "t", "scope": "t",
+            "tab_label": f"relay-{sid}", "model": None, "pid": None, "iterm_session": "w0t0p0:OLD",
+            "claude_session": claude_session, "status": status, "current_packet": 1,
+            "owner_lead": owner_lead, "owner_project": None,
+            "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("first packet")
+        (relay.packets_dir(sid) / "001-report.md").write_text("done")
+
+    def _mk_resumable(self, relay, sid="e1", owner_lead=None, claude_session="uuid-old"):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)  # also creates session_dir
+        relay.write_session(sid, {"session_id": sid, "worktree": "/w", "topic": "t", "scope": "t",
+            "tab_label": "relay-e1", "model": None, "pid": 999, "iterm_session": "w0t0p0:OLD",
+            "claude_session": claude_session, "status": "dead", "current_packet": 1,
+            "owner_lead": owner_lead, "owner_project": None,
+            "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("do the work")
+
+    def _run_relaunch(self, relay, fn, sid="e1", alive=False, force=False):
+        captured = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: captured.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123), \
+             mock.patch.object(relay, "read_iterm_id", return_value="w0t0p0:NEW"), \
+             mock.patch.object(relay, "_ensure_tab_label", return_value=True), \
+             mock.patch.object(relay, "pid_alive", return_value=alive):
+            fn(SimpleNamespace(session_id=sid, force=force))
+        return captured
+
+    def _packet(self, relay, tmp_path):
+        p = tmp_path / "next-packet.md"
+        p.write_text("# Follow-up\n\nDo the next thing.")
+        return str(p)
+
+    def _env(self, monkeypatch, sid):
+        if sid is None:
+            monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        else:
+            monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+
+    def _ledger_events(self, relay):
+        return [json.loads(l) for l in relay.LEDGER.read_text().splitlines()] if relay.LEDGER.exists() else []
+
+    def test_send_adopts_from_retired_lead(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp")
+        self._mk(relay, owner_lead="old-lead")
+        self._env(monkeypatch, "new-lead")
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        s = relay.read_session("e1")
+        assert s["owner_lead"] == "new-lead"
+        assert s["owner_project"] == "webapp"
+        events = self._ledger_events(relay)
+        assert any(e["event"] == "adopted" and e.get("from_lead") == "old-lead" for e in events)
+
+    def test_send_adopts_unowned(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp")
+        self._mk(relay, owner_lead=None)
+        self._env(monkeypatch, "new-lead")
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        s = relay.read_session("e1")
+        assert s["owner_lead"] == "new-lead"
+        events = self._ledger_events(relay)
+        assert any(e["event"] == "adopted" and e.get("from_lead") is None for e in events)
+
+    def test_send_warns_but_does_not_steal_from_live_lead(self, relay, tmp_path, monkeypatch, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "other-lead", project="beta")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp")
+        self._mk(relay, owner_lead="other-lead")
+        self._env(monkeypatch, "new-lead")
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay, "_lead_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        s = relay.read_session("e1")
+        assert s["owner_lead"] == "other-lead"                      # NOT stolen
+        assert s["current_packet"] == 2                             # packet still delivered
+        err = capsys.readouterr().err
+        assert "owned by live lead" in err and "relay adopt e1 --force" in err
+
+    def test_resume_adopts_from_retired_lead(self, relay, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp")
+        self._mk_resumable(relay, owner_lead="old-lead")
+        self._env(monkeypatch, "new-lead")
+        self._run_relaunch(relay, relay.cmd_resume)
+        assert relay.read_session("e1")["owner_lead"] == "new-lead"
+
+    def test_restart_adopts_from_retired_lead(self, relay, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp")
+        self._mk_resumable(relay, owner_lead="old-lead")
+        self._env(monkeypatch, "new-lead")
+        self._run_relaunch(relay, relay.cmd_restart)
+        assert relay.read_session("e1")["owner_lead"] == "new-lead"
+
+    def test_adopt_command_force_takes_from_live_lead(self, relay, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "other-lead", project="beta")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp")
+        self._mk(relay, owner_lead="other-lead")
+        self._env(monkeypatch, "new-lead")
+        with mock.patch.object(relay, "_lead_alive", return_value=True):
+            relay.cmd_adopt(SimpleNamespace(session_id="e1", force=True))
+        s = relay.read_session("e1")
+        assert s["owner_lead"] == "new-lead"
+        events = self._ledger_events(relay)
+        adopted = [e for e in events if e["event"] == "adopted"]
+        assert adopted and adopted[-1]["forced"] is True
+
+    def test_adopt_refuses_non_lead_caller(self, relay, monkeypatch):
+        self._mk(relay, owner_lead="old-lead")
+        self._env(monkeypatch, "no-marker-caller")  # env sid set but never armed as a lead
+        with pytest.raises(SystemExit):
+            relay.cmd_adopt(SimpleNamespace(session_id="e1", force=False))
+        assert relay.read_session("e1")["owner_lead"] == "old-lead"
+
+    def test_no_env_no_adoption(self, relay, tmp_path, monkeypatch):
+        self._mk(relay, owner_lead="old-lead")
+        self._env(monkeypatch, None)  # bare-terminal invocation: no CLAUDE_CODE_SESSION_ID at all
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        assert relay.read_session("e1")["owner_lead"] == "old-lead"
+
+    def test_list_footnotes_orphaned_executors(self, relay, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
+        self._mk(relay, owner_lead="ghost-lead", status="busy")
+        relay.cmd_list(SimpleNamespace(json=False, lead=None, all=False, closed=False))
+        out = capsys.readouterr().out
+        assert "⚠" in out and "e1" in out
+        assert "relay adopt" in out
+
+    def test_same_project_handoff_auto_transfers(self, relay, tmp_path, monkeypatch):
+        # THE corpus-night regression: old + new lead share the SAME project (and thus the same
+        # derived tab_label), but the old lead has no live pid and an unresolvable iterm_session —
+        # that tab-label collision must NOT block the transfer; it must auto-adopt, not warn.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-lead", project="d2cengine_refactor",
+                                       tab_label="[Lead] d2cengine_refactor", iterm_session="w0t0p0:OLDLEAD")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="d2cengine_refactor",
+                                       tab_label="[Lead] d2cengine_refactor", iterm_session="w0t0p0:NEWLEAD")
+        self._mk(relay, owner_lead="old-lead")
+        self._env(monkeypatch, "new-lead")
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay.iterm, "tty_by_id", return_value=None):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        s = relay.read_session("e1")
+        assert s["owner_lead"] == "new-lead"

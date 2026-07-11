@@ -228,7 +228,10 @@ Per-spawn override for `executor_skip_permissions`: pass `--skip-perms` or `--no
   fixed hook: `/plugin update relay@claude-relay` (if not already updated) → `/reload-plugins` →
   re-run `/relay:mode` to re-arm (which also re-stamps the version). Otherwise check
   `ls ~/.relay-tasks/lead/` — if empty, arming failed; re-run `/relay:mode`. A landed report surfaces
-  on the lead's next idle either way, and `relay report <sid>` pulls it by hand.
+  on the lead's next idle either way, and `relay report <sid>` pulls it by hand. **After a lead
+  handoff**, an inherited executor still owned by the retired lead won't wake you at all — run
+  `relay list` and check the footnote for orphaned executors; `relay send`/`relay resume` adopt them
+  automatically, or use `relay adopt <sid>` to re-point ownership without sending anything.
 - **After updating relay, refresh running leads.** A plugin update only caches the new version — a live
   session keeps using the old hook path until you run **`/reload-plugins`** (which re-points hooks for
   the session; relay ships no monitors, so no full restart is needed). Then re-run `/relay:mode` on

@@ -27,3 +27,8 @@ closed/dead session with NO captured conversation needs a fresh `/relay:spawn`. 
 equivalent), so there `relay send` automatically closes the old window and reopens the SAME
 conversation via `claude --resume` in a fresh window with the packet delivered — context is fully
 preserved; it just costs a new window instead of reusing the tab in place.
+
+**Ownership follows the send.** Sending into an executor also **adopts** it — re-points its
+auto-wake to the acting lead — which matters after a handoff (an inherited executor otherwise
+keeps waking its old, retired lead, silently, forever). If it's currently owned by a live *other*
+lead, relay warns instead of stealing it; `relay adopt <session_id> --force` takes it explicitly.

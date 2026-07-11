@@ -22,6 +22,11 @@ have it. If relay says there's no captured id, use `/relay:restart` instead (re-
 a fresh session, losing prior context). If the session still looks alive, relay refuses unless you
 pass `--force` (avoid two live instances of the same conversation).
 
+**Ownership follows the resume.** Resuming an executor also **adopts** it — re-points its auto-wake
+to the acting lead — which matters after a handoff (an inherited executor otherwise keeps waking
+its old, retired lead, silently, forever). If it's currently owned by a live *other* lead, relay
+warns instead of stealing it; `relay adopt <session_id> --force` takes it explicitly.
+
 **Restoring a crashed lead.** `/relay:resume <session-id>` also brings back a **crashed lead** — pass
 the lead's session id (find it in the LEADS section of `/relay:list`). Because a lead's `session_id`
 *is* its own Claude Code session id, restore is `claude --resume <lead_sid>`: the lead's conversation
