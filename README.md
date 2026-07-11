@@ -9,8 +9,18 @@ split and waits for your go, and wakes you when an executor finishes.
 
 ## Requirements
 
-macOS, Claude Code, and either terminal — auto-detected via `$TERM_PROGRAM` (override:
-`RELAY_TERMINAL=iterm|terminal` or `"terminal_app"` in the config below):
+**Dependencies**
+
+- **Claude Code** — the only hard dependency.
+- **Notifications** —
+  - **iTerm2** (default): built-in, clickable, nothing to install.
+  - **Terminal.app**: install `terminal-notifier` (brew) for clickable banners; without it you
+    still get macOS's plain notification — it shows the info, but clicking does nothing.
+- **Optional**: `terminal-notifier` on iTerm too (coalesces repeated banners); `pip3 install
+  iterm2` + iTerm's Python API toggle (true adjacent-tab placement).
+
+**iTerm2 vs Terminal.app** — auto-detected via `$TERM_PROGRAM` (override: `RELAY_TERMINAL` or
+`"terminal_app"` in the config):
 
 | | **iTerm2** (full experience) | **Terminal.app** |
 |---|---|---|
@@ -21,9 +31,7 @@ macOS, Claude Code, and either terminal — auto-detected via `$TERM_PROGRAM` (o
 | `relay focus` | jumps to tab/pane, leads too | brings the window forward |
 | `relay close` | closes the tab | window may linger (Cmd-W it) |
 
-**Nothing else is required.** Optional upgrades: `brew install terminal-notifier` (notification
-coalescing; clickable banners on Terminal.app) and `pip3 install iterm2` + iTerm's Python API
-toggle (true adjacent-tab placement). Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
+Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
 
 ## Install
 
