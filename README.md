@@ -173,6 +173,11 @@ terminal-notifier's click still runs `relay focus <lead>`.
 
 Wakes are scoped to executors the lead owns — multiple leads on different projects don't cross-wake.
 
+Separately, relay nudges a lead **once** (ever, per session) when its transcript file grows past
+`handoff_nudge_mb` (default 5MB) — a proxy for session weight. The suggested flow: summarize state
+to a handoff file, `/relay:stop`, start a fresh session, `/relay:mode` — inherited executors re-wire
+automatically on your first `relay send`/`resume`.
+
 ## Telling tabs apart
 
 - **Role-prefixed titles**: lead tabs are `[Lead] <project>`, executor tabs `[Exec] <session>`.
@@ -210,6 +215,8 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `terminal_app` | "auto" | "iterm" \| "terminal" \| "auto" (auto-detect via `$TERM_PROGRAM`; iTerm default) |
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
+| `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
+| `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) for the handoff nudge — a proxy for session weight, not context-window occupancy; calibrated on real sessions (a full working day ≈ 3MB, the heaviest marathon session ever ≈ 6MB) |
 
 `poll_seconds` must stay under the `Stop` hook's `timeout` in `hooks/hooks.json` (currently 1900s) — the harness kills the hook's background poller at that timeout regardless of `poll_seconds`, so raising one without the other silently breaks auto-wake (see [async-rewake-findings.md](docs/async-rewake-findings.md#addendum-silent-auto-wake-death-2026-07-10)).
 

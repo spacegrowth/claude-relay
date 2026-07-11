@@ -11,6 +11,9 @@ activity it would otherwise miss, and ANNOUNCE-AND-WAIT (never auto-act). Two th
   App 2 — the lead made NEW commit(s) this turn (covers the Bash/`git commit` vector the PreToolUse
           edit-gate can't see). These already exist at stop time → checked synchronously, instantly.
 
+Also, once per lead ever: if the transcript file has grown past handoff_nudge_mb, nudge a handoff
+(summarize → /relay:stop → fresh session + /relay:mode) — a heavy-session proxy, not automation.
+
 Contract (proven by the asyncRewake spike — see docs/async-rewake-findings.md): runs in the
 background; exit 0 → silent, lead stays idle; exit 2 → the idle lead WAKES with this script's
 stderr + the hook's rewakeMessage. Gated to fire ONCE per event (surfaced markers, advancing the
@@ -188,6 +191,26 @@ def main():
                 rlines, rkeys = _report_lines(lg, sid)
                 lines += rlines
                 surfaced_keys += rkeys
+            # Handoff nudge — a heavy transcript is a PROXY for session weight (not context-window
+            # occupancy: compaction shrinks context but the file keeps growing), so this fires ONCE
+            # ever per lead (flag file, not the surfaced_keys dedup — it isn't a report) and rides
+            # whatever wake already fires below rather than opening a second exit-2 path.
+            try:
+                if cfg.get("handoff_nudge", True) and not lg.handoff_nudged(STATE_ROOT, sid):
+                    mb = lg.transcript_mb(payload.get("transcript_path"))
+                    if mb >= float(cfg.get("handoff_nudge_mb", 5)):
+                        lg.mark_handoff_nudged(STATE_ROOT, sid)  # mark FIRST — a crash after this
+                                                                  # can't double-nudge; worst case one
+                                                                  # nudge is silently skipped
+                        lines.append(
+                            f"  \U0001f501 this lead session is getting heavy (~{mb:.1f}MB transcript). "
+                            "Consider handing off: summarize state to a handoff file, run "
+                            "/relay:stop here, start a fresh session + /relay:mode — inherited "
+                            "executors re-wire automatically on your first send/resume."
+                        )
+                        lg.append_ledger(STATE_ROOT, "handoff_nudged", session_id=sid, mb=round(mb, 1))
+            except Exception:
+                pass  # fail-open — the nudge is best-effort, never worth breaking the hook over
             if lines:
                 _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, _notify_summary(lines))  # exits 2
 

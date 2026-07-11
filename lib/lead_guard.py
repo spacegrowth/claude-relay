@@ -43,6 +43,8 @@ LEAD_DEFAULTS = {
     "terminal_app": "auto",      # "iterm" | "terminal" | "auto" ($TERM_PROGRAM decides; iTerm default)
     "tab_colors": True,          # iTerm only: color each lead's tab + its executors' tabs alike
     "executor_layout": "tab",    # "tab" | "pane" (pane: iTerm only, split into the lead's window)
+    "handoff_nudge": True,       # suggest handing off when the lead transcript gets heavy
+    "handoff_nudge_mb": 5,       # transcript-size threshold (MB); proxy, not context occupancy
 }
 
 # Distinguishable, colorblind-tolerant tab colors — brightened so they remain visible when dimmed
@@ -446,6 +448,42 @@ def mark_surfaced(state_root, lead_sid, keys):
         d = lead_dir(state_root, lead_sid)
         d.mkdir(parents=True, exist_ok=True)
         _surfaced_path(state_root, lead_sid).write_text(json.dumps(sorted(cur)))
+    except Exception:
+        pass
+
+
+# ---- Stop-hook: handoff nudge (transcript-size proxy) ------------------------------------------
+
+def transcript_mb(path):
+    """Size of the lead's transcript JSONL in MB (float), 0.0 on any error/missing/None path — a
+    usable PROXY for session weight, NOT context-window occupancy (compaction shrinks context but
+    the file keeps growing, which is exactly why this is a one-time nudge, not automation)."""
+    try:
+        if not path:
+            return 0.0
+        return os.path.getsize(path) / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def _handoff_nudged_path(state_root, lead_sid):
+    return lead_dir(state_root, lead_sid) / "handoff_nudged"
+
+
+def handoff_nudged(state_root, lead_sid):
+    """Whether this lead has already been nudged to hand off — a bare flag file (not JSON, unlike
+    surfaced_reports.json) since it's a single onetime bit, mirrored in spirit from that pattern."""
+    try:
+        return _handoff_nudged_path(state_root, lead_sid).exists()
+    except Exception:
+        return False
+
+
+def mark_handoff_nudged(state_root, lead_sid):
+    try:
+        d = lead_dir(state_root, lead_sid)
+        d.mkdir(parents=True, exist_ok=True)
+        _handoff_nudged_path(state_root, lead_sid).touch()
     except Exception:
         pass
 

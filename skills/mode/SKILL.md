@@ -104,7 +104,9 @@ way, your job is to **announce it to the user and then WAIT** — tell them what
 "executor `X` reported on packet 002, its report is ready to review") and ask whether to proceed.
 Do NOT auto-review the diff, auto-commit, or take any action on the surfaced items on your own until
 the user directs you. The wake is a notification to keep the human in the loop, not a go-ahead to
-act — and this preserves the sign-off gate below.
+act — and this preserves the sign-off gate below. If a wake includes the one-time handoff nudge
+(transcript getting heavy), surface that to the user too and let THEM decide whether to hand off —
+never step down or start a fresh session unilaterally.
 
 **Then adopt this role:**
 

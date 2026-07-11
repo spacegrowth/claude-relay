@@ -891,6 +891,98 @@ class TestStopHookLivePayload:
         assert rc == 0
 
 
+class TestHandoffNudge:
+    """Stop hook: once-ever nudge to hand off when the lead's transcript grows past
+    handoff_nudge_mb. Transcript size is a PROXY for session weight, not context occupancy — hence
+    exactly-once, never automation. Reuses TestStopHookLivePayload's real-subprocess harness for the
+    end-to-end cases; the sparse-file trick (truncate, not real bytes) keeps the size threshold
+    without actually writing megabytes."""
+    def _run(self, home, payload):
+        import subprocess
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "stop_lead_watch.py")],
+            input=json.dumps(payload), capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home), "RELAY_NO_NOTIFY": "1"})
+        return p.returncode, p.stderr
+
+    def _sparse_file(self, path, mb):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            f.truncate(int(mb * 1024 * 1024))
+        return path
+
+    def _ledger_events(self, root):
+        p = root / "sessions.jsonl"
+        if not p.exists():
+            return []
+        return [json.loads(l) for l in p.read_text().splitlines()]
+
+    def test_nudges_once_when_over_threshold(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        transcript = self._sparse_file(tmp_path / "transcript.jsonl", 6)
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                        "transcript_path": str(transcript)})
+        assert rc == 2
+        assert "getting heavy" in err
+        assert lg.handoff_nudged(root, "lead-1")
+        events = self._ledger_events(root)
+        assert any(e["event"] == "handoff_nudged" and e["session_id"] == "lead-1" for e in events)
+
+    def test_no_second_nudge(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        transcript = self._sparse_file(tmp_path / "transcript.jsonl", 6)
+        payload = {"session_id": "lead-1", "cwd": str(tmp_path), "transcript_path": str(transcript)}
+        assert self._run(tmp_path, payload)[0] == 2
+        rc, err = self._run(tmp_path, payload)
+        assert rc == 0
+        assert "getting heavy" not in err
+
+    def test_under_threshold_silent(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        transcript = self._sparse_file(tmp_path / "transcript.jsonl", 1)
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                        "transcript_path": str(transcript)})
+        assert rc == 0
+        assert not lg.handoff_nudged(root, "lead-1")
+
+    def test_disabled_by_config(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        (root / "lead").mkdir(parents=True)
+        (root / "lead" / "config.json").write_text(json.dumps({"handoff_nudge": False}))
+        lg.write_marker(root, "lead-1")
+        transcript = self._sparse_file(tmp_path / "transcript.jsonl", 10)
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                        "transcript_path": str(transcript)})
+        assert rc == 0
+        assert "getting heavy" not in err
+        assert not lg.handoff_nudged(root, "lead-1")
+
+    def test_missing_transcript_path_silent(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path)})
+        assert rc == 0
+        assert "getting heavy" not in err
+        assert not lg.handoff_nudged(root, "lead-1")
+
+    def test_transcript_mb_missing_path(self):
+        assert lg.transcript_mb(None) == 0.0
+        assert lg.transcript_mb("/no/such/file") == 0.0
+
+    def test_transcript_mb_real_file(self, tmp_path):
+        p = self._sparse_file(tmp_path / "t.jsonl", 2)
+        assert lg.transcript_mb(str(p)) == pytest.approx(2.0, abs=0.01)
+
+    def test_handoff_nudged_mark_round_trip(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        assert lg.handoff_nudged(root, "lead-1") is False
+        lg.mark_handoff_nudged(root, "lead-1")
+        assert lg.handoff_nudged(root, "lead-1") is True
+
+
 class TestStopHookBackgroundPoll:
     """The critical case a one-shot check misses: the executor finishes AFTER the lead is idle.
     The hook must background-poll and wake when the report lands. Drives the real hook subprocess."""
