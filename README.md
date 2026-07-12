@@ -171,6 +171,17 @@ If you'd rather not thread stdin through, `--statusline` is optional: `relay sta
 "$CLAUDE_CODE_SESSION_ID"` (or with no argument at all, since `relay status` falls back to that same
 env var) works from a plain shell command with no JSON parsing.
 
+The LEAD view also carries a transcript-weight segment — an ambient early warning before the
+one-shot [handoff nudge](#handing-off-a-long-lived-lead) fires, and a persistent pointer to
+`/relay:handoff` after it does, so you're not relying on catching that single wake. It only appears
+via `--statusline` (that's the only invocation that carries `transcript_path`, confirmed present in
+the statusline JSON payload against the same docs), and only from 60% of `handoff_nudge_mb` upward:
+
+```
+🚦 2 busy · ✅ tk-replay · 4.2MB
+🚦 1 busy · 5.2MB → /relay:handoff
+```
+
 Honest limit: `relay status` reads stored state + report-file existence only — no liveness refresh.
 A crashed executor may still read `busy` in your status line until the next `relay list`/`relay
 check` runs; those commands remain the decision surface for whether something actually needs

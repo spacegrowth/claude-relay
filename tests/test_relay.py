@@ -1803,3 +1803,87 @@ class TestStatus:
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
         relay.cmd_status(self._args(session_id="lead-1"))
         assert capsys.readouterr().out == ""
+
+    # ---- transcript-size / handoff-awareness segment (--statusline mode only) ------------------
+
+    def _sparse_file(self, path, mb):
+        """A file of the given size WITHOUT writing that many real bytes (truncate, sparse) — same
+        trick TestHandoffNudge uses so these tests don't actually write megabytes to disk."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            f.truncate(int(mb * 1024 * 1024))
+        return path
+
+    def _statusline(self, relay, monkeypatch, sid="lead-1", transcript_path=None):
+        import io
+        payload = {"session_id": sid}
+        if transcript_path is not None:
+            payload["transcript_path"] = str(transcript_path)
+        monkeypatch.setattr(relay.sys, "stdin", io.StringIO(json.dumps(payload)))
+        relay.cmd_status(self._args(statusline=True))
+
+    def test_status_weight_segment_below_60pct_silent(self, relay, capsys, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        transcript = self._sparse_file(tmp_path / "t.jsonl", 2)   # 2MB / 5MB default threshold = 40%
+        self._statusline(relay, monkeypatch, transcript_path=transcript)
+        out = capsys.readouterr().out
+        assert "MB" not in out
+
+    def test_status_weight_segment_approaching(self, relay, capsys, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        transcript = self._sparse_file(tmp_path / "t.jsonl", 3.5)   # 70% of the 5MB default
+        self._statusline(relay, monkeypatch, transcript_path=transcript)
+        out = capsys.readouterr().out
+        assert "3.5MB" in out
+        assert "handoff" not in out
+
+    def test_status_weight_segment_at_threshold_points_to_handoff(self, relay, capsys, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        transcript = self._sparse_file(tmp_path / "t.jsonl", 6)   # over the 5MB default threshold
+        self._statusline(relay, monkeypatch, transcript_path=transcript)
+        out = capsys.readouterr().out
+        assert "→ /relay:handoff" in out
+
+    def test_status_weight_segment_after_nudge_flag_persists(self, relay, capsys, tmp_path, monkeypatch):
+        # Flag set but transcript now small: the flag is the durable fact, size math is not
+        # re-consulted to decide WHETHER to point (only mb > 0 gates it, per the packet's rule).
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        relay.lead_guard.mark_handoff_nudged(relay.STATE_ROOT, "lead-1")
+        transcript = self._sparse_file(tmp_path / "t.jsonl", 2)
+        self._statusline(relay, monkeypatch, transcript_path=transcript)
+        out = capsys.readouterr().out
+        assert "→ /relay:handoff" in out
+
+    def test_status_weight_absent_without_statusline(self, relay, capsys, tmp_path):
+        # Positional-id invocation: no JSON payload was ever parsed, so there's no transcript_path
+        # to measure — the segment must not appear, even for a lead that (unbeknownst to this
+        # invocation) is objectively heavy.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        relay.lead_guard.mark_handoff_nudged(relay.STATE_ROOT, "lead-1")
+        relay.cmd_status(self._args(session_id="lead-1"))
+        out = capsys.readouterr().out
+        assert "MB" not in out and "handoff" not in out
+
+    def test_status_weight_respects_disabled_config(self, relay, capsys, tmp_path, monkeypatch):
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps({"handoff_nudge": False}))
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        transcript = self._sparse_file(tmp_path / "t.jsonl", 6)   # would otherwise point to handoff
+        self._statusline(relay, monkeypatch, transcript_path=transcript)
+        out = capsys.readouterr().out
+        assert "MB" not in out and "handoff" not in out
+
+    def test_status_weight_segment_no_writes(self, relay, capsys, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        self._exec(relay, "e1", owner_lead="lead-1", status="busy")
+        transcript = self._sparse_file(tmp_path / "t.jsonl", 6)
+        session_before = (relay.session_dir("e1") / "session.json").read_bytes()
+        lead_dir = relay.lead_guard.lead_dir(relay.STATE_ROOT, "lead-1")
+        files_before = sorted(p.relative_to(lead_dir) for p in lead_dir.rglob("*") if p.is_file())
+        self._statusline(relay, monkeypatch, transcript_path=transcript)
+        out = capsys.readouterr().out
+        assert "→ /relay:handoff" in out   # the segment actually rendered
+        session_after = (relay.session_dir("e1") / "session.json").read_bytes()
+        files_after = sorted(p.relative_to(lead_dir) for p in lead_dir.rglob("*") if p.is_file())
+        assert session_before == session_after
+        assert files_before == files_after
