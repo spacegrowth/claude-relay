@@ -137,38 +137,29 @@ sequenceDiagram
 (`lib/lead_guard.py:602`) both filter by `owner_lead == lead_sid` — a lead never wakes for another
 lead's executors, or gets stuck polling for one. This is deliberate (otherwise every stale unowned
 report on the machine would spam every new lead), but it means ownership has to be re-parented
-correctly whenever a *different* lead starts acting on an inherited executor — which is exactly
-where **bug report #1** (`~/.relay-tasks/wake-bug-ownership-2026-07-11.md`) started: `owner_lead`
-was stamped once at spawn and never updated, so a new lead resuming/sending into an executor from a
-prior handoff silently got zero wakes for it, forever, with `relay list` still showing `WAKE ok`.
-The fix, now in place, is **adopt-on-claim**: `_maybe_adopt` (`bin/relay:535`) runs inside
-`send`/`resume`/`restart`, and re-parents `owner_lead` to the calling lead whenever the current
-owner is `None` or no longer alive (`_lead_alive`, `bin/relay:510` — checked via recorded pid, then
-iTerm tty resolution). A **live** owner is never silently stolen from — the caller gets a warning
-and must run `relay adopt <sid> --force` to take it explicitly. `relay adopt` (`cmd_adopt`,
-`bin/relay:768`) exposes this same logic standalone, for claiming an inherited executor up front
-without sending it anything.
+correctly whenever a *different* lead starts acting on an inherited executor. The fix is
+**adopt-on-claim**: `_maybe_adopt` (`bin/relay:535`) runs inside `send`/`resume`/`restart`, and
+re-parents `owner_lead` to the calling lead whenever the current owner is `None` or no longer alive
+(`_lead_alive`, `bin/relay:510` — checked via recorded pid, then iTerm tty resolution). A **live**
+owner is never silently stolen from — the caller gets a warning and must run `relay adopt <sid>
+--force` to take it explicitly. `relay adopt` (`cmd_adopt`, `bin/relay:768`) exposes this same
+logic standalone, for claiming an inherited executor up front without sending it anything. This
+re-parenting rule exists because a real incident proved its absence costly — see
+`wake-bug-ownership-2026-07-11.md`.
 
 **Single-poller lock with heartbeat.** Only one background poller may run per lead
 (`acquire_poll_lock`, `lib/lead_guard.py:730`), stored as `poll.lock` — a JSON blob `{pid,
 pid_started, ts}`. Every poll tick refreshes `ts` (`heartbeat_poll_lock`). Staleness
 (`_poll_lock_status`, `lib/lead_guard.py:663`) is a triple test, any one of which condemns the
 lock: the recorded pid is dead; the pid is alive but its process-start-time no longer matches
-`pid_started` (the OS recycled that exact pid number for an unrelated process); or the heartbeat
-`ts` is older than `max(3 × poll_interval, 30)` seconds (the holder stopped ticking, whoever it
-is — sufficient on its own, independent of pid checks). This is **bug report #2**'s fix
-(`~/.relay-tasks/wake-bug-stale-poll-lock-2026-07-11.md`, whose stated root cause was corrected
-during triage): a poller hard-killed (plugin reload/crash/sleep) never runs its
-`finally: release_poll_lock`. The old logic *did* reclaim dead-pid locks — but `os.kill(pid, 0)`
-alone can't tell a dead poller from an unrelated process that recycled the same pid number, so a
-recycled pid read as "a poller is watching" — permanently and silently disabling wakes for that
-lead until someone manually deleted the lock. `relay list`'s `WAKE` column now surfaces this
-directly as `stuck` (distinct from `stale`/`ok`) via `poll_lock_state` (`lib/lead_guard.py:720`),
-using the exact same staleness test `acquire_poll_lock` uses — list and acquire can never disagree
-on what counts as dead.
-
-Both bug reports' root causes are now fixed in the code this doc describes; if you read the reports
-directly, treat them as incident history, not current behavior.
+`pid_started` (the OS recycled that exact pid number for an unrelated process, so a liveness check
+on the pid alone can be fooled); or the heartbeat `ts` is older than `max(3 × poll_interval, 30)`
+seconds (the holder stopped ticking, whoever it is — sufficient on its own, independent of pid
+checks). `relay list`'s `WAKE` column surfaces a stale lock as `stuck` (distinct from `stale`/`ok`)
+via `poll_lock_state` (`lib/lead_guard.py:720`), using the exact same staleness test
+`acquire_poll_lock` uses — list and acquire can never disagree on what counts as dead. This
+staleness rule exists because a real incident proved its absence costly — see
+`wake-bug-stale-poll-lock-2026-07-11.md`.
 
 ## 4. The lead lifecycle
 
