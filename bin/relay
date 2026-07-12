@@ -1009,6 +1009,14 @@ def cmd_status(args):
             print(line)
         return
 
+    # Executor lookup, both id spaces: the RELAY session id first (what a human types —
+    # `relay status alert-e2e`), then the pinned Claude conversation id (what the --statusline
+    # payload carries — a session only knows its own Claude id). Missing either lookup silently
+    # blanks a real executor for one caller class; both observed live.
+    s = read_session(sid)
+    if s:
+        print(_executor_status_line(s))
+        return
     for esid in all_session_ids():
         s = read_session(esid)
         if s and s.get("claude_session") == sid:

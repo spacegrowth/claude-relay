@@ -1794,6 +1794,17 @@ class TestStatus:
         assert "pkt" in out and "for webapp" in out
         assert "overall" not in out and "lead:" not in out
 
+    def test_executor_view_by_relay_name(self, relay, capsys):
+        # REGRESSION (observed live): `relay status alert-e2e` printed nothing. The executor
+        # branch only matched by claude_session (the --statusline payload's id space), so the
+        # RELAY session id/name a human types classified as "neither" → silent exit. Both id
+        # spaces must work.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        self._exec(relay, "e1", owner_lead="lead-1", claude_session="cs-1", status="busy")
+        relay.cmd_status(self._args(session_id="e1"))   # relay name, NOT the claude_session
+        out = capsys.readouterr().out
+        assert "pkt" in out and "for webapp" in out
+
     def test_unknown_session_prints_nothing(self, relay, capsys):
         relay.cmd_status(self._args(session_id="nobody-here"))
         assert capsys.readouterr().out == ""
