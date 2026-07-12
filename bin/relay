@@ -8,6 +8,7 @@ Commands:
   relay spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL]
   relay send  <session_id> <packet.md>
   relay check [<session_id> | --all] [--json]
+  relay status [session_id] [--statusline]    # read-only, statusline-safe one-liner; never writes
   relay list [--lead <session_id> | --all] [--json]
   relay report <session_id> [--packet N]      # print an executor's report, framed in green
   relay close <session_id> [--supersede <new_session_id>]
@@ -876,6 +877,106 @@ def cmd_check(args):
         print(f"{s['session_id']}: status={status_c} packet={n:03d} {rep_c}")
 
 
+def _resolve_status_session_id(args):
+    """Priority order for `relay status`'s subject: an explicit positional id, then (only with
+    --statusline) a `session_id` field on a JSON payload piped in on stdin, then
+    $CLAUDE_CODE_SESSION_ID, else None. Garbage/non-JSON stdin degrades to "no id" rather than
+    raising — a malformed statusline payload must not crash a status-line render."""
+    sid = getattr(args, "session_id", None)
+    if not sid and getattr(args, "statusline", False):
+        try:
+            payload = json.loads(sys.stdin.read())
+            sid = payload.get("session_id") if isinstance(payload, dict) else None
+        except Exception:
+            sid = None
+    return sid or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+
+
+def _lead_status_line(lead_sid, marker):
+    """The LEAD view: busy-executor count (stored status busy, no report yet), reported-executor
+    names (report file exists, status not closed/superseded — computed WITHOUT writing anything;
+    report-file existence is only a display-time freshness upgrade over the stored status), and a
+    WAKE segment when this lead's auto-wake is unhealthy. Reuses wake_hook_state/poll_lock_state
+    (lead_guard) rather than re-deriving their staleness rules. Returns "" when every segment is
+    empty (e.g. an armed lead with zero executors)."""
+    busy_n = 0
+    reported = []
+    for esid in all_session_ids():
+        s = read_session(esid)
+        if not s or s.get("owner_lead") != lead_sid:
+            continue
+        status = s.get("status")
+        if status in ("closed", "superseded"):
+            continue
+        n = s.get("current_packet")
+        report_exists = n is not None and (packets_dir(esid) / f"{n:03d}-report.md").exists()
+        if report_exists:
+            reported.append(esid)
+        elif status == "busy":
+            busy_n += 1
+
+    segments = []
+    if busy_n:
+        segments.append(f"🚦 {busy_n} busy")
+    if reported:
+        shown = reported[:3]
+        label = ",".join(shown)
+        if len(reported) > 3:
+            label += f",+{len(reported) - 3}"
+        segments.append(f"✅ {label}")
+
+    cfg = lead_guard.load_config(STATE_ROOT)
+    poll_seconds = cfg.get("poll_seconds", 1800)
+    poll_interval = cfg.get("poll_interval", 5)
+    if lead_guard.poll_lock_state(STATE_ROOT, lead_sid, poll_interval) == "stale":
+        segments.append("WAKE stuck")
+    elif lead_guard.wake_hook_state(marker, poll_seconds) == "stale":
+        segments.append("WAKE stale")
+
+    return " · ".join(segments)
+
+
+def _executor_status_line(s):
+    """The EXECUTOR view: current packet + state (report-file existence upgrades the stored status
+    to "✅ reported", read-only) and a pointer to the owning lead's tab for overall progress."""
+    n = s["current_packet"]
+    report_exists = (packets_dir(s["session_id"]) / f"{n:03d}-report.md").exists()
+    state = "✅ reported" if report_exists else s.get("status", "?")
+
+    owner_lead = s.get("owner_lead")
+    if not owner_lead:
+        return f"🚦 pkt {n:03d} {state} · lead: unowned"
+    marker = lead_guard.read_marker(STATE_ROOT, owner_lead)
+    label = (marker.get("project") if marker else None) or f"{owner_lead[:8]}…"
+    return f"🚦 pkt {n:03d} {state} · lead: {label} → overall: lead tab"
+
+
+def cmd_status(args):
+    """Strictly read-only, statusline-safe one-liner. NO writes anywhere in this path — no
+    write_session, no append_ledger, no _check_one, no marker touches — so it's safe to call on
+    every status-line render (potentially many times a minute). `relay list`/`relay check` remain
+    the decision surface: they refresh real liveness by mutating state; this command only reads
+    markers + session.json as they already are and checks report-file existence. Prints nothing for
+    a session id that's neither a lead nor a known executor — an unrelated session's status line
+    must not grow relay noise."""
+    sid = _resolve_status_session_id(args)
+    if not sid:
+        return
+
+    marker = lead_guard.read_marker(STATE_ROOT, sid)
+    if marker:
+        line = _lead_status_line(sid, marker)
+        if line:
+            print(line)
+        return
+
+    for esid in all_session_ids():
+        s = read_session(esid)
+        if s and s.get("claude_session") == sid:
+            print(_executor_status_line(s))
+            return
+
+
 def _relative_age(ts):
     """A short relative age ('30s ago' / '12m ago' / '2h ago' / '3d ago') from an ISO timestamp in
     now()'s format. Degrades to '-' when ts is missing/None or in an unparseable/old format — a
@@ -1502,6 +1603,12 @@ def main():
     ck.add_argument("--all", action="store_true")
     ck.add_argument("--json", action="store_true")
     ck.set_defaults(func=cmd_check)
+
+    stt = sub.add_parser("status")
+    stt.add_argument("session_id", nargs="?")
+    stt.add_argument("--statusline", action="store_true",
+                     help="read the session id from a JSON payload on stdin (Claude Code's statusLine hook)")
+    stt.set_defaults(func=cmd_status)
 
     ls = sub.add_parser("list")
     ls.add_argument("--json", action="store_true")

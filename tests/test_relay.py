@@ -1721,3 +1721,85 @@ class TestHandoff:
         successors = [m for sid, m in self._leads(relay).items() if sid != "lead-1"]
         assert successors[0]["project"] == "webapp"
         assert successors[0]["model"] == "opus"
+
+
+class TestStatus:
+    """`relay status` — strictly read-only, statusline-safe one-liner. No write_session/
+    append_ledger/_check_one/marker-touch anywhere in this path (unlike `relay list`/`check`)."""
+
+    def _exec(self, relay, sid, owner_lead=None, status="busy", claude_session="cs-x", packet=1, report=False):
+        relay.write_session(sid, {
+            "session_id": sid, "owner_lead": owner_lead, "claude_session": claude_session,
+            "current_packet": packet, "status": status, "topic": "t", "worktree": "/w",
+            "scope": "", "model": "opus", "busy_since": relay.now(), "updated": relay.now(),
+        })
+        if report:
+            d = relay.packets_dir(sid)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{packet:03d}-report.md").write_text("done")
+
+    def _args(self, session_id=None, statusline=False):
+        return SimpleNamespace(session_id=session_id, statusline=statusline)
+
+    def test_lead_view_counts_and_names(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        self._exec(relay, "e1", owner_lead="lead-1", status="busy", report=False)
+        self._exec(relay, "e2", owner_lead="lead-1", status="busy", report=False)
+        self._exec(relay, "e3", owner_lead="lead-1", status="busy", report=True)
+        relay.cmd_status(self._args(session_id="lead-1"))
+        out = capsys.readouterr().out
+        assert "2 busy" in out
+        assert "✅" in out and "e3" in out
+        assert "WAKE" not in out
+
+    def test_reported_upgrade_is_read_only(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        self._exec(relay, "e1", owner_lead="lead-1", status="busy", report=True)
+        before = (relay.session_dir("e1") / "session.json").read_bytes()
+        relay.cmd_status(self._args(session_id="lead-1"))
+        out = capsys.readouterr().out
+        assert "e1" in out and "✅" in out
+        assert "busy" not in out   # report-file existence upgrades it out of the busy count
+        after = (relay.session_dir("e1") / "session.json").read_bytes()
+        assert before == after
+
+    def test_executor_view(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        self._exec(relay, "e1", owner_lead="lead-1", claude_session="cs-1", status="busy")
+        relay.cmd_status(self._args(session_id="cs-1"))
+        out = capsys.readouterr().out
+        assert "pkt" in out and "webapp" in out and "lead tab" in out
+
+    def test_unknown_session_prints_nothing(self, relay, capsys):
+        relay.cmd_status(self._args(session_id="nobody-here"))
+        assert capsys.readouterr().out == ""
+
+    def test_statusline_stdin_json(self, relay, capsys, monkeypatch):
+        import io
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        self._exec(relay, "e1", owner_lead="lead-1", status="busy")
+        monkeypatch.setattr(relay.sys, "stdin", io.StringIO(json.dumps({"session_id": "lead-1"})))
+        relay.cmd_status(self._args(statusline=True))
+        out = capsys.readouterr().out
+        assert "busy" in out
+
+    def test_statusline_garbage_stdin_quiet(self, relay, capsys, monkeypatch):
+        import io
+        monkeypatch.setattr(relay.sys, "stdin", io.StringIO("not json"))
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        relay.cmd_status(self._args(statusline=True))
+        assert capsys.readouterr().out == ""
+
+    def test_wake_stuck_surfaces(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        self._exec(relay, "e1", owner_lead="lead-1", status="busy")
+        lock_path = relay.lead_guard.lead_dir(relay.STATE_ROOT, "lead-1") / "poll.lock"
+        lock_path.write_text(json.dumps({"pid": 999999, "pid_started": None, "ts": 1.0}))
+        relay.cmd_status(self._args(session_id="lead-1"))
+        out = capsys.readouterr().out
+        assert "WAKE stuck" in out
+
+    def test_no_executors_prints_nothing(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        relay.cmd_status(self._args(session_id="lead-1"))
+        assert capsys.readouterr().out == ""

@@ -120,6 +120,7 @@ And the three nouns:
 /relay:route retain "<reason>"             open a grace window when the gate blocks lead work
 /relay:diff <session_id>                   render staged changes to an HTML review page and open it
 /relay:handoff <handoff.md>                 succeed this lead: pre-armed successor tab, then step down
+relay status [session_id] [--statusline]   read-only, statusline-safe one-liner (see below)
 ```
 
 Also: `relay list` hides closed/superseded/dead sessions by default; pass `--closed` to reveal them (capped at 15 most recent). `relay report <sid>` prints a finished report in a green banner, and
@@ -133,6 +134,47 @@ without spending model tokens on it. Its output (and every executor's closing li
 cmd+clickable `file://` URL to the page.
 
 Type them, or just describe what you want ("check on my sessions") — the lead invokes the right one.
+
+### Status line integration (optional)
+
+`relay status` is deliberately dumb: it reads markers + `session.json` files as they already are
+and checks report-file existence — **it writes nothing** — so it's safe to call on every status-line
+render (Claude Code can re-run your `statusLine` command multiple times a minute). It prints one
+line: the LEAD view (busy-executor count, reported names, a `WAKE` warning if auto-wake is
+unhealthy) or the EXECUTOR view (its packet + a pointer to its lead's tab) — whichever role the
+current session has. For any other session it prints nothing, so it never adds noise to an
+unrelated status line.
+
+Claude Code pipes a JSON payload with a top-level `session_id` field to your `statusLine` command's
+stdin (confirmed against the [statusline docs](https://code.claude.com/docs/en/statusline.md)). That
+stdin is only read once — if your status line already parses it for other purposes, capture it into
+a variable and re-pipe it to `relay status --statusline`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/statusline.sh"
+  }
+}
+```
+
+```bash
+#!/bin/bash
+# ~/.claude/statusline.sh
+input=$(cat)
+# ... your existing statusline bits, reading from $input ...
+echo "$input" | ~/path/to/relay status --statusline
+```
+
+If you'd rather not thread stdin through, `--statusline` is optional: `relay status
+"$CLAUDE_CODE_SESSION_ID"` (or with no argument at all, since `relay status` falls back to that same
+env var) works from a plain shell command with no JSON parsing.
+
+Honest limit: `relay status` reads stored state + report-file existence only — no liveness refresh.
+A crashed executor may still read `busy` in your status line until the next `relay list`/`relay
+check` runs; those commands remain the decision surface for whether something actually needs
+attention.
 
 ## The routing gate (friction, not trust)
 
