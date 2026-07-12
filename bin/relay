@@ -1596,6 +1596,82 @@ def cmd_focus(args):
     sys.exit(f"no such session: {sid}")
 
 
+def _sid_candidates_message(token, sids, purpose):
+    """Render resolve_sid's ambiguous-token exit message: every candidate sid, newest-first by
+    activity, alongside whatever identifying context distinguishes it (a lead's project + plugin
+    version, or an executor's topic) — so the caller can tell them apart without the resolver
+    guessing on their behalf."""
+    rows = []
+    for sid in sids:
+        marker = lead_guard.read_marker(STATE_ROOT, sid)
+        if marker:
+            ts = marker.get("last_active") or ""
+            desc = (f"lead '{marker.get('project') or '-'}', v{marker.get('plugin_version') or '?'}, "
+                    f"{_relative_age(ts)}")
+        else:
+            s = read_session(sid) or {}
+            ts = s.get("updated") or ""
+            desc = f"executor '{s.get('topic') or '-'}', {_relative_age(ts)}"
+        rows.append((ts, sid, desc))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    lines = "\n".join(f"  {sid}  ({desc})" for _, sid, desc in rows)
+    return (f"ambiguous {purpose} '{token}' — matches multiple sessions:\n{lines}\n"
+            f"pass the session id (or a unique prefix of it) instead")
+
+
+def resolve_sid(token, purpose="session"):
+    """The ONE name-resolution surface every sid-accepting relay command/flag routes through
+    (wired centrally in main()'s RESOLVE_FIELDS loop) — lets a human type an executor's name
+    (already its id, set via `spawn --name`), a lead's project name, or a unique prefix of either's
+    id, anywhere a raw session id was previously required.
+
+    Resolution order (first hit wins, deterministic):
+      a) exact executor session id (a top-level session dir with session.json) — existing behavior,
+         unchanged, highest precedence.
+      b) exact lead session id (a marker exists for it).
+      c) lead PROJECT NAME — case-sensitive exact match on marker["project"] across
+         lead_guard.list_leads(). Exactly one match wins; more than one (e.g. an old + new lead of
+         the same project after a handoff) exits via _sid_candidates_message — NEVER guessed.
+      d) a unique prefix (len >= 6) of any known sid (executor ids ∪ lead ids). Multiple matches
+         get the same candidates-listing exit as (c).
+      e) no match at all → the token is returned UNCHANGED. Each command's own "no such session"
+         error remains the single source of not-found messaging; this resolver never invents new
+         failure text for a genuine miss.
+
+    Read-only (never writes) and defensive: any exception while scanning degrades to returning the
+    token unchanged — a resolver bug must never be the reason a previously-working raw sid stops
+    working."""
+    if not token:
+        return token
+    try:
+        if read_session(token) is not None:
+            return token
+        if lead_guard.read_marker(STATE_ROOT, token):
+            return token
+
+        leads = lead_guard.list_leads(STATE_ROOT)
+        project_matches = [m["session_id"] for m in leads
+                            if m.get("project") == token and m.get("session_id")]
+        if len(project_matches) == 1:
+            return project_matches[0]
+        if len(project_matches) > 1:
+            sys.exit(_sid_candidates_message(token, project_matches, purpose))
+
+        if len(token) >= 6:
+            all_ids = set(all_session_ids()) | {m.get("session_id") for m in leads if m.get("session_id")}
+            prefix_matches = sorted(sid for sid in all_ids if sid.startswith(token))
+            if len(prefix_matches) == 1:
+                return prefix_matches[0]
+            if len(prefix_matches) > 1:
+                sys.exit(_sid_candidates_message(token, prefix_matches, purpose))
+
+        return token
+    except SystemExit:
+        raise
+    except Exception:
+        return token
+
+
 def main():
     p = argparse.ArgumentParser(prog="relay")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1720,6 +1796,27 @@ def main():
     hf.set_defaults(func=cmd_handoff)
 
     args = p.parse_args()
+
+    # Universal name resolution: every sid-accepting positional/flag gets routed through
+    # resolve_sid HERE, once, rather than duplicated at the top of every cmd_* — this is the only
+    # place a fresh sid surface needs wiring in. Two deliberate exclusions, per resolve_sid's own
+    # docstring: `lead-start`'s session_id CREATES the lead namespace (always the raw
+    # $CLAUDE_CODE_SESSION_ID, nothing to resolve against yet) and `handoff`'s positional is a path,
+    # not a sid — neither appears below. `status`'s positional IS resolved (it's the explicit token
+    # a human typed); its stdin/env-derived id is a separate path inside cmd_status itself and never
+    # touches this loop, keeping the per-render statusline path scan-free.
+    RESOLVE_FIELDS = {
+        "send": ["session_id"], "check": ["session_id"], "status": ["session_id"],
+        "close": ["session_id", "supersede", "self_session"], "stop": ["session_id"],
+        "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
+        "diff": ["session_id"], "focus": ["session_id"], "restart": ["session_id"],
+        "resume": ["session_id"], "spawn": ["lead"], "list": ["lead"],
+    }
+    for field in RESOLVE_FIELDS.get(args.cmd, []):
+        val = getattr(args, field, None)
+        if val:
+            setattr(args, field, resolve_sid(val))
+
     if args.cmd == "check" and not args.all and not args.session_id:
         sys.exit("specify a session_id or --all")
     args.func(args)

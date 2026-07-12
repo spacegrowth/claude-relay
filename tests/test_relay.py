@@ -1887,3 +1887,87 @@ class TestStatus:
         files_after = sorted(p.relative_to(lead_dir) for p in lead_dir.rglob("*") if p.is_file())
         assert session_before == session_after
         assert files_before == files_after
+
+
+class TestResolveSid:
+    """resolve_sid: the ONE name-resolution surface every sid-accepting command/flag routes
+    through (wired centrally in main()). Precedence: exact executor id > exact lead id > unique
+    lead project name > unique sid prefix (len>=6) > unchanged passthrough."""
+
+    def _run_main(self, relay, monkeypatch, argv):
+        monkeypatch.setattr(relay.sys, "argv", ["relay"] + argv)
+        relay.main()
+
+    def test_executor_exact_id_wins_over_lead_project_collision(self, relay):
+        # Executor named "inotes" AND a lead whose project is ALSO "inotes" — precedence (a) must
+        # pin to the executor, never fall through to the project-name branch.
+        relay.write_session("inotes", {"session_id": "inotes", "current_packet": 1, "status": "busy",
+            "topic": "t", "worktree": "/w", "scope": "", "model": "opus", "owner_lead": None})
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-x", project="inotes")
+        assert relay.resolve_sid("inotes") == "inotes"
+
+    def test_lead_project_name_resolves_end_to_end(self, relay, capsys, monkeypatch):
+        # Proves the resolver is actually wired into main() -> cmd_status, not just a unit that
+        # works in isolation: the CLI is invoked with the project NAME, never the raw lead sid.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        relay.write_session("e1", {"session_id": "e1", "current_packet": 1, "status": "busy",
+            "topic": "t", "worktree": "/w", "scope": "", "model": "opus", "owner_lead": "lead-1",
+            "busy_since": relay.now(), "updated": relay.now()})
+        self._run_main(relay, monkeypatch, ["status", "webapp"])
+        out = capsys.readouterr().out
+        assert "1 busy" in out
+
+    def test_ambiguous_project_name_exits_with_candidates(self, relay, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-aaaaaaaa", project="dup")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-bbbbbbbb", project="dup")
+        monkeypatch.setattr(relay.sys, "argv", ["relay", "status", "dup"])
+        with pytest.raises(SystemExit) as exc:
+            relay.main()
+        msg = str(exc.value)
+        assert "lead-aaaaaaaa" in msg and "lead-bbbbbbbb" in msg
+        assert "unique prefix" in msg
+
+    def test_unique_prefix_resolves(self, relay):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "abcdef1234567890", project="proj1")
+        assert relay.resolve_sid("abcdef") == "abcdef1234567890"
+
+    def test_ambiguous_prefix_exits_with_candidates(self, relay):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "abcdef111111", project="p1")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "abcdef222222", project="p2")
+        with pytest.raises(SystemExit) as exc:
+            relay.resolve_sid("abcdef")
+        msg = str(exc.value)
+        assert "abcdef111111" in msg and "abcdef222222" in msg
+        assert "unique prefix" in msg
+
+    def test_unknown_token_passes_through_unchanged(self, relay, monkeypatch):
+        # No executor, no lead, no prefix match — the resolver returns it verbatim and cmd_focus's
+        # OWN pre-existing "no such session" message fires, unmodified.
+        monkeypatch.setattr(relay.sys, "argv", ["relay", "focus", "totally-unknown-xyz"])
+        with pytest.raises(SystemExit) as exc:
+            relay.main()
+        assert "no such session: totally-unknown-xyz" in str(exc.value)
+
+    def test_resolve_sid_is_read_only(self, relay):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        lead_dir = relay.lead_guard.lead_dir(relay.STATE_ROOT, "lead-1")
+        files_before = sorted(p.relative_to(lead_dir) for p in lead_dir.rglob("*") if p.is_file())
+        relay.resolve_sid("webapp")
+        relay.resolve_sid("nonexistent-thing")
+        relay.resolve_sid("lead-1")
+        files_after = sorted(p.relative_to(lead_dir) for p in lead_dir.rglob("*") if p.is_file())
+        assert files_before == files_after
+
+    def test_spawn_lead_flag_resolves_project_name(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        pkt = tmp_path / "packet.md"
+        pkt.write_text("do the thing")
+        with mock.patch.object(relay.iterm, "spawn"), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123), \
+             mock.patch.object(relay, "read_iterm_id", return_value=None):
+            self._run_main(relay, monkeypatch,
+                ["spawn", str(tmp_path), "topic", str(pkt), "--name", "e1", "--lead", "webapp"])
+        s = relay.read_session("e1")
+        assert s["owner_lead"] == "lead-1"
+        assert s["owner_project"] == "webapp"

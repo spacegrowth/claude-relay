@@ -123,6 +123,12 @@ And the three nouns:
 relay status [session_id] [--statusline]   read-only, statusline-safe one-liner (see below)
 ```
 
+Anywhere a command above takes a session id, you can pass the executor's name (its id, set at
+`spawn --name`), a lead's project name, or a unique prefix of either's id — no more pasting lead
+UUIDs. `relay focus d2cengine_refactor` and `relay stop inotes` just work. A project name that
+matches more than one lead (e.g. an old + new lead after a handoff) never guesses: it exits listing
+every candidate sid instead, newest-first, so you can pick one or pass a unique prefix.
+
 Also: `relay list` hides closed/superseded/dead sessions by default; pass `--closed` to reveal them (capped at 15 most recent). `relay report <sid>` prints a finished report in a green banner, and
 `relay prune [--days N] [--dry-run]` clears old closed/dead session state, and also clears dead
 lead markers older than `--days` ("ghost" leads from crashed/abandoned tabs — a lead you're
