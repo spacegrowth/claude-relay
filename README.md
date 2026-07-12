@@ -85,6 +85,8 @@ More examples: [`textkit`](examples/textkit/) (parallel fan-out) and [`calc`](ex
 
 ## Mental model
 
+Deeper dive with diagrams: [docs/how-relay-works.md](docs/how-relay-works.md).
+
 The flow, in five beats:
 
 1. **Design** — tell the session what to build, or point it at a brief.
