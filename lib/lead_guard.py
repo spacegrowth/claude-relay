@@ -18,6 +18,7 @@ Design notes:
 import json
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -306,17 +307,49 @@ def wake_hook_state(marker, poll_seconds):
         return "stale"
 
 
-def touch_lead(state_root, session_id):
+def _read_plugin_version(plugin_root):
+    try:
+        return json.loads((Path(plugin_root) / ".claude-plugin" / "plugin.json").read_text()).get("version")
+    except Exception:
+        return None
+
+
+def _read_stop_hook_timeout(plugin_root):
+    try:
+        d = json.loads((Path(plugin_root) / "hooks" / "hooks.json").read_text())
+        return d["hooks"]["Stop"][0]["hooks"][0].get("timeout")
+    except Exception:
+        return None
+
+
+def touch_lead(state_root, session_id, plugin_root=None):
     """Heartbeat: refresh this lead's `last_active` to now(), preserving every other marker field
     (read-modify-write). Called once per lead turn so `relay list`'s last_active reflects real
-    liveness — a stale one means the lead probably crashed. Fully defensive: a missing/unreadable/
-    non-dict marker is a silent no-op, and nothing here ever raises (the Stop hook's fail-open
-    contract must hold even if the heartbeat can't be written)."""
+    liveness — a stale one means the lead probably crashed.
+
+    When `plugin_root` is given, ALSO re-stamps plugin_version/stop_hook_timeout by reading
+    .claude-plugin/plugin.json and hooks/hooks.json from THAT root — the caller (the Stop hook)
+    passes its OWN plugin root, so what gets read is whatever version is live right now, not
+    whatever was live at arm time. This kills the stale-VER-until-re-arm gap: previously the stamp
+    only refreshed when the lead re-ran /relay:mode, so a lead that stayed armed across a plugin
+    update kept showing its old version/timeout in `relay list` until manually re-armed. Only
+    overwrites a stamped field when the freshly-read value is present AND differs from the marker's
+    current one, keeping this cheap in the steady state.
+
+    Fully defensive: a missing/unreadable/non-dict marker is a silent no-op, and nothing here ever
+    raises (the Stop hook's fail-open contract must hold even if the heartbeat can't be written)."""
     try:
         m = read_marker(state_root, session_id)
         if not isinstance(m, dict) or not m:
             return  # no marker to touch → nothing to do
         m["last_active"] = now()
+        if plugin_root is not None:
+            ver = _read_plugin_version(plugin_root)
+            if ver is not None and ver != m.get("plugin_version"):
+                m["plugin_version"] = ver
+            timeout = _read_stop_hook_timeout(plugin_root)
+            if timeout is not None and timeout != m.get("stop_hook_timeout"):
+                m["stop_hook_timeout"] = timeout
         marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
     except Exception:
         pass
@@ -603,34 +636,159 @@ def _pid_alive(pid):
         return False
 
 
+def _pid_start_time(pid):
+    """The process's launch timestamp (`ps lstart`), or None on any failure. SINGLE SOURCE OF TRUTH
+    for pid-reuse detection — bin/relay's pid_start_time is a thin delegate to this (used for
+    executor liveness there, and for the poll-lock heartbeat here): recorded at
+    acquire/spawn time and compared later so a recycled pid — the OS reusing this exact number for
+    an unrelated process — doesn't read as 'the original holder is alive'."""
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None
+    except Exception:
+        return None
+
+
 def _lock_path(state_root, lead_sid):
     return lead_dir(state_root, lead_sid) / "poll.lock"
 
 
-def acquire_poll_lock(state_root, lead_sid):
+# A legacy (pre-heartbeat) lock is a bare int with no ts/pid_started — it can only be judged stale
+# by file mtime. Uses the DEFAULT poll_seconds (not whatever the current config says), since this
+# path only exists for a brief mixed-version window and doesn't need to track live config.
+_LEGACY_LOCK_TTL = LEAD_DEFAULTS["poll_seconds"] + 120  # + slack
+
+
+def _poll_lock_status(lock_path, poll_interval):
+    """The ONE staleness definition for the poll.lock, shared by acquire_poll_lock (which breaks a
+    stale lock and reclaims it) and poll_lock_state (which only reports it, for `relay list`).
+    Returns "absent" | "live" | "stale". Never raises — any bad input is treated as "stale" so it's
+    reclaimable rather than a permanent block.
+
+    Stale when: content unreadable/garbage; pid not alive; pid alive but its recorded start time no
+    longer matches the pid's CURRENT start time (pid reuse — the holder is an impostor); or the
+    heartbeat ts is older than max(3 * poll_interval, 30) seconds (the holder stopped ticking,
+    whoever it is — this alone is sufficient, independent of pid liveness/reuse). A legacy
+    (pre-heartbeat) bare-int lock has none of that; it's judged stale purely by file mtime against
+    _LEGACY_LOCK_TTL."""
+    try:
+        lp = Path(lock_path)
+        if not lp.exists():
+            return "absent"
+        raw = lp.read_text().strip()
+    except Exception:
+        return "stale"
+    if not raw:
+        return "stale"
+
+    data = None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and "pid" in parsed:
+            data = parsed
+    except Exception:
+        data = None
+
+    try:
+        if data is not None:
+            pid = data.get("pid")
+            if not _pid_alive(pid):
+                return "stale"
+            recorded = data.get("pid_started")
+            if recorded and _pid_start_time(pid) != recorded:
+                return "stale"  # pid recycled — the live process isn't the original holder
+            ts = data.get("ts")
+            if ts is None:
+                return "stale"
+            if (time.time() - float(ts)) > max(3 * poll_interval, 30):
+                return "stale"  # heartbeat too old — holder stopped ticking
+            return "live"
+        else:
+            # Legacy bare-int lock (pre-heartbeat), or garbage that isn't valid JSON either way.
+            pid = int(raw)  # raises ValueError → caught below → "stale"
+            if not _pid_alive(pid):
+                return "stale"
+            mtime = lp.stat().st_mtime
+            if (time.time() - mtime) > _LEGACY_LOCK_TTL:
+                return "stale"
+            return "live"
+    except Exception:
+        return "stale"
+
+
+def poll_lock_state(state_root, lead_sid, poll_interval=5):
+    """Public read-only view of a lead's poll.lock health for `relay list` — "absent" | "live" |
+    "stale". Never breaks or touches the lock; just reports the same verdict acquire_poll_lock would
+    reach. Never raises."""
+    try:
+        return _poll_lock_status(_lock_path(state_root, lead_sid), poll_interval)
+    except Exception:
+        return "stale"
+
+
+def acquire_poll_lock(state_root, lead_sid, poll_interval=5):
     """Ensure only ONE background report-watcher runs per lead at a time — every idle cycle would
-    otherwise spawn another long-lived poller. Returns True if this process took the lock. A lock
-    held by a dead pid is considered stale and reclaimed."""
+    otherwise spawn another long-lived poller. Returns True if this process took the lock. A stale
+    lock (dead pid, recycled pid, or a heartbeat that stopped ticking — see _poll_lock_status) is
+    broken and reclaimed."""
     try:
         lp = _lock_path(state_root, lead_sid)
-        if lp.exists():
-            try:
-                if _pid_alive(lp.read_text().strip()):
-                    return False  # a live poller already holds it
-            except Exception:
-                pass  # unreadable/garbage → treat as stale
+        if _poll_lock_status(lp, poll_interval) == "live":
+            return False  # a live poller already holds it
         d = lead_dir(state_root, lead_sid)
         d.mkdir(parents=True, exist_ok=True)
-        lp.write_text(str(os.getpid()))
+        pid = os.getpid()
+        lp.write_text(json.dumps({
+            "pid": pid,
+            "pid_started": _pid_start_time(pid),
+            "ts": time.time(),
+        }))
         return True
     except Exception:
         return False
 
 
-def release_poll_lock(state_root, lead_sid):
+def heartbeat_poll_lock(state_root, lead_sid):
+    """Refresh this lock's heartbeat ts, once per poll tick — proof of life so a hard-killed poller
+    (plugin reload, sleep, crash, logout) can't leave a stuck lock indefinitely. ONLY rewrites when
+    the lock's pid is THIS process (os.getpid()) — never stomps another holder's lock. Never
+    raises."""
     try:
         lp = _lock_path(state_root, lead_sid)
-        if lp.exists() and lp.read_text().strip() == str(os.getpid()):
+        if not lp.exists():
+            return
+        data = json.loads(lp.read_text().strip())
+        if not isinstance(data, dict) or data.get("pid") != os.getpid():
+            return  # not ours (or legacy/garbage) → don't touch it
+        data["ts"] = time.time()
+        lp.write_text(json.dumps(data))
+    except Exception:
+        pass
+
+
+def release_poll_lock(state_root, lead_sid):
+    """Release the lock, but ONLY if it's still ours (pid == os.getpid()) — same ownership rule as
+    acquire. Handles both JSON (current) and legacy bare-int lock content. Never raises."""
+    try:
+        lp = _lock_path(state_root, lead_sid)
+        if not lp.exists():
+            return
+        raw = lp.read_text().strip()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            pid = data.get("pid")
+        else:
+            # A bare legacy int lock is itself valid JSON (json.loads("123") == 123, no exception),
+            # so it lands here rather than the except above — fall back to plain int parsing.
+            try:
+                pid = int(raw)
+            except Exception:
+                pid = None
+        if pid == os.getpid():
             lp.unlink()
     except Exception:
         pass

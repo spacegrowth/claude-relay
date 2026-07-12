@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -678,6 +679,144 @@ class TestTouchLead:
         lg.touch_lead(root, "ghost")
         assert lg.read_marker(root, "ghost") == {}
         assert not lg.marker_path(root, "ghost").exists()
+
+    def test_touch_restamps_version_from_plugin_root(self, root, tmp_path):
+        # Hermetic fixture plugin root — no dependency on the repo's real version string.
+        plugin_root = tmp_path / "fixture_plugin"
+        (plugin_root / ".claude-plugin").mkdir(parents=True)
+        (plugin_root / ".claude-plugin" / "plugin.json").write_text(json.dumps({"version": "9.9.9"}))
+        (plugin_root / "hooks").mkdir()
+        (plugin_root / "hooks" / "hooks.json").write_text(json.dumps(
+            {"hooks": {"Stop": [{"hooks": [{"timeout": 777}]}]}}))
+
+        lg.write_marker(root, "lead-1", plugin_version="0.0.1", stop_hook_timeout=30)
+        lg.touch_lead(root, "lead-1", plugin_root=plugin_root)
+        m = lg.read_marker(root, "lead-1")
+        assert m["plugin_version"] == "9.9.9"
+        assert m["stop_hook_timeout"] == 777
+
+    def test_touch_without_plugin_root_leaves_version_untouched(self, root):
+        lg.write_marker(root, "lead-1", plugin_version="0.0.1", stop_hook_timeout=30)
+        lg.touch_lead(root, "lead-1")  # no plugin_root given → version fields untouched
+        m = lg.read_marker(root, "lead-1")
+        assert m["plugin_version"] == "0.0.1"
+        assert m["stop_hook_timeout"] == 30
+
+
+# ---- poll.lock heartbeat (pid + start-time + per-tick ts) --------------------------------------
+
+class TestPollLock:
+    DEAD_PID = 999999  # convention used across this suite for "definitely not alive"
+
+    def _write_json_lock(self, root, sid, pid, pid_started, ts):
+        d = lg.lead_dir(root, sid)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "poll.lock").write_text(json.dumps({"pid": pid, "pid_started": pid_started, "ts": ts}))
+
+    def _write_legacy_lock(self, root, sid, pid):
+        d = lg.lead_dir(root, sid)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "poll.lock").write_text(str(pid))
+
+    # -- acquire breaks a stale lock (and reclaims it) --
+
+    def test_acquire_breaks_dead_pid_lock(self, root):
+        self._write_json_lock(root, "lead-1", pid=self.DEAD_PID, pid_started="Mon Jan 1", ts=time.time())
+        assert lg.acquire_poll_lock(root, "lead-1") is True
+        data = json.loads((lg.lead_dir(root, "lead-1") / "poll.lock").read_text())
+        assert data["pid"] == os.getpid()
+
+    def test_acquire_breaks_recycled_pid_lock(self, root, monkeypatch):
+        # live pid, but recorded start-time no longer matches the CURRENT start time → impostor.
+        monkeypatch.setattr(lg, "_pid_start_time", lambda pid: "current-start-time")
+        self._write_json_lock(root, "lead-1", pid=os.getpid(), pid_started="stale-start-time",
+                              ts=time.time())
+        assert lg.acquire_poll_lock(root, "lead-1") is True
+
+    def test_acquire_breaks_stale_heartbeat_alone(self, root, monkeypatch):
+        # Condition (d) alone must suffice: live pid, OWN correct start-time, but ts is ancient.
+        monkeypatch.setattr(lg, "_pid_start_time", lambda pid: "same-start-time")
+        self._write_json_lock(root, "lead-1", pid=os.getpid(), pid_started="same-start-time",
+                              ts=time.time() - 1000)
+        assert lg.acquire_poll_lock(root, "lead-1", poll_interval=5) is True
+
+    def test_acquire_breaks_garbage_lock(self, root):
+        d = lg.lead_dir(root, "lead-1")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "poll.lock").write_text("{not json or an int")
+        assert lg.acquire_poll_lock(root, "lead-1") is True
+
+    def test_acquire_breaks_legacy_lock_with_ancient_mtime(self, root, tmp_path):
+        self._write_legacy_lock(root, "lead-1", pid=self.DEAD_PID)  # dead pid alone already covers
+        # this, but also exercise the mtime path with a LIVE pid + ancient mtime.
+        self._write_legacy_lock(root, "lead-1", pid=os.getpid())
+        lock = lg.lead_dir(root, "lead-1") / "poll.lock"
+        old = time.time() - (lg._LEGACY_LOCK_TTL + 60)
+        os.utime(lock, (old, old))
+        assert lg.acquire_poll_lock(root, "lead-1") is True
+
+    def test_acquire_refuses_live_lock(self, root, monkeypatch):
+        monkeypatch.setattr(lg, "_pid_start_time", lambda pid: "same-start-time")
+        self._write_json_lock(root, "lead-1", pid=os.getpid(), pid_started="same-start-time",
+                              ts=time.time())
+        assert lg.acquire_poll_lock(root, "lead-1", poll_interval=5) is False
+
+    def test_recycled_pid_lock_does_not_block_arming(self, root, monkeypatch):
+        """THE REGRESSION PIN — exactly the incident: the stale lock's pid gets recycled by an
+        unrelated live process at the moment the Stop hook runs; os.kill(pid, 0) says 'alive'; the
+        pre-fix hook concluded 'a poller is already watching' and never armed. pid + start-time
+        together must catch this."""
+        monkeypatch.setattr(lg, "_pid_start_time", lambda pid: "actual-current-start-time")
+        self._write_json_lock(root, "lead-1", pid=os.getpid(),
+                              pid_started="recorded-start-time-of-the-original-holder", ts=time.time())
+        assert lg.acquire_poll_lock(root, "lead-1") is True
+
+    # -- heartbeat_poll_lock --
+
+    def test_heartbeat_refreshes_own_ts(self, root):
+        self._write_json_lock(root, "lead-1", pid=os.getpid(), pid_started=None, ts=1000.0)
+        lg.heartbeat_poll_lock(root, "lead-1")
+        data = json.loads((lg.lead_dir(root, "lead-1") / "poll.lock").read_text())
+        assert data["ts"] > 1000.0
+        assert data["pid"] == os.getpid()
+
+    def test_heartbeat_does_not_touch_other_pid_lock(self, root):
+        self._write_json_lock(root, "lead-1", pid=self.DEAD_PID, pid_started=None, ts=1000.0)
+        lg.heartbeat_poll_lock(root, "lead-1")
+        data = json.loads((lg.lead_dir(root, "lead-1") / "poll.lock").read_text())
+        assert data["ts"] == 1000.0  # untouched — not our pid
+
+    # -- release_poll_lock --
+
+    def test_release_releases_own_json_lock(self, root):
+        self._write_json_lock(root, "lead-1", pid=os.getpid(), pid_started=None, ts=time.time())
+        lg.release_poll_lock(root, "lead-1")
+        assert not (lg.lead_dir(root, "lead-1") / "poll.lock").exists()
+
+    def test_release_leaves_other_pid_lock_alone(self, root):
+        self._write_json_lock(root, "lead-1", pid=self.DEAD_PID, pid_started=None, ts=time.time())
+        lg.release_poll_lock(root, "lead-1")
+        assert (lg.lead_dir(root, "lead-1") / "poll.lock").exists()
+
+    def test_release_handles_legacy_lock(self, root):
+        self._write_legacy_lock(root, "lead-1", pid=os.getpid())
+        lg.release_poll_lock(root, "lead-1")
+        assert not (lg.lead_dir(root, "lead-1") / "poll.lock").exists()
+
+    # -- poll_lock_state --
+
+    def test_poll_lock_state_absent(self, root):
+        assert lg.poll_lock_state(root, "lead-1") == "absent"
+
+    def test_poll_lock_state_live(self, root, monkeypatch):
+        monkeypatch.setattr(lg, "_pid_start_time", lambda pid: "same-start-time")
+        self._write_json_lock(root, "lead-1", pid=os.getpid(), pid_started="same-start-time",
+                              ts=time.time())
+        assert lg.poll_lock_state(root, "lead-1", poll_interval=5) == "live"
+
+    def test_poll_lock_state_stale(self, root):
+        self._write_json_lock(root, "lead-1", pid=self.DEAD_PID, pid_started=None, ts=time.time())
+        assert lg.poll_lock_state(root, "lead-1") == "stale"
 
 
 # ---- App 2: lead-commit surfacing (real git repo) ----------------------------------------------

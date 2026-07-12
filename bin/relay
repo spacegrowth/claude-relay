@@ -296,15 +296,9 @@ def pid_alive(pid):
 
 
 def pid_start_time(pid):
-    """The process's launch timestamp (ps lstart), or None on any failure. Recorded at spawn and
-    compared later so a recycled pid — the OS reusing this exact number for an unrelated process —
-    doesn't read as 'our executor is alive' (or worse, get SIGTERMed at close)."""
-    try:
-        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))],
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() or None
-    except Exception:
-        return None
+    """Thin delegate — the single source of truth is lead_guard._pid_start_time (shared with the
+    poll-lock heartbeat's pid-reuse guard, see acquire_poll_lock)."""
+    return lead_guard._pid_start_time(pid)
 
 
 def session_pid_alive(s):
@@ -973,10 +967,22 @@ def cmd_list(args):
         # is the silent missed-wake bug made visible — a lead bound to a pre-fix hook gets back on the
         # fixed one by /reload-plugins then re-running /relay:mode (re-arms + re-stamps); the stamp
         # only refreshes on re-arm, which is why an updated-but-not-re-armed lead can still read stale.
-        poll_seconds = lead_guard.load_config(STATE_ROOT).get("poll_seconds", 1800)
-        wake_states = {m.get("session_id"): lead_guard.wake_hook_state(m, poll_seconds) for m in leads}
+        lead_cfg = lead_guard.load_config(STATE_ROOT)
+        poll_seconds = lead_cfg.get("poll_seconds", 1800)
+        poll_interval = lead_cfg.get("poll_interval", 5)
+        wake_states = {}
+        for m in leads:
+            sid = m.get("session_id")
+            state = lead_guard.wake_hook_state(m, poll_seconds)
+            # "stuck" overrides ok/stale/ver?: a dead watcher's lock blocking wakes is a distinct,
+            # more urgent condition than a pre-fix hook timeout — surfaced via the SAME staleness
+            # definition acquire_poll_lock uses (lead_guard.poll_lock_state), so list and acquire
+            # never diverge on what counts as stale.
+            if lead_guard.poll_lock_state(STATE_ROOT, sid, poll_interval) == "stale":
+                state = "stuck"
+            wake_states[sid] = state
         _WAKE_CELL = {"ok": ("ok", ("green",)), "stale": ("STALE", ("red", "bold")),
-                      "unknown": ("ver?", ("dim",))}
+                      "unknown": ("ver?", ("dim",)), "stuck": ("stuck", ("red", "bold"))}
         # Calculate dynamic widths for LEADS table with per-column caps.
         lead_cols = [
             ("PROJECT", 22, [m.get("project") or "-" for m in leads]),
@@ -1005,6 +1011,10 @@ def cmd_list(args):
             print(" ".join(row_parts))
         # Footnote only when something needs action — a stale (or unknown) wake hook is exactly the
         # silent condition that used to cost a forensic investigation to find.
+        if any(st == "stuck" for st in wake_states.values()):
+            print(c("  ⚠ WAKE=stuck: a dead watcher's lock is blocking wakes for this lead — it "
+                    "will self-heal on the lead's next turn (the lock is now auto-broken), and any "
+                    "landed report surfaces then.", "red"))
         if any(st == "stale" for st in wake_states.values()):
             print(c("  ⚠ WAKE=STALE: this lead's auto-wake hook predates the timeout fix — it will "
                     "MISS late executor reports.", "red"))

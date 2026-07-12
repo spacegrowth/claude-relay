@@ -31,6 +31,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 
 STATE_ROOT = os.path.join(os.path.expanduser("~"), ".relay-tasks")
 RELAY_BIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "relay")
+# THIS hook's own plugin root — after a plugin reload this script runs from the NEW version, so
+# reading .claude-plugin/plugin.json / hooks/hooks.json from here (not wherever the lead armed
+# under) is what keeps touch_lead's version re-stamp always current.
+PLUGIN_ROOT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
 
 
 def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_session=None):
@@ -162,9 +166,11 @@ def main():
         sid = payload.get("session_id")
         if not sid or not lg.is_lead(STATE_ROOT, sid):
             sys.exit(0)  # not a lead session → silent, zero impact
-        # Heartbeat: every lead turn refreshes last_active so `relay list` reflects real liveness.
+        # Heartbeat: every lead turn refreshes last_active (and re-stamps plugin_version/
+        # stop_hook_timeout from THIS hook's own plugin root) so `relay list` reflects real liveness
+        # and the current version — not whichever version was live at last arm time.
         try:
-            lg.touch_lead(STATE_ROOT, sid)
+            lg.touch_lead(STATE_ROOT, sid, plugin_root=PLUGIN_ROOT)
         except Exception:
             pass
 
@@ -218,13 +224,14 @@ def main():
         # just exits 0.
         if not (cfg.get("auto_wake", True) and lg.has_inflight_executors(STATE_ROOT, sid)):
             sys.exit(0)
-        if not lg.acquire_poll_lock(STATE_ROOT, sid):
+        interval = max(1, int(cfg.get("poll_interval", 5)))
+        if not lg.acquire_poll_lock(STATE_ROOT, sid, interval):
             sys.exit(0)  # a poller is already watching
         try:
             deadline = time.time() + max(1, int(cfg.get("poll_seconds", 1800)))
-            interval = max(1, int(cfg.get("poll_interval", 5)))
             while time.time() < deadline:
                 time.sleep(interval)
+                lg.heartbeat_poll_lock(STATE_ROOT, sid)  # proof of life every tick
                 if not lg.is_lead(STATE_ROOT, sid):
                     sys.exit(0)  # lead stepped down / session ended while we waited
                 rlines, rkeys = _report_lines(lg, sid)
