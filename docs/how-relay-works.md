@@ -172,57 +172,48 @@ directly, treat them as incident history, not current behavior.
 
 ## 4. The lead lifecycle
 
-```mermaid
-flowchart TD
-    A["/relay:mode<br/>marker + VER/WAKE stamp + git-HEAD baseline"] --> B["Routing gate armed<br/>PreToolUse blocks large inline Edit/Write/MultiEdit"]
-    B --> C{"Session grows heavy?"}
-    C -->|"transcript ≥ 60% of<br/>handoff_nudge_mb"| D["Statusline weight segment<br/>ambient early warning"]
-    D --> E{"transcript ≥<br/>handoff_nudge_mb?"}
-    E -->|yes, once ever| F["🔁 one-shot Stop-hook nudge<br/>(flag-filed, never repeats)"]
-    F --> G["/relay:handoff &lt;md&gt;"]
-    G --> H["Pre-armed successor tab<br/>pinned session id, gate+wake live from turn 1"]
-    H --> I["Caller steps down<br/>(clear_lead, FINAL act, only after spawn succeeds)"]
-    I -.inherited executors.-> J["adopt-on-claim on first<br/>send/resume — re-wires wakes"]
-    K["Tab closes / crashes<br/>without /relay:stop"] --> L["Ghost lead marker"]
-    L --> M["relay prune --days N<br/>triple-guarded: never self,<br/>liveness probe, staleness window"]
-```
+Five steps, in order — no branching, no thresholds to track in a diagram; those live in the prose
+under each step instead.
 
-- **Arm** (`cmd_lead_start`, `bin/relay:1427`): writes `lead/<sid>/marker.json` (project, cwd,
-  tab_label, per-lead color, `plugin_version` + `stop_hook_timeout` captured from
-  `${CLAUDE_PLUGIN_ROOT}` *right now*), and records the repo's current git `HEAD` as the baseline
-  for commit-surfacing (`lead_guard.write_head`). Idempotent — re-running `/relay:mode` just
-  refreshes the marker.
-- **Routing gate** (`hooks/pretool_route_guard.py`): blocks a single `Edit`/`Write`/`MultiEdit`
-  that adds ≥ `edit_line_threshold` (default 40) new lines, or creates a new file when
-  `block_on_new_file` is set — *before* it lands. It deliberately does **not** gate `Bash`
-  (`git commit`, `sed -i`, heredocs pass ungated — see [§7](#7-honest-limits)), and packet files
-  (`*-packet.md`, or anything under `~/.relay-tasks`) are exempt, since writing them is the lead's
-  own job. `/relay:route retain "<reason>"` (`cmd_route`, `bin/relay:1559`) opens a `grace_seconds`
-  (default 120s) window where edits pass through untouched — logged as one `retained` ledger event.
-  Every block is logged too (`blocked` event, with file/line-count/new-file fields).
-- **Heavy-session arc**: `relay status --statusline`'s lead view carries a transcript-weight
-  segment (`_weight_segment`, `bin/relay:900`) once the transcript passes 60% of
-  `handoff_nudge_mb` — ambient, informational, no action taken. Separately, `stop_lead_watch.py`
-  fires a **one-shot** 🔁 nudge (flag-filed via `mark_handoff_nudged` so it can never repeat) the
-  first time the transcript crosses the full `handoff_nudge_mb` threshold (default 5MB — see the
-  README's [`handoff_nudge_mb`](../README.md#config) row for calibration notes).
-- **`/relay:handoff <handoff.md>`** (`cmd_handoff`, `bin/relay:1486`): writes the successor's
-  marker (pinned `session_uuid`) *before* spawning its tab, so gate + auto-wake are live from the
-  successor's very first turn — no `/relay:mode` needed. Only after the spawn call returns
-  successfully does the caller step down (`lead_guard.clear_lead`) — a failed spawn leaves the
-  caller as lead and drops the pre-written successor marker, so the project is **never leadless,
-  never left with a ghost**. Inherited executors don't need any explicit re-wiring: the successor's
-  first `send`/`resume` into one adopts it automatically (§3).
-- **Ghost cleanup**: a lead whose tab crashed or was closed without `/relay:stop` leaves a marker
-  behind with no live process — `sessionend_lead_cleanup.py` only clears lead state on documented
-  real-end reasons (`clear`, `logout`, `prompt_input_exit`, `exit`; anything else, e.g. plugin-reload
-  churn, preserves the marker — see the SessionEnd-safety addendum in
-  `docs/async-rewake-findings.md`). `relay prune` (`cmd_prune`, `bin/relay:1365`) is what actually
-  removes stale ghosts, and does so under a **triple guard**, none of which may be weakened: never
-  the calling lead itself, a liveness probe (`_lead_alive`), and a staleness window (`last_active`
-  older than `--days`). Wrongly pruning a live lead unarms its gate and wakes — worse than a stale
-  row lingering — so this is intentionally more conservative than executor adoption's
-  fail-toward-adoptable default.
+1. **Arm** (`cmd_lead_start`, `bin/relay:1427`) — `/relay:mode` writes `lead/<sid>/marker.json`
+   (project, cwd, tab_label, per-lead color, `plugin_version` + `stop_hook_timeout` captured from
+   `${CLAUDE_PLUGIN_ROOT}` *right now*), and records the repo's current git `HEAD` as the baseline
+   for commit-surfacing (`lead_guard.write_head`). Idempotent — re-running `/relay:mode` just
+   refreshes the marker.
+2. **Work happens through the gate** (`hooks/pretool_route_guard.py`) — blocks a single
+   `Edit`/`Write`/`MultiEdit` that adds ≥ `edit_line_threshold` (default 40) new lines, or creates a
+   new file when `block_on_new_file` is set, *before* it lands. It deliberately does **not** gate
+   `Bash` (`git commit`, `sed -i`, heredocs pass ungated — see [§7](#7-honest-limits)), and packet
+   files (`*-packet.md`, or anything under `~/.relay-tasks`) are exempt, since writing them is the
+   lead's own job. `/relay:route retain "<reason>"` (`cmd_route`, `bin/relay:1559`) opens a
+   `grace_seconds` (default 120s) window where edits pass through untouched — logged as one
+   `retained` ledger event. Every block is logged too (`blocked` event, with
+   file/line-count/new-file fields).
+3. **Session gets heavy** — `relay status --statusline`'s lead view carries a transcript-weight
+   segment (`_weight_segment`, `bin/relay:900`) once the transcript passes 60% of
+   `handoff_nudge_mb` — ambient, informational, no action taken. Separately, `stop_lead_watch.py`
+   fires a **one-shot** 🔁 nudge (flag-filed via `mark_handoff_nudged` so it can never repeat) the
+   first time the transcript crosses the full `handoff_nudge_mb` threshold (default 5MB — see the
+   README's [`handoff_nudge_mb`](../README.md#config) row for calibration notes).
+4. **`/relay:handoff <handoff.md>`** (`cmd_handoff`, `bin/relay:1486`) — writes the successor's
+   marker (pinned `session_uuid`) *before* spawning its tab, so gate + auto-wake are live from the
+   successor's very first turn — no `/relay:mode` needed. Only after the spawn call returns
+   successfully does the caller step down (`lead_guard.clear_lead`) — a failed spawn leaves the
+   caller as lead and drops the pre-written successor marker, so the project is **never leadless,
+   never left with a ghost**.
+5. **Successor leads, pre-armed** — inherited executors don't need any explicit re-wiring: the
+   successor's first `send`/`resume` into one adopts it automatically (§3).
+
+**The abnormal path.** A lead whose tab crashed or was closed without `/relay:stop` leaves a marker
+behind with no live process — `sessionend_lead_cleanup.py` only clears lead state on documented
+real-end reasons (`clear`, `logout`, `prompt_input_exit`, `exit`; anything else, e.g. plugin-reload
+churn, preserves the marker — see the SessionEnd-safety addendum in
+`docs/async-rewake-findings.md`). `relay prune` (`cmd_prune`, `bin/relay:1365`) is what actually
+removes stale ghosts, and does so under a **triple guard**, none of which may be weakened: never the
+calling lead itself, a liveness probe (`_lead_alive`), and a staleness window (`last_active` older
+than `--days`). Wrongly pruning a live lead unarms its gate and wakes — worse than a stale row
+lingering — so this is intentionally more conservative than executor adoption's
+fail-toward-adoptable default.
 
 ## 5. Health surfaces
 
@@ -234,8 +225,8 @@ flowchart TD
 | `WAKE = ver?` | dim `ver?` | marker predates version stamping at all — can't prove safety either way | re-run `/relay:mode`; `/reload-plugins` first if it predates your last update |
 | `WAKE = stuck` | red `stuck` | poll lock is stale (dead/recycled pid, or heartbeat gone quiet) — a dead watcher is blocking wakes right now (`poll_lock_state`, overrides `ok`/`stale`) | nothing manual needed — self-heals on the lead's next turn (`acquire_poll_lock` auto-breaks a stale lock); a landed report surfaces then |
 | orphan footnote (`relay list`) | `⚠ N executor(s) owned by retired leads` | an executor's `owner_lead` marker no longer exists — wake is dead for it until claimed | `relay adopt <sid>`, or just `relay send`/`resume` (adopt automatically) |
-| `relay status` lead view | `🚦 2 busy · ✅ tk-replay · 4.2MB` | busy-executor count, reported-executor names (report-file existence, read-only), optional `WAKE stuck`/`WAKE stale` segment, transcript-weight segment (`--statusline` only) | see the matching WAKE row above; `4.2MB → /relay:handoff` once past threshold |
-| `relay status` executor view | `🚦 pkt 003 busy · lead: tk-refactor → overall: lead tab` | this executor's current packet + state, and a pointer to its owning lead's tab | check the lead's tab for overall progress |
+| `relay status` lead view | `🚦 busy: tk-replay,corpus-2 · ✅ alert-e2e · 4.2MB` | busy-executor NAMES (not a bare count — live-usage feedback: "1 busy" doesn't say who), reported-executor names (report-file existence, read-only), optional `WAKE stuck`/`WAKE stale` segment, transcript-weight segment (`--statusline` only) | see the matching WAKE row above; `4.2MB → /relay:handoff` once past threshold |
+| `relay status` executor view | `🚦 pkt 003 busy · for tk-refactor` | this executor's current packet + state, and its owning lead's project name | check the lead's tab for overall progress |
 | desktop notification | iTerm OSC banner (native click→session) → terminal-notifier (`-execute relay focus`, coalesces per lead) → osascript (`display notification`, not clickable) | three tiers, first one that applies wins — see the README's [Auto-wake and notifications](../README.md#auto-wake-and-notifications) for the full breakdown | `notify_via: "terminal-notifier"` in config skips tier 1 for a clean, relay-set title/subtitle |
 
 ## 6. Name resolution
