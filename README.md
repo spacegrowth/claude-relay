@@ -1,11 +1,29 @@
-# relay — delegate Claude Code work across terminal tabs
+# 🚦 relay — a lead/executor pattern for Claude Code
 
-A Claude Code plugin for macOS (iTerm2 or Terminal.app) that turns one session into a **lead** —
-it plans, delegates, and reviews — and spawns **executor** sessions in their own terminal tabs,
-windows, or split panes, each seeded with a work
-packet. Executors **stage their work (never commit)**, write a report, and stay idle for reuse; the
-lead reviews the staged diff and commits. You stay in the loop at every gate: the lead proposes a
-split and waits for your go, and wakes you when an executor finishes.
+A Claude Code plugin for macOS (iTerm2 or Terminal.app) that delegates work from one Claude Code
+session (the lead) to executor sessions in their own terminal tabs, windows, or split panes, each
+seeded with a work packet. The lead plans, delegates, and reviews; executors **stage their work
+(never commit)**, write a report, and stay idle for reuse; the lead reviews the staged diff and
+commits. You stay in the loop at every gate: the lead proposes a split and waits for your go, and
+wakes you when an executor finishes.
+
+## Why
+
+- **Per-executor model choice.** The lead picks `--model` at spawn time (and again per respawn via
+  `--supersede`) — a strong model does the thinking (decomposition, review, integration), cheaper
+  models do the bounded implementation. Net effect: your highest-cost tokens go to judgment calls,
+  not to grinding out diffs a smaller model can produce just as well.
+- **Bounded packets narrow the failure surface.** Each executor gets a small, self-contained work
+  order with explicit acceptance criteria — narrow scope leaves less room to wander off-spec, and
+  the report + staged-diff review is where mistakes that happen anyway get caught, before they
+  land.
+- **Context isolation.** Each executor burns its own context window, not the lead's — the lead
+  stays light across a long session. When it doesn't, the transcript-weight nudge and
+  `/relay:handoff` exist for exactly that.
+- **Real parallelism.** Independent packets run concurrently, each in its own tab — no serializing
+  unrelated work through one context.
+- **Human gates throughout.** Nothing spawns without your go, nothing lands without your review,
+  and executors stage, never commit.
 
 ## Requirements
 
@@ -93,8 +111,9 @@ The flow, in five beats:
 2. **`/relay:mode`** — arm it as the lead. (Order is flexible: arm first and then describe the
    work, or design first and arm after — both work.)
 3. **Approve the split** — the lead proposes executors + packet files and **waits for your go**.
-4. **Spawn** — executors build in parallel, each in its own tab/pane; the lead wakes you as each
-   one reports.
+4. **Spawn** — executors build in parallel, each in its own tab/pane, each on the model the lead
+   picked for it (`--model`, per executor — see [Why](#why)); the lead wakes you as each one
+   reports.
 5. **Review → commit → close** — diff page per executor, you approve, the lead commits, sessions
    close (or take follow-up packets).
 
@@ -308,23 +327,30 @@ Per-spawn override for `executor_skip_permissions`: pass `--skip-perms` or `--no
 - **Tab died mid-build?** `relay resume <sid>` reopens the same conversation with context and staged
   work intact; `relay restart <sid>` re-runs the packet fresh.
 - **Executor finished but the lead never woke?** First check `relay list` — a **`WAKE=STALE`** on the
-  lead means it's bound to a pre-fix wake hook and will keep missing late reports. Get it onto the
-  fixed hook: `/plugin update relay@claude-relay` (if not already updated) → `/reload-plugins` →
-  re-run `/relay:mode` to re-arm (which also re-stamps the version). Otherwise check
+  lead means it's bound to a pre-fix wake hook and will keep missing late reports. A **`WAKE=stuck`**
+  means a dead watcher's lock is blocking wakes right now; no action needed, it self-heals on the
+  lead's next turn (the lock auto-breaks) and any landed report surfaces then. For `STALE`, get it
+  onto the fixed hook: `/plugin update relay@claude-relay` (if not already updated) → `/reload-plugins`
+  → re-run `/relay:mode` to re-arm (which also re-stamps the version). Otherwise check
   `ls ~/.relay-tasks/lead/` — if empty, arming failed; re-run `/relay:mode`. A landed report surfaces
   on the lead's next idle either way, and `relay report <sid>` pulls it by hand. **After a lead
   handoff**, an inherited executor still owned by the retired lead won't wake you at all — run
   `relay list` and check the footnote for orphaned executors; `relay send`/`relay resume` adopt them
   automatically, or use `relay adopt <sid>` to re-point ownership without sending anything.
+- **Tab closed or the session went dead, and you just want to send it more work?** `relay send <sid>
+  <packet.md>` revives a closed/dead session by itself — no separate `resume` step needed: it kills
+  any lingering process, closes the stale tab, resumes the conversation, and delivers the new packet
+  in one shot.
 - **After updating relay, verify — don't trust — that running leads picked it up.** A plugin update
   only caches the new version; `/reload-plugins` is *supposed* to re-point a live session's hooks to
   it, but has been observed not to in long-lived sessions. So: update → `/reload-plugins` → take one
   normal turn **without** re-arming → check `relay list`. Current hooks re-stamp the lead's `VER`
   column on every turn, so if it bumped by itself, you're current; if it didn't, **restart that
   session** — don't just re-run `/relay:mode` to "fix" it. A manual re-stamp only masks the check (it
-  also blinds `relay list`'s own stale-hooks footnote, which relies on the same signal). If you've
-  already re-stamped and need a check that survives it: on the next idle turn with a busy executor,
-  look at that lead's `poll.lock` — JSON `{pid, pid_started, ts}` means current hooks; a bare integer
+  also blinds `relay list`'s own red **`stale hooks`** footnote — which flags exactly this
+  automatically for any recently-active lead, no manual check needed unless you've re-stamped over
+  it). If you've already re-stamped and need a check that survives it: on the next idle turn with a
+  busy executor, look at that lead's `poll.lock` — JSON `{pid, pid_started, ts}` means current hooks; a bare integer
   means stale.
 - **A stale row in the LEADS table with an old LAST ACTIVE** is a dead lead (tab closed/crashed
   without `/relay:stop`) — `relay prune` clears it once it's older than `--days`; a lead you're
