@@ -18,7 +18,7 @@ Verification:
   idle → background poller detects it and exits 2) and the lock/once-per-event gating.
 - **Live E2E** (real `claude --plugin-dir relay`, transcript-confirmed): the plugin's Stop hook
   fired on idle, detected a real executor's report, **woke the idle lead**, which announced it in
-  announce-and-wait form (*"An executor has finished work: ✅ executor 'daily-sectors' reported…"*).
+  announce-and-wait form (*"An executor has finished work: ✅ executor 'tk-parser' reported…"*).
   This exercised the fast path (report already present at idle). The late-report background-poll
   path is proven by composition: plugin Stop hook fires (this E2E) → poll loop (unit test) → async
   exit-2 wakes an idle session (the original spike).

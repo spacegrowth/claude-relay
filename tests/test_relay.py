@@ -229,10 +229,10 @@ class TestPacketSummary:
     """packet_summary + build_pointer_message: the executor's first message states the ask up front,
     stays single-line, and gracefully degrades to the bare pointer when there's no usable gist."""
     def test_first_heading_is_the_gist(self, relay):
-        assert relay.packet_summary("# Fix the three Both-view bugs\n\nDetails...") == "Fix the three Both-view bugs"
+        assert relay.packet_summary("# Fix the three login-page bugs\n\nDetails...") == "Fix the three login-page bugs"
 
     def test_collapses_whitespace_and_skips_blanks(self, relay):
-        assert relay.packet_summary("\n\n   ##   Add   the  SMA  toggle  \nmore") == "Add the SMA toggle"
+        assert relay.packet_summary("\n\n   ##   Add   the  dark-mode  toggle  \nmore") == "Add the dark-mode toggle"
 
     def test_truncates_long_lines(self, relay):
         out = relay.packet_summary("x" * 500, limit=20)
@@ -626,6 +626,65 @@ class TestCmdList:
         assert "…and" not in out
 
 
+class TestVersionTuple:
+    """_version_tuple: real numeric ordering for version strings, not lexical — "0.3.14" sorts
+    BELOW "0.3.9" as strings, which is exactly the trap the stale-hooks footnote must not fall into."""
+
+    def test_semver_tuple_ordering_beats_lexical_trap(self, relay):
+        assert relay._version_tuple("0.3.14") > relay._version_tuple("0.3.9")
+        assert relay._version_tuple("0.3.14") == (0, 3, 14)
+
+    def test_garbage_returns_none(self, relay):
+        assert relay._version_tuple("not-a-version") is None
+        assert relay._version_tuple(None) is None
+        assert relay._version_tuple("") is None
+
+
+class TestStaleHooksFootnote:
+    """cmd_list's stale-hooks footnote (wake bug #3): a lead active within 6h whose stamped
+    plugin_version parses LOWER than the installed plugin_version() means /reload-plugins did not
+    re-point its hooks — current hooks re-stamp on every lead turn, so a recent-but-stale stamp is
+    proof, not just suspicion."""
+    @pytest.fixture(autouse=True)
+    def _procs_alive(self, relay, monkeypatch):
+        monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
+
+    def _mk_lead(self, relay, sid, stamped_version, last_active, project="webapp"):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, sid, project=project, plugin_version=stamped_version)
+        mp = relay.lead_guard.marker_path(relay.STATE_ROOT, sid)
+        m = json.loads(mp.read_text())
+        m["last_active"] = last_active
+        mp.write_text(json.dumps(m))
+
+    def _args(self, json=False, lead=None, all=False, closed=False):
+        return SimpleNamespace(json=json, lead=lead, all=all, closed=closed)
+
+    def test_fires_for_recent_lead_stamped_older(self, relay, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "plugin_version", lambda: "0.3.14")
+        self._mk_lead(relay, "lead-1", "0.3.9", relay.now())  # active now, stamp stale
+        relay.cmd_list(self._args())
+        out = capsys.readouterr().out
+        assert "stale hooks" in out
+
+    def test_silent_when_stamp_matches_installed(self, relay, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "plugin_version", lambda: "0.3.14")
+        self._mk_lead(relay, "lead-1", "0.3.14", relay.now())
+        relay.cmd_list(self._args())
+        assert "stale hooks" not in capsys.readouterr().out
+
+    def test_silent_when_lead_inactive(self, relay, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "plugin_version", lambda: "0.3.14")
+        self._mk_lead(relay, "lead-1", "0.3.9", "2000-01-01T00:00:00")  # ancient last_active
+        relay.cmd_list(self._args())
+        assert "stale hooks" not in capsys.readouterr().out
+
+    def test_silent_when_stamp_unparseable(self, relay, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "plugin_version", lambda: "0.3.14")
+        self._mk_lead(relay, "lead-1", "garbage", relay.now())
+        relay.cmd_list(self._args())
+        assert "stale hooks" not in capsys.readouterr().out
+
+
 class TestListAlignment:
     """Table cell alignment: long values are truncated with ellipsis and never shift columns after them.
     capsys is not a tty, so ANSI color codes are off — no escape-stripping needed."""
@@ -645,7 +704,7 @@ class TestListAlignment:
     def test_long_topic_truncated_and_aligned(self, relay, capsys):
         # Two executors: one with a 60-char topic, one with a short one.
         # The EXECUTORS table should have columns aligned even though one topic is very long.
-        long_topic = "fix: Both-view bugs (draggable sep, panel default, 1h SMA) extra"  # 60 chars
+        long_topic = "fix: split-view bugs (draggable sep, panel default, extra) extra"  # 60 chars
         self._exec(relay, "e-long", topic=long_topic)
         self._exec(relay, "e-short", topic="short")
         relay.cmd_list(self._args())
@@ -1606,13 +1665,13 @@ class TestAdoption:
         assert "relay adopt" in out
 
     def test_same_project_handoff_auto_transfers(self, relay, tmp_path, monkeypatch):
-        # THE corpus-night regression: old + new lead share the SAME project (and thus the same
+        # A real regression: old + new lead share the SAME project (and thus the same
         # derived tab_label), but the old lead has no live pid and an unresolvable iterm_session —
         # that tab-label collision must NOT block the transfer; it must auto-adopt, not warn.
-        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-lead", project="d2cengine_refactor",
-                                       tab_label="[Lead] d2cengine_refactor", iterm_session="w0t0p0:OLDLEAD")
-        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="d2cengine_refactor",
-                                       tab_label="[Lead] d2cengine_refactor", iterm_session="w0t0p0:NEWLEAD")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-lead", project="webapp",
+                                       tab_label="[Lead] webapp", iterm_session="w0t0p0:OLDLEAD")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp",
+                                       tab_label="[Lead] webapp", iterm_session="w0t0p0:NEWLEAD")
         self._mk(relay, owner_lead="old-lead")
         self._env(monkeypatch, "new-lead")
         with mock.patch.object(relay.iterm, "send", return_value=True), \
@@ -1795,7 +1854,7 @@ class TestStatus:
         assert "overall" not in out and "lead:" not in out
 
     def test_executor_view_by_relay_name(self, relay, capsys):
-        # REGRESSION (observed live): `relay status alert-e2e` printed nothing. The executor
+        # REGRESSION (observed live): `relay status e1` printed nothing. The executor
         # branch only matched by claude_session (the --statusline payload's id space), so the
         # RELAY session id/name a human types classified as "neither" → silent exit. Both id
         # spaces must work.
@@ -1934,12 +1993,12 @@ class TestResolveSid:
         relay.main()
 
     def test_executor_exact_id_wins_over_lead_project_collision(self, relay):
-        # Executor named "inotes" AND a lead whose project is ALSO "inotes" — precedence (a) must
-        # pin to the executor, never fall through to the project-name branch.
-        relay.write_session("inotes", {"session_id": "inotes", "current_packet": 1, "status": "busy",
+        # Executor named "docs-site" AND a lead whose project is ALSO "docs-site" — precedence (a)
+        # must pin to the executor, never fall through to the project-name branch.
+        relay.write_session("docs-site", {"session_id": "docs-site", "current_packet": 1, "status": "busy",
             "topic": "t", "worktree": "/w", "scope": "", "model": "opus", "owner_lead": None})
-        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-x", project="inotes")
-        assert relay.resolve_sid("inotes") == "inotes"
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-x", project="docs-site")
+        assert relay.resolve_sid("docs-site") == "docs-site"
 
     def test_lead_project_name_resolves_end_to_end(self, relay, capsys, monkeypatch):
         # Proves the resolver is actually wired into main() -> cmd_status, not just a unit that

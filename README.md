@@ -127,7 +127,7 @@ relay status [session_id] [--statusline]   read-only, statusline-safe one-liner 
 
 Anywhere a command above takes a session id, you can pass the executor's name (its id, set at
 `spawn --name`), a lead's project name, or a unique prefix of either's id — no more pasting lead
-UUIDs. `relay focus d2cengine_refactor` and `relay stop inotes` just work. A project name that
+UUIDs. `relay focus webapp` and `relay stop docs-site` just work. A project name that
 matches more than one lead (e.g. an old + new lead after a handoff) never guesses: it exits listing
 every candidate sid instead, newest-first, so you can pick one or pass a unique prefix.
 
@@ -148,10 +148,10 @@ Type them, or just describe what you want ("check on my sessions") — the lead 
 `relay status` is deliberately dumb: it reads markers + `session.json` files as they already are
 and checks report-file existence — **it writes nothing** — so it's safe to call on every status-line
 render (Claude Code can re-run your `statusLine` command multiple times a minute). It prints one
-line: the LEAD view (busy-executor count, reported names, a `WAKE` warning if auto-wake is
-unhealthy) or the EXECUTOR view (its packet + a pointer to its lead's tab) — whichever role the
-current session has. For any other session it prints nothing, so it never adds noise to an
-unrelated status line.
+line: the LEAD view (busy-executor NAMES, reported-executor names, a `WAKE` warning if auto-wake is
+unhealthy) or the EXECUTOR view (its packet + state, and "for <project>" when it's owned by a lead)
+— whichever role the current session has. For any other session it prints nothing, so it never adds
+noise to an unrelated status line.
 
 Claude Code pipes a JSON payload with a top-level `session_id` field to your `statusLine` command's
 stdin (confirmed against the [statusline docs](https://code.claude.com/docs/en/statusline.md)). That
@@ -186,8 +186,8 @@ via `--statusline` (that's the only invocation that carries `transcript_path`, c
 the statusline JSON payload against the same docs), and only from 60% of `handoff_nudge_mb` upward:
 
 ```
-🚦 busy: tk-replay,corpus-2 · ✅ alert-e2e · 4.2MB
-🚦 busy: tk-replay · 5.2MB → /relay:handoff
+🚦 busy: tk-parser,tk-render · ✅ tk-auth · 4.2MB
+🚦 busy: tk-parser · 5.2MB → /relay:handoff
 ```
 
 Honest limit: `relay status` reads stored state + report-file existence only — no liveness refresh.
@@ -316,12 +316,16 @@ Per-spawn override for `executor_skip_permissions`: pass `--skip-perms` or `--no
   handoff**, an inherited executor still owned by the retired lead won't wake you at all — run
   `relay list` and check the footnote for orphaned executors; `relay send`/`relay resume` adopt them
   automatically, or use `relay adopt <sid>` to re-point ownership without sending anything.
-- **After updating relay, refresh running leads.** A plugin update only caches the new version — a live
-  session keeps using the old hook path until you run **`/reload-plugins`** (which re-points hooks for
-  the session; relay ships no monitors, so no full restart is needed). Then re-run `/relay:mode` on
-  each lead so its next wake poller runs the new code and its marker re-stamps — `relay list`'s
-  `VER`/`WAKE` columns confirm which version each lead is actually on. (A poller already in flight
-  keeps the old code until it next arms, so re-arming is the clean step.)
+- **After updating relay, verify — don't trust — that running leads picked it up.** A plugin update
+  only caches the new version; `/reload-plugins` is *supposed* to re-point a live session's hooks to
+  it, but has been observed not to in long-lived sessions. So: update → `/reload-plugins` → take one
+  normal turn **without** re-arming → check `relay list`. Current hooks re-stamp the lead's `VER`
+  column on every turn, so if it bumped by itself, you're current; if it didn't, **restart that
+  session** — don't just re-run `/relay:mode` to "fix" it. A manual re-stamp only masks the check (it
+  also blinds `relay list`'s own stale-hooks footnote, which relies on the same signal). If you've
+  already re-stamped and need a check that survives it: on the next idle turn with a busy executor,
+  look at that lead's `poll.lock` — JSON `{pid, pid_started, ts}` means current hooks; a bare integer
+  means stale.
 - **A stale row in the LEADS table with an old LAST ACTIVE** is a dead lead (tab closed/crashed
   without `/relay:stop`) — `relay prune` clears it once it's older than `--days`; a lead you're
   actively using is never pruned.

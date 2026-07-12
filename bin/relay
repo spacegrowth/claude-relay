@@ -129,6 +129,16 @@ def plugin_version():
         return None
 
 
+def _version_tuple(v):
+    """"0.3.14" → (0, 3, 14) for real ordering, or None if unparseable. Naive string comparison
+    is a trap here — "0.3.14" < "0.3.9" lexically — and a wrong verdict either way makes the
+    stale-hooks footnote lie, so unparseable versions opt out of the check entirely."""
+    try:
+        return tuple(int(p) for p in str(v).strip().split("."))
+    except Exception:
+        return None
+
+
 def stop_hook_timeout():
     """The Stop hook's `timeout` (seconds) declared in THIS plugin version's hooks.json, or None if
     absent/unparseable. None is the 0.1.0 signature — no timeout field, so the harness kills the
@@ -1010,7 +1020,7 @@ def cmd_status(args):
         return
 
     # Executor lookup, both id spaces: the RELAY session id first (what a human types —
-    # `relay status alert-e2e`), then the pinned Claude conversation id (what the --statusline
+    # `relay status tk-auth`), then the pinned Claude conversation id (what the --statusline
     # payload carries — a session only knows its own Claude id). Missing either lookup silently
     # blanks a real executor for one caller class; both observed live.
     s = read_session(sid)
@@ -1171,6 +1181,31 @@ def cmd_list(args):
         elif any(st == "unknown" for st in wake_states.values()):
             print(c("  ⚠ WAKE=ver?: armed before version stamping — re-run /relay:mode to re-stamp; if it "
                     "predates your last relay update, /reload-plugins first (or restart).", "dim"))
+        # Stale-hooks detection (wake bug #3): current hooks (>=0.3.10) re-stamp the marker's
+        # version on EVERY lead turn — so a RECENTLY-ACTIVE lead whose stamp is still older than
+        # the installed version proves its session is executing old hook code (/reload-plugins
+        # didn't re-point it). The one thing that defeats this tell is a manual /relay:mode
+        # re-stamp on top of stale hooks, hence the warning's last clause. Inactive leads are
+        # skipped (no recent turn = no re-stamp expected = no signal either way).
+        installed = _version_tuple(plugin_version())
+        if installed:
+            stale_hooks = []
+            for m in leads:
+                stamped = _version_tuple(m.get("plugin_version"))
+                if not stamped or stamped >= installed:
+                    continue
+                try:
+                    age = time.time() - time.mktime(time.strptime(m.get("last_active", ""),
+                                                                  "%Y-%m-%dT%H:%M:%S"))
+                except Exception:
+                    continue  # unknown activity → no signal, stay quiet
+                if age < 6 * 3600:  # active recently enough that current hooks would have re-stamped
+                    stale_hooks.append(m.get("project") or (m.get("session_id") or "?")[:8])
+            if stale_hooks:
+                print(c(f"  ⚠ stale hooks: {', '.join(stale_hooks)} — active but still stamped older "
+                        f"than the installed {plugin_version()}, so /reload-plugins did NOT re-point "
+                        f"that session's hooks. Restart it (a manual /relay:mode re-stamp only hides "
+                        f"this warning).", "red"))
         print()
 
     print(c("EXECUTORS", "bold"))
