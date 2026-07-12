@@ -918,14 +918,15 @@ def _weight_segment(state_root, lead_sid, transcript_path):
 
 
 def _lead_status_line(lead_sid, marker, transcript_path=None):
-    """The LEAD view: busy-executor count (stored status busy, no report yet), reported-executor
-    names (report file exists, status not closed/superseded — computed WITHOUT writing anything;
-    report-file existence is only a display-time freshness upgrade over the stored status), a
-    WAKE segment when this lead's auto-wake is unhealthy, and (--statusline mode only, when
-    `transcript_path` is given) a transcript-weight segment. Reuses wake_hook_state/poll_lock_state/
-    transcript_mb/handoff_nudged (lead_guard) rather than re-deriving their rules. Returns "" when
-    every segment is empty (e.g. an armed lead with zero executors)."""
-    busy_n = 0
+    """The LEAD view: busy-executor NAMES (stored status busy, no report yet — a bare count doesn't
+    tell you WHO, per live-usage feedback), reported-executor names (report file exists, status not
+    closed/superseded — computed WITHOUT writing anything; report-file existence is only a
+    display-time freshness upgrade over the stored status), a WAKE segment when this lead's
+    auto-wake is unhealthy, and (--statusline mode only, when `transcript_path` is given) a
+    transcript-weight segment. Reuses wake_hook_state/poll_lock_state/transcript_mb/handoff_nudged
+    (lead_guard) rather than re-deriving their rules. Returns "" when every segment is empty (e.g.
+    an armed lead with zero executors)."""
+    busy = []
     reported = []
     for esid in all_session_ids():
         s = read_session(esid)
@@ -939,11 +940,15 @@ def _lead_status_line(lead_sid, marker, transcript_path=None):
         if report_exists:
             reported.append(esid)
         elif status == "busy":
-            busy_n += 1
+            busy.append(esid)
 
     segments = []
-    if busy_n:
-        segments.append(f"🚦 {busy_n} busy")
+    if busy:
+        shown = busy[:3]
+        label = ",".join(shown)
+        if len(busy) > 3:
+            label += f" +{len(busy) - 3}"
+        segments.append(f"🚦 busy: {label}")
     if reported:
         shown = reported[:3]
         label = ",".join(shown)
@@ -969,17 +974,20 @@ def _lead_status_line(lead_sid, marker, transcript_path=None):
 
 def _executor_status_line(s):
     """The EXECUTOR view: current packet + state (report-file existence upgrades the stored status
-    to "✅ reported", read-only) and a pointer to the owning lead's tab for overall progress."""
+    to "✅ reported", read-only) and, when owned, the owning lead's project name as "for <project>"
+    ("lead: <project>" read ambiguously in an executor tab — whose role is 'lead' here?). No
+    "→ overall: lead tab" tail — live usage feedback called it noise; an unowned executor just
+    shows pkt+state, nothing else to point at."""
     n = s["current_packet"]
     report_exists = (packets_dir(s["session_id"]) / f"{n:03d}-report.md").exists()
     state = "✅ reported" if report_exists else s.get("status", "?")
 
     owner_lead = s.get("owner_lead")
     if not owner_lead:
-        return f"🚦 pkt {n:03d} {state} · lead: unowned"
+        return f"🚦 pkt {n:03d} {state}"
     marker = lead_guard.read_marker(STATE_ROOT, owner_lead)
     label = (marker.get("project") if marker else None) or f"{owner_lead[:8]}…"
-    return f"🚦 pkt {n:03d} {state} · lead: {label} → overall: lead tab"
+    return f"🚦 pkt {n:03d} {state} · for {label}"
 
 
 def cmd_status(args):

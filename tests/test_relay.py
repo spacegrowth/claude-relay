@@ -1748,9 +1748,29 @@ class TestStatus:
         self._exec(relay, "e3", owner_lead="lead-1", status="busy", report=True)
         relay.cmd_status(self._args(session_id="lead-1"))
         out = capsys.readouterr().out
-        assert "2 busy" in out
+        # DELIBERATE spec change (packet 004, live-usage feedback): busy executors are now named,
+        # not just counted — a bare "2 busy" doesn't tell you WHO.
+        assert "busy: e1,e2" in out
         assert "✅" in out and "e3" in out
         assert "WAKE" not in out
+
+    def test_lead_view_names_busy_executors(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        self._exec(relay, "e1", owner_lead="lead-1", status="busy")
+        self._exec(relay, "e2", owner_lead="lead-1", status="busy")
+        relay.cmd_status(self._args(session_id="lead-1"))
+        out = capsys.readouterr().out
+        assert "e1" in out and "e2" in out
+        assert "2 busy" not in out   # the old count-only format must be gone
+
+    def test_lead_view_busy_overflow(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        for sid in ("e1", "e2", "e3", "e4"):
+            self._exec(relay, sid, owner_lead="lead-1", status="busy")
+        relay.cmd_status(self._args(session_id="lead-1"))
+        out = capsys.readouterr().out
+        assert "busy: e1,e2,e3 +1" in out
+        assert "e4" not in out
 
     def test_reported_upgrade_is_read_only(self, relay, capsys):
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
@@ -1768,7 +1788,11 @@ class TestStatus:
         self._exec(relay, "e1", owner_lead="lead-1", claude_session="cs-1", status="busy")
         relay.cmd_status(self._args(session_id="cs-1"))
         out = capsys.readouterr().out
-        assert "pkt" in out and "webapp" in out and "lead tab" in out
+        # DELIBERATE spec change (packet 004 + lead's review, live-usage feedback): the
+        # " -> overall: lead tab" tail was noise — dropped entirely; and the owner label reads
+        # "for <project>" ("lead: <project>" was ambiguous inside an executor tab).
+        assert "pkt" in out and "for webapp" in out
+        assert "overall" not in out and "lead:" not in out
 
     def test_unknown_session_prints_nothing(self, relay, capsys):
         relay.cmd_status(self._args(session_id="nobody-here"))
@@ -1915,7 +1939,8 @@ class TestResolveSid:
             "busy_since": relay.now(), "updated": relay.now()})
         self._run_main(relay, monkeypatch, ["status", "webapp"])
         out = capsys.readouterr().out
-        assert "1 busy" in out
+        # DELIBERATE spec change (packet 004): busy executors are named, not counted.
+        assert "busy: e1" in out
 
     def test_ambiguous_project_name_exits_with_candidates(self, relay, monkeypatch):
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-aaaaaaaa", project="dup")

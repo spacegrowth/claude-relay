@@ -186,8 +186,8 @@ via `--statusline` (that's the only invocation that carries `transcript_path`, c
 the statusline JSON payload against the same docs), and only from 60% of `handoff_nudge_mb` upward:
 
 ```
-🚦 2 busy · ✅ tk-replay · 4.2MB
-🚦 1 busy · 5.2MB → /relay:handoff
+🚦 busy: tk-replay,corpus-2 · ✅ alert-e2e · 4.2MB
+🚦 busy: tk-replay · 5.2MB → /relay:handoff
 ```
 
 Honest limit: `relay status` reads stored state + report-file existence only — no liveness refresh.
