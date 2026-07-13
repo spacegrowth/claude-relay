@@ -90,9 +90,29 @@ def title_is_live(label, live_names):
     return False
 
 
+def _session_exists_by_id(iterm_id):
+    """True/False if an id-based lookup ran and found (or didn't find) a matching session, None if
+    the osascript call itself failed (iTerm not running, timeout, etc) — callers treat None like
+    False (id lookup found nothing) and fall back to title matching."""
+    if not iterm_id:
+        return None
+    uuid = iterm_id.split(":")[-1]
+    script = _for_session_by_id(uuid, "          return true\n") + "return false"
+    r = run_osascript(script, timeout=5)
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip().lower() == "true"
+
+
 def is_alive(label, handle=None, pid=None):
-    # handle/pid are part of the shared backend signature (Terminal.app addresses by window id);
-    # iTerm addresses by title, so they're unused here.
+    # pid is part of the shared backend signature (Terminal.app addresses by window id); unused here.
+    # handle ($TERM_SESSION_ID) is unambiguous where present — two tabs can share a title (e.g. a
+    # handoff predecessor/successor pair both titled "[Lead] <project>") but never an iTerm session
+    # id. Fall back to the bounded title match when handle is empty or the id lookup finds nothing.
+    if handle:
+        found = _session_exists_by_id(handle)
+        if found:
+            return True
     return title_is_live(label, live_session_names())
 
 
@@ -184,6 +204,33 @@ def tty_by_id(iterm_id):
     r = run_osascript(script, timeout=5)
     out = (r.stdout or "").strip()
     return out if r.returncode == 0 and out.startswith("/dev/") else None
+
+
+def pid_on_tty(tty_path, binary_suffix=CLAUDE_BIN):
+    """The pid of the process named `binary_suffix` (default "claude") attached to `tty_path`
+    (a "/dev/ttysNNN" from tty_by_id), or None. Used to SIGTERM a predecessor lead's claude process
+    before closing its tab — iTerm pops a 'confirm close running process' dialog otherwise, which
+    blocks osascript indefinitely (see close()'s docstring)."""
+    if not tty_path:
+        return None
+    tty_name = tty_path.removeprefix("/dev/")
+    try:
+        r = subprocess.run(["ps", "-axo", "pid=,tty=,comm="], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) != 3:
+            continue
+        pid_s, tty, comm = parts
+        if tty == tty_name and comm.endswith(binary_suffix):
+            try:
+                return int(pid_s)
+            except ValueError:
+                continue
+    return None
 
 
 def _create_target_block(lead_handle=None, layout="tab"):
@@ -416,11 +463,22 @@ def rename_by_id(iterm_id, new_name):
 
 
 def close(label, handle=None, pid=None):
-    """Close the iTerm tab/session matched by `label` (bounded title match). The caller should kill
-    the session's process FIRST so iTerm doesn't pop a 'confirm close running process' dialog (which
-    would block osascript). The executor's report is already on disk, so closing loses nothing.
-    Returns True if a session matched and the close command ran.
-    handle/pid: shared backend signature, unused here (iTerm addresses by title)."""
+    """Close the iTerm tab/session matched by `handle` (unique iTerm session id) when given, else by
+    `label` (bounded title match). id-based matching first because a title CAN be shared by two live
+    tabs (e.g. a handoff predecessor/successor pair, both titled "[Lead] <project>") — closing by
+    title alone risks closing the wrong one. Falls back to the title match when `handle` is empty or
+    the id lookup finds nothing (e.g. the tab already closed itself).
+
+    The caller should kill the session's process FIRST so iTerm doesn't pop a 'confirm close running
+    process' dialog (which would block osascript). The executor's report is already on disk, so
+    closing loses nothing. Returns True if a session matched and the close command ran.
+    pid: shared backend signature, unused here (iTerm addresses by title/id, not pid)."""
+    if handle:
+        uuid = handle.split(":")[-1]
+        script = _for_session_by_id(uuid, "          tell s to close\n          return true\n") + "return false"
+        r = run_osascript(script, timeout=5)
+        if r.returncode == 0 and r.stdout.strip().lower() == "true":
+            return True
     action = "          tell s to close\n"
     script = (
         "set matched to false\n"

@@ -146,6 +146,80 @@ class TestFocusPaneSelect:
         assert "tell s to select" in script
 
 
+class TestIdBasedClose:
+    """close()/is_alive() must target by unique iTerm session id (`handle`) when one is given,
+    falling back to the bounded title match only when handle is empty or the id lookup finds
+    nothing. Regression: two live tabs (a handoff predecessor/successor pair) can share the exact
+    same title, so title-only targeting is a coin flip about which tab gets closed."""
+
+    def test_close_with_handle_targets_id_only(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run:
+            closed = iterm.close("[Lead] webapp", "w1t5p0:SOME-UUID", None)
+        assert closed is True
+        assert osa_run.call_count == 1
+        script = osa_run.call_args[0][0]
+        assert 'id of s) is "SOME-UUID"' in script
+        assert "tell s to close" in script
+
+    def test_close_with_handle_falls_back_to_title_when_id_not_found(self):
+        with mock.patch.object(iterm, "run_osascript", side_effect=[_ok("false"), _ok("true")]) as osa_run:
+            closed = iterm.close("[Lead] webapp", "w1t5p0:SOME-UUID", None)
+        assert closed is True
+        assert osa_run.call_count == 2
+        title_script = osa_run.call_args_list[1][0][0]
+        assert "name of s is equal to" in title_script
+
+    def test_close_without_handle_uses_title_match_directly(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run:
+            closed = iterm.close("[Lead] webapp")
+        assert closed is True
+        assert osa_run.call_count == 1
+        script = osa_run.call_args[0][0]
+        assert "name of s is equal to" in script
+        assert "id of s" not in script
+
+    def test_is_alive_with_handle_short_circuits_on_id_match(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run, \
+             mock.patch.object(iterm, "title_is_live") as title_is_live:
+            alive = iterm.is_alive("[Lead] webapp", "w1t5p0:SOME-UUID")
+        assert alive is True
+        title_is_live.assert_not_called()
+        assert osa_run.call_count == 1
+
+    def test_is_alive_falls_back_to_title_when_id_not_found(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("false")), \
+             mock.patch.object(iterm, "running", return_value=True), \
+             mock.patch.object(iterm, "live_session_names", return_value={"[Lead] webapp"}):
+            alive = iterm.is_alive("[Lead] webapp", "w1t5p0:SOME-UUID")
+        assert alive is True
+
+    def test_is_alive_without_handle_uses_title_match_only(self):
+        with mock.patch.object(iterm, "run_osascript") as osa_run, \
+             mock.patch.object(iterm, "live_session_names", return_value={"[Lead] webapp"}):
+            alive = iterm.is_alive("[Lead] webapp")
+        assert alive is True
+        osa_run.assert_not_called()   # no id lookup attempted at all without a handle
+
+
+class TestPidOnTty:
+    def test_matches_pid_by_tty_and_comm(self):
+        ps_out = "  123 ttys000 login\n  456 ttys000 claude\n  789 ttys001 claude\n"
+        with mock.patch.object(iterm.subprocess, "run",
+                                return_value=subprocess.CompletedProcess(["ps"], 0, ps_out, "")):
+            assert iterm.pid_on_tty("/dev/ttys000") == 456
+
+    def test_no_match_returns_none(self):
+        ps_out = "  123 ttys002 claude\n"
+        with mock.patch.object(iterm.subprocess, "run",
+                                return_value=subprocess.CompletedProcess(["ps"], 0, ps_out, "")):
+            assert iterm.pid_on_tty("/dev/ttys000") is None
+
+    def test_empty_tty_path_returns_none_without_running_ps(self):
+        with mock.patch.object(iterm.subprocess, "run") as run_mock:
+            assert iterm.pid_on_tty(None) is None
+        run_mock.assert_not_called()
+
+
 class TestPyApiHybrid:
     """spawn()'s hybrid placement: when iterm_pyapi.try_create_adjacent_tab succeeds (package
     installed, API enabled, lead session found), its returned session id is handed to the

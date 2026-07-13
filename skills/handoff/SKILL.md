@@ -3,7 +3,6 @@ name: handoff
 description: >-
   Hand this lead session off to a fresh successor. Invoke with /relay:handoff, or when asked to
   "hand off", "hand this off to a new session", "start a successor lead".
-arguments: [handoff_md]
 ---
 
 Use this when the lead session has gotten heavy (long-lived, large transcript — see the auto-wake

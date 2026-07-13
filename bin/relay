@@ -407,6 +407,22 @@ def cmd_spawn(args):
                  f"not a directory. Pass the existing project directory all executors share "
                  f"(an absolute path, e.g. /tmp/calc).")
 
+    # Resolve the model BEFORE any packet/session files are written: an explicit --model always
+    # wins; otherwise relay's own executor_default_model policy applies — never the CLI's personal
+    # `/model` default (see the "executor model policy" section in lead_guard.py). A requested model above
+    # executor_model_ceiling is refused unless --model-override "<reason>" is given, so a lead can't
+    # accidentally (or silently) spawn an executor on the top-tier model without a deliberate,
+    # ledgered reason.
+    cfg = lead_guard.load_config(STATE_ROOT)
+    resolved_model = args.model or cfg.get("executor_default_model", "sonnet")
+    ceiling = cfg.get("executor_model_ceiling", "opus")
+    if lead_guard.model_exceeds_ceiling(resolved_model, ceiling):
+        if not args.model_override:
+            sys.exit(f"spawn: requested model '{resolved_model}' is above the configured ceiling "
+                     f"'{ceiling}' — pass --model-override \"<reason>\" to spawn on it anyway.")
+        append_ledger("model_ceiling_override", session_id=session_id, model=resolved_model,
+                      reason=args.model_override)
+
     auto_trust(worktree)
     label = f"[Exec] {session_id}"  # role-prefixed: exec tabs and lead tabs are told apart at a glance
     d = packets_dir(session_id)
@@ -423,7 +439,6 @@ def cmd_spawn(args):
     # config default (executor_skip_permissions, default False = safe/prompts). Skip-perms means the
     # executor edits files / runs commands without prompting — mitigated by relay's design
     # (executors STAGE, never commit; the lead reviews before anything lands), but a real tradeoff.
-    cfg = lead_guard.load_config(STATE_ROOT)
     skip_perms = args.skip_perms if args.skip_perms is not None else bool(cfg.get("executor_skip_permissions", False))
     # Same tri-state pattern as skip_perms: --pane/--tab wins; else config's executor_layout
     # ("tab" default). "pane" only takes effect if the lead's iTerm session can be located at
@@ -450,7 +465,7 @@ def cmd_spawn(args):
         prompt=build_pointer_message(str(packet_path), packet_summary(body)),
         label=label,
         pidfile=str(pid_path(session_id)),
-        model=args.model,
+        model=resolved_model,
         skip_perms=skip_perms,
         iterm_id_file=str(iterm_id_path(session_id)),
         session_uuid=claude_session,
@@ -470,7 +485,9 @@ def cmd_spawn(args):
         "topic": args.topic,
         "scope": args.scope or args.topic,
         "tab_label": label,
-        "model": args.model,
+        "model": resolved_model,  # the resolved effective model, even when --model was omitted —
+                                  # never store null just because the caller didn't pass one (that's
+                                  # what let `relay list` render `-` for a live executor)
         "pid": pid,
         "pid_started": pid_start_time(pid) if pid else None,  # pid-reuse guard (see session_pid_alive)
         "iterm_session": iterm_session,
@@ -513,12 +530,21 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     tab_color = None
     if cfg.get("tab_colors", True) and s.get("owner_lead"):
         tab_color = lead_guard.read_marker(STATE_ROOT, s["owner_lead"]).get("color")
+    # A resume (`resume_id` set) reopens the SAME conversation — build_claude_cmd doesn't even pass
+    # --model on that path, so whatever model that conversation already runs is exempt and untouched
+    # here. A restart (`session_uuid` set) is a genuinely FRESH launch though, so it gets the same
+    # relay-owned default-model policy as a first spawn — a legacy/null s["model"] must not silently
+    # fall through to the CLI's personal default a second time.
+    model = s.get("model")
+    if session_uuid and not model:
+        model = cfg.get("executor_default_model", "sonnet")
+        s["model"] = model
     bk.spawn(
         cwd=s["worktree"],
         prompt=prompt,
         label=label,
         pidfile=str(pid_path(session_id)),
-        model=s.get("model"),
+        model=model,
         skip_perms=skip_perms,
         iterm_id_file=str(iterm_id_path(session_id)),
         session_uuid=session_uuid,
@@ -1545,10 +1571,15 @@ def cmd_lead_start(args):
                     f.write(iterm.tab_color_escape(color))
             except OSError:
                 pass  # cosmetic — never block arming on a paint failure
+    # Re-arm (e.g. the successor's post-handoff /relay:mode verify) must not clobber handoff/history
+    # state that only the FIRST arm ever sets: `predecessor` (cmd_handoff pre-arms it before this
+    # ever runs) and `started` (should reflect when the lead actually began, not each re-verify).
+    existing = lead_guard.read_marker(STATE_ROOT, args.session_id)
     lead_guard.write_marker(STATE_ROOT, args.session_id, model=args.model,
                             iterm_session=iterm_session, project=project, cwd=cwd,
                             tab_label=tab_label, color=color,
-                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout())
+                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
+                            predecessor=existing.get("predecessor"), started=existing.get("started"))
     # Record the cwd's current git HEAD as the baseline, so the Stop-hook commit-surfacing (App 2)
     # only reports commits made AFTER lead mode began — not the repo's entire prior history.
     lead_guard.write_head(STATE_ROOT, args.session_id, lead_guard.git_head(os.getcwd()))
@@ -1676,10 +1707,22 @@ def cmd_close_predecessor(args):
     if pred_sid and lead_guard.is_lead(STATE_ROOT, pred_sid):
         sys.exit(f"close-predecessor: predecessor {pred_sid[:8]}… is still an armed lead — not "
                  f"closing a live lead's tab; ask them to /relay:stop first.")
+    # Kill the predecessor's claude process BEFORE closing the tab — iTerm's `close` docstring:
+    # without this, iTerm pops a 'confirm close running process' dialog that blocks osascript.
+    # There's no recorded pid for a lead (unlike executors), so find it live via the tab's tty.
+    # Best-effort throughout: a lookup miss at any step still falls through to attempting the close.
+    pred_tty = iterm.tty_by_id(pred.get("iterm_session")) if pred.get("iterm_session") else None
+    pred_pid = iterm.pid_on_tty(pred_tty) if pred_tty else None
+    if pred_pid:
+        try:
+            os.kill(pred_pid, signal.SIGTERM)
+            time.sleep(0.3)
+        except Exception:
+            pass
     closed = iterm.close(pred.get("tab_label") or "", pred.get("iterm_session"), None)
     if closed:
         tab_note = "closed its tab"
-    elif not iterm.is_alive(pred.get("tab_label") or ""):
+    elif not iterm.is_alive(pred.get("tab_label") or "", pred.get("iterm_session")):
         tab_note = "tab closed itself"
     else:
         tab_note = "tab not auto-closed — Cmd-W it if it lingers"
@@ -1814,6 +1857,9 @@ def main():
     sp.add_argument("topic")
     sp.add_argument("packet")
     sp.add_argument("--model")
+    sp.add_argument("--model-override", metavar="REASON",
+                    help="required to spawn a model above executor_model_ceiling — the reason is "
+                    "recorded in the ledger (model_ceiling_override)")
     sp.add_argument("--name")
     sp.add_argument("--scope")
     sp.add_argument("--lead", help="session id of the lead spawning this executor (stamps ownership); "

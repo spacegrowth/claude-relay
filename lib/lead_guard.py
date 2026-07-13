@@ -46,6 +46,13 @@ LEAD_DEFAULTS = {
     "executor_layout": "tab",    # "tab" | "pane" (pane: iTerm only, split into the lead's window)
     "handoff_nudge": True,       # suggest handing off when the lead transcript gets heavy
     "handoff_nudge_mb": 5,       # transcript-size threshold (MB); proxy, not context occupancy
+    "executor_default_model": "sonnet",  # model an executor launches with when --model is omitted —
+                                  # relay's own policy, never the human's personal `/model` default
+                                  # (see "executor model policy" section below: incident where a
+                                  # null-model executor silently ran a full day on the user's
+                                  # top-tier default)
+    "executor_model_ceiling": "opus",    # spawn refuses a requested executor model ABOVE this tier
+                                  # without --model-override "<reason>" (see "executor model policy")
 }
 
 # Distinguishable, colorblind-tolerant tab colors — brightened so they remain visible when dimmed
@@ -168,6 +175,47 @@ def load_config(state_root):
     return cfg
 
 
+# ---- executor model policy ---------------------------------------------------------------------
+# LIVE INCIDENT (2026-07-12, ~.relay-tasks/executor-model-leak-2026-07-12.md): an executor spawned
+# without --model stored "model": null and launched plain `claude`, which silently inherited the
+# HUMAN's personal `/model` default — a full day (11 packets) ran on their top-tier default before
+# anyone noticed, because `relay list` renders null as `-`. executor_default_model/
+# executor_model_ceiling (LEAD_DEFAULTS above) exist so an executor's model is always relay's own
+# policy decision, never an accidental inheritance.
+
+# Ascending: name-based, tier-agnostic (compares the tier WORD found in a model string, not a
+# specific model id), so tomorrow's new top-tier release just needs a word added here rather than
+# every existing model string enumerated.
+TIER_ORDER = ["haiku", "sonnet", "opus", "fable"]
+
+
+def model_tier(model):
+    """The tier word from TIER_ORDER contained in `model` (case-insensitive substring), or None if
+    `model` is empty or names no recognized tier."""
+    if not model:
+        return None
+    s = str(model).lower()
+    for tier in TIER_ORDER:
+        if tier in s:
+            return tier
+    return None
+
+
+def model_exceeds_ceiling(model, ceiling):
+    """True if `model`'s tier is strictly above `ceiling`'s tier in TIER_ORDER. An unrecognized
+    tier — for `model` OR `ceiling` — is treated as above-ceiling (refuse by default): a model name
+    this list doesn't know about yet must not silently sail through just because it can't be
+    ranked, and a misconfigured ceiling must fail toward requiring an override, not toward
+    allowing everything."""
+    model_t = model_tier(model)
+    if model_t is None:
+        return True
+    ceiling_t = model_tier(ceiling)
+    if ceiling_t is None:
+        return True
+    return TIER_ORDER.index(model_t) > TIER_ORDER.index(ceiling_t)
+
+
 # ---- pure edit-sizing logic (unit-tested independent of any I/O) -------------------------------
 
 def _count_lines(s):
@@ -252,7 +300,7 @@ def is_lead(state_root, session_id):
 
 def write_marker(state_root, session_id, model=None, iterm_session=None, project=None, cwd=None,
                  tab_label=None, color=None, plugin_version=None, stop_hook_timeout=None,
-                 predecessor=None):
+                 predecessor=None, started=None):
     d = lead_dir(state_root, session_id)
     d.mkdir(parents=True, exist_ok=True)
     marker_path(state_root, session_id).write_text(json.dumps({
@@ -262,7 +310,7 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
         "tab_label": tab_label,      # stable relay-controlled tab title → makes `relay focus <lead>` work
         "color": color,              # [r,g,b] tab color; this lead's executors inherit it at spawn
         "last_active": now(),        # heartbeat — refreshed on every write_marker call
-        "started": now(),
+        "started": started or now(), # preserved across re-arms by callers that read the existing marker first
         "model": model,
         "iterm_session": iterm_session,  # $TERM_SESSION_ID — recorded tab metadata (debugging)
         # The plugin version this session is bound to, and the Stop-hook timeout that version

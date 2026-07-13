@@ -126,6 +126,50 @@ class TestLoadConfig:
         assert cfg["edit_line_threshold"] == 7
 
 
+# ---- executor model policy ---------------------------------------------------------------------
+
+class TestModelTier:
+    def test_extracts_known_tiers(self):
+        assert lg.model_tier("claude-sonnet-5") == "sonnet"
+        assert lg.model_tier("claude-opus-4-8") == "opus"
+        assert lg.model_tier("claude-haiku-4-5-20251001") == "haiku"
+        assert lg.model_tier("claude-fable-5") == "fable"
+
+    def test_bare_tier_name(self):
+        assert lg.model_tier("opus") == "opus"
+
+    def test_unknown_model_returns_none(self):
+        assert lg.model_tier("some-future-model-xyz") is None
+
+    def test_empty_or_none_returns_none(self):
+        assert lg.model_tier(None) is None
+        assert lg.model_tier("") is None
+
+
+class TestModelExceedsCeiling:
+    def test_below_ceiling_does_not_exceed(self):
+        assert lg.model_exceeds_ceiling("sonnet", "opus") is False
+
+    def test_at_ceiling_does_not_exceed(self):
+        assert lg.model_exceeds_ceiling("opus", "opus") is False
+
+    def test_above_ceiling_exceeds(self):
+        assert lg.model_exceeds_ceiling("fable", "opus") is True
+
+    def test_unknown_model_tier_exceeds_by_default(self):
+        # Fail closed: a model name this list doesn't recognize must be refused, not silently let
+        # through just because it can't be ranked.
+        assert lg.model_exceeds_ceiling("some-future-model-xyz", "opus") is True
+
+    def test_unknown_ceiling_tier_exceeds_by_default(self):
+        assert lg.model_exceeds_ceiling("sonnet", "not-a-real-tier") is True
+
+    def test_tier_ordering_is_fable_above_opus_above_sonnet_above_haiku(self):
+        assert lg.model_exceeds_ceiling("opus", "sonnet") is True
+        assert lg.model_exceeds_ceiling("sonnet", "haiku") is True
+        assert lg.model_exceeds_ceiling("haiku", "sonnet") is False
+
+
 # ---- is_new_file ------------------------------------------------------------------------------
 
 class TestIsNewFile:

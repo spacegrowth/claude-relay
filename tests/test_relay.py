@@ -354,6 +354,71 @@ class TestSpawnLayout:
         assert self._run(relay, tmp_path, pane=True)["layout"] == "pane"   # flag on, no config
 
 
+class TestSpawnModel:
+    """cmd_spawn's model policy (LIVE INCIDENT, 2026-07-12): an executor spawned without --model
+    must launch on relay's own executor_default_model, never the CLI's personal /model default, and
+    a requested model above executor_model_ceiling is refused without --model-override. iterm.spawn/
+    auto_trust/read_pid mocked so no real iTerm/AppleScript is touched."""
+    def _run(self, relay, tmp_path, cfg=None, model=None, model_override=None, name="s1"):
+        pkt = tmp_path / "packet.md"; pkt.write_text("do the thing")
+        if cfg is not None:
+            (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+            (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps(cfg))
+        captured = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: captured.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt),
+                model=model, model_override=model_override, name=name, scope=None,
+                skip_perms=None, pane=None))
+        return captured
+
+    def _ledger_events(self, relay):
+        return [json.loads(l) for l in relay.LEDGER.read_text().splitlines()] if relay.LEDGER.exists() else []
+
+    def test_omitted_model_launches_and_stores_config_default(self, relay, tmp_path):
+        cap = self._run(relay, tmp_path)
+        assert cap["model"] == "sonnet"                          # built-in default
+        assert relay.read_session("s1")["model"] == "sonnet"     # honest display — never null
+
+    def test_omitted_model_uses_configured_default(self, relay, tmp_path):
+        cap = self._run(relay, tmp_path, cfg={"executor_default_model": "haiku"})
+        assert cap["model"] == "haiku"
+        assert relay.read_session("s1")["model"] == "haiku"
+
+    def test_explicit_model_within_ceiling_passes_through(self, relay, tmp_path):
+        cap = self._run(relay, tmp_path, model="opus")
+        assert cap["model"] == "opus"
+        assert relay.read_session("s1")["model"] == "opus"
+
+    def test_model_above_ceiling_refused(self, relay, tmp_path):
+        with pytest.raises(SystemExit) as ei:
+            self._run(relay, tmp_path, model="claude-fable-5")
+        assert "ceiling" in str(ei.value)
+        assert "--model-override" in str(ei.value)
+        assert relay.read_session("s1") is None    # refused before any session was recorded
+
+    def test_model_above_ceiling_with_override_succeeds_and_ledgers(self, relay, tmp_path):
+        cap = self._run(relay, tmp_path, model="claude-fable-5", model_override="benchmarking a hard case")
+        assert cap["model"] == "claude-fable-5"
+        events = self._ledger_events(relay)
+        overrides = [e for e in events if e["event"] == "model_ceiling_override"]
+        assert len(overrides) == 1
+        assert overrides[0]["model"] == "claude-fable-5"
+        assert overrides[0]["reason"] == "benchmarking a hard case"
+
+    def test_unknown_tier_name_refused_by_default(self, relay, tmp_path):
+        # A model string containing no tier word this list recognizes must fail CLOSED, not open —
+        # tomorrow's new top-tier model is caught by default instead of silently sailing through.
+        with pytest.raises(SystemExit) as ei:
+            self._run(relay, tmp_path, model="some-future-model-xyz")
+        assert "ceiling" in str(ei.value)
+
+    def test_custom_ceiling_allows_higher_default_tier(self, relay, tmp_path):
+        cap = self._run(relay, tmp_path, cfg={"executor_model_ceiling": "fable"}, model="opus")
+        assert cap["model"] == "opus"   # opus <= fable ceiling, no override needed
+
+
 class TestSpawnOwnership:
     """cmd_spawn stamps the executor's session.json with its owning lead + project. --lead wins,
     else $CLAUDE_CODE_SESSION_ID, else unowned (None). owner_project is read from the lead's marker.
@@ -936,6 +1001,51 @@ class TestRestartResume:
         relay.pid_path("e1").write_text("999")  # stale
         self._run(relay, relay.cmd_restart)
         assert relay.read_session("e1")["pid"] == 123  # picked up the NEW pid, not the stale file
+
+    def test_restart_fills_missing_model_with_config_default(self, relay):
+        # `_mk`'s fixture session has "model": None (a legacy/never-set-explicitly record) — restart
+        # is a FRESH launch (new session_uuid), so it must get relay's own default policy applied,
+        # same as a first spawn, and persist it (not leave `-` in `relay list` a second time).
+        self._mk(relay)
+        cap = self._run(relay, relay.cmd_restart)
+        assert cap["model"] == "sonnet"
+        assert relay.read_session("e1")["model"] == "sonnet"
+
+    def test_restart_respects_configured_default(self, relay):
+        self._mk(relay)
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps({"executor_default_model": "haiku"}))
+        cap = self._run(relay, relay.cmd_restart)
+        assert cap["model"] == "haiku"
+        assert relay.read_session("e1")["model"] == "haiku"
+
+    def test_restart_keeps_existing_explicit_model(self, relay):
+        self._mk(relay)
+        s = relay.read_session("e1")
+        s["model"] = "opus"
+        relay.write_session("e1", s)
+        cap = self._run(relay, relay.cmd_restart)
+        assert cap["model"] == "opus"                              # not overwritten by the default
+        assert relay.read_session("e1")["model"] == "opus"
+
+    def test_resume_does_not_rewrite_existing_session_model(self, relay):
+        # A resume (`resume_id` set, no fresh `session_uuid`) reopens the SAME conversation — its
+        # model is exempt from relay's spawn-time policy entirely, whatever it already was.
+        self._mk(relay)
+        s = relay.read_session("e1")
+        s["model"] = "opus"
+        relay.write_session("e1", s)
+        cap = self._run(relay, relay.cmd_resume)
+        assert cap["model"] == "opus"
+        assert relay.read_session("e1")["model"] == "opus"
+
+    def test_resume_does_not_fill_missing_model(self, relay):
+        # `_mk`'s fixture session has "model": None — resume must leave it exactly that way, not
+        # apply the default-fill logic that only fresh (restart/spawn) launches get.
+        self._mk(relay)
+        cap = self._run(relay, relay.cmd_resume)
+        assert cap["model"] is None
+        assert relay.read_session("e1")["model"] is None
 
 
 class TestResumeLead:
@@ -1680,6 +1790,43 @@ class TestAdoption:
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
         s = relay.read_session("e1")
         assert s["owner_lead"] == "new-lead"
+
+
+class TestLeadStart:
+    """`relay lead-start <sid>` (invoked by /relay:mode): idempotent arm/re-arm. A re-arm on an
+    already-armed session must preserve handoff/history state (`predecessor`, `started`) that only
+    the FIRST arm sets — a bug let the successor's post-handoff /relay:mode verify silently wipe
+    both fields."""
+
+    def _args(self, session_id, model=None, project=None):
+        return SimpleNamespace(session_id=session_id, model=model, project=project, no_rename=True)
+
+    def test_fresh_arm_has_no_predecessor(self, relay, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        relay.cmd_lead_start(self._args("lead-1"))
+        marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert marker["predecessor"] is None
+        assert marker["started"] is not None
+
+    def test_rearm_preserves_predecessor_and_started(self, relay, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        predecessor = {"session_id": "old-lead", "tab_label": "[Lead] webapp", "iterm_session": "w1t1p0:OLD"}
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path),
+                                       predecessor=predecessor, started="2020-01-01T00:00:00")
+        relay.cmd_lead_start(self._args("lead-1", project="webapp"))
+        marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert marker["predecessor"] == predecessor
+        assert marker["started"] == "2020-01-01T00:00:00"
+
+    def test_rearm_refreshes_last_active(self, relay, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path),
+                                       started="2020-01-01T00:00:00")
+        monkeypatch.setattr(relay.lead_guard, "now", lambda: "2030-01-01T00:00:00")
+        relay.cmd_lead_start(self._args("lead-1", project="webapp"))
+        marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert marker["last_active"] == "2030-01-01T00:00:00"
+        assert marker["started"] == "2020-01-01T00:00:00"   # unaffected by the last_active refresh
 
 
 class TestHandoff:

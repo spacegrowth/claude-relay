@@ -24,6 +24,11 @@ wakes you when an executor finishes.
   unrelated work through one context.
 - **Human gates throughout.** Nothing spawns without your go, nothing lands without your review,
   and executors stage, never commit.
+- **Hallucination risk is contained, not eliminated.** An executor can be confidently wrong —
+  invent an API, misread the spec, report tests green that it never ran. relay's answer is
+  structural, not trust: acceptance criteria live in the packet, the report has a required format,
+  and the lead independently verifies the staged diff (re-running tests itself) before anything is
+  committed. Wrong output still costs a review cycle — it just doesn't land.
 
 ## Requirements
 
@@ -310,6 +315,8 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `notify_on_wake` | true | Send macOS notification when lead wakes to review |
 | `notify_via` | "auto" | "auto" \| "terminal-notifier". "auto" uses iTerm's OSC banner first (native click→session, but iTerm forces a "Session …" title you can't override); "terminal-notifier" skips that tier for a clean title/subtitle (falls back to osascript) |
 | `executor_skip_permissions` | false | Spawn executors with `--dangerously-skip-permissions` (false = prompt before edits/commands; true = hands-off but requires careful review before landing) |
+| `executor_default_model` | "sonnet" | Model an executor launches with when `--model` is omitted — relay's own policy, never the CLI's personal `/model` default |
+| `executor_model_ceiling` | "opus" | Spawn refuses a requested executor model above this tier unless `--model-override "<reason>"` is passed (recorded in the ledger) |
 | `terminal_app` | "auto" | "iterm" \| "terminal" \| "auto" (auto-detect via `$TERM_PROGRAM`; iTerm default) |
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
