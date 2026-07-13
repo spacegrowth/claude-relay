@@ -193,7 +193,10 @@ under each step instead.
    caller as lead and drops the pre-written successor marker, so the project is **never leadless,
    never left with a ghost**.
 5. **Successor leads, pre-armed** — inherited executors don't need any explicit re-wiring: the
-   successor's first `send`/`resume` into one adopts it automatically (§3).
+   successor's first `send`/`resume` into one adopts it automatically (§3). Once settled, the
+   successor runs `/relay:mode` to VERIFY arming (idempotent if the pin held); the predecessor's
+   tab is recorded in the successor's marker and closed, on user approval, via `relay
+   close-predecessor`.
 
 **The abnormal path.** A lead whose tab crashed or was closed without `/relay:stop` leaves a marker
 behind with no live process — `sessionend_lead_cleanup.py` only clears lead state on documented

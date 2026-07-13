@@ -1727,7 +1727,10 @@ class TestHandoff:
         assert "stop_hook_timeout" in succ
         assert cap["session_uuid"] == succ["session_id"]
         assert str(md) in cap["prompt"]
-        assert "do NOT run /relay:mode" in cap["prompt"]
+        # DELIBERATE spec change (aftercare packet): the successor now verifies its own arming via
+        # /relay:mode after settling instead of being told never to run it — see
+        # test_handoff_seed_prompt_instructs_verify_and_ask for the full replacement spec.
+        assert "do NOT run /relay:mode" not in cap["prompt"]
 
     def test_handoff_steps_caller_down(self, relay, tmp_path, monkeypatch):
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
@@ -1780,6 +1783,86 @@ class TestHandoff:
         successors = [m for sid, m in self._leads(relay).items() if sid != "lead-1"]
         assert successors[0]["project"] == "webapp"
         assert successors[0]["model"] == "opus"
+
+    def test_handoff_records_predecessor(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path),
+                                       tab_label="[Lead] webapp", iterm_session="w1t1p0:OLD")
+        self._env(monkeypatch, "lead-1")
+        md = self._md(tmp_path)
+        self._run(relay, md)
+        successors = [m for sid, m in self._leads(relay).items() if sid != "lead-1"]
+        pred = successors[0]["predecessor"]
+        assert pred["session_id"] == "lead-1"
+        assert pred["tab_label"] == "[Lead] webapp"
+        assert pred["iterm_session"] == "w1t1p0:OLD"
+
+    def test_handoff_seed_prompt_instructs_verify_and_ask(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        md = self._md(tmp_path)
+        cap = self._run(relay, md)
+        prompt = cap["prompt"]
+        assert "/relay:mode" in prompt
+        assert cap["session_uuid"] in prompt
+        assert "relay stop" in prompt
+        assert "close-predecessor" in prompt
+        assert "do NOT run /relay:mode" not in prompt
+
+
+class TestClosePredecessor:
+    """`relay close-predecessor`: the successor-only aftercare step that closes the outgoing lead's
+    now-unarmed zombie tab, recorded in the successor's own marker at handoff time."""
+
+    def _env(self, monkeypatch, sid):
+        if sid is None:
+            monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        else:
+            monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+
+    def _ledger_events(self, relay):
+        return [json.loads(l) for l in relay.LEDGER.read_text().splitlines()] if relay.LEDGER.exists() else []
+
+    def test_close_predecessor_closes_and_clears(self, relay, tmp_path, monkeypatch):
+        predecessor = {"session_id": "old-lead", "tab_label": "[Lead] webapp", "iterm_session": "w1t1p0:OLD"}
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp", cwd=str(tmp_path),
+                                       predecessor=predecessor)
+        self._env(monkeypatch, "new-lead")
+        with mock.patch.object(relay.iterm, "close", return_value=True) as close_mock:
+            relay.cmd_close_predecessor(SimpleNamespace())
+        close_mock.assert_called_once_with("[Lead] webapp", "w1t1p0:OLD", None)
+        marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "new-lead")
+        assert "predecessor" not in marker or not marker["predecessor"]
+        events = self._ledger_events(relay)
+        closed_events = [e for e in events if e["event"] == "predecessor_closed"]
+        assert len(closed_events) == 1
+        assert closed_events[0]["predecessor"] == "old-lead"
+        assert closed_events[0]["tab_closed"] is True
+
+    def test_close_predecessor_refuses_live_lead(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-lead", project="webapp", cwd=str(tmp_path),
+                                       tab_label="[Lead] webapp")
+        predecessor = {"session_id": "old-lead", "tab_label": "[Lead] webapp", "iterm_session": None}
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp", cwd=str(tmp_path),
+                                       predecessor=predecessor)
+        self._env(monkeypatch, "new-lead")
+        with mock.patch.object(relay.iterm, "close") as close_mock:
+            with pytest.raises(SystemExit):
+                relay.cmd_close_predecessor(SimpleNamespace())
+            close_mock.assert_not_called()
+        marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "new-lead")
+        assert marker["predecessor"] == predecessor
+
+    def test_close_predecessor_no_predecessor_noop(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "new-lead")
+        with mock.patch.object(relay.iterm, "close") as close_mock:
+            relay.cmd_close_predecessor(SimpleNamespace())  # no exception
+            close_mock.assert_not_called()
+
+    def test_close_predecessor_refuses_non_lead(self, relay, monkeypatch):
+        self._env(monkeypatch, "not-a-lead")
+        with pytest.raises(SystemExit):
+            relay.cmd_close_predecessor(SimpleNamespace())
 
 
 class TestStatus:

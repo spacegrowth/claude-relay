@@ -18,6 +18,7 @@ Commands:
   relay adopt <session_id> [--force]          # re-point an executor's auto-wake ownership to this lead
   relay route retain "<reason>" --session <session_id>   # open the retain grace window
   relay handoff <handoff.md> [--project NAME] [--model NAME]  # succeed this lead with a pre-armed fresh one
+  relay close-predecessor                    # close the outgoing lead's tab after a handoff, on user go
 """
 import argparse
 import json
@@ -1538,9 +1539,12 @@ def cmd_handoff(args):
     """One-command lead succession: spawn a successor lead tab PRE-ARMED (its marker written for a
     pinned session id before its first turn — same trick `cmd_spawn` already uses to pin an
     executor's Claude session id via `session_uuid`), seeded with a handoff file the outgoing lead
-    wrote, then step the outgoing lead down as the final act. The successor needs no /relay:mode:
-    its gate + auto-wake are active from turn one. Inherited executors re-parent automatically on
-    the successor's first send/resume (adopt-on-claim) — nothing to wire here."""
+    wrote, then step the outgoing lead down as the final act. Its gate + auto-wake are active from
+    turn one; the successor still runs /relay:mode after settling, but only to VERIFY the pin held
+    (idempotent) rather than to arm from scratch (mirrors cmd_resume_lead's nudge). The
+    predecessor's tab identity travels in the successor's marker (`predecessor` field) so it can be
+    closed later via `relay close-predecessor`, once the user says go. Inherited executors re-parent
+    automatically on the successor's first send/resume (adopt-on-claim) — nothing to wire here."""
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if not caller or not lead_guard.is_lead(STATE_ROOT, caller):
         sys.exit("handoff: caller isn't an armed lead — run /relay:mode first")
@@ -1558,18 +1562,28 @@ def cmd_handoff(args):
     tab_label = f"[Lead] {slugify(project)}"
     cfg = lead_guard.load_config(STATE_ROOT)
     color = lead_guard.pick_lead_color(STATE_ROOT, successor_sid) if cfg.get("tab_colors", True) else None
+    # Record the predecessor NOW, while its marker is still readable — by the time the successor
+    # gets around to acting on it, `clear_lead(caller)` below will have deleted it, so this is the
+    # only place this information can be captured.
+    predecessor = {"session_id": caller, "tab_label": caller_marker.get("tab_label"),
+                   "iterm_session": caller_marker.get("iterm_session")}
 
     # PRE-ARM: write the successor's marker (same stamping as cmd_lead_start) BEFORE it ever runs a
     # turn, so its gate + auto-wake are live from the moment the tab opens — no /relay:mode needed.
     lead_guard.write_marker(STATE_ROOT, successor_sid, model=model, project=project, cwd=cwd,
                             tab_label=tab_label, color=color,
-                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout())
+                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
+                            predecessor=predecessor)
     lead_guard.write_head(STATE_ROOT, successor_sid, lead_guard.git_head(cwd))
 
-    seed = (f"You are the successor lead for project '{project}' — pre-armed by relay handoff (do "
-            f"NOT run /relay:mode; your routing gate and auto-wake are already active). Read the "
-            f"handoff at {handoff_path}, then run /relay:list to see what's in flight. Your first "
-            f"send/resume of an inherited executor adopts it automatically.")
+    seed = (f"You are the successor lead for project '{project}', pre-armed by relay handoff. Read "
+            f"the handoff at {handoff_path}, run /relay:list to see what's in flight, and once "
+            f"you've settled: (1) run /relay:mode to VERIFY arming — idempotent if your session id "
+            f"matches the pinned '{successor_sid}', and it arms your REAL id if the pin didn't "
+            f"hold; if your id differs from '{successor_sid}', also run `relay stop {successor_sid}` "
+            f"to clear the orphaned pre-armed marker; (2) ASK the user whether to close the previous "
+            f"lead's tab, and on their go run `relay close-predecessor` — never close it unasked. "
+            f"Your first send/resume of an inherited executor adopts it automatically.")
 
     # never leave the project leadless; never leave a ghost on failure: a failed spawn must NOT
     # step the caller down (it's still the only live lead), and must NOT leave the successor's
@@ -1597,7 +1611,8 @@ def cmd_handoff(args):
     iterm_session = read_iterm_id_at(iterm_id_file)  # best-effort; None on timeout is non-fatal
     lead_guard.write_marker(STATE_ROOT, successor_sid, model=model, project=project, cwd=cwd,
                             tab_label=tab_label, color=color, iterm_session=iterm_session,
-                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout())
+                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
+                            predecessor=predecessor)
 
     # Step the caller down — the FINAL act, only after the spawn call has returned successfully.
     lead_guard.clear_lead(STATE_ROOT, caller)
@@ -1605,6 +1620,37 @@ def cmd_handoff(args):
                   handoff_md=str(handoff_path))
     print(f"handoff complete — successor lead '{project}' (session {successor_sid}) opened, "
           f"pre-armed; this session has stepped down (gate + auto-wake off here).")
+
+
+def cmd_close_predecessor(args):
+    """Close the zombie tab a handoff leaves behind: the outgoing lead steps down (its marker is
+    deleted) but its iTerm tab stays open with nothing on disk pointing at it. cmd_handoff records
+    that tab's identity in the successor's OWN marker (`predecessor`) before the old marker is gone
+    — this reads it back, closes the tab, and clears the field so the offer can't repeat. Never
+    invoked automatically; the successor's seed prompt asks the user first."""
+    caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not caller or not lead_guard.is_lead(STATE_ROOT, caller):
+        sys.exit("close-predecessor: caller isn't an armed lead — run /relay:mode first")
+    marker = lead_guard.read_marker(STATE_ROOT, caller)
+    pred = marker.get("predecessor") or {}
+    if not pred:
+        print("close-predecessor: no predecessor recorded for this lead — nothing to close.")
+        return
+    pred_sid = pred.get("session_id")
+    if pred_sid and lead_guard.is_lead(STATE_ROOT, pred_sid):
+        sys.exit(f"close-predecessor: predecessor {pred_sid[:8]}… is still an armed lead — not "
+                 f"closing a live lead's tab; ask them to /relay:stop first.")
+    closed = iterm.close(pred.get("tab_label") or "", pred.get("iterm_session"), None)
+    if closed:
+        tab_note = "closed its tab"
+    elif not iterm.is_alive(pred.get("tab_label") or ""):
+        tab_note = "tab closed itself"
+    else:
+        tab_note = "tab not auto-closed — Cmd-W it if it lingers"
+    marker.pop("predecessor", None)
+    lead_guard.marker_path(STATE_ROOT, caller).write_text(json.dumps(marker, indent=2))
+    append_ledger("predecessor_closed", session_id=caller, predecessor=pred_sid, tab_closed=bool(closed))
+    print(f"close-predecessor: predecessor {pred_sid[:8] if pred_sid else '?'}… — {tab_note}")
 
 
 def cmd_route(args):
@@ -1845,6 +1891,9 @@ def main():
     hf.add_argument("--project", help="successor's project name (default: caller lead's project, else cwd basename)")
     hf.add_argument("--model", help="successor's model (default: caller lead's marker model)")
     hf.set_defaults(func=cmd_handoff)
+
+    cp = sub.add_parser("close-predecessor")
+    cp.set_defaults(func=cmd_close_predecessor)
 
     args = p.parse_args()
 

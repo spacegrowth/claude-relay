@@ -251,7 +251,8 @@ def is_lead(state_root, session_id):
 
 
 def write_marker(state_root, session_id, model=None, iterm_session=None, project=None, cwd=None,
-                 tab_label=None, color=None, plugin_version=None, stop_hook_timeout=None):
+                 tab_label=None, color=None, plugin_version=None, stop_hook_timeout=None,
+                 predecessor=None):
     d = lead_dir(state_root, session_id)
     d.mkdir(parents=True, exist_ok=True)
     marker_path(state_root, session_id).write_text(json.dumps({
@@ -271,6 +272,11 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
         # `relay list` rather than only found by forensics after a missed wake.
         "plugin_version": plugin_version,
         "stop_hook_timeout": stop_hook_timeout,
+        # A handoff successor's predecessor lead (session_id/tab_label/iterm_session), stamped by
+        # cmd_handoff BEFORE the caller steps down — by successor-time the old marker is gone, so
+        # this is the only record of how to close that now-unarmed zombie tab. `relay
+        # close-predecessor` reads and clears it. None for any lead that didn't arrive via handoff.
+        "predecessor": predecessor,
     }, indent=2))
 
 

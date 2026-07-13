@@ -141,6 +141,7 @@ And the three nouns:
 /relay:route retain "<reason>"             open a grace window when the gate blocks lead work
 /relay:diff <session_id>                   render staged changes to an HTML review page and open it
 /relay:handoff <handoff.md>                 succeed this lead: pre-armed successor tab, then step down
+relay close-predecessor                    successor-only: close the outgoing lead's tab, on user go
 relay status [session_id] [--statusline]   read-only, statusline-safe one-liner (see below)
 ```
 
@@ -263,9 +264,11 @@ md, then `/relay:handoff <md>`.
 Heavy session (large transcript, or just wanting a fresh context)? Distill what matters to a
 handoff md — what's in flight, what's reviewed/committed, open questions, next steps — then run
 `/relay:handoff <handoff.md>`. It opens a **pre-armed** successor tab (gate + auto-wake already
-active, no `/relay:mode` needed), seeds it with a pointer to the handoff file, and steps this
-session down as its final act. Inherited executors adopt automatically on the successor's first
-`send`/`resume` — nothing to re-wire.
+active from turn one), seeds it with a pointer to the handoff file, and steps this session down as
+its final act. Inherited executors adopt automatically on the successor's first `send`/`resume` —
+nothing to re-wire. Once settled, the successor runs `/relay:mode` to verify the pin held (idempotent),
+then asks you whether to close the predecessor's now-unarmed tab — say yes and it runs `relay
+close-predecessor`.
 
 This is a different tool from `relay resume`/`restart`: **resume/restart is for CRASH
 recovery** (reopens the identical conversation, same context back). **Handoff is for WEIGHT**
