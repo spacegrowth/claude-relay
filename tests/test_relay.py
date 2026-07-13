@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -2363,3 +2364,60 @@ class TestResolveSid:
         s = relay.read_session("e1")
         assert s["owner_lead"] == "lead-1"
         assert s["owner_project"] == "webapp"
+
+
+class TestUniqueLeadProject:
+    """unique_lead_project: auto-suffixing so no two LIVE leads share a project name at arm time."""
+
+    NOW = time.mktime(time.strptime("2026-01-01T12:00:00", "%Y-%m-%dT%H:%M:%S"))
+
+    @staticmethod
+    def _stamp(offset_seconds):
+        return time.strftime("%Y-%m-%dT%H:%M:%S",
+                              time.localtime(TestUniqueLeadProject.NOW - offset_seconds))
+
+    def _lead(self, sid, project, offset_seconds=60, last_active=...):
+        return {"session_id": sid, "project": project,
+                "last_active": self._stamp(offset_seconds) if last_active is ... else last_active}
+
+    def test_fresh_name_returned_unchanged(self, relay):
+        leads = [self._lead("other-1", "some-other-project")]
+        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        assert (name, clash) == ("claude-relay", None)
+
+    def test_exact_collision_with_live_lead_suffixes_to_2(self, relay):
+        leads = [self._lead("other-1", "claude-relay")]
+        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        assert name == "claude-relay-2"
+        assert clash == "other-1"
+
+    def test_dash_2_also_taken_advances_to_smallest_free(self, relay):
+        leads = [self._lead("other-1", "claude-relay"), self._lead("other-2", "claude-relay-2")]
+        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        assert name == "claude-relay-3"
+        assert clash == "other-1"
+
+    def test_self_session_id_is_not_reserved(self, relay):
+        # idempotent re-arm: this session's own existing marker must not suffix itself.
+        leads = [self._lead("self-1", "claude-relay")]
+        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        assert (name, clash) == ("claude-relay", None)
+
+    def test_excluded_predecessor_is_not_reserved(self, relay):
+        # handoff: successor inherits the predecessor's name rather than getting suffixed.
+        leads = [self._lead("predecessor-1", "claude-relay")]
+        name, clash = relay.unique_lead_project(
+            "claude-relay", "self-1", ["predecessor-1"], leads, now_ts=self.NOW)
+        assert (name, clash) == ("claude-relay", None)
+
+    def test_stale_last_active_beyond_window_is_a_ghost(self, relay):
+        leads = [self._lead("other-1", "claude-relay",
+                             offset_seconds=relay.LEAD_LIVE_WINDOW_SECONDS + 1)]
+        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        assert (name, clash) == ("claude-relay", None)
+
+    def test_unparseable_or_missing_last_active_is_a_ghost(self, relay):
+        leads = [self._lead("other-1", "claude-relay", last_active=None),
+                 self._lead("other-2", "claude-relay", last_active="not-a-timestamp")]
+        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        assert (name, clash) == ("claude-relay", None)

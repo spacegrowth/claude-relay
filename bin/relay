@@ -1524,6 +1524,58 @@ def cmd_prune(args):
         print(f"nothing to prune (terminal sessions newer than {args.days}d: {kept})")
 
 
+# How long a lead's last_active stamp counts as "plausibly still live" for the purpose of reserving
+# its project name (see unique_lead_project). Too short and two genuinely-live-but-idle leads could
+# momentarily collide on a name; too long and a crashed lead's name stays reserved (and a stale
+# ghost sitting in the same folder makes every re-arm creep the suffix) long after it's gone. 15
+# minutes comfortably outlasts normal idle gaps between turns while still reclaiming crashed names
+# well within a session.
+LEAD_LIVE_WINDOW_SECONDS = 900
+
+
+def unique_lead_project(project, self_sid, exclude_sids, leads, now_ts=None):
+    """Resolve `project` to a name no other LIVE lead currently holds, auto-suffixing with the
+    smallest free `-N` (N >= 2) on collision. `leads` is the list of marker dicts (as returned by
+    `lead_guard.list_leads`); a marker reserves its name only if its session_id is neither
+    `self_sid` (idempotent re-arm must keep the same name) nor in `exclude_sids` (a handoff
+    successor passes its predecessor's id here, since succession intentionally inherits the name),
+    AND its `last_active` parses and is within LEAD_LIVE_WINDOW_SECONDS of `now_ts` — an
+    unparseable/missing stamp, or one older than the window, is treated as a ghost and never
+    reserves its name, mirroring the existing "unparseable → ancient" convention used elsewhere in
+    this file for lead pruning.
+
+    Returns `(resolved_project, clashing_sid)` — `clashing_sid` is the session_id of the live lead
+    that holds the *exact* `project` name (for the caller's NOTE), or None when `project` was
+    already free (the common case, including reclaiming a name whose only holder is a ghost).
+
+    Pure and fail-open by design: any exception degrades to returning `project` unchanged — a bug
+    in this uniqueness check must never prevent a lead from arming."""
+    try:
+        now_ts = time.time() if now_ts is None else now_ts
+        exclude = set(exclude_sids or ()) | {self_sid}
+        reserved = {}  # project name -> session_id of the first (oldest) live lead holding it
+        for m in leads:
+            sid = m.get("session_id")
+            name = m.get("project")
+            if not sid or not name or sid in exclude:
+                continue
+            try:
+                last_active = time.mktime(time.strptime(m.get("last_active") or "", "%Y-%m-%dT%H:%M:%S"))
+            except Exception:
+                continue  # unparseable/missing last_active → ghost, doesn't reserve
+            if now_ts - last_active > LEAD_LIVE_WINDOW_SECONDS:
+                continue  # stale → ghost, doesn't reserve
+            reserved.setdefault(name, sid)
+        if project not in reserved:
+            return project, None
+        n = 2
+        while f"{project}-{n}" in reserved:
+            n += 1
+        return f"{project}-{n}", reserved[project]
+    except Exception:
+        return project, None
+
+
 def cmd_lead_start(args):
     """Mark THIS session as a lead (invoked by /relay:mode). The marker's existence is what every
     hook checks to decide whether to act — so non-lead/executor sessions stay completely untouched.
@@ -1551,6 +1603,19 @@ def cmd_lead_start(args):
     # working-directory basename when not named explicitly. cwd is where a restored lead reopens.
     cwd = os.getcwd()
     project = getattr(args, "project", None) or os.path.basename(cwd)
+    # Re-arm (e.g. the successor's post-handoff /relay:mode verify) must not clobber handoff/history
+    # state that only the FIRST arm ever sets: `predecessor` (cmd_handoff pre-arms it before this
+    # ever runs) and `started` (should reflect when the lead actually began, not each re-verify).
+    # Read it now (rather than at write_marker time below) so its `predecessor` can also feed the
+    # name-uniqueness exclusion: a handoff successor inherits its predecessor's name on purpose.
+    existing = lead_guard.read_marker(STATE_ROOT, args.session_id)
+    pred_sid = (existing.get("predecessor") or {}).get("session_id")
+    resolved_project, clash_sid = unique_lead_project(
+        project, args.session_id, [pred_sid] if pred_sid else [], lead_guard.list_leads(STATE_ROOT))
+    if resolved_project != project:
+        print(f"NOTE: '{project}' is taken by a live lead ({(clash_sid or '?')[:8]}) — armed as "
+              f"'{resolved_project}' instead.", file=sys.stderr)
+    project = resolved_project
     iterm_session = os.environ.get("TERM_SESSION_ID")  # the lead's own iTerm session ("w#t#p#:UUID")
     # Give the lead tab a stable, relay-controlled title (like executors get) so `relay focus <lead>`
     # and notification click-through can land on it. Rename via /rename into the lead's OWN session,
@@ -1571,10 +1636,6 @@ def cmd_lead_start(args):
                     f.write(iterm.tab_color_escape(color))
             except OSError:
                 pass  # cosmetic — never block arming on a paint failure
-    # Re-arm (e.g. the successor's post-handoff /relay:mode verify) must not clobber handoff/history
-    # state that only the FIRST arm ever sets: `predecessor` (cmd_handoff pre-arms it before this
-    # ever runs) and `started` (should reflect when the lead actually began, not each re-verify).
-    existing = lead_guard.read_marker(STATE_ROOT, args.session_id)
     lead_guard.write_marker(STATE_ROOT, args.session_id, model=args.model,
                             iterm_session=iterm_session, project=project, cwd=cwd,
                             tab_label=tab_label, color=color,
