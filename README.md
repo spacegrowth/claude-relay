@@ -264,11 +264,12 @@ md, then `/relay:handoff <md>`.
 Heavy session (large transcript, or just wanting a fresh context)? Distill what matters to a
 handoff md — what's in flight, what's reviewed/committed, open questions, next steps — then run
 `/relay:handoff <handoff.md>`. It opens a **pre-armed** successor tab (gate + auto-wake already
-active from turn one), seeds it with a pointer to the handoff file, and steps this session down as
-its final act. Inherited executors adopt automatically on the successor's first `send`/`resume` —
-nothing to re-wire. Once settled, the successor runs `/relay:mode` to verify the pin held (idempotent),
-then asks you whether to close the predecessor's now-unarmed tab — say yes and it runs `relay
-close-predecessor`.
+active from turn one), seeds it with a short pointer at a relay-prepared copy of your handoff file
+(your source md is untouched — relay appends a SUCCESSOR AFTERCARE section to its own copy), and
+steps this session down as its final act. Inherited executors adopt automatically on the
+successor's first `send`/`resume` — nothing to re-wire. Once settled, the successor runs
+`/relay:mode` to verify the pin held (idempotent), then asks you whether to close the predecessor's
+now-unarmed tab — say yes and it runs `relay close-predecessor`.
 
 This is a different tool from `relay resume`/`restart`: **resume/restart is for CRASH
 recovery** (reopens the identical conversation, same context back). **Handoff is for WEIGHT**

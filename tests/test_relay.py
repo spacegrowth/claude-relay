@@ -1726,10 +1726,15 @@ class TestHandoff:
         assert succ["plugin_version"] is not None
         assert "stop_hook_timeout" in succ
         assert cap["session_uuid"] == succ["session_id"]
-        assert str(md) in cap["prompt"]
+        # DELIBERATE spec change #2 (truncation-fix packet): the seed no longer points at the
+        # user's own md — it points at relay's own copy under the successor's lead dir (aftercare
+        # appended there instead of inlined in the prompt; see test_handoff_seed_prompt_is_short_pointer).
+        copy_path = relay.lead_guard.lead_dir(relay.STATE_ROOT, succ["session_id"]) / "handoff.md"
+        assert str(copy_path) in cap["prompt"]
+        assert str(md) not in cap["prompt"]
         # DELIBERATE spec change (aftercare packet): the successor now verifies its own arming via
         # /relay:mode after settling instead of being told never to run it — see
-        # test_handoff_seed_prompt_instructs_verify_and_ask for the full replacement spec.
+        # test_handoff_copy_has_aftercare_section for the full replacement spec.
         assert "do NOT run /relay:mode" not in cap["prompt"]
 
     def test_handoff_steps_caller_down(self, relay, tmp_path, monkeypatch):
@@ -1796,17 +1801,79 @@ class TestHandoff:
         assert pred["tab_label"] == "[Lead] webapp"
         assert pred["iterm_session"] == "w1t1p0:OLD"
 
-    def test_handoff_seed_prompt_instructs_verify_and_ask(self, relay, tmp_path, monkeypatch):
+    def test_handoff_seed_prompt_is_short_pointer(self, relay, tmp_path, monkeypatch):
+        # REGRESSION PIN (live incident, tonight): the seed prompt inlined the full aftercare text
+        # WITH the pinned UUID twice, and the typed launch command (cd + tab-color printf +
+        # pidfile + iterm_id + `exec claude --session-id <uuid> '<seed>'`) truncated mid-string —
+        # visible cutoff at "relay stop f268fe91-fdbc-4fb8-a04" — leaving an unbalanced quote, zsh
+        # fell into its `quote>` continuation prompt, and the successor never launched. The seed
+        # must now be a short pointer at a file, not an inlined instruction block.
+        #
+        # STATE_ROOT is repointed to a short tmp dir (not the `relay` fixture's deep pytest
+        # tmp_path, which nests the full test id and would inflate the copy path length well past
+        # any real ~/.relay-tasks/lead/<uuid>/handoff.md — that's a pytest artifact, not something
+        # the 300-char budget is meant to absorb).
+        import tempfile
+        short_root = Path(tempfile.mkdtemp(prefix="rl-")) / ".relay-tasks"
+        monkeypatch.setattr(relay, "STATE_ROOT", short_root)
+        monkeypatch.setattr(relay, "LEDGER", short_root / "sessions.jsonl")
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
         self._env(monkeypatch, "lead-1")
         md = self._md(tmp_path)
         cap = self._run(relay, md)
         prompt = cap["prompt"]
-        assert "/relay:mode" in prompt
-        assert cap["session_uuid"] in prompt
-        assert "relay stop" in prompt
-        assert "close-predecessor" in prompt
-        assert "do NOT run /relay:mode" not in prompt
+        assert len(prompt) < 300, f"seed prompt is {len(prompt)} chars — must stay a short pointer: {prompt!r}"
+        copy_path = relay.lead_guard.lead_dir(relay.STATE_ROOT, cap["session_uuid"]) / "handoff.md"
+        assert str(copy_path) in prompt
+        # The uuid appears exactly ONCE, as the copy path's directory name (the same structural
+        # convention as marker.json/pid/iterm_id under lead_dir(sid) — not something worth avoiding).
+        # What actually caused the truncation, and what must NOT reappear, is the aftercare text
+        # being inlined a second time alongside it (the old prompt used the pin in two separate
+        # sentences — "matches the pinned '<uuid>'" AND "relay stop <uuid>" — a much longer string).
+        assert prompt.count(cap["session_uuid"]) == 1
+        assert "relay stop" not in prompt   # aftercare content lives in the copy file now, not here
+
+    def test_handoff_copy_contains_user_content(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        md = self._md(tmp_path, text="what's in flight: the parser rewrite. next: wire the CLI.")
+        cap = self._run(relay, md)
+        copy_path = relay.lead_guard.lead_dir(relay.STATE_ROOT, cap["session_uuid"]) / "handoff.md"
+        copy_text = copy_path.read_text()
+        assert copy_text.startswith("what's in flight: the parser rewrite. next: wire the CLI.")
+
+    def test_handoff_copy_has_aftercare_section(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        md = self._md(tmp_path)
+        cap = self._run(relay, md)
+        copy_path = relay.lead_guard.lead_dir(relay.STATE_ROOT, cap["session_uuid"]) / "handoff.md"
+        copy_text = copy_path.read_text()
+        assert "SUCCESSOR AFTERCARE" in copy_text
+        assert "/relay:mode" in copy_text
+        assert cap["session_uuid"] in copy_text
+        assert "relay stop" in copy_text
+        assert "close-predecessor" in copy_text
+        assert "do NOT run /relay:mode" not in copy_text
+
+    def test_handoff_copy_write_failure_preserves_caller(self, relay, tmp_path, monkeypatch):
+        # Same invariant as a failed spawn: writing the relay-owned copy is on the critical path
+        # BEFORE the successor's tab exists, so a failure there must leave the caller as lead and
+        # drop no ghost marker either.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        md = self._md(tmp_path)
+        # Fails specifically the try/except around the copy write (build_handoff_copy is the last
+        # thing called before handoff_copy_path.write_text) — NOT the earlier pre-arm write_marker
+        # call, which must still succeed so this stays an isolated "copy write fails" case.
+        with mock.patch.object(relay, "build_handoff_copy", side_effect=OSError("disk full")), \
+             mock.patch.object(relay.iterm, "spawn") as spawn_mock:
+            with pytest.raises(SystemExit):
+                relay.cmd_handoff(SimpleNamespace(handoff_md=str(md), project=None, model=None))
+            spawn_mock.assert_not_called()
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1") != {}   # caller intact
+        successors = [sid for sid in self._leads(relay) if sid != "lead-1"]
+        assert successors == []                                                # no ghost
 
 
 class TestClosePredecessor:

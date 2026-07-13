@@ -193,9 +193,12 @@ under each step instead.
    caller as lead and drops the pre-written successor marker, so the project is **never leadless,
    never left with a ghost**.
 5. **Successor leads, pre-armed** — inherited executors don't need any explicit re-wiring: the
-   successor's first `send`/`resume` into one adopts it automatically (§3). Once settled, the
-   successor runs `/relay:mode` to VERIFY arming (idempotent if the pin held); the predecessor's
-   tab is recorded in the successor's marker and closed, on user approval, via `relay
+   successor's first `send`/`resume` into one adopts it automatically (§3). Its seed prompt is a
+   short pointer at a relay-owned copy of the handoff file (`build_handoff_copy`), with a SUCCESSOR
+   AFTERCARE section appended — the user's source md is untouched, and the launch prompt stays a
+   one-liner (a prior revision inlined the aftercare directly and truncated a real launch command).
+   Once settled, the successor runs `/relay:mode` to VERIFY arming (idempotent if the pin held); the
+   predecessor's tab is recorded in the successor's marker and closed, on user approval, via `relay
    close-predecessor`.
 
 **The abnormal path.** A lead whose tab crashed or was closed without `/relay:stop` leaves a marker

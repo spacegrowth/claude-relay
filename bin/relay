@@ -96,6 +96,28 @@ AFTER writing your report, run:
 (generates your staged-diff review page; do not open it, do not attach it anywhere — just run it once)
 """
 
+AFTERCARE_FOOTER = """
+
+---
+(relay — SUCCESSOR AFTERCARE; do not remove)
+You were pre-armed by relay handoff under pinned session id {successor_sid}.
+1. VERIFY ARMING once you've settled: run /relay:mode — idempotent if your session id matches the
+   pin; it arms your REAL id if the pin didn't hold. If your id differs from {successor_sid}, also
+   run: relay stop {successor_sid}   (clears the orphaned pre-armed marker).
+2. THE PREDECESSOR'S TAB: its identity is recorded in your marker. ASK the user whether to close
+   it; on their go run: relay close-predecessor . Never close it unasked.
+3. Your first send/resume of an inherited executor adopts it automatically.
+"""
+
+
+def build_handoff_copy(body, successor_sid):
+    """The relay-owned handoff.md a successor actually reads: the user's authored content
+    unmodified, plus an appended SUCCESSOR AFTERCARE section — same relationship as
+    build_packet/TEMPLATE_FOOTER. Written under the successor's OWN lead dir so the user's source
+    file is never touched, and the seed prompt can stay a short pointer at this copy instead of
+    inlining the aftercare (see cmd_handoff's truncation postmortem)."""
+    return body.rstrip() + AFTERCARE_FOOTER.format(successor_sid=successor_sid)
+
 
 def path_to_file_url(path):
     """Convert an absolute path to a file:// URL with proper encoding."""
@@ -1538,13 +1560,18 @@ def cmd_lead_start(args):
 def cmd_handoff(args):
     """One-command lead succession: spawn a successor lead tab PRE-ARMED (its marker written for a
     pinned session id before its first turn — same trick `cmd_spawn` already uses to pin an
-    executor's Claude session id via `session_uuid`), seeded with a handoff file the outgoing lead
-    wrote, then step the outgoing lead down as the final act. Its gate + auto-wake are active from
-    turn one; the successor still runs /relay:mode after settling, but only to VERIFY the pin held
-    (idempotent) rather than to arm from scratch (mirrors cmd_resume_lead's nudge). The
-    predecessor's tab identity travels in the successor's marker (`predecessor` field) so it can be
-    closed later via `relay close-predecessor`, once the user says go. Inherited executors re-parent
-    automatically on the successor's first send/resume (adopt-on-claim) — nothing to wire here."""
+    executor's Claude session id via `session_uuid`), seeded with a SHORT POINTER at a relay-owned
+    copy of the outgoing lead's handoff file (the copy has a SUCCESSOR AFTERCARE section appended,
+    build_packet-style — see build_handoff_copy), then step the outgoing lead down as the final
+    act. Its gate + auto-wake are active from turn one; the aftercare section tells the successor to
+    run /relay:mode after settling only to VERIFY the pin held (idempotent), not to arm from
+    scratch (mirrors cmd_resume_lead's nudge), and names the predecessor-tab-close flow (`relay
+    close-predecessor`, only on user go). LIVE-INCIDENT FIX: an earlier revision inlined that whole
+    aftercare block (with the pinned UUID twice) directly into the seed prompt — the typed launch
+    command truncated mid-string on a real run, corrupting the shell. build_pointer_message's
+    fragility rule (short pointer, content lives in a file) applies here too now. Inherited
+    executors re-parent automatically on the successor's first send/resume (adopt-on-claim) —
+    nothing to wire here."""
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if not caller or not lead_guard.is_lead(STATE_ROOT, caller):
         sys.exit("handoff: caller isn't an armed lead — run /relay:mode first")
@@ -1576,14 +1603,23 @@ def cmd_handoff(args):
                             predecessor=predecessor)
     lead_guard.write_head(STATE_ROOT, successor_sid, lead_guard.git_head(cwd))
 
+    # Relay-owned copy of the handoff file, aftercare appended — see build_handoff_copy. The user's
+    # source md is never modified (same relationship as packet source → packets/NNN-packet.md).
+    # Writing it is treated exactly like a failed spawn below: it must NOT leave the pre-written
+    # successor marker behind as an unreachable ghost, and must NOT step the caller down.
+    handoff_copy_path = lead_guard.lead_dir(STATE_ROOT, successor_sid) / "handoff.md"
+    try:
+        handoff_copy_path.write_text(build_handoff_copy(handoff_path.read_text(), successor_sid))
+    except Exception as e:
+        lead_guard.clear_lead(STATE_ROOT, successor_sid)  # best-effort — drop the pre-written ghost
+        sys.exit(f"handoff: failed to write successor's handoff copy ({e}) — this session remains "
+                 f"lead; nothing was stepped down.")
+
+    # SHORT POINTER ONLY — see build_pointer_message's fragility rule and cmd_handoff's docstring:
+    # a prior revision inlined the full aftercare (with the pinned UUID twice) here and the typed
+    # launch command truncated mid-seed on a real run, corrupting the shell.
     seed = (f"You are the successor lead for project '{project}', pre-armed by relay handoff. Read "
-            f"the handoff at {handoff_path}, run /relay:list to see what's in flight, and once "
-            f"you've settled: (1) run /relay:mode to VERIFY arming — idempotent if your session id "
-            f"matches the pinned '{successor_sid}', and it arms your REAL id if the pin didn't "
-            f"hold; if your id differs from '{successor_sid}', also run `relay stop {successor_sid}` "
-            f"to clear the orphaned pre-armed marker; (2) ASK the user whether to close the previous "
-            f"lead's tab, and on their go run `relay close-predecessor` — never close it unasked. "
-            f"Your first send/resume of an inherited executor adopts it automatically.")
+            f"{handoff_copy_path} and follow its SUCCESSOR AFTERCARE section before anything else.")
 
     # never leave the project leadless; never leave a ghost on failure: a failed spawn must NOT
     # step the caller down (it's still the only live lead), and must NOT leave the successor's
