@@ -552,6 +552,108 @@ class TestUserPromptLeadStateHook:
         assert p.returncode == 0
 
 
+class TestExecutorEscalationHook:
+    """Drive hooks/executor_escalation.py exactly as Claude Code would (JSON on stdin, tmp HOME).
+    Gating/fail-open cases return before the grace sleep, so they're fast; the one live-loop case
+    shrinks grace/poll_interval via config, matching TestStopHookBackgroundPoll's convention for
+    stop_lead_watch.py."""
+
+    def _executor(self, root, sid="exec-1", packet=1, owner_lead=None, report=True, status="busy"):
+        d = root / sid
+        (d / "packets").mkdir(parents=True)
+        (d / "session.json").write_text(json.dumps({
+            "session_id": sid, "current_packet": packet, "status": status, "owner_lead": owner_lead,
+        }))
+        if report:
+            (d / "packets" / f"{packet:03d}-report.md").write_text("done")
+
+    def _run(self, home, payload, timeout=10):
+        import subprocess
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "executor_escalation.py")],
+            input=json.dumps(payload), capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "HOME": str(home), "RELAY_NO_NOTIFY": "1"})
+        return p.returncode
+
+    def test_non_executor_session_is_silent(self, tmp_path):
+        assert self._run(tmp_path, {"session_id": "nobody"}) == 0
+
+    def test_no_report_yet_is_silent(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        self._executor(root, report=False)
+        assert self._run(tmp_path, {"session_id": "exec-1"}) == 0
+
+    def test_kill_switch_off_is_silent(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        self._executor(root, owner_lead="lead-1")
+        (root / "lead").mkdir(parents=True, exist_ok=True)
+        (root / "lead" / "config.json").write_text(json.dumps({"executor_escalation": False}))
+        assert self._run(tmp_path, {"session_id": "exec-1"}) == 0
+
+    def test_bad_payload_fails_open(self, tmp_path):
+        import subprocess
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "executor_escalation.py")],
+            input="not json", capture_output=True, text=True, timeout=10,
+            env={**os.environ, "HOME": str(tmp_path), "RELAY_NO_NOTIFY": "1"})
+        assert p.returncode == 0
+
+    def test_already_resolved_marks_ledger_and_exits(self, tmp_path):
+        # Zero grace/short interval so the loop's first tick fires almost immediately.
+        root = tmp_path / ".relay-tasks"
+        self._executor(root, owner_lead="lead-1")
+        lg.write_marker(root, "lead-1")
+        lg.mark_surfaced(root, "lead-1", ["exec-1:1"])
+        (root / "lead" / "config.json").write_text(json.dumps({
+            "executor_escalation_grace_seconds": 0, "executor_escalation_poll_interval": 1,
+            "executor_escalation_max_runtime_seconds": 5,
+        }))
+        rc = self._run(tmp_path, {"session_id": "exec-1"}, timeout=10)
+        assert rc == 0
+        assert lg.load_escalation(root, "exec-1")["1"]["resolved"] is True
+
+    def test_second_poller_does_not_stack(self, tmp_path):
+        import subprocess
+        import time
+        root = tmp_path / ".relay-tasks"
+        self._executor(root, owner_lead="lead-1")
+        lg.write_marker(root, "lead-1")
+        lg.stamp_lead_state(root, "lead-1", "busy")  # "wait" — first poller keeps running
+        (root / "lead" / "config.json").write_text(json.dumps({
+            "executor_escalation_grace_seconds": 0, "executor_escalation_poll_interval": 1,
+            "executor_escalation_max_runtime_seconds": 8,
+        }))
+        p1 = subprocess.Popen(
+            ["python3", str(REPO_ROOT / "hooks" / "executor_escalation.py")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            env={**os.environ, "HOME": str(tmp_path), "RELAY_NO_NOTIFY": "1"})
+        p1.stdin.write(json.dumps({"session_id": "exec-1"}))
+        p1.stdin.close()
+        time.sleep(1.5)  # p1 holds the escalation lock
+        rc2 = self._run(tmp_path, {"session_id": "exec-1"}, timeout=8)
+        assert rc2 == 0  # second poller saw the lock and bailed immediately
+        p1.terminate()
+        try:
+            p1.wait(timeout=5)
+        except Exception:
+            p1.kill()
+
+    def test_unowned_notifies_human_not_lead(self, tmp_path):
+        # No owner_lead at all -> "unowned": must go straight to notify, never call nudge-lead.
+        import time
+        root = tmp_path / ".relay-tasks"
+        self._executor(root, owner_lead=None)
+        (root / "lead").mkdir(parents=True, exist_ok=True)
+        (root / "lead" / "config.json").write_text(json.dumps({
+            "executor_escalation_grace_seconds": 0, "executor_escalation_poll_interval": 1,
+            "executor_escalation_max_runtime_seconds": 3,
+        }))
+        assert self._run(tmp_path, {"session_id": "exec-1"}, timeout=10) == 0
+        ledger = lg.load_escalation(root, "exec-1")
+        assert ledger["1"]["last_action"] == "notify"
+        assert ledger["1"]["attempts"] >= 1
+
+
 # ---- bin/relay commands driving the above ------------------------------------------------------
 
 class TestRelayLeadCommands:
@@ -814,6 +916,141 @@ class TestOwnershipScoping:
         assert [f[1] for f in lg.new_reports_for(root, "lead-B")] == ["exec-b"]  # B: only B's
         # Explicitly: lead A's new_reports_for EXCLUDES lead B's executor.
         assert "exec-b" not in {f[1] for f in lg.new_reports_for(root, "lead-A")}
+
+
+class TestEscalationDecision:
+    """lg.escalation_decision: the wake-watch §4.1 decision tree, pure given on-disk marker/surfaced
+    state — unowned/owner-missing/resolved/nudge(idle)/wait(busy)/stale(stale-busy)."""
+
+    def test_unowned_has_no_owner(self, root):
+        assert lg.escalation_decision(root, "exec-1", 1, owner_lead=None) == "unowned"
+
+    def test_owner_missing_marker_gone(self, root):
+        # owner_lead is set but no marker exists for it (crashed/closed/pruned lead).
+        assert lg.escalation_decision(root, "exec-1", 1, owner_lead="ghost-lead") == "owner-missing"
+
+    def test_resolved_when_already_surfaced(self, root):
+        lg.write_marker(root, "lead-1")
+        lg.mark_surfaced(root, "lead-1", ["exec-1:1"])
+        assert lg.escalation_decision(root, "exec-1", 1, owner_lead="lead-1") == "resolved"
+
+    def test_nudge_when_owner_idle(self, root):
+        lg.write_marker(root, "lead-1")
+        lg.stamp_lead_state(root, "lead-1", "idle")
+        assert lg.escalation_decision(root, "exec-1", 1, owner_lead="lead-1") == "nudge"
+
+    def test_nudge_when_owner_has_no_state_yet(self, root):
+        lg.write_marker(root, "lead-1")  # no state stamped yet → idle by default
+        assert lg.escalation_decision(root, "exec-1", 1, owner_lead="lead-1") == "nudge"
+
+    def test_wait_when_owner_busy(self, root):
+        lg.write_marker(root, "lead-1")
+        lg.stamp_lead_state(root, "lead-1", "busy")
+        assert lg.escalation_decision(root, "exec-1", 1, owner_lead="lead-1") == "wait"
+
+    def test_stale_when_owner_busy_stamp_is_old(self, root):
+        lg.write_marker(root, "lead-1")
+        m = lg.read_marker(root, "lead-1")
+        m["state"] = "busy"
+        m["state_since"] = "2000-01-01T00:00:00"  # long, long ago
+        lg.marker_path(root, "lead-1").write_text(json.dumps(m))
+        assert lg.escalation_decision(root, "exec-1", 1, owner_lead="lead-1") == "stale"
+
+    def test_different_packet_numbers_are_independent(self, root):
+        # Surfacing packet 1 must not resolve packet 2's escalation for the same executor.
+        lg.write_marker(root, "lead-1")
+        lg.mark_surfaced(root, "lead-1", ["exec-1:1"])
+        assert lg.escalation_decision(root, "exec-1", 1, owner_lead="lead-1") == "resolved"
+        assert lg.escalation_decision(root, "exec-1", 2, owner_lead="lead-1") == "nudge"
+
+
+class TestEscalationLedger:
+    """The executor's OWN escalation-state ledger — separate from the lead's surfaced_reports.json
+    (design §4.4), so the executor's 'I notified/nudged' bookkeeping never suppresses the lead's own
+    announcement when the human returns."""
+
+    def test_missing_ledger_is_empty_dict(self, root):
+        assert lg.load_escalation(root, "exec-1") == {}
+
+    def test_round_trip(self, root):
+        lg.save_escalation(root, "exec-1", {"1": {"attempts": 2, "last_action": "nudge"}})
+        assert lg.load_escalation(root, "exec-1") == {"1": {"attempts": 2, "last_action": "nudge"}}
+
+    def test_separate_from_surfaced_reports(self, root):
+        # The capstone assertion for design §4.4: writing the executor's OWN ledger must not touch
+        # (or be confused with) the owning lead's surfaced_reports.json.
+        lg.write_marker(root, "lead-1")
+        lg.mark_surfaced(root, "lead-1", ["exec-1:1"])
+        lg.save_escalation(root, "exec-1", {"1": {"attempts": 1, "last_action": "notify"}})
+        # The lead's surfaced set is untouched by the executor's ledger write.
+        assert lg.load_surfaced(root, "lead-1") == {"exec-1:1"}
+        # And the executor's ledger lives at a distinct path from the lead's surfaced_reports.json.
+        assert lg._escalation_path(root, "exec-1") != lg._surfaced_path(root, "lead-1")
+        assert lg.load_escalation(root, "exec-1") == {"1": {"attempts": 1, "last_action": "notify"}}
+
+
+class TestEscalationLock:
+    """acquire/heartbeat/release_escalation_lock — same mechanics as the lead's poll.lock (shared
+    _acquire_lock/_heartbeat_lock/_release_lock), scoped per-executor."""
+
+    def test_acquire_then_second_call_fails(self, root):
+        assert lg.acquire_escalation_lock(root, "exec-1") is True
+        assert lg.acquire_escalation_lock(root, "exec-1") is False
+
+    def test_release_then_reacquire_succeeds(self, root):
+        lg.acquire_escalation_lock(root, "exec-1")
+        lg.release_escalation_lock(root, "exec-1")
+        assert lg.acquire_escalation_lock(root, "exec-1") is True
+
+    def test_stale_lock_is_reclaimed(self, root, monkeypatch):
+        lg.acquire_escalation_lock(root, "exec-1")
+        # Simulate a dead holder: patch _pid_alive False so the lock reads as stale.
+        monkeypatch.setattr(lg, "_pid_alive", lambda pid: False)
+        assert lg.acquire_escalation_lock(root, "exec-1") is True
+
+
+class TestEscalationSettings:
+    """build_escalation_settings / write_escalation_settings — the `--settings` file that arms an
+    EXECUTOR with the escalation Stop hook (executors get NO hooks by default)."""
+
+    def test_settings_shape_registers_asyncrewake_stop_hook(self, tmp_path):
+        settings = lg.build_escalation_settings(str(tmp_path), timeout=1234)
+        hook = settings["hooks"]["Stop"][0]["hooks"][0]
+        assert hook["command"] == str(tmp_path / "hooks" / "executor_escalation.py")
+        assert hook["asyncRewake"] is True
+        assert hook["timeout"] == 1234
+
+    def test_write_creates_file_and_returns_path(self, root, tmp_path):
+        p = lg.write_escalation_settings(root, str(tmp_path))
+        assert p is not None
+        content = json.loads(Path(p).read_text())
+        assert content["hooks"]["Stop"][0]["hooks"][0]["asyncRewake"] is True
+
+    def test_write_refreshes_on_repeat_call(self, root, tmp_path):
+        lg.write_escalation_settings(root, str(tmp_path / "v1"))
+        p = lg.write_escalation_settings(root, str(tmp_path / "v2"))
+        content = json.loads(Path(p).read_text())
+        assert "v2" in content["hooks"]["Stop"][0]["hooks"][0]["command"]
+
+
+class TestEscalationHookBackoffCap:
+    """hooks/executor_escalation.py's own _next_backoff — pure, imported directly (the file HAS a
+    .py extension, unlike bin/relay, so a normal importlib load works). Confirms the widening
+    backoff (60s -> 5m -> 15m) caps at the schedule's last value rather than growing unbounded."""
+
+    @pytest.fixture
+    def hook_mod(self):
+        import importlib.util
+        path = str(REPO_ROOT / "hooks" / "executor_escalation.py")
+        spec = importlib.util.spec_from_file_location("executor_escalation_test_import", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_backoff_widens_then_caps(self, hook_mod):
+        seq = [hook_mod._next_backoff(a) for a in range(6)]
+        assert seq == [60, 300, 900, 900, 900, 900]
+        assert seq == hook_mod.BACKOFF_SCHEDULE_SECONDS + [900, 900, 900]
 
 
 # ---- lead heartbeat ----------------------------------------------------------------------------

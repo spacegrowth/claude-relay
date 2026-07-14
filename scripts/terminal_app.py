@@ -37,16 +37,18 @@ def _wid(handle):
 
 def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_delay=1.5,
           env_prefix="", iterm_id_file=None, session_uuid=None, resume_id=None, tab_color=None,
-          lead_handle=None, layout="tab"):
+          lead_handle=None, layout="tab", settings_file=None):
     """New Terminal WINDOW running the standard launch chain (cd → pidfile via $$ → exec claude).
     Writes "twid:<window id>" to `iterm_id_file` — the handle every later operation uses — then
     best-effort sets the tab's custom title to `label` (cosmetic only; addressing never relies on
     it). `tab_color` ignored (Terminal.app has no tab colors). `rename_delay` unused (no post-start
     /rename dance needed — the custom title is Terminal chrome, not Claude's OSC title).
     `lead_handle` ignored (Terminal.app addresses by window, not adjacent tabs — n/a here).
-    `layout` ignored (Terminal.app has no split-pane scripting surface — always a new window)."""
+    `layout` ignored (Terminal.app has no split-pane scripting surface — always a new window).
+    `settings_file` passed straight through to build_claude_cmd (same meaning as iTerm's backend)."""
     base = build_claude_cmd(prompt, model=model, skip_perms=skip_perms,
-                            session_uuid=session_uuid, resume_id=resume_id)
+                            session_uuid=session_uuid, resume_id=resume_id,
+                            settings_file=settings_file)
     cmd = f"cd {shlex.quote(cwd)} && {env_prefix}echo $$ > {shlex.quote(pidfile)} && exec {base}"
     # The window id must be derived from the RETURNED tab itself — "front window" races with any
     # window that is mid-close (observed live: it returned the closing window's id). A tab has no

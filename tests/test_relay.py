@@ -324,6 +324,46 @@ class TestSpawnSkipPerms:
         assert self._run(relay, tmp_path, skip_perms=True)["skip_perms"] is True   # flag on, no config
 
 
+class TestSpawnExecutorEscalation:
+    """cmd_spawn arms the executor-side wake escalation Stop hook (wake-watch design §4) via
+    `--settings` — executors get no hooks by default, so bin/relay must generate and pass this file
+    explicitly at spawn time. iterm.spawn/auto_trust/read_pid mocked; no real iTerm touched."""
+
+    def _run(self, relay, tmp_path, cfg=None):
+        pkt = tmp_path / "packet.md"; pkt.write_text("do the thing")
+        if cfg is not None:
+            (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+            (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps(cfg))
+        captured = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: captured.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt),
+                model=None, name="s1", scope=None, skip_perms=None, pane=None))
+        return captured
+
+    def test_settings_file_present_and_points_at_escalation_hook(self, relay, tmp_path):
+        cap = self._run(relay, tmp_path)
+        settings_file = cap.get("settings_file")
+        assert settings_file is not None
+        content = json.loads(Path(settings_file).read_text())
+        hook = content["hooks"]["Stop"][0]["hooks"][0]
+        assert hook["command"].endswith("hooks/executor_escalation.py")
+        assert hook["asyncRewake"] is True
+
+    def test_kill_switch_omits_settings_file(self, relay, tmp_path):
+        cap = self._run(relay, tmp_path, cfg={"executor_escalation": False})
+        assert cap.get("settings_file") is None
+
+    def test_build_claude_cmd_includes_settings_flag(self, relay, tmp_path):
+        # End-to-end through the real (unmocked) build_claude_cmd: --settings actually lands in the
+        # launched command line, pointed at the written file.
+        settings_path = relay.lead_guard.write_escalation_settings(
+            relay.STATE_ROOT, relay._plugin_root())
+        cmd = relay.iterm.build_claude_cmd("do the thing", settings_file=settings_path)
+        assert f"--settings {settings_path}" in cmd
+
+
 class TestSpawnLayout:
     """cmd_spawn's pane-vs-tab decision: --pane/--tab wins, else config default (executor_layout,
     default "tab") — same tri-state pattern as TestSpawnSkipPerms. iterm.spawn/auto_trust/read_pid

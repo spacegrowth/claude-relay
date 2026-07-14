@@ -72,6 +72,22 @@ def _stall_threshold_seconds():
 
 RELAY_BIN = str(Path(__file__).resolve())
 
+# `--settings` timeout for the executor escalation Stop hook (wake-watch design §4) — comfortably
+# above its grace + backoff sleeping, same lesson as the lead's own Stop hook timeout (see
+# docs/async-rewake-executor-findings.md).
+EXECUTOR_ESCALATION_TIMEOUT_SECONDS = 1900
+
+
+def _maybe_escalation_settings_file():
+    """The `--settings` file to launch an executor with (arms hooks/executor_escalation.py), or
+    None if the config kill-switch is off or the settings file couldn't be written — a write
+    failure must degrade to spawning WITHOUT escalation armed, never block the spawn itself."""
+    cfg = lead_guard.load_config(STATE_ROOT)
+    if not cfg.get("executor_escalation", True):
+        return None
+    return lead_guard.write_escalation_settings(STATE_ROOT, _plugin_root(),
+                                                timeout=EXECUTOR_ESCALATION_TIMEOUT_SECONDS)
+
 TEMPLATE_FOOTER = """
 
 ---
@@ -473,6 +489,10 @@ def cmd_spawn(args):
     owner_project = owner_marker.get("project")
     tab_color = owner_marker.get("color") if cfg.get("tab_colors", True) else None
 
+    # Arm the executor-side wake escalation (wake-watch design §4): a plain `claude` launch gets NO
+    # hooks, so this executor only gets the escalation Stop hook if we pass it explicitly here.
+    settings_file = _maybe_escalation_settings_file()
+
     iterm.spawn(
         cwd=worktree,
         prompt=build_pointer_message(str(packet_path), packet_summary(body)),
@@ -483,6 +503,7 @@ def cmd_spawn(args):
         iterm_id_file=str(iterm_id_path(session_id)),
         session_uuid=claude_session,
         tab_color=tab_color,
+        settings_file=settings_file,
         lead_handle=owner_marker.get("iterm_session"),
         layout=layout,
     )
@@ -563,6 +584,9 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
         session_uuid=session_uuid,
         resume_id=resume_id,
         tab_color=tab_color,
+        settings_file=_maybe_escalation_settings_file(),  # re-arm escalation on the fresh tab too —
+                                                          # a resumed/restarted executor must not
+                                                          # silently lose wake coverage
     )
     pid = read_pid(session_id)
     s["pid"] = pid

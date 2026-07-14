@@ -116,11 +116,18 @@ def is_alive(label, handle=None, pid=None):
     return title_is_live(label, live_session_names())
 
 
-def build_claude_cmd(prompt, model=None, skip_perms=False, session_uuid=None, resume_id=None):
+def build_claude_cmd(prompt, model=None, skip_perms=False, session_uuid=None, resume_id=None,
+                     settings_file=None):
     """The `claude …` invocation both backends launch. resume_id reopens an existing conversation
     (no --model — the session already has one); otherwise a fresh session, optionally pinned to
-    session_uuid so relay can `--resume` it later without scraping transcripts."""
+    session_uuid so relay can `--resume` it later without scraping transcripts.
+
+    settings_file: path to a `--settings` JSON file — how an EXECUTOR gets hooks at all (a plain
+    `claude` launch has none; the lead gets its hooks from the plugin instead). Used to arm the
+    wake-watch executor-escalation Stop hook (lead_guard.write_escalation_settings)."""
     base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
+    if settings_file:
+        base += " --settings " + shlex.quote(settings_file)
     if resume_id:
         base += " --resume " + shlex.quote(resume_id)
     else:
@@ -345,7 +352,7 @@ def _match_session_block(label, action):
 
 def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_delay=1.5, env_prefix="",
           iterm_id_file=None, session_uuid=None, resume_id=None, tab_color=None, lead_handle=None,
-          layout="tab"):
+          layout="tab", settings_file=None):
     """Open a new iTerm tab (or pane), cd into `cwd`, launch `claude [--model X] <prompt>`, then
     (after a delay for claude to finish starting) send `/rename <label>` into the SAME session —
     one AppleScript call holding a single `targetSession` reference throughout, so there's no race
@@ -383,9 +390,13 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     `env_prefix` is a test-only hook (default "", no effect on real usage): a shell fragment
     prepended before the PID-capture step, e.g. `'PATH="/tmp/fakebin:$PATH" '` to scope a stub
     `claude` binary to just this one spawned command, without touching the real system PATH.
+
+    `settings_file`: passed straight through to build_claude_cmd's `--settings` — how an executor
+    gets ANY hooks at all (see that function's docstring).
     """
     base = build_claude_cmd(prompt, model=model, skip_perms=skip_perms,
-                            session_uuid=session_uuid, resume_id=resume_id)
+                            session_uuid=session_uuid, resume_id=resume_id,
+                            settings_file=settings_file)
     # Record the new session's own iTerm id (ITERM_SESSION_ID, set in the interactive iTerm shell;
     # fall back to TERM_SESSION_ID) into a file BEFORE exec replaces the shell — the handle used by
     # the rename-retry (_ensure_tab_label) and the lead tab-color path. Best-effort; empty var →
