@@ -886,6 +886,61 @@ class TestFocus:
             relay.cmd_focus(SimpleNamespace(session_id="nope"))
 
 
+class TestNudgeLead:
+    """cmd_nudge_lead: `relay send` pointed at a LEAD's own tab (wake-watch design §4.0). Guarded by
+    lead_guard.lead_turn_state — refuses on busy/stale-busy, proceeds only on idle. iterm.send
+    mocked (no real AppleScript)."""
+
+    def _lead(self, relay, sid="lead-1", tab_label="[Lead] alpha", state=None, state_since=None):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, sid, project="alpha", tab_label=tab_label)
+        if state is not None:
+            m = relay.lead_guard.read_marker(relay.STATE_ROOT, sid)
+            m["state"] = state
+            if state_since is not None:
+                m["state_since"] = state_since
+            relay.lead_guard.marker_path(relay.STATE_ROOT, sid).write_text(json.dumps(m))
+
+    def test_idle_lead_gets_nudged(self, relay):
+        self._lead(relay, state="idle")
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+            relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="wake up"))
+        send.assert_called_once_with("[Lead] alpha", "wake up", None)
+
+    def test_no_state_defaults_idle_and_nudges(self, relay):
+        self._lead(relay)  # no state stamped yet → idle by default
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+            relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
+        send.assert_called_once()
+
+    def test_busy_lead_refused(self, relay):
+        self._lead(relay, state="busy", state_since=relay.now())
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
+        assert "busy" in str(ei.value)
+        send.assert_not_called()
+
+    def test_stale_busy_lead_refused(self, relay):
+        old = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+        self._lead(relay, state="busy", state_since=old)
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
+        assert "stale" in str(ei.value)
+        send.assert_not_called()
+
+    def test_no_live_tab_reports_no_live_tab(self, relay):
+        self._lead(relay, state="idle")
+        with mock.patch.object(relay.iterm, "send", return_value=False):
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
+        assert "no-live-tab" in str(ei.value)
+
+    def test_unknown_lead_errors(self, relay):
+        with pytest.raises(SystemExit):
+            relay.cmd_nudge_lead(SimpleNamespace(lead="nope", message="hi"))
+
+
 class TestCloseTab:
     """cmd_close now kills the executor's process and closes its iTerm tab (report's on disk). Mocks
     iterm.close / pid_alive / os.kill / time.sleep — no real iTerm or signals."""

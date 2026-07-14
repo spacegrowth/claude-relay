@@ -228,6 +228,72 @@ class TestLeadState:
         assert not lg.lead_dir(root, "sess-1").exists()
 
 
+class TestLeadTurnState:
+    """lead_turn_state: pure, from a marker dict + a fixed now_ts — idle/busy/stale-busy per
+    wake-watch design §4.2. stamp_lead_state is the read-modify-write half that produces the
+    `state`/`state_since` fields this consumes."""
+
+    def test_no_marker_is_idle(self):
+        assert lg.lead_turn_state({}) == "idle"
+        assert lg.lead_turn_state(None) == "idle"
+
+    def test_state_idle_is_idle(self):
+        assert lg.lead_turn_state({"state": "idle"}) == "idle"
+
+    def test_missing_state_defaults_idle(self):
+        assert lg.lead_turn_state({"session_id": "lead-1"}) == "idle"
+
+    def test_busy_within_window_is_busy(self):
+        marker = {"state": "busy", "state_since": "2026-01-01T12:00:00"}
+        now_ts = time.mktime(time.strptime("2026-01-01T12:02:00", "%Y-%m-%dT%H:%M:%S"))
+        assert lg.lead_turn_state(marker, now_ts=now_ts) == "busy"
+
+    def test_busy_past_window_is_stale_busy(self):
+        marker = {"state": "busy", "state_since": "2026-01-01T12:00:00"}
+        now_ts = time.mktime(time.strptime("2026-01-01T12:10:00", "%Y-%m-%dT%H:%M:%S"))
+        assert lg.lead_turn_state(marker, now_ts=now_ts) == "stale-busy"
+
+    def test_busy_missing_state_since_is_stale_busy(self):
+        assert lg.lead_turn_state({"state": "busy"}) == "stale-busy"
+
+    def test_busy_unparseable_state_since_is_stale_busy(self):
+        marker = {"state": "busy", "state_since": "not-a-timestamp"}
+        assert lg.lead_turn_state(marker) == "stale-busy"
+
+    def test_exactly_at_boundary_is_still_busy(self):
+        marker = {"state": "busy", "state_since": "2026-01-01T12:00:00"}
+        boundary = time.mktime(time.strptime("2026-01-01T12:00:00", "%Y-%m-%dT%H:%M:%S")) \
+            + lg.LEAD_BUSY_STALE_SECONDS
+        assert lg.lead_turn_state(marker, now_ts=boundary) == "busy"
+
+
+class TestStampLeadState:
+    def test_stamps_state_and_since(self, root, monkeypatch):
+        lg.write_marker(root, "lead-1")
+        monkeypatch.setattr(lg, "now", lambda: "2026-01-01T12:00:00")
+        lg.stamp_lead_state(root, "lead-1", "busy")
+        m = lg.read_marker(root, "lead-1")
+        assert m["state"] == "busy"
+        assert m["state_since"] == "2026-01-01T12:00:00"
+
+    def test_no_marker_is_noop(self, root):
+        lg.stamp_lead_state(root, "no-such-lead", "busy")  # must not raise
+        assert lg.read_marker(root, "no-such-lead") == {}
+
+    def test_preserves_other_marker_fields(self, root):
+        lg.write_marker(root, "lead-1", project="webapp")
+        lg.stamp_lead_state(root, "lead-1", "busy")
+        m = lg.read_marker(root, "lead-1")
+        assert m["project"] == "webapp"
+
+    def test_idle_then_busy_round_trip(self, root):
+        lg.write_marker(root, "lead-1")
+        lg.stamp_lead_state(root, "lead-1", "busy")
+        assert lg.lead_turn_state(lg.read_marker(root, "lead-1")) == "busy"
+        lg.stamp_lead_state(root, "lead-1", "idle")
+        assert lg.lead_turn_state(lg.read_marker(root, "lead-1")) == "idle"
+
+
 class TestListLeads:
     """list_leads reads every lead/*/marker.json, oldest-first by `started`, and is fully
     defensive: config.json, non-marker dirs, and malformed markers are all skipped, never fatal."""
@@ -450,6 +516,42 @@ class TestPreToolHookPacketExemption:
         assert rc == 0 and '"deny"' in out            # blocked with guidance
 
 
+class TestUserPromptLeadStateHook:
+    """Drive hooks/userprompt_lead_state.py exactly as Claude Code would: a lead session gets
+    `state: busy` + `state_since` stamped; a non-lead session is untouched (silent, exit 0)."""
+
+    def _run(self, home, payload):
+        import subprocess
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "userprompt_lead_state.py")],
+            input=json.dumps(payload), capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)})
+        return p.returncode, p.stdout
+
+    def test_lead_turn_start_stamps_busy(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        rc, out = self._run(tmp_path, {"session_id": "lead-1"})
+        assert rc == 0 and out.strip() == ""
+        m = lg.read_marker(root, "lead-1")
+        assert m["state"] == "busy"
+        assert m["state_since"]
+
+    def test_non_lead_session_untouched(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        rc, out = self._run(tmp_path, {"session_id": "not-a-lead"})
+        assert rc == 0 and out.strip() == ""
+        assert lg.read_marker(root, "not-a-lead") == {}
+
+    def test_bad_payload_fails_open(self, tmp_path):
+        import subprocess
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "userprompt_lead_state.py")],
+            input="not json", capture_output=True, text=True,
+            env={**os.environ, "HOME": str(tmp_path)})
+        assert p.returncode == 0
+
+
 # ---- bin/relay commands driving the above ------------------------------------------------------
 
 class TestRelayLeadCommands:
@@ -638,6 +740,13 @@ class TestOwnershipScoping:
             "session_id": sid, "current_packet": 1, "status": "busy", "owner_lead": owner_lead,
         }))
 
+    def _stalled(self, root, sid, owner_lead):
+        d = root / sid
+        d.mkdir(parents=True)
+        (d / "session.json").write_text(json.dumps({
+            "session_id": sid, "current_packet": 1, "status": "stalled", "owner_lead": owner_lead,
+        }))
+
     def _reported(self, root, sid, owner_lead, packet=1):
         d = root / sid
         (d / "packets").mkdir(parents=True)
@@ -672,6 +781,14 @@ class TestOwnershipScoping:
         # Only another lead's executor is busy → scoped lead sees nothing in flight.
         self._busy(root, "exec-b", owner_lead="lead-B")
         assert lg.has_inflight_executors(root, "lead-A") is False
+
+    def test_inflight_counts_stalled_as_in_flight(self, root):
+        # wake-watch design §6: a long-but-alive (stalled) executor is the MOST likely to report
+        # while the lead idles — excluding it (the pre-fix behavior) was backwards.
+        self._stalled(root, "exec-a", owner_lead="lead-A")
+        assert lg.has_inflight_executors(root, "lead-A") is True
+        assert lg.has_inflight_executors(root, "lead-B") is False  # still ownership-scoped
+        assert lg.has_inflight_executors(root) is True
 
     # --- new_reports_for ---
 
@@ -1072,6 +1189,17 @@ class TestStopHookLivePayload:
         # see test_stop_active_still_polls_for_late_report.)
         rc, _ = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path), "stop_hook_active": True})
         assert rc == 0
+
+    def test_stop_stamps_idle_turn_state(self, tmp_path):
+        # Turn-end half of wake-watch design §4.2 — paired with the UserPromptSubmit hook's
+        # `state: busy` stamp. A lead mid-turn (busy) becomes idle the moment its Stop hook runs.
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        lg.stamp_lead_state(root, "lead-1", "busy")
+        self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path)})
+        m = lg.read_marker(root, "lead-1")
+        assert lg.lead_turn_state(m) == "idle"
+        assert m["state"] == "idle"
 
 
 class TestHandoffNudge:

@@ -1,11 +1,18 @@
 {
-  "description": "Lead-mode discipline for /relay:mode sessions: (1) PreToolUse gate blocks large inline Edit/Write/MultiEdit so work gets delegated; (2) Stop hook wakes the idle lead when an executor reports or the lead made commits this turn, announcing them and waiting for the user (never auto-acts). Silent on non-lead and executor sessions (each hook fast-exits when the lead marker is absent). SessionEnd cleans up lead state.",
+  "description": "Lead-mode discipline for /relay:mode sessions: (1) PreToolUse gate blocks large inline Edit/Write/MultiEdit so work gets delegated; (2) UserPromptSubmit stamps busy/idle turn-state at turn-start; (3) Stop hook wakes the idle lead when an executor reports or the lead made commits this turn, announcing them and waiting for the user (never auto-acts), and stamps busy/idle turn-state at turn-end. Silent on non-lead and executor sessions (each hook fast-exits when the lead marker is absent). SessionEnd cleans up lead state.",
   "hooks": {
     "PreToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
           {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretool_route_guard.py"}
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/userprompt_lead_state.py"}
         ]
       }
     ],

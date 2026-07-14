@@ -173,6 +173,12 @@ def main():
             lg.touch_lead(STATE_ROOT, sid, plugin_root=PLUGIN_ROOT)
         except Exception:
             pass
+        # Turn-end half of the lead's busy/idle turn-state (wake-watch design §4.2) — paired with
+        # the UserPromptSubmit hook's `state: busy` stamp at turn-start.
+        try:
+            lg.stamp_lead_state(STATE_ROOT, sid, "idle")
+        except Exception:
+            pass
 
         cfg = lg.load_config(STATE_ROOT)
 

@@ -19,6 +19,7 @@ Commands:
   relay route retain "<reason>" --session <session_id>   # open the retain grace window
   relay handoff <handoff.md> [--project NAME] [--model NAME]  # succeed this lead with a pre-armed fresh one
   relay close-predecessor                    # close the outgoing lead's tab after a handoff, on user go
+  relay nudge-lead <lead> "<message>"        # type a message into a LEAD's own tab; refuses if busy/stale
 """
 import argparse
 import json
@@ -55,7 +56,19 @@ def term_backend(s):
 STATE_ROOT = Path.home() / ".relay-tasks"
 LEDGER = STATE_ROOT / "sessions.jsonl"
 
-STALL_THRESHOLD_SECONDS = 30 * 60
+# Default only — kept independently settable from poll_seconds (1800) via config's
+# stall_threshold_seconds (lead_guard.LEAD_DEFAULTS) so the executor stall-flip and the idle-lead
+# poller's timeout no longer fire on one shared clock (wake-watch design §6, §2.2's "two numeric
+# coincidences"). _stall_threshold_seconds() is the one place that resolves the live value; this
+# constant is only the fallback when no config is readable.
+STALL_THRESHOLD_SECONDS = 45 * 60
+
+
+def _stall_threshold_seconds():
+    try:
+        return int(lead_guard.load_config(STATE_ROOT).get("stall_threshold_seconds", STALL_THRESHOLD_SECONDS))
+    except Exception:
+        return STALL_THRESHOLD_SECONDS
 
 RELAY_BIN = str(Path(__file__).resolve())
 
@@ -881,7 +894,7 @@ def _check_one(session_id):
             s["status"] = "reported"
         elif proc_alive:
             elapsed = _busy_elapsed(s)
-            if s["status"] == "busy" and elapsed is not None and elapsed > STALL_THRESHOLD_SECONDS:
+            if s["status"] == "busy" and elapsed is not None and elapsed > _stall_threshold_seconds():
                 s["status"] = "stalled"
                 append_ledger("stalled", session_id=session_id, packet=n, reason=f"busy {int(elapsed/60)}min, no report")
             # else: process alive, hasn't reported yet → still busy, no change.
@@ -1833,6 +1846,37 @@ def cmd_focus(args):
     sys.exit(f"no such session: {sid}")
 
 
+def cmd_nudge_lead(args):
+    """`relay send` pointed at a LEAD's own tab instead of an executor's (wake-watch design §4.0) —
+    the plumbing an executor-side watcher will call to wake an idle lead. Same typing mechanism as
+    cmd_send (iterm.send), same busy-guard discipline as its "refusing to send (would inject
+    mid-turn)" check — except here the guard is the lead's OWN busy/idle turn-state
+    (lead_guard.lead_turn_state), not an executor's session status. Never nudges a lead that's mid-
+    turn or plausibly wedged; the DECISION of when to call this lives in the next packet's hook, not
+    here."""
+    sid = args.lead
+    marker = lead_guard.read_marker(STATE_ROOT, sid)
+    if not marker:
+        sys.exit(f"no such lead: {sid}")
+
+    state = lead_guard.lead_turn_state(marker)
+    if state == "busy":
+        sys.exit(f"refused-busy: lead '{sid}' is mid-turn — not nudging (would inject mid-turn).")
+    if state == "stale-busy":
+        sys.exit(f"refused-stale: lead '{sid}'s busy stamp is stale (possibly wedged/crashed "
+                 "mid-turn) — not nudging. That call is the caller's, not this command's.")
+
+    label = marker.get("tab_label")
+    try:
+        ok = bool(label) and iterm.send(label, args.message, marker.get("iterm_session"))
+    except Exception:
+        ok = False
+    if not ok:
+        sys.exit(f"no-live-tab: could not find a live tab for lead '{sid}' (label '{label}').")
+
+    print(f"nudged: sent message to idle lead '{sid}' (tab '{label}')")
+
+
 def _sid_candidates_message(token, sids, purpose):
     """Render resolve_sid's ambiguous-token exit message: every candidate sid, newest-first by
     activity, alongside whatever identifying context distinguishes it (a lead's project + plugin
@@ -2038,6 +2082,11 @@ def main():
     cp = sub.add_parser("close-predecessor")
     cp.set_defaults(func=cmd_close_predecessor)
 
+    nl = sub.add_parser("nudge-lead")
+    nl.add_argument("lead")
+    nl.add_argument("message")
+    nl.set_defaults(func=cmd_nudge_lead)
+
     args = p.parse_args()
 
     # Universal name resolution: every sid-accepting positional/flag gets routed through
@@ -2054,6 +2103,7 @@ def main():
         "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
         "diff": ["session_id"], "focus": ["session_id"], "restart": ["session_id"],
         "resume": ["session_id"], "spawn": ["lead"], "list": ["lead"],
+        "nudge-lead": ["lead"],
     }
     for field in RESOLVE_FIELDS.get(args.cmd, []):
         val = getattr(args, field, None)

@@ -53,6 +53,11 @@ LEAD_DEFAULTS = {
                                   # top-tier default)
     "executor_model_ceiling": "opus",    # spawn refuses a requested executor model ABOVE this tier
                                   # without --model-override "<reason>" (see "executor model policy")
+    "stall_threshold_seconds": 2700,  # bin/relay's STALL_THRESHOLD_SECONDS override (wake-watch
+                                  # design §6): kept independently of poll_seconds (1800) so a long
+                                  # executor doesn't flip to `stalled` at the exact instant the
+                                  # idle-lead poller's window also expires — see
+                                  # docs/wake-watch-design.md §2.2's "two numeric coincidences".
 }
 
 # Distinguishable, colorblind-tolerant tab colors — brightened so they remain visible when dimmed
@@ -409,6 +414,75 @@ def touch_lead(state_root, session_id, plugin_root=None):
         pass
 
 
+# ---- lead busy/idle turn-state (wake-watch design §4.2) ----------------------------------------
+# Gives a LEAD a real busy/idle state, symmetric to how executors already have one, so a future
+# executor-side watcher can tell whether it's safe to nudge the lead (`relay nudge-lead`) rather
+# than injecting mid-turn. Stamped busy at turn-start (UserPromptSubmit hook) and idle at turn-end
+# (the existing Stop hook, alongside touch_lead).
+
+LEAD_BUSY_STALE_SECONDS = 5 * 60  # a single lead turn rarely runs beyond a few minutes; a `busy`
+                                   # stamp older than this most likely means the lead crashed/died
+                                   # mid-turn (the stamp freezes, nothing clears it) rather than a
+                                   # genuinely long turn — treated as `stale-busy` so a future
+                                   # watcher escalates to the human instead of waiting forever.
+
+
+def stamp_lead_state(state_root, session_id, state, now_ts=None):
+    """Read-modify-write marker.json's `state`/`state_since` fields — the turn-tracking counterpart
+    to touch_lead's `last_active` heartbeat. Shared by the UserPromptSubmit hook (state="busy") and
+    the Stop hook (state="idle") so both use ONE marker read-modify-write code path. No-op if no
+    marker exists yet (mirrors touch_lead). Never raises."""
+    try:
+        m = read_marker(state_root, session_id)
+        if not isinstance(m, dict) or not m:
+            return  # no marker to stamp → nothing to do
+        m["state"] = state
+        m["state_since"] = now() if now_ts is None else time.strftime(
+            "%Y-%m-%dT%H:%M:%S", time.localtime(now_ts))
+        marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
+    except Exception:
+        pass
+
+
+def _parse_marker_ts(s):
+    """Parse a marker timestamp in now()'s exact format ("%Y-%m-%dT%H:%M:%S") to a unix ts, or None
+    on any unparseable/missing value."""
+    try:
+        return time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return None
+
+
+def lead_turn_state(marker, now_ts=None):
+    """One of "idle" | "busy" | "stale-busy" from a lead's marker dict — pure, no I/O.
+
+      "idle"        — marker's `state` is "idle", or absent entirely (a marker predating this
+                       feature, or one that's never taken a stamped turn) — idle is the safe
+                       default: no reason to believe a turn is in progress.
+      "busy"        — `state` is "busy" and `state_since` parses to within LEAD_BUSY_STALE_SECONDS
+                       of `now_ts`.
+      "stale-busy"  — `state` is "busy" but `state_since` is older than that window, OR
+                       unparseable/missing on a `busy` marker (a wedged/crashed lead leaves `busy`
+                       frozen with no further stamps — this is the signal an executor-side watcher
+                       uses to escalate to the human rather than waiting forever; see
+                       docs/wake-watch-design.md §4.2/§4.4).
+
+    Defensive: any bad input degrades to "stale-busy" (surface the ambiguous case rather than
+    silently treating a possibly-wedged lead as safely idle or busy)."""
+    try:
+        if now_ts is None:
+            now_ts = time.time()
+        state = (marker or {}).get("state")
+        if state != "busy":
+            return "idle"
+        since = _parse_marker_ts(marker.get("state_since"))
+        if since is None:
+            return "stale-busy"
+        return "busy" if (now_ts - since) <= LEAD_BUSY_STALE_SECONDS else "stale-busy"
+    except Exception:
+        return "stale-busy"
+
+
 def list_leads(state_root):
     """Every lead marker under <state_root>/lead/*/marker.json, oldest-first by `started`. Each
     item is the marker dict exactly as stored. Fully defensive: config.json and any non-marker
@@ -654,8 +728,14 @@ def new_commits(cwd, since_head):
 
 
 def has_inflight_executors(state_root, owner_lead=None):
-    """True if any executor is still `busy` (working, no report yet) — i.e. there's something worth
-    the idle lead waiting on. Reported ones are handled instantly, not by waiting.
+    """True if any executor is still `busy` OR `stalled` (working, or long-running-but-alive, with
+    no report yet) — i.e. there's something worth the idle lead waiting on. Reported ones are
+    handled instantly, not by waiting.
+
+    `stalled` counts as in-flight (wake-watch design §6): a long-but-alive executor is the MOST
+    likely to report while the lead idles, so excluding it (as the pre-fix code did) was backwards
+    — it dropped the executor out of the watched set at exactly the moment its report becomes most
+    imminent.
 
     When `owner_lead` is given, ONLY executors this lead owns (`executor's owner_lead == owner_lead`)
     count — so a lead never idles waiting on another lead's executor OR an unowned (bare/legacy)
@@ -670,7 +750,7 @@ def has_inflight_executors(state_root, owner_lead=None):
                 continue
             try:
                 s = json.loads(sj.read_text())
-                if s.get("status") != "busy":
+                if s.get("status") not in ("busy", "stalled"):
                     continue
                 if owner_lead is not None and s.get("owner_lead") != owner_lead:
                     continue  # busy, but not THIS lead's (another lead's, or unowned) → not ours
