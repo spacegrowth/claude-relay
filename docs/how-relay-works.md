@@ -100,11 +100,13 @@ history across every lead and executor on the machine.
 ## 3. The wake path (the deep one)
 
 The lead is turn-based, not a daemon — after delegating, it needs to *learn* an executor finished
-without the user asking, without blocking a turn, and without a `/loop` re-fire. relay uses a
-`Stop` hook with Claude Code's `asyncRewake` (background execution; exit `2` wakes the idle
-session) — see `docs/async-rewake-findings.md` for the spike that proved this works. The
-implementation is `hooks/stop_lead_watch.py`, and it covers two halves: a synchronous fast path,
-and a background poller for reports that land later.
+without the user asking, without blocking a turn, and without a `/loop` re-fire. The wake is now
+**two layers**, both built on Claude Code's `asyncRewake` (background execution; exit `2` wakes the
+idle session) — see `docs/async-rewake-findings.md` for the spike that proved this works, and
+`docs/wake-watch-design.md` for the full design behind the second layer.
+
+**Layer 1 — the lead's own fast path.** `hooks/stop_lead_watch.py` covers two halves: a synchronous
+fast path, and a background poller for reports that land later.
 
 ```mermaid
 sequenceDiagram
@@ -160,6 +162,34 @@ via `poll_lock_state` (`lib/lead_guard.py:720`), using the exact same staleness 
 `acquire_poll_lock` uses — list and acquire can never disagree on what counts as dead. This
 staleness rule exists because a real incident proved its absence costly — see
 `wake-bug-stale-poll-lock-2026-07-11.md`.
+
+**Layer 2 — executor-side escalation, the net underneath.** Layer 1 is one in-process poller whose
+existence depends on the lead's process staying alive, its hooks being current, and the poll window
+not having expired — see `docs/wake-watch-design.md` §1-2 for the full inventory of ways that's
+failed historically. `hooks/executor_escalation.py` puts a second, independent watcher on the one
+process guaranteed alive when a report exists: the executor itself. Every spawned executor is armed
+with it (via `--settings` at spawn) as its own `asyncRewake` Stop hook. Its decision tree
+(`lib/lead_guard.py:1024`, `escalation_decision`), evaluated after an `executor_escalation_grace_seconds`
+(default 60) grace window so a healthy lead's own fast path wins first:
+
+- **resolved** — the owning lead already surfaced this report (its key is in that lead's
+  `surfaced_reports.json`) — done, nothing to do.
+- **unowned** / **owner-missing** — no `owner_lead` recorded, or its marker is gone (crashed, closed,
+  pruned) — notify the human directly.
+- **nudge** — the owning lead is idle (`lead_turn_state`, `lib/lead_guard.py:468`) — call `relay
+  nudge-lead` (`cmd_nudge_lead`, `bin/relay:1953`), which types into the lead's tab the same way
+  `relay send` does, guarded by the lead's own busy/idle turn-state so it never injects mid-turn.
+- **wait** — the owning lead is busy — its own Stop hook will surface the report at its next
+  turn-end anyway (§4.3 of the design doc); the watcher re-checks on `executor_escalation_poll_interval`
+  (default 15s) rather than escalating immediately.
+- **stale** — the owning lead's busy stamp is older than `LEAD_BUSY_STALE_SECONDS` (wedged or
+  crashed mid-turn) — notify the human now rather than wait on a lead that will never finish its turn.
+
+The watcher keeps a separate ledger from the lead's `surfaced_reports.json` (design §4.4), so a
+human notification never masks the lead's own announcement, and exits cleanly before
+`executor_escalation_max_runtime_seconds` (default 1800) to beat its own hook timeout — a later
+executor turn re-arms and resumes from that persisted state. This is a net *under* layer 1, not a
+replacement for it: on a healthy lead the grace window makes it a no-op.
 
 ## 4. The lead lifecycle
 
@@ -227,6 +257,12 @@ fail-toward-adoptable default.
 | `relay status` executor view | `🚦 pkt 003 busy · for webapp` | this executor's current packet + state, and its owning lead's project name | check the lead's tab for overall progress |
 | desktop notification | iTerm OSC banner (native click→session) → terminal-notifier (`-execute relay focus`, coalesces per lead) → osascript (`display notification`, not clickable) | three tiers, first one that applies wins — see the README's [Auto-wake and notifications](../README.md#auto-wake-and-notifications) for the full breakdown | `notify_via: "terminal-notifier"` in config skips tier 1 for a clean, relay-set title/subtitle |
 
+`has_inflight_executors` counts a `stalled` executor as in-flight, not just `busy` — a long-but-alive
+executor is exactly the kind most likely to report while the lead idles, so excluding it would be
+backwards. Its threshold (`stall_threshold_seconds`, default 2700) is a separate config key from
+`poll_seconds` (1800) precisely so the two clocks can't flip an executor to `stalled` at the same
+instant layer 1's poller would time out.
+
 ## 6. Name resolution
 
 Every sid-accepting relay command routes through `resolve_sid` (`bin/relay:1622`, wired centrally
@@ -240,6 +276,13 @@ handoff) is never guessed: the command exits listing every candidate sid, newest
 context (project + version, or topic) to tell them apart (`_sid_candidates_message`,
 `bin/relay:1599`).
 
+Project names feed this resolution too, so they have to stay unique among *live* leads: arming a
+lead whose project name collides with another live lead's runs it through `unique_lead_project`
+(`bin/relay:1653`), which auto-suffixes the smallest free `-N` (`claude-relay` → `claude-relay-2`)
+and prints a NOTE. A crashed or stale lead (`last_active` past `LEAD_LIVE_WINDOW_SECONDS`, or
+unparseable) doesn't reserve its name, so re-arming in the same folder reclaims the base name
+instead of the suffix creeping upward; a self re-arm or a handoff successor keeps its name too.
+
 ## 7. Honest limits
 
 - **`Bash` is ungated.** The routing gate only sees `Edit`/`Write`/`MultiEdit`; `git commit`, `sed
@@ -252,6 +295,14 @@ context (project + version, or topic) to tell them apart (`_sid_candidates_messa
   self-heals (§3), but only when something calls `acquire_poll_lock` again — that happens on the
   lead's next `Stop` event, i.e. its next turn. A report landing in between surfaces as soon as
   that turn happens, not instantly.
+- **The escalation net closes most of what layer 1 missed, but not everything.** It covers the
+  vectors that come from layer 1's own poller dying, timing out, or losing ownership (see
+  `docs/wake-watch-design.md` §1 for the incident history) — but a **lead that is itself dead or out
+  of tokens** is still a manual recovery: nothing wakes a dead process, so the human has to resume it
+  and reconcile-on-return surfaces whatever was missed. And the escalation watcher is itself bounded
+  by the same constraint as layer 1 — it only runs as long as its own executor process stays alive
+  (`executor_escalation_max_runtime_seconds`, default 1800s, after which a later executor turn has
+  to re-arm it from its persisted state). The wake is much harder to miss now; it is not bulletproof.
 - **Transcript size is a proxy, not context occupancy.** Compaction shrinks the model's actual
   context but the transcript file keeps growing — `handoff_nudge_mb` measures session weight, not
   how full the context window is.
