@@ -3,9 +3,12 @@ iTerm2 backend for claude-relay: spawn a new tab running `claude` seeded with a 
 send a follow-up prompt into an existing live tab, and check aliveness.
 
 Vendored/adapted from ~/.swiftbar/.lib/ccsessions/app.py (ITermBackend) — same title-matching
-rules, scoped to just what relay needs. Addressing is inherently by mutable tab title (owned by
-Claude Code's own OSC title updates), which is why the caller (relay) treats the recorded PID as
-the source of truth for aliveness and the title match as a secondary confirmation only.
+rules, scoped to just what relay needs. Tab title is owned by Claude Code's own OSC title updates
+and mutable at any time, so send()/focus()/close()/is_alive() all address by the captured iTerm
+session id (`iterm_session` / $TERM_SESSION_ID) first when one is available, falling back to the
+bounded title match only for legacy/unowned sessions with no captured handle — see each function's
+docstring. The caller (relay) additionally treats the recorded PID as the source of truth for
+aliveness, the title/id match as a secondary confirmation.
 """
 import shlex
 import subprocess
@@ -433,9 +436,13 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
 
 
 def send(label, prompt, handle=None, pid=None):
-    """Write `prompt` into the existing live tab matched by `label` (bounded title match) — no
-    new process, preserves that session's conversation. Returns True if a match was found.
-    handle/pid: shared backend signature, unused here (iTerm addresses by title).
+    """Write `prompt` into the existing live tab matched by `handle` (unique iTerm session id) when
+    given, else by `label` (bounded title match). id-based first, same reasoning as close(): once
+    Claude Code's own OSC titling clobbers a tab's title, title-match addressing misfires — this is
+    what caused an earlier `relay send` to report "tab was gone — resumed" on a live executor.
+    Falls back to the title match when `handle` is empty or the id lookup finds nothing (e.g. a
+    legacy/unowned session with no captured handle). pid: shared backend signature, unused here.
+    Returns True if a match was found (by either path).
 
     The text and the Enter are sent as TWO separate writes: `write text` delivers text+newline in
     one burst, which Claude Code treats as a PASTE — the newline lands as a literal line break and
@@ -446,6 +453,13 @@ def send(label, prompt, handle=None, pid=None):
     action = (f'          tell s to write text "{cmd_e}" newline NO\n'
               "          delay 0.3\n"
               '          tell s to write text ""\n')
+    if handle:
+        uuid = handle.split(":")[-1]
+        id_action = action + "          return true\n"
+        script = _for_session_by_id(uuid, id_action) + "return false"
+        r = run_osascript(script, timeout=5)
+        if r.returncode == 0 and r.stdout.strip().lower() == "true":
+            return True
     script = (
         "set matched to false\n"
         f'tell application "{ITERM_APP_NAME}"\n'
@@ -503,16 +517,30 @@ def close(label, handle=None, pid=None):
 
 
 def focus(label, handle=None, pid=None):
-    """Jump to the live iTerm session matched by `label` (bounded title match): `activate` iTerm,
-    then `tell w to select` + `select t` + `tell s to select` — select the WINDOW (brings it to
-    front), the TAB, AND the exact SESSION/PANE within it. This is the reliable mechanism proven in
-    claude-sessions-swiftbar (ccsessions); the same authorized osascript path as spawn/send. (The
-    iterm2:///reveal URL scheme was tried and dropped: `open` always exits 0 so it reported false
-    success but didn't actually switch.) `tell s to select` was confirmed live (osascript probe on
-    this machine) to genuinely shift the active PANE within a split tab — not just a no-op — so a
-    notification click lands on the exact executor pane, not just its tab (for tab-layout
-    executors, `s` is the tab's only session, so this is a harmless no-op). Returns True if a tab
-    matched."""
+    """Jump to the live iTerm session matched by `handle` (unique iTerm session id) when given, else
+    by `label` (bounded title match) — same id-first/title-fallback shape as send()/close(), for the
+    same reason: a title clobbered by Claude Code's own OSC titling misdirects title-match lookups.
+    Either path: `activate` iTerm, then `tell w to select` + `select t` + `tell s to select` —
+    select the WINDOW (brings it to front), the TAB, AND the exact SESSION/PANE within it. This is
+    the reliable mechanism proven in claude-sessions-swiftbar (ccsessions); the same authorized
+    osascript path as spawn/send. (The iterm2:///reveal URL scheme was tried and dropped: `open`
+    always exits 0 so it reported false success but didn't actually switch.) `tell s to select` was
+    confirmed live (osascript probe on this machine) to genuinely shift the active PANE within a
+    split tab — not just a no-op — so a notification click lands on the exact executor pane, not
+    just its tab (for tab-layout executors, `s` is the tab's only session, so this is a harmless
+    no-op). Returns True if a tab matched (by either path)."""
+    if handle:
+        uuid = handle.split(":")[-1]
+        id_action = ("          tell w to select\n          select t\n          tell s to select\n"
+                     "          return true\n")
+        script = (
+            f'tell application "{ITERM_APP_NAME}" to activate\n'
+            + _for_session_by_id(uuid, id_action)
+            + "return false"
+        )
+        r = run_osascript(script, timeout=5)
+        if r.returncode == 0 and r.stdout.strip().lower() == "true":
+            return True
     action = "          tell w to select\n          select t\n          tell s to select\n"
     script = (
         "set matched to false\n"

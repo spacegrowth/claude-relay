@@ -2516,3 +2516,135 @@ class TestUniqueLeadProject:
                  self._lead("other-2", "claude-relay", last_active="not-a-timestamp")]
         name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
         assert (name, clash) == ("claude-relay", None)
+
+
+class TestLaunchBackgroundLabelAssert:
+    """_launch_background_label_assert: the detached follow-up _ensure_tab_label kicks off so the
+    [Exec] label survives Claude Code's one-time ~6-8s OSC titling (see the relay-exec-label
+    packet's Findings) -- iTerm-only, best-effort, never blocks the caller."""
+
+    def test_iterm_with_handle_launches_detached_ensure_label(self, relay):
+        bk = mock.Mock(NAME="iterm")
+        with mock.patch.object(relay.subprocess, "Popen") as popen:
+            relay._launch_background_label_assert(bk, "w1t2p0:UUID", "[Exec] e1")
+        popen.assert_called_once()
+        argv, kwargs = popen.call_args
+        cmd = argv[0]
+        assert cmd[0] == relay.sys.executable
+        assert cmd[1] == relay.RELAY_BIN
+        assert cmd[2:] == ["_ensure-label", "w1t2p0:UUID", "[Exec] e1"]
+        assert kwargs.get("start_new_session") is True
+
+    def test_no_handle_does_not_launch(self, relay):
+        bk = mock.Mock(NAME="iterm")
+        with mock.patch.object(relay.subprocess, "Popen") as popen:
+            relay._launch_background_label_assert(bk, None, "[Exec] e1")
+        popen.assert_not_called()
+
+    def test_terminal_app_backend_does_not_launch(self, relay):
+        bk = mock.Mock(NAME="terminal")
+        with mock.patch.object(relay.subprocess, "Popen") as popen:
+            relay._launch_background_label_assert(bk, "twid:5", "[Exec] e1")
+        popen.assert_not_called()
+
+    def test_launch_failure_is_swallowed(self, relay):
+        bk = mock.Mock(NAME="iterm")
+        with mock.patch.object(relay.subprocess, "Popen", side_effect=OSError("boom")):
+            relay._launch_background_label_assert(bk, "w1t2p0:UUID", "[Exec] e1")  # no raise
+
+
+class TestEnsureTabLabelBackgroundHandoff:
+    """_ensure_tab_label must hand off to _launch_background_label_assert on every return path
+    (label already live, label recovered mid-retry, label still missing after all attempts) --
+    the synchronous window alone (~4.5s) never reaches past Claude's ~6-8s clobber point."""
+
+    def test_launches_when_already_alive(self, relay):
+        bk = mock.Mock(NAME="iterm")
+        bk.is_alive.return_value = True
+        with mock.patch.object(relay, "_launch_background_label_assert") as launch:
+            ok = relay._ensure_tab_label(bk, "h1", "[Exec] e1")
+        assert ok is True
+        launch.assert_called_once_with(bk, "h1", "[Exec] e1")
+        bk.rename_by_id.assert_not_called()
+
+    def test_launches_after_exhausting_retries_still_missing(self, relay):
+        bk = mock.Mock(NAME="iterm")
+        bk.is_alive.return_value = False
+        with mock.patch.object(relay, "_launch_background_label_assert") as launch, \
+             mock.patch.object(relay.time, "sleep"):
+            ok = relay._ensure_tab_label(bk, "h1", "[Exec] e1", attempts=2, delay=0)
+        assert ok is False
+        launch.assert_called_once_with(bk, "h1", "[Exec] e1")
+
+    def test_no_handle_never_launches(self, relay):
+        bk = mock.Mock(NAME="iterm")
+        with mock.patch.object(relay, "_launch_background_label_assert") as launch:
+            ok = relay._ensure_tab_label(bk, None, "[Exec] e1")
+        assert ok is False
+        launch.assert_not_called()
+        bk.is_alive.assert_not_called()
+
+
+class TestBackgroundLabelLoop:
+    """_background_label_loop: the polling logic that runs inside the detached `relay
+    _ensure-label` subprocess. Uses injectable clock_fn/sleep_fn so the bounded window is
+    exercised without a real ~30s wait."""
+
+    def _fake_clock(self, ticks):
+        """ticks: a list of times consumed one per clock_fn() call; the last value repeats once
+        exhausted, so a loop that overruns still terminates instead of raising."""
+        state = {"i": 0}
+
+        def clock():
+            i = min(state["i"], len(ticks) - 1)
+            state["i"] += 1
+            return ticks[i]
+        return clock
+
+    def test_noop_when_already_labeled_two_checks_in_a_row(self, relay):
+        with mock.patch.object(relay.iterm_backend, "live_session_names", return_value={"[Exec] e1"}), \
+             mock.patch.object(relay.iterm_backend, "title_is_live", return_value=True), \
+             mock.patch.object(relay.iterm_backend, "rename_by_id") as rename:
+            ok = relay._background_label_loop(
+                "h1", "[Exec] e1", window=30, interval=3,
+                clock_fn=self._fake_clock([0, 1, 2, 3, 4, 5]), sleep_fn=lambda s: None)
+        assert ok is True
+        rename.assert_not_called()
+
+    def test_reasserts_until_clobber_fixed_then_holds(self, relay):
+        # First two polls see the title clobbered away from [Exec]; from the third poll on it
+        # reads [Exec] again (as if the background rename just landed) and must hold for 2 in a row.
+        reads = [False, False, True, True, True]
+        with mock.patch.object(relay.iterm_backend, "live_session_names", return_value=set()), \
+             mock.patch.object(relay.iterm_backend, "title_is_live", side_effect=reads), \
+             mock.patch.object(relay.iterm_backend, "rename_by_id") as rename:
+            ok = relay._background_label_loop(
+                "h1", "[Exec] e1", window=30, interval=3,
+                clock_fn=self._fake_clock([0, 1, 2, 3, 4, 5, 6]), sleep_fn=lambda s: None)
+        assert ok is True
+        assert rename.call_count == 2  # one per clobbered read
+        rename.assert_called_with("h1", "[Exec] e1")
+
+    def test_gives_up_after_window_if_never_holds(self, relay):
+        with mock.patch.object(relay.iterm_backend, "live_session_names", return_value=set()), \
+             mock.patch.object(relay.iterm_backend, "title_is_live", return_value=False), \
+             mock.patch.object(relay.iterm_backend, "rename_by_id") as rename:
+            ok = relay._background_label_loop(
+                "h1", "[Exec] e1", window=10, interval=3,
+                clock_fn=self._fake_clock([0, 3, 6, 9, 12]), sleep_fn=lambda s: None)
+        assert ok is False
+        assert rename.call_count >= 1
+
+
+class TestCmdEnsureLabel:
+    """cmd_ensure_label: the hidden subcommand entry point run inside the detached subprocess --
+    must never raise regardless of what _background_label_loop does."""
+
+    def test_delegates_to_background_loop(self, relay):
+        with mock.patch.object(relay, "_background_label_loop", return_value=True) as loop:
+            relay.cmd_ensure_label(SimpleNamespace(handle="h1", label="[Exec] e1"))
+        loop.assert_called_once_with("h1", "[Exec] e1")
+
+    def test_exception_in_loop_is_swallowed(self, relay):
+        with mock.patch.object(relay, "_background_label_loop", side_effect=RuntimeError("boom")):
+            relay.cmd_ensure_label(SimpleNamespace(handle="h1", label="[Exec] e1"))  # no raise

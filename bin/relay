@@ -40,6 +40,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 import backend
 import diff_render
 import lead_guard
+import iterm as iterm_backend  # the REAL scripts/iterm.py module, always -- distinct from the
+                               # `iterm` name below (this invocation's SELECTED backend, which can
+                               # resolve to terminal_app). _background_label_loop is iTerm-specific
+                               # by design (see its docstring) and must not follow that selection.
 
 # The terminal backend for THIS invocation ($RELAY_TERMINAL > config > $TERM_PROGRAM; see
 # scripts/backend.py). Named `iterm` because that was the only backend for most of relay's life —
@@ -384,15 +388,91 @@ def _ensure_tab_label(bk, handle, label, attempts=3, delay=1.5):
     swallow it, and an unlabeled tab silently breaks everything title-based (send/close/focus,
     stalled-vs-dead). The retry goes through rename_by_id — matched by the captured handle (iTerm
     session id / Terminal window id), so it can't hit the wrong tab. Best-effort: without a
-    captured handle there's nothing safe to do."""
+    captured handle there's nothing safe to do.
+
+    This synchronous pass (attempts=3, delay=1.5 ≈ 4.5s) only covers the FIRST few seconds after
+    launch — Claude Code sets its own OSC tab title once, ~6-8s in, derived from the task prompt,
+    and silently clobbers whatever relay wrote here with nobody re-asserting afterward (confirmed
+    empirically; see the relay-exec-label packet's Findings). So every return path here also kicks
+    off `_launch_background_label_assert`, a detached follow-up that re-renames PAST that ~6-8s
+    clobber point — durably, but without making spawn/relaunch block for it."""
     if not handle:
         return False
     for _ in range(attempts):
         if bk.is_alive(label, handle):
+            _launch_background_label_assert(bk, handle, label)
             return True
         bk.rename_by_id(handle, label)
         time.sleep(delay)
-    return bk.is_alive(label, handle)
+    ok = bk.is_alive(label, handle)
+    _launch_background_label_assert(bk, handle, label)
+    return ok
+
+
+def _launch_background_label_assert(bk, handle, label):
+    """Detached follow-up to _ensure_tab_label's synchronous attempts, launched as its very last
+    step: spawns `relay _ensure-label <handle> <label>` as a fully independent subprocess
+    (start_new_session=True so it survives this relay invocation exiting) that polls PAST Claude
+    Code's one-time ~6-8s OSC titling and re-renames until the label sticks — see
+    _background_label_loop. NEVER blocks the caller (cmd_spawn/_relaunch) on it: Popen returns
+    immediately, and any failure to even launch is swallowed, exactly like a labeling failure must
+    never break or delay the spawn itself.
+
+    iTerm-only (`bk.NAME == "iterm"`): Terminal.app sets its custom tab title once via
+    rename_by_id at spawn time and nothing ever re-titles it afterward (no Claude OSC clobber to
+    outlast there), so there's nothing for a background pass to fix — today's behavior is kept
+    unchanged."""
+    if getattr(bk, "NAME", None) != "iterm" or not handle:
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, RELAY_BIN, "_ensure-label", handle, label],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
+def _background_label_loop(handle, label, window=27.0, interval=3.0, hold_checks=2,
+                            sleep_fn=time.sleep, clock_fn=time.time):
+    """The durable half of the [Exec]-label fix: runs INSIDE the detached subprocess launched by
+    _launch_background_label_assert. Polls the actual live tab title (iterm.live_session_names +
+    iterm.title_is_live, via the real scripts/iterm.py module — see the `iterm_backend` import at
+    the top of this file — a real title read, not is_alive's id short-circuit, which would report
+    the tab "alive" without checking what its title currently says) and re-renames via
+    rename_by_id whenever it isn't (still) `label`, over a bounded window (~25-30s by default — a
+    few seconds past Claude Code's observed ~6-8s one-time titling).
+
+    Requires `hold_checks` (default 2) CONSECUTIVE live reads of `label` before declaring success
+    and exiting early, not just one: the very first post-clobber read could itself land moments
+    before Claude's titling actually fires. Since Claude only ever titles once, two clean reads in
+    a row means no further clobber is coming, so the loop doesn't need to burn its whole window.
+    Returns True if the label was confirmed to hold (by the hold-checks streak, whether that
+    happened immediately or after re-renames), False if the window ran out first."""
+    consecutive = 0
+    deadline = clock_fn() + window
+    while clock_fn() < deadline:
+        if iterm_backend.title_is_live(label, iterm_backend.live_session_names()):
+            consecutive += 1
+            if consecutive >= hold_checks:
+                return True
+        else:
+            consecutive = 0
+            iterm_backend.rename_by_id(handle, label)
+        sleep_fn(interval)
+    return consecutive >= hold_checks
+
+
+def cmd_ensure_label(args):
+    """Hidden subcommand: the entry point for the detached background process
+    _launch_background_label_assert spawns (`relay _ensure-label <handle> <label>`). Not meant to
+    be typed by a human. Never raises — a labeling failure in a background process with nobody
+    watching its exit code must not surface anywhere."""
+    try:
+        _background_label_loop(args.handle, args.label)
+    except Exception:
+        pass
 
 
 def _kill_and_wait(s, timeout=3.0):
@@ -2110,6 +2190,11 @@ def main():
     nl.add_argument("lead")
     nl.add_argument("message")
     nl.set_defaults(func=cmd_nudge_lead)
+
+    el = sub.add_parser("_ensure-label", help=argparse.SUPPRESS)  # internal: see cmd_ensure_label
+    el.add_argument("handle")
+    el.add_argument("label")
+    el.set_defaults(func=cmd_ensure_label)
 
     args = p.parse_args()
 

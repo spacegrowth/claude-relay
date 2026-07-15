@@ -1,6 +1,6 @@
 {
   "name": "relay",
-  "version": "0.3.21",
+  "version": "0.3.22",
   "description": "Delegate work packets from a lead Claude Code session to executor sessions in their own iTerm tabs, with session reuse instead of always spawning fresh.",
   "keywords": [
     "orchestration",

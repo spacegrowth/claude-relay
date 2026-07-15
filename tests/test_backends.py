@@ -201,6 +201,81 @@ class TestIdBasedClose:
         osa_run.assert_not_called()   # no id lookup attempted at all without a handle
 
 
+class TestIdBasedSend:
+    """send() must target by unique iTerm session id (`handle`) when one is given, falling back to
+    the bounded title match only when handle is empty or the id lookup finds nothing -- same
+    reasoning as TestIdBasedClose: once Claude Code's own OSC titling clobbers a tab's title,
+    title-match addressing misfires, which is what caused an earlier `relay send` to report 'tab
+    was gone -- resumed' on a live executor."""
+
+    def test_send_with_handle_targets_id_only(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run:
+            ok = iterm.send("[Exec] e1", "do the thing", "w1t5p0:SOME-UUID")
+        assert ok is True
+        assert osa_run.call_count == 1
+        script = osa_run.call_args[0][0]
+        assert 'id of s) is "SOME-UUID"' in script
+        assert 'write text "do the thing" newline NO' in script
+
+    def test_send_with_handle_finds_session_even_when_title_is_not_exec(self):
+        # The whole point: the live tab's title has already been clobbered away from "[Exec] e1"
+        # by Claude's own OSC titling, but the id-based lookup still finds and writes to it.
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run:
+            ok = iterm.send("[Exec] e1", "do the thing", "w1t5p0:SOME-UUID")
+        assert ok is True
+        script = osa_run.call_args[0][0]
+        assert "name of s" not in script   # id path never even builds a title predicate
+
+    def test_send_with_handle_falls_back_to_title_when_id_not_found(self):
+        with mock.patch.object(iterm, "run_osascript", side_effect=[_ok("false"), _ok("true")]) as osa_run:
+            ok = iterm.send("[Exec] e1", "do the thing", "w1t5p0:SOME-UUID")
+        assert ok is True
+        assert osa_run.call_count == 2
+        title_script = osa_run.call_args_list[1][0][0]
+        assert "name of s is equal to" in title_script
+
+    def test_send_without_handle_uses_title_match_directly(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run:
+            ok = iterm.send("[Exec] e1", "do the thing")
+        assert ok is True
+        assert osa_run.call_count == 1
+        script = osa_run.call_args[0][0]
+        assert "name of s is equal to" in script
+        assert "id of s" not in script
+
+
+class TestIdBasedFocus:
+    """focus() must target by unique iTerm session id (`handle`) when one is given, falling back
+    to the bounded title match only when handle is empty or the id lookup finds nothing."""
+
+    def test_focus_with_handle_targets_id_only(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run:
+            ok = iterm.focus("[Exec] e1", "w1t5p0:SOME-UUID")
+        assert ok is True
+        assert osa_run.call_count == 1
+        script = osa_run.call_args[0][0]
+        assert 'id of s) is "SOME-UUID"' in script
+        assert "activate" in script
+        assert "tell s to select" in script
+
+    def test_focus_with_handle_falls_back_to_title_when_id_not_found(self):
+        with mock.patch.object(iterm, "run_osascript", side_effect=[_ok("false"), _ok("true")]) as osa_run:
+            ok = iterm.focus("[Exec] e1", "w1t5p0:SOME-UUID")
+        assert ok is True
+        assert osa_run.call_count == 2
+        title_script = osa_run.call_args_list[1][0][0]
+        assert "name of s is equal to" in title_script
+
+    def test_focus_without_handle_uses_title_match_directly(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run:
+            ok = iterm.focus("[Exec] e1")
+        assert ok is True
+        assert osa_run.call_count == 1
+        script = osa_run.call_args[0][0]
+        assert "name of s is equal to" in script
+        assert "id of s" not in script
+
+
 class TestPidOnTty:
     def test_matches_pid_by_tty_and_comm(self):
         ps_out = "  123 ttys000 login\n  456 ttys000 claude\n  789 ttys001 claude\n"
