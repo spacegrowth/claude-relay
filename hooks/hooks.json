@@ -30,6 +30,14 @@
         ]
       }
     ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart_lead_rearm.py"}
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

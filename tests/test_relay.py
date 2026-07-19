@@ -2648,3 +2648,43 @@ class TestCmdEnsureLabel:
     def test_exception_in_loop_is_swallowed(self, relay):
         with mock.patch.object(relay, "_background_label_loop", side_effect=RuntimeError("boom")):
             relay.cmd_ensure_label(SimpleNamespace(handle="h1", label="[Exec] e1"))  # no raise
+
+
+class TestTombstoneNameReservation:
+    """A PAUSED (tombstoned) lead keeps holding its project name; a plain stale GHOST does not.
+
+    These two cases look identical by `last_active` alone — both are old — so they are tested as a
+    matched pair. The difference is intent: a tombstone announced it is coming back (resume revives
+    it under its own name), a ghost never did. Without the tombstone half, quitting and resuming
+    could hand your name to another lead and bring you back as `<project>-2`
+    (docs/lead-arming-durability.md §9.2)."""
+
+    NOW = TestUniqueLeadProject.NOW
+    STALE = 999999  # far beyond LEAD_LIVE_WINDOW_SECONDS
+
+    def _lead(self, sid, project, offset_seconds, ended=False):
+        m = {"session_id": sid, "project": project,
+             "last_active": TestUniqueLeadProject._stamp(offset_seconds)}
+        if ended:
+            m["ended"] = True
+        return m
+
+    def test_tombstoned_lead_reserves_its_name_even_when_stale(self, relay):
+        leads = [self._lead("paused-1", "claude-relay", self.STALE, ended=True)]
+        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        assert name == "claude-relay-2"
+        assert clash == "paused-1"
+
+    def test_plain_stale_ghost_still_releases_its_name(self, relay):
+        """The matched negative: same staleness, no tombstone → name reclaimed, no suffix creep."""
+        leads = [self._lead("ghost-1", "claude-relay", self.STALE, ended=False)]
+        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        assert (name, clash) == ("claude-relay", None)
+
+    def test_resuming_lead_gets_its_own_name_back(self, relay):
+        """Self is always excluded, so the paused lead reviving under its own id keeps the base
+        name — the whole point of reserving it."""
+        leads = [self._lead("paused-1", "claude-relay", self.STALE, ended=True)]
+        name, clash = relay.unique_lead_project("claude-relay", "paused-1", [], leads,
+                                                now_ts=self.NOW)
+        assert (name, clash) == ("claude-relay", None)

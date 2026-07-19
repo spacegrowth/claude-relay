@@ -308,9 +308,17 @@ def exceeds_gate(lines, new_file, config):
 
 def is_lead(state_root, session_id):
     """The sole 'is this a lead session' test. Marker absent (or any error) → not lead → the hooks
-    fast-exit-allow, which is the entire zero-impact path for non-lead/executor sessions."""
+    fast-exit-allow, which is the entire zero-impact path for non-lead/executor sessions.
+
+    A TOMBSTONED marker counts as NOT a lead. A tombstone means the session exited cleanly but is
+    resumable, so its identity is retained (see tombstone_lead / docs/lead-arming-durability.md) —
+    but until a resume revives it, the gate and the wake must stay off. Returning True here for a
+    tombstone would be strictly worse than the bug this replaced: an exited session would still be
+    armed."""
     try:
-        return marker_path(state_root, session_id).exists()
+        if not marker_path(state_root, session_id).exists():
+            return False
+        return not is_tombstoned(read_marker(state_root, session_id))
     except Exception:
         return False
 
@@ -547,12 +555,69 @@ def in_grace(state_root, session_id, now_ts=None):
 
 
 def clear_lead(state_root, session_id):
-    """Remove the whole lead/<sid>/ subtree (step-down or SessionEnd). Best-effort; routing events
-    already live durably in the shared sessions.jsonl ledger, so there's nothing here to preserve."""
+    """Remove the whole lead/<sid>/ subtree (step-down, or a SessionEnd whose reason means the
+    conversation is genuinely gone — `clear`/`logout`). Best-effort; routing events already live
+    durably in the shared sessions.jsonl ledger, so there's nothing here to preserve.
+
+    NOT used for a resumable exit any more — see tombstone_lead."""
     try:
         shutil.rmtree(lead_dir(state_root, session_id))
     except Exception:
         pass
+
+
+# ---- tombstones: arming that survives exit→resume (docs/lead-arming-durability.md) --------------
+# A Claude Code session is RESUMABLE: `--resume` restores the same session_id AND the full
+# conversation, and fires SessionStart with source="resume" (spiked and verified — see that doc's
+# §7). Deleting the lead marker on a routine quit therefore treated a *pause* as a *death*, and the
+# resumed session came back silently unarmed: gate off, wake structurally impossible.
+#
+# So a resumable exit TOMBSTONES the marker instead of deleting it — retaining everything (project,
+# cwd, iterm_session, colour, predecessor, started) so the revive is lossless — while `is_lead`
+# reports False for the duration.
+
+def is_tombstoned(marker):
+    """True if this marker is a tombstone: the session exited cleanly but is resumable, so its
+    identity is retained while it counts as NOT armed. Never raises."""
+    try:
+        return bool((marker or {}).get("ended"))
+    except Exception:
+        return False
+
+
+def tombstone_lead(state_root, session_id, now_ts=None):
+    """Mark a lead ended-but-resumable instead of deleting it. Retains every other field so
+    revive_lead() is lossless. Returns True if a marker was actually tombstoned (no marker, or an
+    already-tombstoned one, returns False so callers can stay quiet). Never raises."""
+    try:
+        m = read_marker(state_root, session_id)
+        if not m or is_tombstoned(m):
+            return False
+        m["ended"] = True
+        m["ended_at"] = now() if now_ts is None else time.strftime(
+            "%Y-%m-%dT%H:%M:%S", time.localtime(now_ts))
+        marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
+        return True
+    except Exception:
+        return False
+
+
+def revive_lead(state_root, session_id):
+    """Re-arm a tombstoned lead (SessionStart source="resume"): drop the tombstone flags and refresh
+    last_active. Everything else — project name included — is restored untouched, so a resumed lead
+    is indistinguishable from one that never exited. Returns True ONLY if a tombstone was actually
+    revived, so a plain fresh start stays a silent no-op. Never raises."""
+    try:
+        m = read_marker(state_root, session_id)
+        if not m or not is_tombstoned(m):
+            return False
+        m.pop("ended", None)
+        m.pop("ended_at", None)
+        m["last_active"] = now()
+        marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
+        return True
+    except Exception:
+        return False
 
 
 # ---- ledger (reuses the EXISTING ~/.relay-tasks/sessions.jsonl, same record shape as bin/relay) -

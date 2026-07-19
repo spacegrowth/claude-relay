@@ -1711,3 +1711,190 @@ class TestSessionEndHookLeadCleanup:
         ledger = self._read_ledger(root)
         assert any(r["event"] == "session_end" and r["session_id"] == "nobody"
                    and r["was_lead"] is False for r in ledger)
+
+
+class TestTombstone:
+    """Arming that survives exit→resume (docs/lead-arming-durability.md). A resumable exit
+    TOMBSTONES the marker (identity retained, arming dropped); a resume revives it losslessly."""
+
+    def _armed(self, root, sid="lead-1"):
+        lg.write_marker(root, sid, model="opus", iterm_session="w1t2p0:ABC", project="proj",
+                        cwd="/tmp/x", tab_label="[Lead] proj", color=[1, 2, 3],
+                        plugin_version="9.9.9", stop_hook_timeout=1900)
+        return lg.read_marker(root, sid)
+
+    def test_is_tombstoned_detects_flag(self, root):
+        assert lg.is_tombstoned({"ended": True}) is True
+        assert lg.is_tombstoned({}) is False
+        assert lg.is_tombstoned(None) is False
+
+    def test_armed_lead_is_lead_true(self, root):
+        self._armed(root)
+        assert lg.is_lead(root, "lead-1") is True
+
+    def test_tombstoned_lead_is_NOT_lead(self, root):
+        """THE critical property: a tombstone must not count as armed, or an exited session would
+        still have the gate and wake live — strictly worse than the bug this replaced."""
+        self._armed(root)
+        assert lg.tombstone_lead(root, "lead-1") is True
+        assert lg.is_lead(root, "lead-1") is False
+        assert lg.read_marker(root, "lead-1")["ended"] is True
+
+    def test_tombstone_retains_everything(self, root):
+        before = self._armed(root)
+        lg.tombstone_lead(root, "lead-1")
+        after = lg.read_marker(root, "lead-1")
+        for k in ("project", "cwd", "iterm_session", "tab_label", "color", "model", "started"):
+            assert after.get(k) == before.get(k), f"{k} was lost by tombstoning"
+
+    def test_tombstone_noop_without_marker_or_when_already_tombstoned(self, root):
+        assert lg.tombstone_lead(root, "never-armed") is False
+        self._armed(root)
+        assert lg.tombstone_lead(root, "lead-1") is True
+        assert lg.tombstone_lead(root, "lead-1") is False  # already tombstoned
+
+    def test_revive_restores_arming_losslessly(self, root):
+        before = self._armed(root)
+        lg.tombstone_lead(root, "lead-1")
+        assert lg.revive_lead(root, "lead-1") is True
+        assert lg.is_lead(root, "lead-1") is True
+        after = lg.read_marker(root, "lead-1")
+        assert "ended" not in after and "ended_at" not in after
+        # project name in particular must come back untouched — no "-2" surprise on resume
+        assert after["project"] == before["project"]
+        for k in ("cwd", "iterm_session", "tab_label", "color", "model"):
+            assert after.get(k) == before.get(k)
+
+    def test_revive_only_ever_restores_prior_state(self, root):
+        """Re-arm is a RESTORATION, never a fresh grant: a session that was never a lead, and a
+        session that is currently armed, are both untouched."""
+        assert lg.revive_lead(root, "never-armed") is False
+        assert lg.is_lead(root, "never-armed") is False
+        self._armed(root, "lead-2")
+        assert lg.revive_lead(root, "lead-2") is False  # armed, not tombstoned → no double-arm
+        assert lg.is_lead(root, "lead-2") is True
+
+
+class TestSessionEndReasonSplit:
+    """hooks/sessionend_lead_cleanup.py: clear/logout destroy the conversation (hard clear);
+    exit/prompt_input_exit are resumable (tombstone); anything else is untouched."""
+
+    def _run(self, home, payload):
+        import subprocess
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "sessionend_lead_cleanup.py")],
+            input=json.dumps(payload), capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)})
+        return p.returncode
+
+    @pytest.mark.parametrize("reason", ["clear", "logout"])
+    def test_context_destroying_reasons_hard_clear(self, tmp_path, reason):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", project="proj")
+        assert self._run(tmp_path, {"session_id": "lead-1", "reason": reason}) == 0
+        assert lg.read_marker(root, "lead-1") == {}  # gone entirely
+
+    @pytest.mark.parametrize("reason", ["exit", "prompt_input_exit"])
+    def test_resumable_reasons_tombstone_instead_of_deleting(self, tmp_path, reason):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", project="proj")
+        assert self._run(tmp_path, {"session_id": "lead-1", "reason": reason}) == 0
+        m = lg.read_marker(root, "lead-1")
+        assert m != {} and m["ended"] is True      # identity retained
+        assert m["project"] == "proj"
+        assert lg.is_lead(root, "lead-1") is False  # but NOT armed
+
+    def test_unknown_reason_leaves_lead_armed(self, tmp_path):
+        """Headless `claude -p` ends with reason='other' (verified) — it must not disturb arming."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", project="proj")
+        assert self._run(tmp_path, {"session_id": "lead-1", "reason": "other"}) == 0
+        assert lg.is_lead(root, "lead-1") is True
+
+
+class TestSessionStartRearmHook:
+    """hooks/sessionstart_lead_rearm.py: source=resume revives a tombstone, source=clear hard
+    clears, startup/compact are no-ops. Verified source values, not documented ones."""
+
+    def _run(self, home, payload):
+        import subprocess
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "sessionstart_lead_rearm.py")],
+            input=json.dumps(payload), capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)})
+        return p.returncode, p.stderr
+
+    def test_resume_revives_tombstoned_lead(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", project="proj")
+        lg.tombstone_lead(root, "lead-1")
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "source": "resume"})
+        assert rc == 0
+        assert lg.is_lead(root, "lead-1") is True
+        assert lg.read_marker(root, "lead-1")["project"] == "proj"
+        assert "relay" in err.lower()  # loud, not silent
+
+    def test_resume_never_arms_a_session_that_was_not_a_lead(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        rc, err = self._run(tmp_path, {"session_id": "stranger", "source": "resume"})
+        assert rc == 0
+        assert lg.is_lead(root, "stranger") is False
+        assert err.strip() == ""
+
+    def test_resume_of_already_armed_lead_is_a_noop(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", project="proj")
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "source": "resume"})
+        assert rc == 0
+        assert lg.is_lead(root, "lead-1") is True
+        assert err.strip() == ""
+
+    def test_clear_hard_clears(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", project="proj")
+        lg.tombstone_lead(root, "lead-1")
+        rc, _ = self._run(tmp_path, {"session_id": "lead-1", "source": "clear"})
+        assert rc == 0
+        assert lg.read_marker(root, "lead-1") == {}
+
+    @pytest.mark.parametrize("source", ["startup", "compact"])
+    def test_startup_and_compact_are_noops(self, tmp_path, source):
+        """compact fires SessionStart on EVERY compaction (verified) — it must never disturb a
+        tombstone or an armed lead."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", project="proj")
+        lg.tombstone_lead(root, "lead-1")
+        rc, _ = self._run(tmp_path, {"session_id": "lead-1", "source": source})
+        assert rc == 0
+        assert lg.read_marker(root, "lead-1")["ended"] is True  # still tombstoned, untouched
+
+    def test_bad_payload_fails_open(self, tmp_path):
+        import subprocess
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "sessionstart_lead_rearm.py")],
+            input="not json", capture_output=True, text=True,
+            env={**os.environ, "HOME": str(tmp_path)})
+        assert p.returncode == 0
+
+
+class TestHooksAreExecutable:
+    """Every hook registered in hooks.json is invoked by the harness as a BARE PATH, so it must
+    carry the executable bit. A hook created without +x fails silently at runtime — and unit tests
+    that shell out via `python3 <path>` cannot detect it, because that path doesn't need +x. This
+    caught a real, silently-broken SessionStart hook; it exists so that can't recur."""
+
+    def test_every_registered_hook_is_executable(self):
+        cfg = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())
+        checked = []
+        for event, entries in cfg["hooks"].items():
+            for entry in entries:
+                for h in entry.get("hooks", []):
+                    cmd = h.get("command", "")
+                    rel = cmd.replace("${CLAUDE_PLUGIN_ROOT}/", "").split()[0]
+                    path = REPO_ROOT / rel
+                    assert path.exists(), f"{event}: {rel} does not exist"
+                    assert os.access(path, os.X_OK), (
+                        f"{event}: {rel} is NOT executable — the harness invokes it as a bare "
+                        f"path, so it would fail silently at runtime")
+                    checked.append(rel)
+        assert checked, "no hooks found to check"

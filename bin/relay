@@ -1200,6 +1200,15 @@ def cmd_status(args):
             return
 
 
+def _lead_age_cell(m):
+    """LAST ACTIVE cell for a lead row, prefixed with ⏸ when the lead is PAUSED (tombstoned: its
+    session exited but is resumable, so it is NOT armed right now). Without this a paused lead
+    renders identically to a live one, which is precisely the silent state this mechanism exists to
+    eliminate."""
+    age = _relative_age(m.get("last_active"))
+    return f"⏸ {age}" if lead_guard.is_tombstoned(m) else age
+
+
 def _relative_age(ts):
     """A short relative age ('30s ago' / '12m ago' / '2h ago' / '3d ago') from an ISO timestamp in
     now()'s format. Degrades to '-' when ts is missing/None or in an unparseable/old format — a
@@ -1314,7 +1323,7 @@ def cmd_list(args):
             ("MODEL", 8, [m.get("model") or "-" for m in leads]),
             ("VER", 8, [m.get("plugin_version") or "?" for m in leads]),
             ("WAKE", 5, [_WAKE_CELL[wake_states[m.get("session_id")]][0] for m in leads]),
-            ("LAST ACTIVE", 12, [_relative_age(m.get("last_active")) for m in leads]),
+            ("LAST ACTIVE", 12, [_lead_age_cell(m) for m in leads]),
         ]
         lead_widths = {name: min(cap, max(len(name), max((len(str(v)) for v in vals), default=0)))
                        for name, cap, vals in lead_cols}
@@ -1330,9 +1339,14 @@ def cmd_list(args):
                 cell(m.get("model") or "-", lead_widths["MODEL"]),
                 cell(m.get("plugin_version") or "?", lead_widths["VER"]),
                 c(cell(wake_text, lead_widths["WAKE"]), *wake_styles),
-                cell(_relative_age(m.get("last_active")), lead_widths["LAST ACTIVE"]),
+                cell(_lead_age_cell(m), lead_widths["LAST ACTIVE"]),
             ]
             print(" ".join(row_parts))
+        # A paused lead looks identical to a live one without this — and "silently not armed" is the
+        # exact failure this whole mechanism exists to end (docs/lead-arming-durability.md).
+        if any(lead_guard.is_tombstoned(m) for m in leads):
+            print(c("  ⏸ paused: this lead's session exited but is resumable — its name and state "
+                    "are held, and resuming re-arms it automatically.", "dim"))
         # Footnote only when something needs action — a stale (or unknown) wake hook is exactly the
         # silent condition that used to cost a forensic investigation to find.
         if any(st == "stuck" for st in wake_states.values()):
@@ -1675,6 +1689,14 @@ def unique_lead_project(project, self_sid, exclude_sids, leads, now_ts=None):
             sid = m.get("session_id")
             name = m.get("project")
             if not sid or not name or sid in exclude:
+                continue
+            if lead_guard.is_tombstoned(m):
+                # A tombstoned lead is PAUSED, not dead — it will be revived under its own name on
+                # resume, so it keeps holding that name (docs/lead-arming-durability.md §9.2).
+                # Without this, quitting and resuming could hand your name to someone else and bring
+                # you back as "<project>-2". Deliberately different from the ghost rule below: a
+                # ghost never announced an intent to return, a tombstone did.
+                reserved.setdefault(name, sid)
                 continue
             try:
                 last_active = time.mktime(time.strptime(m.get("last_active") or "", "%Y-%m-%dT%H:%M:%S"))
