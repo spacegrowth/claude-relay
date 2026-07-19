@@ -107,13 +107,60 @@ Two facts make the fix trivial:
 - **it fires on `--resume` / `--continue` / `/resume`**, and
 - **`--resume` preserves the same `session_id`**, so per-session state keys straight through.
 
-> **VERIFICATION STATUS — read before building.** The above is from the official hook docs and is
-> **not yet empirically confirmed on this machine's Claude Code build.** This project has repeatedly
-> been bitten by doc-vs-reality gaps (see `async-rewake-findings.md`, where a documented mechanism
-> behaved differently in practice and two separate spikes returned false results). **Spike it first**
-> (§8).
+> **VERIFICATION STATUS: ✅ SPIKED AND CONFIRMED on this build (2026-07-19).** See §7.
 
-## 7. Proposed fix — a closed state machine
+## 7. Spike findings (2026-07-19) — VERIFIED on this build
+
+Rig: a throwaway `--settings` file registering `SessionStart` + `SessionEnd` hooks whose only job is
+to append the **raw stdin payload** to a log. Ground truth = the logged payloads, not the docs.
+
+### 7.1 The full round-trip — the exact failing sequence
+
+Interactive session in a real tab, exited with `/exit`, then resumed:
+
+```
+07:42:25  [SessionStart]  source=startup                     same sid
+07:43:16  [SessionEnd  ]  reason=prompt_input_exit           same sid   ← deletes the lead marker TODAY
+07:43:42  [SessionStart]  source=resume                      same sid   ← the re-arm hook fires HERE
+07:43:44  [SessionEnd  ]  reason=other                       same sid
+```
+
+**Every claim the fix depends on is confirmed:**
+
+| Claim | Result |
+|---|---|
+| `SessionStart` fires at all | ✅ fires on startup and on resume |
+| `source` distinguishes why | ✅ `startup` / `resume` observed directly |
+| Fires on `--resume` | ✅ `source=resume` |
+| `session_id` preserved across resume | ✅ **identical** in all four events |
+| Interactive exit yields the marker-clearing reason | ✅ `/exit` → `reason=prompt_input_exit` |
+| Hook can run an arbitrary command | ✅ (the rig is a shell script) |
+
+### 7.2 Doc-vs-reality gaps the spike caught
+
+Worth having spiked rather than trusted:
+
+- **The documented optional fields were NOT delivered.** Docs list `model`, `agent_type`,
+  `session_title` as optional payload fields; **none appeared** in any observed payload. The actual
+  `SessionStart` payload on this build is exactly: `session_id`, `transcript_path`, `cwd`,
+  `hook_event_name`, `source`. **Do not build on those three.**
+- **`SessionEnd` carries an undocumented `prompt_id`** field.
+- **Headless (`claude -p`) ends with `reason=other`,** not `prompt_input_exit` — and `other` is *not*
+  in `REAL_END_REASONS`, so a headless run does **not** clear a lead marker. Only interactive exits do.
+  (This is why the bug only ever showed up in real interactive use.)
+
+### 7.3 Practical notes for the implementer
+
+- `matcher: "*"` works for `SessionStart`; `SessionEnd` needs no matcher.
+- Do **not** rely on env inheritance into the hook subprocess — resolve paths inside the hook.
+- `timeout(1)` does not exist on macOS (it's `gtimeout`) — same trap noted in
+  `async-rewake-findings.md`.
+- Ctrl-D injected via AppleScript did **not** exit the session; typing `/exit` did. Relevant if
+  anyone automates this test later.
+
+---
+
+## 8. Proposed fix — a closed state machine
 
 `SessionEnd.reason` and `SessionStart.source` are complementary, which turns arming into a proper
 lifecycle instead of a one-way delete:
@@ -136,28 +183,30 @@ Three properties worth stating:
    writes `was_lead: true` to the ledger at the exact instant it unarms a lead. The warning
    information existed and went into a log nobody reads. **Silence is the actual defect.**
 
-## 8. Plan
+## 9. Decisions (settled — build to these)
 
-1. **Spike (gates everything).** A throwaway `SessionStart` hook that does nothing but append its raw
-   stdin payload to a file. Verify empirically, on this build:
-   - does it fire on a fresh start, and what is `source`?
-   - does it fire on `claude --resume <id>`, and is `source == "resume"`?
-   - is `session_id` present, and **identical** to the original session's id?
-   Ground truth = the logged payloads, not the docs. Same discipline as `async-rewake-findings.md`.
-2. **Implement** (only if the spike confirms): tombstone-on-pause in `sessionend_lead_cleanup.py`,
-   new `SessionStart` hook, registration in `hooks/hooks.json`, `relay list` surfacing of tombstoned
+1. **Auto re-arm.** On `SessionStart(source=resume)` with a tombstone present, **re-arm
+   automatically** — do not merely warn. (The warning is still the fallback if re-arm fails.)
+2. **The project name is preserved.** A resumed lead comes back under its **original name** — no
+   `claude-relay` → `claude-relay-2` surprise. This means a tombstone **does** reserve its name for
+   the uniqueness check, unlike a plain ghost. Note this is a deliberate change to
+   `unique_lead_project`'s current "stale leads don't reserve names" rule, and needs a test pinning
+   it (a tombstoned lead's name is held; a genuinely-dead ghost's is still reclaimed).
+3. **The tombstone retains everything** — project, cwd, `iterm_session`, colour, `predecessor`,
+   `started` — so re-arm is **lossless** and the resumed lead is indistinguishable from one that
+   never exited.
+
+## 10. Plan
+
+1. ~~**Spike**~~ — **done, §7. All claims confirmed.**
+2. **Implement:** tombstone-on-pause in `sessionend_lead_cleanup.py` (hard-clear only on
+   `clear`/`logout`), new `SessionStart` hook + registration in `hooks/hooks.json`, auto re-arm on
+   `source=resume`, name-preservation in `unique_lead_project`, `relay list` surfacing of tombstoned
    leads, tests, version bump.
-3. **Decide re-arm vs warn.** Auto-re-arm is convenient but arming has side effects (tab rename,
-   colour, gate on). Warning loudly is the safe floor. Open question — resolve before implementing.
-4. **Merge to `main`** once verified. This branch stays independent of `wake-push`.
+3. **Merge to `main`** once verified. This branch stays independent of `wake-push`.
 
-## 9. Open questions
+## 11. Remaining open question
 
-- **Auto-re-arm, or warn-and-let-the-human-run `/relay:mode`?** (§8.3)
-- **What exactly does a tombstone retain?** Everything (project, cwd, iterm_session, colour,
-  predecessor) so re-arm is lossless — or a minimal identity record?
-- **Does a tombstone reserve its project name?** Today ghosts don't (`LEAD_LIVE_WINDOW_SECONDS`).
-  A tombstoned-but-resumable lead arguably *should* hold its name, or a resume could come back
-  renamed (`claude-relay` → `claude-relay-2`).
-- **`compact`** — confirm a compaction doesn't unarm anything today, and that `SessionStart(compact)`
-  needs no action.
+- **`compact`** — the spike did not exercise a compaction. Confirm a compaction doesn't unarm
+  anything today and that `SessionStart(compact)` needs no action. Low risk (compaction doesn't fire
+  `SessionEnd`, so there should be no tombstone to act on), but unverified.
