@@ -1100,8 +1100,17 @@ def _lead_status_line(lead_sid, marker, transcript_path=None):
     display-time freshness upgrade over the stored status), a WAKE segment when this lead's
     auto-wake is unhealthy, and (--statusline mode only, when `transcript_path` is given) a
     transcript-weight segment. Reuses wake_hook_state/poll_lock_state/transcript_mb/handoff_nudged
-    (lead_guard) rather than re-deriving their rules. Returns "" when every segment is empty (e.g.
-    an armed lead with zero executors)."""
+    (lead_guard) rather than re-deriving their rules.
+
+    ALWAYS leads with an armed/paused token, even for a lead with zero executors and nothing wrong.
+    That is the whole point: "am I armed right now?" had no glanceable answer, so silent unarming
+    went unnoticed for days (docs/lead-arming-durability.md). A blank status line must mean "not a
+    lead", never "armed but quiet"."""
+    if lead_guard.is_tombstoned(marker):
+        # PAUSED: session exited but resumable. Not armed — gate and wake are OFF — so it would be
+        # actively misleading to render executor/wake segments as though a live lead were watching.
+        return f"⏸ {marker.get('project') or 'lead'} paused"
+
     busy = []
     reported = []
     for esid in all_session_ids():
@@ -1118,7 +1127,8 @@ def _lead_status_line(lead_sid, marker, transcript_path=None):
         elif status == "busy":
             busy.append(esid)
 
-    segments = []
+    # Armed token first, unconditionally — an armed lead is never invisible.
+    segments = [f"🚦 {marker.get('project') or 'lead'}"]
     if busy:
         shown = busy[:3]
         label = ",".join(shown)

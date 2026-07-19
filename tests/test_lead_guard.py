@@ -1822,21 +1822,26 @@ class TestSessionStartRearmHook:
             ["python3", str(REPO_ROOT / "hooks" / "sessionstart_lead_rearm.py")],
             input=json.dumps(payload), capture_output=True, text=True,
             env={**os.environ, "HOME": str(home)})
-        return p.returncode, p.stderr
+        return p.returncode, p.stdout, p.stderr
 
     def test_resume_revives_tombstoned_lead(self, tmp_path):
         root = tmp_path / ".relay-tasks"
         lg.write_marker(root, "lead-1", project="proj")
         lg.tombstone_lead(root, "lead-1")
-        rc, err = self._run(tmp_path, {"session_id": "lead-1", "source": "resume"})
+        rc, out, err = self._run(tmp_path, {"session_id": "lead-1", "source": "resume"})
         assert rc == 0
         assert lg.is_lead(root, "lead-1") is True
         assert lg.read_marker(root, "lead-1")["project"] == "proj"
-        assert "relay" in err.lower()  # loud, not silent
+        # The message MUST be on stdout: a SessionStart hook's stdout is surfaced as session
+        # context, its stderr is not shown to anyone. The first cut used stderr — the re-arm worked
+        # and announced itself into the void, which is the exact silent-failure this fix exists to
+        # end. Pin the channel, not just the presence of a message.
+        assert "relay" in out.lower()
+        assert err.strip() == ""
 
     def test_resume_never_arms_a_session_that_was_not_a_lead(self, tmp_path):
         root = tmp_path / ".relay-tasks"
-        rc, err = self._run(tmp_path, {"session_id": "stranger", "source": "resume"})
+        rc, out, err = self._run(tmp_path, {"session_id": "stranger", "source": "resume"})
         assert rc == 0
         assert lg.is_lead(root, "stranger") is False
         assert err.strip() == ""
@@ -1844,7 +1849,7 @@ class TestSessionStartRearmHook:
     def test_resume_of_already_armed_lead_is_a_noop(self, tmp_path):
         root = tmp_path / ".relay-tasks"
         lg.write_marker(root, "lead-1", project="proj")
-        rc, err = self._run(tmp_path, {"session_id": "lead-1", "source": "resume"})
+        rc, out, err = self._run(tmp_path, {"session_id": "lead-1", "source": "resume"})
         assert rc == 0
         assert lg.is_lead(root, "lead-1") is True
         assert err.strip() == ""
@@ -1853,7 +1858,7 @@ class TestSessionStartRearmHook:
         root = tmp_path / ".relay-tasks"
         lg.write_marker(root, "lead-1", project="proj")
         lg.tombstone_lead(root, "lead-1")
-        rc, _ = self._run(tmp_path, {"session_id": "lead-1", "source": "clear"})
+        rc, _out, _err = self._run(tmp_path, {"session_id": "lead-1", "source": "clear"})
         assert rc == 0
         assert lg.read_marker(root, "lead-1") == {}
 
@@ -1864,7 +1869,7 @@ class TestSessionStartRearmHook:
         root = tmp_path / ".relay-tasks"
         lg.write_marker(root, "lead-1", project="proj")
         lg.tombstone_lead(root, "lead-1")
-        rc, _ = self._run(tmp_path, {"session_id": "lead-1", "source": source})
+        rc, _out, _err = self._run(tmp_path, {"session_id": "lead-1", "source": source})
         assert rc == 0
         assert lg.read_marker(root, "lead-1")["ended"] is True  # still tombstoned, untouched
 

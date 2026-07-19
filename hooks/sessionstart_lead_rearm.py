@@ -67,8 +67,10 @@ def main():
                 lg.append_ledger(STATE_ROOT, "lead_rearmed", session_id=sid, source=source)
                 marker = lg.read_marker(STATE_ROOT, sid)
                 # Loudness is the point: the original defect was that unarming happened in silence.
-                # stdout from a SessionStart hook surfaces as context for the session.
-                sys.stderr.write(
+                # This MUST be stdout — a SessionStart hook's stdout is surfaced as session context;
+                # its stderr goes nowhere the user will see. (Learned the hard way: the first cut
+                # wrote to stderr, the re-arm worked perfectly and reported itself to no one.)
+                sys.stdout.write(
                     f"🚦 [relay] — lead mode restored for this resumed session "
                     f"(project '{marker.get('project') or '?'}'). Gate and auto-wake are active again.\n"
                 )

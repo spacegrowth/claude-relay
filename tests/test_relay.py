@@ -2286,10 +2286,25 @@ class TestStatus:
         out = capsys.readouterr().out
         assert "WAKE stuck" in out
 
-    def test_no_executors_prints_nothing(self, relay, capsys):
+    def test_armed_lead_is_visible_even_with_no_executors(self, relay, capsys):
+        """DELIBERATE behavior change (was: printed nothing). An armed lead with no executors and
+        nothing wrong used to render an EMPTY status line — indistinguishable from not being a lead
+        at all. That invisibility is the root of the silent-unarming class of bug
+        (docs/lead-arming-durability.md): 'am I armed?' had no glanceable answer. A blank line must
+        now mean 'not a lead', never 'armed but quiet'."""
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
         relay.cmd_status(self._args(session_id="lead-1"))
-        assert capsys.readouterr().out == ""
+        assert "webapp" in capsys.readouterr().out
+
+    def test_paused_lead_renders_as_paused_not_armed(self, relay, capsys):
+        """A tombstoned lead is NOT armed (gate and wake off), so it must say so rather than render
+        the armed token — and must not show executor/wake segments implying a live watcher."""
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        relay.lead_guard.tombstone_lead(relay.STATE_ROOT, "lead-1")
+        relay.cmd_status(self._args(session_id="lead-1"))
+        out = capsys.readouterr().out
+        assert "paused" in out and "webapp" in out
+        assert "🚦" not in out  # must not look armed
 
     # ---- transcript-size / handoff-awareness segment (--statusline mode only) ------------------
 
