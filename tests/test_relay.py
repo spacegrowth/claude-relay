@@ -930,11 +930,18 @@ class TestFocus:
 class TestNudgeLead:
     """cmd_nudge_lead: `relay send` pointed at a LEAD's own tab (wake-watch design §9). ALWAYS
     sends — §9.5b spiked that typing into a busy lead is harmless, so there is no busy/stale guard
-    left; a marker still carrying a legacy `state: busy` field must be ignored. iterm.send mocked
-    (no real AppleScript)."""
+    left; a marker still carrying a legacy `state: busy` field must be ignored.
 
-    def _lead(self, relay, sid="lead-1", tab_label="[Lead] alpha", state=None, state_since=None):
-        relay.lead_guard.write_marker(relay.STATE_ROOT, sid, project="alpha", tab_label=tab_label)
+    Sends go through `backend.by_name(marker["backend"])`, NOT `relay.iterm` (the caller's ambient
+    guess) — mocking that ambient-selected module would be environment-dependent (it resolves
+    differently depending on the machine/shell $TERM_PROGRAM the suite happens to run under; see
+    scripts/backend.py), so every test here pins the concrete backend module via
+    `relay.backend.by_name(...)` instead, exactly like cmd_nudge_lead itself does post-D2/D3."""
+
+    def _lead(self, relay, sid="lead-1", tab_label="[Lead] alpha", state=None, state_since=None,
+              backend="iterm"):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, sid, project="alpha", tab_label=tab_label,
+                                      backend=backend)
         if state is not None:
             m = relay.lead_guard.read_marker(relay.STATE_ROOT, sid)
             m["state"] = state
@@ -944,13 +951,13 @@ class TestNudgeLead:
 
     def test_idle_lead_gets_nudged(self, relay):
         self._lead(relay, state="idle")
-        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+        with mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="wake up"))
         send.assert_called_once_with("[Lead] alpha", "wake up", None)
 
     def test_no_state_defaults_and_nudges(self, relay):
         self._lead(relay)  # no state stamped at all
-        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+        with mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
         send.assert_called_once()
 
@@ -958,27 +965,187 @@ class TestNudgeLead:
         # This test would FAIL if someone reintroduced a busy/stale guard — a legacy `state: busy`
         # marker must not block the send.
         self._lead(relay, state="busy", state_since=relay.now())
-        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+        with mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
         send.assert_called_once()
 
     def test_stale_busy_marked_lead_still_gets_nudged(self, relay):
         old = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
         self._lead(relay, state="busy", state_since=old)
-        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+        with mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
         send.assert_called_once()
 
     def test_no_live_tab_reports_no_live_tab(self, relay):
-        self._lead(relay)
-        with mock.patch.object(relay.iterm, "send", return_value=False):
+        # is_alive is mocked FALSE deliberately: the refusal path now probes liveness to tell a dead
+        # tab apart from a live-but-uninjectable one, so leaving it unmocked would make a real
+        # osascript call and flip this test to `cannot-inject` on any machine that happens to have a
+        # tab named "[Lead] alpha".
+        bk = relay.backend.by_name("iterm")
+        with mock.patch.object(bk, "send", return_value=False), \
+             mock.patch.object(bk, "is_alive", return_value=False):
+            self._lead(relay)
             with pytest.raises(SystemExit) as ei:
                 relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
         assert "no-live-tab" in str(ei.value)
 
+    def test_alive_but_uninjectable_tab_reports_cannot_inject_not_no_live_tab(self, relay):
+        # Terminal.app's send() is unconditionally False by design (it cannot type into a running
+        # process), so a HEALTHY Terminal-hosted lead used to be reported as "no-live-tab" — a dead
+        # tab and a live one failing for a totally different reason looked identical. Verified live
+        # against a real Terminal window (is_alive True / send False) before this test was written.
+        bk = relay.backend.by_name("terminal")
+        with mock.patch.object(bk, "send", return_value=False), \
+             mock.patch.object(bk, "is_alive", return_value=True):
+            self._lead(relay, backend="terminal")
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
+        msg = str(ei.value)
+        assert "cannot-inject" in msg
+        assert "no-live-tab" not in msg
+
     def test_unknown_lead_errors(self, relay):
         with pytest.raises(SystemExit):
             relay.cmd_nudge_lead(SimpleNamespace(lead="nope", message="hi"))
+
+    def test_sends_via_markers_recorded_backend_not_ambient_guess(self, relay, monkeypatch):
+        # Defect A, reproduced live: an executor running under Terminal.app selects the `terminal`
+        # backend for ITSELF (ambient), but the lead being nudged is actually iTerm-hosted. The send
+        # must go through the marker's OWN recorded backend, never the caller's ambient guess — so
+        # even swapping the ambient `relay.iterm` for a decoy that would fail must not matter.
+        self._lead(relay, backend="iterm")
+        decoy_calls = []
+        monkeypatch.setattr(relay, "iterm",
+                            SimpleNamespace(send=lambda *a, **k: decoy_calls.append(a) or False,
+                                            NAME="decoy"))
+        with mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
+            relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
+        assert not decoy_calls, "ambient (wrong) backend was used instead of the marker's recorded one"
+        send.assert_called_once_with("[Lead] alpha", "hi", None)
+
+    def test_backend_missing_probes_and_sends_via_the_one_with_a_live_tab(self, relay):
+        # D3.2: a marker armed before D2 has backend=None — every currently-armed lead on a real
+        # machine, per the packet. Probe rather than guess: exactly one backend reports a live tab.
+        self._lead(relay, backend=None)
+        with mock.patch.object(relay.backend.by_name("terminal"), "is_alive", return_value=False), \
+             mock.patch.object(relay.backend.by_name("iterm"), "is_alive", return_value=True), \
+             mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
+            relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
+        send.assert_called_once_with("[Lead] alpha", "hi", None)
+
+    def test_backend_missing_and_ambiguous_probe_falls_back_to_ambient(self, relay, monkeypatch):
+        # Both backends claim a live tab (shouldn't normally happen, but the probe must degrade to
+        # the old ambient-guess behavior rather than pick arbitrarily).
+        self._lead(relay, backend=None)
+        with mock.patch.object(relay.backend.by_name("terminal"), "is_alive", return_value=True), \
+             mock.patch.object(relay.backend.by_name("iterm"), "is_alive", return_value=True), \
+             mock.patch.object(relay.iterm, "send", return_value=True) as send:
+            relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
+        send.assert_called_once()
+
+
+class TestWhoami:
+    """`relay whoami [<token>]` (D1) — resolve a lead's session id, an executor's relay name, or an
+    executor's `claude_session` uuid to a single answer: who is this, and (for an executor) who is
+    its lead. Read-only over EXISTING state only — no new reverse index (Boundaries)."""
+
+    def _exec(self, relay, name="term-exec", owner_lead=None, packet=1, report=True,
+             claude_session="9b7ae35f-2cf1-4e5a-9487-11acb785ab31", status="reported"):
+        relay.write_session(name, {
+            "session_id": name, "owner_lead": owner_lead, "current_packet": packet,
+            "status": status, "claude_session": claude_session, "topic": "t", "worktree": "/w",
+        })
+        d = relay.packets_dir(name)
+        d.mkdir(parents=True, exist_ok=True)
+        if report:
+            (d / f"{packet:03d}-report.md").write_text("done")
+        return name
+
+    def test_resolves_executor_by_relay_name(self, relay, capsys):
+        self._exec(relay, name="term-exec")
+        relay.cmd_whoami(SimpleNamespace(token="term-exec", json=False))
+        out = capsys.readouterr().out
+        assert "name       : term-exec" in out
+        assert "role       : executor" in out
+
+    def test_resolves_executor_by_claude_session_uuid(self, relay, capsys):
+        self._exec(relay, name="term-exec", claude_session="uuid-123")
+        relay.cmd_whoami(SimpleNamespace(token="uuid-123", json=False))
+        out = capsys.readouterr().out
+        assert "name       : term-exec" in out
+
+    def test_resolves_lead_by_session_id(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="claude-relay",
+                                      tab_label="[Lead] claude-relay", backend="iterm")
+        relay.cmd_whoami(SimpleNamespace(token="lead-1", json=False))
+        out = capsys.readouterr().out
+        assert "name       : claude-relay" in out
+        assert "role       : lead" in out
+
+    def test_default_token_falls_back_to_env(self, relay, capsys, monkeypatch):
+        self._exec(relay, name="term-exec", claude_session="env-uuid")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "env-uuid")
+        relay.cmd_whoami(SimpleNamespace(token=None, json=False))
+        out = capsys.readouterr().out
+        assert "name       : term-exec" in out
+
+    def test_unresolvable_token_exits_nonzero_with_message(self, relay):
+        with pytest.raises(SystemExit) as ei:
+            relay.cmd_whoami(SimpleNamespace(token="totally-unknown", json=False))
+        assert "could not resolve" in str(ei.value)
+
+    def test_no_token_and_no_env_exits(self, relay, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        with pytest.raises(SystemExit):
+            relay.cmd_whoami(SimpleNamespace(token=None, json=False))
+
+    def test_json_executor_shape(self, relay, capsys):
+        self._exec(relay, name="term-exec", owner_lead="lead-1", claude_session="uuid-xyz")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="claude-relay",
+                                      tab_label="[Lead] claude-relay", iterm_session="w0t1p0:X",
+                                      backend="iterm")
+        relay.cmd_whoami(SimpleNamespace(token="term-exec", json=True))
+        data = json.loads(capsys.readouterr().out)
+        assert data["name"] == "term-exec"
+        assert data["session"] == "uuid-xyz"
+        assert data["role"] == "executor"
+        assert data["owner_lead"] == "lead-1"
+        assert data["current_packet"] == 1
+        assert data["report_path"].endswith("001-report.md")
+        assert os.path.isabs(data["report_path"])
+        assert data["report_exists"] is True
+        assert data["lead_backend"] == "iterm"
+        assert data["lead_tab_label"] == "[Lead] claude-relay"
+        assert data["lead_iterm_session"] == "w0t1p0:X"
+
+    def test_json_executor_report_not_yet_written(self, relay, capsys):
+        self._exec(relay, name="term-exec", report=False)
+        relay.cmd_whoami(SimpleNamespace(token="term-exec", json=True))
+        data = json.loads(capsys.readouterr().out)
+        assert data["report_exists"] is False
+
+    def test_json_executor_unowned_lead_fields_are_null(self, relay, capsys):
+        self._exec(relay, name="term-exec", owner_lead=None)
+        relay.cmd_whoami(SimpleNamespace(token="term-exec", json=True))
+        data = json.loads(capsys.readouterr().out)
+        assert data["owner_lead"] is None
+        assert data["lead_backend"] is None
+        assert data["lead_tab_label"] is None
+
+    def test_json_lead_shape_lists_execs(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="claude-relay",
+                                      tab_label="[Lead] claude-relay", backend="iterm")
+        self._exec(relay, name="term-exec", owner_lead="lead-1", status="reported")
+        self._exec(relay, name="relay-wake-push", owner_lead="lead-1", status="reported",
+                  claude_session="uuid-2")
+        relay.cmd_whoami(SimpleNamespace(token="lead-1", json=True))
+        data = json.loads(capsys.readouterr().out)
+        assert data["role"] == "lead"
+        assert data["session"] == "lead-1"
+        assert data["backend"] == "iterm"
+        assert data["tab_label"] == "[Lead] claude-relay"
+        names = {e["name"] for e in data["execs"]}
+        assert names == {"term-exec", "relay-wake-push"}
 
 
 class TestCloseTab:
@@ -1923,6 +2090,26 @@ class TestLeadStart:
         marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
         assert marker["last_active"] == "2030-01-01T00:00:00"
         assert marker["started"] == "2020-01-01T00:00:00"   # unaffected by the last_active refresh
+
+    def test_records_backend(self, relay, tmp_path, monkeypatch):
+        # D2 (Defect A's root cause): lead-start never used to stamp a backend at all, so a fresh
+        # marker's `backend` read null and `term_backend`'s `or iterm` fallback in cmd_nudge_lead
+        # fell straight through to whichever backend the CALLER happened to be running under.
+        monkeypatch.chdir(tmp_path)
+        relay.cmd_lead_start(self._args("lead-1"))
+        marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert marker["backend"] == relay.iterm.NAME
+        assert marker["backend"] in ("iterm", "terminal")
+
+    def test_rearm_restamps_backend(self, relay, tmp_path, monkeypatch):
+        # Unlike predecessor/started, backend is NOT preserved across re-arms — it always reflects
+        # whatever backend THIS arm actually ran under (e.g. relay re-armed from a different shell).
+        monkeypatch.chdir(tmp_path)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp",
+                                      cwd=str(tmp_path), backend="stale-backend")
+        relay.cmd_lead_start(self._args("lead-1", project="webapp"))
+        marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert marker["backend"] == relay.iterm.NAME
 
 
 class TestHandoff:

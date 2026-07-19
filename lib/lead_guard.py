@@ -318,7 +318,7 @@ def is_lead(state_root, session_id):
 
 def write_marker(state_root, session_id, model=None, iterm_session=None, project=None, cwd=None,
                  tab_label=None, color=None, plugin_version=None, stop_hook_timeout=None,
-                 predecessor=None, started=None):
+                 predecessor=None, started=None, backend=None):
     d = lead_dir(state_root, session_id)
     d.mkdir(parents=True, exist_ok=True)
     marker_path(state_root, session_id).write_text(json.dumps({
@@ -331,6 +331,11 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
         "started": started or now(), # preserved across re-arms by callers that read the existing marker first
         "model": model,
         "iterm_session": iterm_session,  # $TERM_SESSION_ID — recorded tab metadata (debugging)
+        "backend": backend,          # which terminal app hosts this lead's OWN tab ("iterm" |
+                                      # "terminal"), same field name/values as an executor's
+                                      # session.json — term_backend() reads either. Re-stamped on
+                                      # every arm (unlike predecessor/started) so it always reflects
+                                      # the ambient backend `relay lead-start` actually ran under.
         # The plugin version this session is bound to, and the Stop-hook timeout that version
         # declares — captured at arm time (bin/relay shares ${CLAUDE_PLUGIN_ROOT} with the hooks, so
         # what it reads IS what will fire). wake_hook_state() reads these back to flag a lead whose

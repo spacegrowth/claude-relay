@@ -1793,7 +1793,12 @@ def cmd_lead_start(args):
                             iterm_session=iterm_session, project=project, cwd=cwd,
                             tab_label=tab_label, color=color,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
-                            predecessor=existing.get("predecessor"), started=existing.get("started"))
+                            predecessor=existing.get("predecessor"), started=existing.get("started"),
+                            backend=iterm.NAME)  # which terminal app THIS lead-start ran under (D2,
+                                                # wake-watch design "cross-backend nudge" fix) — the
+                                                # same field/values cmd_spawn already writes for
+                                                # executors (bin/relay:612), so term_backend() reads
+                                                # either uniformly instead of guessing ambient
     # Record the cwd's current git HEAD as the baseline, so the Stop-hook commit-surfacing (App 2)
     # only reports commits made AFTER lead mode began — not the repo's entire prior history.
     lead_guard.write_head(STATE_ROOT, args.session_id, lead_guard.git_head(os.getcwd()))
@@ -1986,26 +1991,168 @@ def cmd_focus(args):
     sys.exit(f"no such session: {sid}")
 
 
+def _probe_backend_for_tab(label, handle):
+    """When a lead's marker has no recorded `backend` (armed before D2, or a pre-D2 packet), don't
+    fall back to the CALLER's ambient guess (backend.select() — exactly the bug: an executor
+    running in Terminal.app selecting the `terminal` backend to address an iTerm-hosted lead, see
+    Defect A). Instead probe every known backend's `is_alive(label, handle)` and use whichever one
+    actually has the tab. Returns the backend module if EXACTLY one has it; None if zero or more
+    than one matched (ambiguous — caller falls back to the ambient guess, same as before this
+    existed). Never raises; a backend whose probe itself errors is just skipped."""
+    found = []
+    for name in ("iterm", "terminal"):
+        bk = backend.by_name(name)
+        try:
+            if bk and label and bk.is_alive(label, handle):
+                found.append(bk)
+        except Exception:
+            continue
+    return found[0] if len(found) == 1 else None
+
+
 def cmd_nudge_lead(args):
     """`relay send` pointed at a LEAD's own tab instead of an executor's (wake-watch design §9) —
-    the push primitive the executor-side escalation hook calls to wake an idle lead. Same typing
-    mechanism as cmd_send (iterm.send). ALWAYS sends, unconditionally — §9.5b spiked this directly:
-    typing into a busy lead is harmless (it queues in the input box and is processed intact at
-    turn-end), so there is no busy/stale guard here any more. The only refusal left is a dead tab."""
+    the push primitive the executor-side escalation hook calls to wake an idle lead. ALWAYS sends,
+    unconditionally — §9.5b spiked this directly: typing into a busy lead is harmless (it queues in
+    the input box and is processed intact at turn-end), so there is no busy/stale guard here any
+    more. The only refusal left is a dead tab.
+
+    Sends via the marker's OWN recorded backend (`term_backend`), never the caller's ambient guess
+    — Defect A, live-reproduced: an executor running under Terminal.app selects the `terminal`
+    backend for ITSELF, and used to hand that same wrong backend to an iTerm-hosted lead, which
+    can't inject text at all (terminal_app.send is unconditionally False by design — see its
+    docstring), so every cross-backend nudge silently "found no live tab" even though the lead's tab
+    was right there. A marker with no recorded backend (every lead armed before D2) gets probed
+    (_probe_backend_for_tab) rather than guessed."""
     sid = args.lead
     marker = lead_guard.read_marker(STATE_ROOT, sid)
     if not marker:
         sys.exit(f"no such lead: {sid}")
 
     label = marker.get("tab_label")
+    handle = marker.get("iterm_session")
+    recorded = marker.get("backend")
+    if recorded:
+        bk = backend.by_name(recorded) or iterm
+    else:
+        bk = _probe_backend_for_tab(label, handle) or iterm  # last resort: ambient guess, as before
     try:
-        ok = bool(label) and iterm.send(label, args.message, marker.get("iterm_session"))
+        ok = bool(label) and bk.send(label, args.message, handle)
     except Exception:
         ok = False
     if not ok:
+        # A dead tab and a live-but-uninjectable one are DIFFERENT failures and must not report the
+        # same way: terminal_app.send is unconditionally False by design (Terminal.app cannot inject
+        # text into a running process), so a healthy Terminal-hosted lead would otherwise be reported
+        # as "no live tab" — the exact silent-failure/indistinguishable-cause pattern §9.6a exists to
+        # kill. Probe liveness to tell them apart before refusing.
+        alive = False
+        try:
+            alive = bool(label) and bk.is_alive(label, handle)
+        except Exception:
+            alive = False
+        if alive:
+            sys.exit(f"cannot-inject: lead '{sid}' tab '{label}' is ALIVE, but backend "
+                     f"'{getattr(bk, 'NAME', '?')}' cannot type into a running process. The push is "
+                     f"unavailable here; the lead still surfaces reports via its own at-Stop check "
+                     f"and the desktop notification.")
         sys.exit(f"no-live-tab: could not find a live tab for lead '{sid}' (label '{label}').")
 
     print(f"nudged: sent message to idle lead '{sid}' (tab '{label}')")
+
+
+def _resolve_whoami(token):
+    """Resolve ANY of: a lead's session id, an executor's relay NAME, or an executor's
+    `claude_session` uuid to (role, name, record) — `role` is "lead"|"executor", `name` is the
+    canonical relay identifier (the lead's session id, or the executor's relay name — NOT its
+    claude_session uuid), `record` is the marker dict (lead) or session.json dict (executor).
+    (None, None, None) if the token matches nothing. Read-only — no new state, no reverse index
+    (Boundaries): the uuid case is a linear scan over existing session.json files, same cost class
+    as every other multi-session bin/relay command (cmd_list, cmd_check --all, ...)."""
+    marker = lead_guard.read_marker(STATE_ROOT, token)
+    if marker:
+        return "lead", token, marker
+    s = read_session(token)
+    if s:
+        return "executor", token, s
+    for name in all_session_ids():
+        s = read_session(name)
+        if s and s.get("claude_session") == token:
+            return "executor", name, s
+    return None, None, None
+
+
+def cmd_whoami(args):
+    """`relay whoami [<token>]` — a session asking relay "who am I, and who is my lead" through a
+    command instead of poking at ~/.relay-tasks JSON by hand. `<token>` may be a lead's session id,
+    an executor's relay name, or an executor's claude_session uuid; omitted, it falls back to
+    $CLAUDE_CODE_SESSION_ID (an executor's own shell has that set to its claude_session; a lead's,
+    to its session id directly). --json is the machine contract hooks/executor_escalation.py (D5)
+    consumes instead of reading session.json/report paths itself."""
+    token = args.token or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not token:
+        sys.exit("whoami: no token given and $CLAUDE_CODE_SESSION_ID is not set")
+
+    role, name, record = _resolve_whoami(token)
+    if role is None:
+        sys.exit(f"whoami: could not resolve '{token}' to a known executor or lead")
+
+    if role == "lead":
+        execs = []
+        for eid in all_session_ids():
+            s = read_session(eid)
+            if s and s.get("owner_lead") == name:
+                execs.append({"name": s.get("session_id"), "status": s.get("status")})
+        data = {
+            "name": record.get("project") or name,
+            "session": name,
+            "role": "lead",
+            "backend": record.get("backend"),
+            "tab_label": record.get("tab_label"),
+            "iterm_session": record.get("iterm_session"),
+            "execs": execs,
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(data, indent=2))
+        else:
+            print(f"name       : {data['name']}")
+            print(f"session    : {data['session']}")
+            print("role       : lead")
+            print(f"backend    : {data['backend'] or '-'}             tab '{data['tab_label'] or '-'}'")
+            exs = ", ".join(f"{e['name']} ({e['status']})" for e in execs) if execs else "-"
+            print(f"execs      : {exs}")
+        return
+
+    # role == "executor"
+    n = int(record.get("current_packet", 1))
+    report_path = str(packets_dir(name) / f"{n:03d}-report.md")
+    owner_lead = record.get("owner_lead")
+    owner_marker = lead_guard.read_marker(STATE_ROOT, owner_lead) if owner_lead else {}
+    data = {
+        "name": name,
+        "session": record.get("claude_session"),
+        "role": "executor",
+        "status": record.get("status"),
+        "owner_lead": owner_lead,
+        "current_packet": n,
+        "report_path": report_path,
+        "report_exists": os.path.exists(report_path),
+        "lead_backend": owner_marker.get("backend"),
+        "lead_tab_label": owner_marker.get("tab_label"),
+        "lead_iterm_session": owner_marker.get("iterm_session"),
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+    else:
+        print(f"name       : {data['name']}")
+        print(f"session    : {data['session']}")
+        print("role       : executor")
+        print(f"status     : {data['status']}          (packet {n:03d})")
+        if owner_lead:
+            print(f"lead       : {owner_lead}  {owner_marker.get('project') or '-'}  "
+                  f"[{data['lead_backend'] or '?'}]  tab '{data['lead_tab_label'] or '-'}'")
+        else:
+            print("lead       : -  (unowned)")
 
 
 def _sid_candidates_message(token, sids, purpose):
@@ -2217,6 +2364,11 @@ def main():
     nl.add_argument("lead")
     nl.add_argument("message")
     nl.set_defaults(func=cmd_nudge_lead)
+
+    wm = sub.add_parser("whoami")
+    wm.add_argument("token", nargs="?")
+    wm.add_argument("--json", action="store_true")
+    wm.set_defaults(func=cmd_whoami)
 
     el = sub.add_parser("_ensure-label", help=argparse.SUPPRESS)  # internal: see cmd_ensure_label
     el.add_argument("handle")

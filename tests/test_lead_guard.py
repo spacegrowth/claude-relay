@@ -554,7 +554,11 @@ class TestExecutorEscalationHookSendPath:
     exercised by importing hooks/executor_escalation.py directly (same load pattern as
     TestEscalationHookBackoffCap) instead of shelling out — mocking `subprocess.run` only works
     in-process; the hook's own subprocess boundary makes that unmockable from a parent-process
-    test."""
+    test. `_run_main`'s fake `subprocess.run` intercepts ONLY the `nudge-lead` call (the one that
+    would otherwise shell out to real `relay nudge-lead` → osascript); the hook's OTHER subprocess
+    call, `relay whoami --json <name>` (D5), is let through to the REAL subprocess against the same
+    tmp HOME, so these tests exercise the actual whoami contract rather than a hand-rolled stand-in
+    for it."""
 
     @pytest.fixture
     def hook_mod(self):
@@ -565,15 +569,31 @@ class TestExecutorEscalationHookSendPath:
         spec.loader.exec_module(mod)
         return mod
 
-    def _run_main(self, hook_mod, root, payload, monkeypatch, calls, argv_name="exec-1"):
+    def _run_main(self, hook_mod, root, payload, monkeypatch, calls, argv_name="exec-1",
+                  nudge_ok=True):
         import io
+        # `hook_mod.subprocess` IS the same singleton `subprocess` module this test file's own
+        # `import subprocess` would bind to (Python caches modules by name) — so patching
+        # `hook_mod.subprocess.run` mutates the ONE shared module. Grabbing `real_run` AFTER that
+        # patch (or via a fresh `import subprocess as X`) would just hand back the fake — capture
+        # the ORIGINAL function object first, before any patching, so forwarding to it can't recurse
+        # into itself.
+        real_run = hook_mod.subprocess.run
         monkeypatch.setattr(hook_mod, "STATE_ROOT", str(root))
         # Simulate the REAL invocation: relay bakes the executor's relay NAME into the hook command
         # as argv[1] (lead_guard.build_escalation_settings). The payload carries the CLAUDE session
         # id, which does NOT name any relay state dir.
         monkeypatch.setattr("sys.argv", ["executor_escalation.py", argv_name])
-        monkeypatch.setattr(hook_mod.subprocess, "run",
-                             lambda *a, **k: calls.append(a[0]) or SimpleNamespace(returncode=0))
+        monkeypatch.setenv("HOME", str(root.parent))  # so the REAL `relay whoami` subprocess below
+                                                       # resolves STATE_ROOT to this same tmp tree
+
+        def fake_run(cmd, **kwargs):
+            if len(cmd) > 1 and cmd[1] == "nudge-lead":
+                calls.append(cmd)
+                return SimpleNamespace(returncode=0 if nudge_ok else 1)
+            return real_run(cmd, **kwargs)  # whoami (and anything else) runs for real
+
+        monkeypatch.setattr(hook_mod.subprocess, "run", fake_run)
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
         monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
         with pytest.raises(SystemExit) as ei:
@@ -621,6 +641,23 @@ class TestExecutorEscalationHookSendPath:
         assert rc == 0
         assert calls and "nudge-lead" in calls[0], "push did not fire — identity lookup regressed"
         assert lg.load_escalation(root, "exec-2")["1"]["status"] == "sent"
+
+    def test_failed_push_records_failed_not_sent(self, hook_mod, root, monkeypatch):
+        # D4: a nudge that fails (nonzero exit, e.g. no-live-tab) must not be recorded as delivered.
+        d = root / "exec-3"; (d / "packets").mkdir(parents=True)
+        (d / "session.json").write_text(json.dumps({
+            "session_id": "exec-3", "current_packet": 1, "status": "busy", "owner_lead": "lead-1"}))
+        (d / "packets" / "001-report.md").write_text("done")
+        lg.write_marker(root, "lead-1", tab_label="[Lead] alpha")
+        calls = []
+        rc = self._run_main(hook_mod, root, {"session_id": "irrelevant"}, monkeypatch, calls,
+                            argv_name="exec-3", nudge_ok=False)
+        assert rc == 0
+        assert calls and "nudge-lead" in calls[0]
+        assert lg.load_escalation(root, "exec-3")["1"]["status"] == "failed"
+        events = [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+        assert any(e["event"] == "escalation_push_failed" and e["session_id"] == "exec-3"
+                   for e in events)
 
 
 # ---- bin/relay commands driving the above ------------------------------------------------------

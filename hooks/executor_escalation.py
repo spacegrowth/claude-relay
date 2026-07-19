@@ -14,6 +14,13 @@ deliberately (§9.6 #2) and deduped via the owning lead's surfaced_reports.json 
 path logs `escalation_resolved` instead of exiting silently, so the dedup working and a dead hook
 don't look identical).
 
+Learns its own IDENTITY through `relay whoami --json` rather than reaching into
+~/.relay-tasks/<name>/session.json by hand — one more subprocess (this hook already shells out to
+`relay nudge-lead`), but now every other relay operation and this hook go through the same command
+contract. Still learns its NAME from argv[1] (baked in at spawn by
+lead_guard.build_escalation_settings) — deriving it from Claude Code's own payload is exactly the
+bug that kept this hook from EVER firing in production (see the regression test pinning this).
+
 HARD RULE: any error → exit 0. A bug here must never brick the executor's normal Stop behavior.
 """
 import json
@@ -25,6 +32,24 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 
 STATE_ROOT = os.path.join(os.path.expanduser("~"), ".relay-tasks")
 RELAY_BIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "relay")
+
+
+def _whoami(sid):
+    """`relay whoami --json <sid>` — this executor's own identity, its current packet + report
+    state, and its owning lead's reachability, all in one read instead of the hook reconstructing
+    them from `lg.read_session_json` + manual `owner_lead` / report-path joins. Returns the parsed
+    dict, or None on ANY failure (unresolvable token, `relay` missing, malformed output, non-
+    executor role) — the caller treats None exactly like the old "not a relay executor session"
+    case: silent, zero impact. Never raises."""
+    try:
+        r = subprocess.run([RELAY_BIN, "whoami", "--json", sid], capture_output=True, text=True,
+                           timeout=10)
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout)
+        return data if data.get("role") == "executor" else None
+    except Exception:
+        return None
 
 
 def _notify_human(lg, cfg, sid, packet, owner_lead, reason):
@@ -50,20 +75,26 @@ def _notify_human(lg, cfg, sid, packet, owner_lead, reason):
 def _push_to_lead(owner_lead, sid, packet):
     """`relay nudge-lead` — the phase-1 primitive, invoked exactly as a human would from the CLI
     (not reimplemented here). Sent UNCONDITIONALLY (§9.5b — no busy check: a busy lead just queues
-    it). Best-effort; with no retry left in this design, a failed push falls through to the once-
-    per-packet mark anyway — the lead's own fast path (or a human via `relay list`) is the net under
-    a push that didn't land."""
+    it). Returns True only if the send actually succeeded (checked `returncode`) — a failed push
+    must not be recorded as delivered (D4: the once-per-packet ledger used to lie about this).
+    Best-effort otherwise; with no retry left in this design, a failed push falls through to the
+    once-per-packet mark anyway — the lead's own fast path (or a human via `relay list`) is the net
+    under a push that didn't land."""
     try:
         msg = f"executor '{sid}' reported (packet {packet:03d}) while you were idle — review it."
-        subprocess.run([RELAY_BIN, "nudge-lead", owner_lead, msg], capture_output=True, timeout=10)
+        r = subprocess.run([RELAY_BIN, "nudge-lead", owner_lead, msg], capture_output=True,
+                           timeout=10)
+        return r.returncode == 0
     except Exception:
-        pass
+        return False
 
 
 def _mark(lg, sid, packet, status):
     """Record this packet's terminal state so a later Stop (repeated executor idles) gates out
     before re-checking anything — the whole of what `escalation.json` needs to be now that there is
-    nothing to retry or back off from."""
+    nothing to retry or back off from. `status` is "resolved" | "notified" | "sent" | "failed" —
+    "failed" still occupies the once-per-packet slot (no retry, per design), it just tells the
+    truth instead of claiming delivery that didn't happen (D4)."""
     ledger = lg.load_escalation(STATE_ROOT, sid)
     ledger[str(packet)] = {"status": status}
     lg.save_escalation(STATE_ROOT, sid, ledger)
@@ -87,23 +118,23 @@ def main():
         sid = sys.argv[1] if len(sys.argv) > 1 else payload.get("session_id")
         if not sid:
             sys.exit(0)
-        s = lg.read_session_json(STATE_ROOT, sid)
-        if not s:
+
+        who = _whoami(sid)
+        if not who:
             sys.exit(0)  # not a relay executor session → silent, zero impact
 
         cfg = lg.load_config(STATE_ROOT)
         if not cfg.get("executor_escalation", True):
             sys.exit(0)  # kill-switch
 
-        n = int(s.get("current_packet", 1))
-        report_path = os.path.join(STATE_ROOT, sid, "packets", f"{n:03d}-report.md")
-        if not os.path.exists(report_path):
+        n = int(who.get("current_packet", 1))
+        if not who.get("report_exists"):
             sys.exit(0)  # idle mid-work, nothing written yet → nothing to push
 
         if str(n) in lg.load_escalation(STATE_ROOT, sid):
             sys.exit(0)  # already handled this packet — once-per-packet gate
 
-        owner_lead = s.get("owner_lead")
+        owner_lead = who.get("owner_lead")
         decision = lg.escalation_decision(STATE_ROOT, sid, n, owner_lead)
 
         if decision == "resolved":
@@ -121,8 +152,11 @@ def main():
             sys.exit(0)
 
         # decision == "send"
-        _push_to_lead(owner_lead, sid, n)
-        _mark(lg, sid, n, "sent")
+        ok = _push_to_lead(owner_lead, sid, n)
+        _mark(lg, sid, n, "sent" if ok else "failed")
+        if not ok:
+            lg.append_ledger(STATE_ROOT, "escalation_push_failed", session_id=sid, packet=n,
+                              owner_lead=owner_lead)
         sys.exit(0)
     except SystemExit:
         raise
