@@ -19,7 +19,7 @@ Commands:
   relay route retain "<reason>" --session <session_id>   # open the retain grace window
   relay handoff <handoff.md> [--project NAME] [--model NAME]  # succeed this lead with a pre-armed fresh one
   relay close-predecessor                    # close the outgoing lead's tab after a handoff, on user go
-  relay nudge-lead <lead> "<message>"        # type a message into a LEAD's own tab; refuses if busy/stale
+  relay nudge-lead <lead> "<message>"        # type a message into a LEAD's own tab; always sends
 """
 import argparse
 import json
@@ -76,10 +76,10 @@ def _stall_threshold_seconds():
 
 RELAY_BIN = str(Path(__file__).resolve())
 
-# `--settings` timeout for the executor escalation Stop hook (wake-watch design §4) — comfortably
-# above its grace + backoff sleeping, same lesson as the lead's own Stop hook timeout (see
-# docs/async-rewake-executor-findings.md).
-EXECUTOR_ESCALATION_TIMEOUT_SECONDS = 1900
+# `--settings` timeout for the executor escalation Stop hook (wake-watch design §9) — the hook is a
+# plain synchronous push now (no asyncRewake, nothing long-running to host), so this is just a
+# safety margin above its few-hundred-ms of work, not a budget for grace/backoff sleeping.
+EXECUTOR_ESCALATION_TIMEOUT_SECONDS = 30
 
 
 def _maybe_escalation_settings_file():
@@ -1983,24 +1983,15 @@ def cmd_focus(args):
 
 
 def cmd_nudge_lead(args):
-    """`relay send` pointed at a LEAD's own tab instead of an executor's (wake-watch design §4.0) —
-    the plumbing an executor-side watcher will call to wake an idle lead. Same typing mechanism as
-    cmd_send (iterm.send), same busy-guard discipline as its "refusing to send (would inject
-    mid-turn)" check — except here the guard is the lead's OWN busy/idle turn-state
-    (lead_guard.lead_turn_state), not an executor's session status. Never nudges a lead that's mid-
-    turn or plausibly wedged; the DECISION of when to call this lives in the next packet's hook, not
-    here."""
+    """`relay send` pointed at a LEAD's own tab instead of an executor's (wake-watch design §9) —
+    the push primitive the executor-side escalation hook calls to wake an idle lead. Same typing
+    mechanism as cmd_send (iterm.send). ALWAYS sends, unconditionally — §9.5b spiked this directly:
+    typing into a busy lead is harmless (it queues in the input box and is processed intact at
+    turn-end), so there is no busy/stale guard here any more. The only refusal left is a dead tab."""
     sid = args.lead
     marker = lead_guard.read_marker(STATE_ROOT, sid)
     if not marker:
         sys.exit(f"no such lead: {sid}")
-
-    state = lead_guard.lead_turn_state(marker)
-    if state == "busy":
-        sys.exit(f"refused-busy: lead '{sid}' is mid-turn — not nudging (would inject mid-turn).")
-    if state == "stale-busy":
-        sys.exit(f"refused-stale: lead '{sid}'s busy stamp is stale (possibly wedged/crashed "
-                 "mid-turn) — not nudging. That call is the caller's, not this command's.")
 
     label = marker.get("tab_label")
     try:

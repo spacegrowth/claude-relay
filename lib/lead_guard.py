@@ -59,17 +59,10 @@ LEAD_DEFAULTS = {
                                   # idle-lead poller's window also expires — see
                                   # docs/wake-watch-design.md §2.2's "two numeric coincidences".
     "executor_escalation": True,  # arm every spawned executor with the escalation Stop hook
-                                  # (wake-watch design §4): after its report lands and the owning
-                                  # lead doesn't pick it up, it nudges the idle lead or notifies the
-                                  # human directly. A net UNDER the lead's own fast-path poller, not
-                                  # a replacement — kill-switch matches the auto_wake/notify_on_wake
-                                  # pattern above.
-    "executor_escalation_grace_seconds": 60,      # hooks/executor_escalation.py: let the lead's own
-                                  # healthy fast-path win first before escalating (design §4.1).
-    "executor_escalation_poll_interval": 15,      # how often that hook's background loop re-checks.
-    "executor_escalation_max_runtime_seconds": 1800,  # exit cleanly before the --settings Stop
-                                  # hook's declared `timeout` kills it; a later executor turn
-                                  # re-arms and resumes from the persisted escalation ledger.
+                                  # (wake-watch design §9): once its report lands and it goes idle,
+                                  # push a nudge into the owning lead's tab, once. A net UNDER the
+                                  # lead's own fast-path check, not a replacement — kill-switch
+                                  # matches the auto_wake/notify_on_wake pattern above.
 }
 
 # Distinguishable, colorblind-tolerant tab colors — brightened so they remain visible when dimmed
@@ -432,75 +425,6 @@ def touch_lead(state_root, session_id, plugin_root=None):
         marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
     except Exception:
         pass
-
-
-# ---- lead busy/idle turn-state (wake-watch design §4.2) ----------------------------------------
-# Gives a LEAD a real busy/idle state, symmetric to how executors already have one, so a future
-# executor-side watcher can tell whether it's safe to nudge the lead (`relay nudge-lead`) rather
-# than injecting mid-turn. Stamped busy at turn-start (UserPromptSubmit hook) and idle at turn-end
-# (the existing Stop hook, alongside touch_lead).
-
-LEAD_BUSY_STALE_SECONDS = 5 * 60  # a single lead turn rarely runs beyond a few minutes; a `busy`
-                                   # stamp older than this most likely means the lead crashed/died
-                                   # mid-turn (the stamp freezes, nothing clears it) rather than a
-                                   # genuinely long turn — treated as `stale-busy` so a future
-                                   # watcher escalates to the human instead of waiting forever.
-
-
-def stamp_lead_state(state_root, session_id, state, now_ts=None):
-    """Read-modify-write marker.json's `state`/`state_since` fields — the turn-tracking counterpart
-    to touch_lead's `last_active` heartbeat. Shared by the UserPromptSubmit hook (state="busy") and
-    the Stop hook (state="idle") so both use ONE marker read-modify-write code path. No-op if no
-    marker exists yet (mirrors touch_lead). Never raises."""
-    try:
-        m = read_marker(state_root, session_id)
-        if not isinstance(m, dict) or not m:
-            return  # no marker to stamp → nothing to do
-        m["state"] = state
-        m["state_since"] = now() if now_ts is None else time.strftime(
-            "%Y-%m-%dT%H:%M:%S", time.localtime(now_ts))
-        marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
-    except Exception:
-        pass
-
-
-def _parse_marker_ts(s):
-    """Parse a marker timestamp in now()'s exact format ("%Y-%m-%dT%H:%M:%S") to a unix ts, or None
-    on any unparseable/missing value."""
-    try:
-        return time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
-    except Exception:
-        return None
-
-
-def lead_turn_state(marker, now_ts=None):
-    """One of "idle" | "busy" | "stale-busy" from a lead's marker dict — pure, no I/O.
-
-      "idle"        — marker's `state` is "idle", or absent entirely (a marker predating this
-                       feature, or one that's never taken a stamped turn) — idle is the safe
-                       default: no reason to believe a turn is in progress.
-      "busy"        — `state` is "busy" and `state_since` parses to within LEAD_BUSY_STALE_SECONDS
-                       of `now_ts`.
-      "stale-busy"  — `state` is "busy" but `state_since` is older than that window, OR
-                       unparseable/missing on a `busy` marker (a wedged/crashed lead leaves `busy`
-                       frozen with no further stamps — this is the signal an executor-side watcher
-                       uses to escalate to the human rather than waiting forever; see
-                       docs/wake-watch-design.md §4.2/§4.4).
-
-    Defensive: any bad input degrades to "stale-busy" (surface the ambiguous case rather than
-    silently treating a possibly-wedged lead as safely idle or busy)."""
-    try:
-        if now_ts is None:
-            now_ts = time.time()
-        state = (marker or {}).get("state")
-        if state != "busy":
-            return "idle"
-        since = _parse_marker_ts(marker.get("state_since"))
-        if since is None:
-            return "stale-busy"
-        return "busy" if (now_ts - since) <= LEAD_BUSY_STALE_SECONDS else "stale-busy"
-    except Exception:
-        return "stale-busy"
 
 
 def list_leads(state_root):
@@ -952,9 +876,10 @@ def poll_lock_state(state_root, lead_sid, poll_interval=5):
 
 def _acquire_lock(lock_path, poll_interval=5):
     """Path-generic lock acquire — the shared mechanics behind acquire_poll_lock (a lead's
-    poll.lock) and acquire_escalation_lock (an executor's escalation.lock, wake-watch design §4.1).
-    A stale lock (dead pid, recycled pid, or a heartbeat that stopped ticking — see
-    _poll_lock_status) is broken and reclaimed. Returns True if this process took the lock."""
+    poll.lock, the only current caller since the executor-side escalation lock was retired in
+    wake-watch design §9 — the push is single-shot, with nothing left to serialize). A stale lock
+    (dead pid, recycled pid, or a heartbeat that stopped ticking — see _poll_lock_status) is broken
+    and reclaimed. Returns True if this process took the lock."""
     try:
         lp = Path(lock_path)
         if _poll_lock_status(lp, poll_interval) == "live":
@@ -1033,32 +958,13 @@ def release_poll_lock(state_root, lead_sid):
 
 
 # ---- executor-side escalation lock (wake-watch design §4.1) — same mechanics, own lock file -----
-# so an executor's background escalation poller never stacks duplicates across repeated idle
-# cycles, exactly like the lead's own poll.lock exists to do for its poller.
-
-def _escalation_lock_path(state_root, exec_sid):
-    return Path(state_root) / str(exec_sid) / "escalation.lock"
-
-
-def acquire_escalation_lock(state_root, exec_sid, poll_interval=5):
-    return _acquire_lock(_escalation_lock_path(state_root, exec_sid), poll_interval)
-
-
-def heartbeat_escalation_lock(state_root, exec_sid):
-    _heartbeat_lock(_escalation_lock_path(state_root, exec_sid))
-
-
-def release_escalation_lock(state_root, exec_sid):
-    _release_lock(_escalation_lock_path(state_root, exec_sid))
-
-
-# ---- executor-side escalation ledger + decision tree (wake-watch design §4.1, §4.4) --------------
-# A SEPARATE ledger from the lead's surfaced_reports.json, by design: the executor's "I
-# notified/nudged" bookkeeping must never be written into the lead's own surfacing ledger, or the
+# ---- executor-side escalation ledger + decision tree (wake-watch design §9) ---------------------
+# A SEPARATE ledger from the lead's surfaced_reports.json, by design: the executor's own "I
+# pushed/notified" bookkeeping must never be written into the lead's own surfacing ledger, or the
 # executor pinging the human would silently consume the lead's own announcement — leaving the lead
-# silent when the human returns (design §4.4). Keyed by packet number (the file itself already
-# scopes to one executor via its path), each record holds {"attempts", "last_action",
-# "next_eligible", "resolved"}.
+# silent when the human returns. Keyed by packet number (the file itself already scopes to one
+# executor via its path); with the push single-shot (§9.2 — no retry, no backoff), each record is
+# now just a one-bit "already handled" flag: {"status": "resolved" | "notified" | "sent"}.
 
 def _escalation_path(state_root, exec_sid):
     return Path(state_root) / str(exec_sid) / "escalation.json"
@@ -1076,8 +982,7 @@ def load_escalation(state_root, exec_sid):
 
 def save_escalation(state_root, exec_sid, ledger):
     """Write the full escalation ledger dict back (the hook reads, mutates one packet's record,
-    then calls this with the whole dict — same read-modify-write shape as stamp_lead_state).
-    Best-effort; never raises."""
+    then calls this with the whole dict). Best-effort; never raises."""
     try:
         p = _escalation_path(state_root, exec_sid)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1087,24 +992,24 @@ def save_escalation(state_root, exec_sid, ledger):
 
 
 def escalation_decision(state_root, exec_sid, packet, owner_lead):
-    """wake-watch design §4.1's decision tree for the executor-side escalation hook, given the
+    """wake-watch design §9's push decision tree for the executor-side escalation hook, given the
     on-disk state it reads (the owning lead's marker + its surfaced_reports.json) — one of:
 
       "resolved"      — the owning lead already surfaced this report (its key is in that lead's
                         surfaced_reports.json) — nothing left to do.
-      "unowned"       — no owner_lead recorded at all → no lead to check; notify the human directly.
+      "unowned"       — no owner_lead recorded at all → no lead to push to; notify the human
+                        directly.
       "owner-missing" — owner_lead is set but its marker is gone (crashed/closed/pruned) → notify
                         the human directly (do NOT assume a marker exists just because owner_lead
                         is non-null).
-      "nudge"         — the owning lead is idle → `relay nudge-lead` it.
-      "wait"          — the owning lead is busy → its OWN Stop hook surfaces this at its next
-                        turn-end (design §4.3 — busy is patient, not an alarm); do nothing yet.
-      "stale"         — the owning lead's busy stamp is stale (wedged/crashed mid-turn) → notify
-                        the human now rather than wait forever (design §4.2's non-negotiable rule).
+      "send"          — push it: type into the owning lead's tab, unconditionally. §9.5b proved
+                        injecting mid-turn is harmless (it queues and is processed intact at
+                        turn-end), so there is no busy check left in this tree — it collapsed from
+                        the pre-push 6-branch version (resolved/unowned/owner-missing/nudge/wait/
+                        stale) once the busy-guard was shown to protect nothing.
 
-    Reuses read_marker/load_surfaced/lead_turn_state — no reimplementation. Never raises; any bad
-    input degrades to "owner-missing" (the safe direction is surfacing to a human, never silent
-    inaction)."""
+    Reuses read_marker/load_surfaced — no reimplementation. Never raises; any bad input degrades to
+    "owner-missing" (the safe direction is surfacing to a human, never silent inaction)."""
     try:
         if not owner_lead:
             return "unowned"
@@ -1114,12 +1019,7 @@ def escalation_decision(state_root, exec_sid, packet, owner_lead):
         key = f"{exec_sid}:{packet}"
         if key in load_surfaced(state_root, owner_lead):
             return "resolved"
-        state = lead_turn_state(marker)
-        if state == "idle":
-            return "nudge"
-        if state == "busy":
-            return "wait"
-        return "stale"  # stale-busy
+        return "send"
     except Exception:
         return "owner-missing"
 
@@ -1131,11 +1031,12 @@ def escalation_decision(state_root, exec_sid, packet, owner_lead):
 # must generate a settings file and pass it via `claude --settings <file>` (threaded through
 # scripts/iterm.py's build_claude_cmd/spawn).
 
-def build_escalation_settings(plugin_root, timeout=1900):
-    """The `--settings` JSON content that arms an EXECUTOR with hooks/executor_escalation.py as an
-    asyncRewake Stop hook. `timeout` must exceed the hook's own grace + backoff sleeping or the
-    harness kills the background poll early — see docs/async-rewake-executor-findings.md (the same
-    constraint the lead's own Stop hook timeout already respects)."""
+def build_escalation_settings(plugin_root, timeout=30):
+    """The `--settings` JSON content that arms an EXECUTOR with hooks/executor_escalation.py as a
+    PLAIN synchronous Stop hook (wake-watch design §9.4) — no `asyncRewake`. The push is a
+    single-shot: read some on-disk state, maybe type into a tab, exit — a few hundred ms of work,
+    not a long-running background watcher, so there's nothing left to host asynchronously. `timeout`
+    is just a safety margin above that, not a budget for grace/backoff sleeping (there is none)."""
     hook_path = str(Path(plugin_root) / "hooks" / "executor_escalation.py")
     return {
         "hooks": {
@@ -1145,7 +1046,6 @@ def build_escalation_settings(plugin_root, timeout=1900):
                         {
                             "type": "command",
                             "command": hook_path,
-                            "asyncRewake": True,
                             "timeout": timeout,
                         }
                     ]
@@ -1155,7 +1055,7 @@ def build_escalation_settings(plugin_root, timeout=1900):
     }
 
 
-def write_escalation_settings(state_root, plugin_root, timeout=1900):
+def write_escalation_settings(state_root, plugin_root, timeout=30):
     """Write (or refresh) the shared executor-escalation settings file used by every spawn —
     regenerated (idempotent overwrite) on each call so it always points at the CURRENTLY live
     plugin_root/version rather than whatever was live at a previous spawn. Returns the path (str),

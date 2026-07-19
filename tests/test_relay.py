@@ -325,7 +325,7 @@ class TestSpawnSkipPerms:
 
 
 class TestSpawnExecutorEscalation:
-    """cmd_spawn arms the executor-side wake escalation Stop hook (wake-watch design §4) via
+    """cmd_spawn arms the executor-side wake escalation Stop hook (wake-watch design §9) via
     `--settings` — executors get no hooks by default, so bin/relay must generate and pass this file
     explicitly at spawn time. iterm.spawn/auto_trust/read_pid mocked; no real iTerm touched."""
 
@@ -349,7 +349,7 @@ class TestSpawnExecutorEscalation:
         content = json.loads(Path(settings_file).read_text())
         hook = content["hooks"]["Stop"][0]["hooks"][0]
         assert hook["command"].endswith("hooks/executor_escalation.py")
-        assert hook["asyncRewake"] is True
+        assert "asyncRewake" not in hook  # plain synchronous push (§9.4) — nothing to host async
 
     def test_kill_switch_omits_settings_file(self, relay, tmp_path):
         cap = self._run(relay, tmp_path, cfg={"executor_escalation": False})
@@ -927,9 +927,10 @@ class TestFocus:
 
 
 class TestNudgeLead:
-    """cmd_nudge_lead: `relay send` pointed at a LEAD's own tab (wake-watch design §4.0). Guarded by
-    lead_guard.lead_turn_state — refuses on busy/stale-busy, proceeds only on idle. iterm.send
-    mocked (no real AppleScript)."""
+    """cmd_nudge_lead: `relay send` pointed at a LEAD's own tab (wake-watch design §9). ALWAYS
+    sends — §9.5b spiked that typing into a busy lead is harmless, so there is no busy/stale guard
+    left; a marker still carrying a legacy `state: busy` field must be ignored. iterm.send mocked
+    (no real AppleScript)."""
 
     def _lead(self, relay, sid="lead-1", tab_label="[Lead] alpha", state=None, state_since=None):
         relay.lead_guard.write_marker(relay.STATE_ROOT, sid, project="alpha", tab_label=tab_label)
@@ -946,31 +947,29 @@ class TestNudgeLead:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="wake up"))
         send.assert_called_once_with("[Lead] alpha", "wake up", None)
 
-    def test_no_state_defaults_idle_and_nudges(self, relay):
-        self._lead(relay)  # no state stamped yet → idle by default
+    def test_no_state_defaults_and_nudges(self, relay):
+        self._lead(relay)  # no state stamped at all
         with mock.patch.object(relay.iterm, "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
         send.assert_called_once()
 
-    def test_busy_lead_refused(self, relay):
+    def test_busy_marked_lead_still_gets_nudged(self, relay):
+        # This test would FAIL if someone reintroduced a busy/stale guard — a legacy `state: busy`
+        # marker must not block the send.
         self._lead(relay, state="busy", state_since=relay.now())
         with mock.patch.object(relay.iterm, "send", return_value=True) as send:
-            with pytest.raises(SystemExit) as ei:
-                relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
-        assert "busy" in str(ei.value)
-        send.assert_not_called()
+            relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
+        send.assert_called_once()
 
-    def test_stale_busy_lead_refused(self, relay):
+    def test_stale_busy_marked_lead_still_gets_nudged(self, relay):
         old = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
         self._lead(relay, state="busy", state_since=old)
         with mock.patch.object(relay.iterm, "send", return_value=True) as send:
-            with pytest.raises(SystemExit) as ei:
-                relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
-        assert "stale" in str(ei.value)
-        send.assert_not_called()
+            relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
+        send.assert_called_once()
 
     def test_no_live_tab_reports_no_live_tab(self, relay):
-        self._lead(relay, state="idle")
+        self._lead(relay)
         with mock.patch.object(relay.iterm, "send", return_value=False):
             with pytest.raises(SystemExit) as ei:
                 relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
