@@ -1821,7 +1821,10 @@ class TestSessionStartRearmHook:
         p = subprocess.run(
             ["python3", str(REPO_ROOT / "hooks" / "sessionstart_lead_rearm.py")],
             input=json.dumps(payload), capture_output=True, text=True,
-            env={**os.environ, "HOME": str(home)})
+            # RELAY_NO_NOTIFY: re-arm now fires a real desktop banner. Without this the suite
+            # would spam actual notifications on every run (same kill-switch every other relay
+            # notification honours).
+            env={**os.environ, "HOME": str(home), "RELAY_NO_NOTIFY": "1"})
         return p.returncode, p.stdout, p.stderr
 
     def test_resume_revives_tombstoned_lead(self, tmp_path):
@@ -1903,3 +1906,48 @@ class TestHooksAreExecutable:
                         f"path, so it would fail silently at runtime")
                     checked.append(rel)
         assert checked, "no hooks found to check"
+
+
+class TestRearmNotification:
+    """Re-arm must reach a HUMAN, not just the model. A SessionStart hook's stdout becomes session
+    context (model-visible) and its stderr goes nowhere, so the desktop banner is the only channel
+    that reaches the user — and the only one that works without a statusline configured."""
+
+    def _load_hook(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "sessionstart_lead_rearm_under_test",
+            REPO_ROOT / "hooks" / "sessionstart_lead_rearm.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_rearm_fires_notification_with_its_own_subtitle(self, tmp_path, monkeypatch):
+        mod = self._load_hook()
+        monkeypatch.setattr(mod, "STATE_ROOT", str(tmp_path))
+        sys.path.insert(0, str(REPO_ROOT / "hooks"))
+        import stop_lead_watch as slw
+        calls = []
+        monkeypatch.setattr(slw, "_notify", lambda *a, **k: calls.append((a, k)))
+
+        mod._notify_rearm(lg, "lead-1", {"project": "webapp", "iterm_session": "w1t2p0:X"})
+
+        assert calls, "re-arm did not attempt a desktop notification"
+        _args, kwargs = calls[0]
+        assert kwargs.get("project") == "webapp"
+        assert kwargs.get("lead_sid") == "lead-1"
+        # Must NOT inherit _notify's default "review needed" subtitle — nothing needs reviewing.
+        assert "re-armed" in (kwargs.get("subtitle") or "").lower()
+
+    def test_notification_failure_never_breaks_rearm(self, tmp_path, monkeypatch):
+        """Arming is the contract; the banner is a courtesy. A notifier blowing up must not
+        propagate."""
+        mod = self._load_hook()
+        monkeypatch.setattr(mod, "STATE_ROOT", str(tmp_path))
+        sys.path.insert(0, str(REPO_ROOT / "hooks"))
+        import stop_lead_watch as slw
+
+        def boom(*a, **k):
+            raise RuntimeError("notifier exploded")
+        monkeypatch.setattr(slw, "_notify", boom)
+        mod._notify_rearm(lg, "lead-1", {"project": "webapp"})  # must not raise

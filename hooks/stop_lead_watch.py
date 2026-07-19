@@ -37,7 +37,8 @@ RELAY_BIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin
 PLUGIN_ROOT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
 
 
-def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_session=None):
+def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_session=None,
+            subtitle=None):
     """Desktop notification, three tiers, first one that applies wins:
 
     1. iTerm native (OSC 777, written straight to the lead's own tty) — zero external deps, and
@@ -60,7 +61,10 @@ def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_sess
                 #             desktop banners (neither notifier path has a dry-run). Also usable in CI.
     import lead_guard as lg
     title = f"relay · {project}" if project else "relay — review needed"
-    subtitle = f"{executor} reported" if executor else "review needed"
+    # `subtitle` lets non-report callers (e.g. the SessionStart re-arm) say what actually happened;
+    # without it the default below would mislabel every notification as "review needed".
+    if subtitle is None:
+        subtitle = f"{executor} reported" if executor else "review needed"
     # Tier 1 is skipped when notify_via='terminal-notifier'. iTerm posts the OSC notification under a
     # "Session …" title it controls — no escape parameter overrides or suppresses it — so a lead who
     # wants a clean banner title opts out of this tier and takes terminal-notifier/osascript below

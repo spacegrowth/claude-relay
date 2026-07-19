@@ -38,6 +38,29 @@ REVIVE_SOURCES = {"resume"}
 HARD_CLEAR_SOURCES = {"clear"}
 
 
+def _notify_rearm(lg, sid, marker):
+    """Desktop banner on re-arm — reuses stop_lead_watch's existing three-tier `_notify` (iTerm
+    OSC 777 → terminal-notifier → osascript) rather than inventing a second notification path.
+
+    This is the ONLY channel that reaches the human here: a SessionStart hook's stdout goes to the
+    model as session context, and its stderr goes nowhere at all. Honours the same `notify_on_wake`
+    config and `RELAY_NO_NOTIFY` kill-switch as every other relay notification. Never raises."""
+    try:
+        hooks_dir = os.path.dirname(os.path.realpath(__file__))
+        if hooks_dir not in sys.path:
+            sys.path.insert(0, hooks_dir)
+        import stop_lead_watch as slw
+        project = marker.get("project") or "?"
+        slw._notify(
+            lg.load_config(STATE_ROOT),
+            f"lead mode restored for '{project}' — gate and auto-wake are active again",
+            project=project, lead_sid=sid, iterm_session=marker.get("iterm_session"),
+            subtitle="lead re-armed on resume",
+        )
+    except Exception:
+        pass
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -74,6 +97,12 @@ def main():
                     f"🚦 [relay] — lead mode restored for this resumed session "
                     f"(project '{marker.get('project') or '?'}'). Gate and auto-wake are active again.\n"
                 )
+                # ...but stdout only reaches the MODEL (it becomes session context). Nothing a
+                # SessionStart hook writes lands on the user's screen. So also fire the desktop
+                # notification — the one channel that reaches a human, works with no statusline
+                # configured, and doesn't risk garbling the live TUI the way writing to the tty
+                # would. Best-effort; a notification failure must never affect arming.
+                _notify_rearm(lg, sid, marker)
         # startup / compact / anything else → nothing to do.
     except Exception:
         pass
