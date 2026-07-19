@@ -316,12 +316,61 @@ see 9.6); `relay nudge-lead` itself is **kept and simplified**.
 *other* jobs (commit surfacing, handoff nudge, `touch_lead`); `relay send` / id-based addressing /
 the tab-label fix, which are the transport the push rides on.
 
+### 9.5b SPIKED (2026-07-19): typing into a BUSY lead is safe — the busy-guard is dead weight
+
+The biggest open question was whether a push can just *always send*, or must detect that the lead is
+mid-turn and wait. **Tested directly, in both busy modes:**
+
+| Lead state when text was injected | Result |
+|---|---|
+| Blocked on a foreground tool call (~35s busy-wait) | ✅ queued in the input box, processed cleanly at turn-end |
+| Mid-token-stream writing 1200 words of prose | ✅ queued; the 8,495-char reply completed **intact**, then the injected message was answered |
+
+Ordering from the second run's transcript, the conclusive one:
+
+```
+[USER]       118 chars  Write a detailed 1200-word essay…
+[ASSISTANT] 8495 chars  # The History of Tea Cultivation…   ← COMPLETE, uncorrupted
+[USER]        52 chars  STREAMTEST: reply exactly STREAM-OK ← injected mid-stream
+[ASSISTANT]    9 chars  STREAM-OK
+```
+
+Injection happened while the prose was visibly mid-sentence, and the essay still finished in full —
+so the session was genuinely streaming, not idle. **No interruption, no truncation, no interleaving.**
+
+**Consequence: the busy-guard never protected anything, and actively caused misses.** Refusing to
+nudge a busy lead doesn't avoid damage — it just fails to deliver, which IS the bug. The rule becomes
+**always send**, and all of this becomes deletable:
+
+- `lead_turn_state` (idle/busy/stale-busy) — `lib/lead_guard.py`
+- `stamp_lead_state` + the `UserPromptSubmit` hook that stamps `busy` at turn-start
+- `nudge-lead`'s busy/stale refusals (`bin/relay`) — they manufacture the miss
+- the escalation's `wait` branch, `BUSY_WAIT_TIMEOUT_SECONDS`, the backoff schedule, and the
+  `stale-busy` → notify-human branch
+
+It also **retires an unanswered question instead of answering it**: whether `UserPromptSubmit` fires
+on an `asyncRewake`-injected turn (§7 spike #1, never run) stops mattering once nothing reads the
+busy stamp.
+
+> **Corroborating, independently checked:** Claude Code exposes **no** way to query whether a session
+> is busy from outside — no CLI command, no state file, no IPC; transcripts are append-only JSONL in
+> an explicitly internal format. relay built a whole subsystem to derive a signal the harness doesn't
+> publish *and* that it turns out not to need.
+
+**Residual limit, stated honestly:** both tests injected via `iterm.send` into an iTerm session.
+Terminal.app's backend uses a different addressing path and was not re-tested.
+
+**Methodology note (this bit us):** the FIRST attempt at the busy test was invalid — the task was
+`sleep 40 && echo`, which the harness blocked, so the session re-ran it with `run_in_background` and
+went idle immediately. The tab title still *looked* busy. Same false-positive shape as the
+"Not enough messages to compact" decline in `lead-arming-durability.md` §11. Any re-run must confirm
+the session is genuinely mid-turn, not merely activity-glyphed.
+
 ### 9.6 Open questions to settle before building
 
-1. **Busy lead: send anyway, or guard?** Claude Code *queues* typed input and submits it at
-   turn-end, so sending into a busy lead is probably harmless and arguably correct. Today's
-   `nudge-lead` *refuses* when busy, which manufactures a miss. If we send-always, `lead_turn_state`
-   and the `UserPromptSubmit` hook stop being load-bearing. **Needs a live check.**
+1. ~~**Busy lead: send anyway, or guard?**~~ — **SETTLED by spike, see §9.5b. Always send.** The
+   busy-guard protected nothing and caused misses; `lead_turn_state`, the `UserPromptSubmit` stamp,
+   and the escalation's wait/backoff/stale branches are all deletable.
 2. **Do we delete the lead-side fast path entirely, or keep the synchronous at-Stop report check?**
    Keeping it is cheap and covers "report already present when the lead ends a turn", but it
    reintroduces a second mechanism (and therefore dedup). Leaning: delete, keep one path.
