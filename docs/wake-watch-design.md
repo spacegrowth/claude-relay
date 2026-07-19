@@ -222,6 +222,127 @@ These are low-regret even alongside the executor-side redesign; land them as par
 
 ---
 
+## 9. REVISION (2026-07-19) — push, not watch. §4 is superseded.
+
+**Status of this section:** proposed, on branch `wake-push`. Nothing on `main` changes until this is
+proven. §4's executor-side *watcher* shipped as 0.3.21; this section argues it was the right
+*location* but the wrong *shape*, and proposes replacing it with a push.
+
+### 9.1 Why revise something we just shipped
+
+§2.3 got the key fact right — *the executor is the one process guaranteed alive when a report
+exists* — but §4 then built a **watcher** on the executor (grace window, poll loop, backoff, ledger,
+lock, six-branch decision tree) instead of the obvious thing: **just send a message.**
+
+The tell is where the complexity lives. Nearly all of it exists to manage a **race between two
+mechanisms**:
+
+- the grace window = "let the lead's own poller win first",
+- the separate ledger = "don't double-notify what the lead already surfaced",
+- the decision tree = "what state is the lead in right now",
+- the backoff = "don't spam while we keep re-checking".
+
+**Delete the second mechanism and all of that evaporates.** There is no race to manage if only one
+thing is responsible for delivery.
+
+### 9.2 The design
+
+`relay send` (lead types into an executor's tab) is relay's most reliable primitive — it is how
+every packet is delivered. The push is that same primitive, reversed:
+
+```
+executor's Stop hook fires (harness event, on idle)
+  → is there a report for my current packet?      no  → exit 0
+  → have I already sent for this packet?          yes → exit 0
+  → type a message into the owning lead's tab  (relay send, in reverse)
+  → mark sent. exit 0.
+       (tab gone / no owner → notify the human instead — the ONE fallback)
+```
+
+That is the whole mechanism. No polling. No grace. No backoff. No window to expire. No lock to go
+stale. No in-flight set to fall out of. Vectors 1–5 of §1 stop being *possible* rather than being
+*patched*, because none of their preconditions exist anymore.
+
+### 9.3 The one hard constraint: hook-triggered, never prompt-triggered
+
+This is the whole design. The *action* is identical either way; the *trigger* determines the
+reliability class.
+
+- **Prompt-triggered** — the packet instructs the executor's model *"after writing your report, run
+  `relay nudge-lead …`"*. This is **compliance, not mechanism**: it works most of the time and fails
+  silently the rest. Evidence from the session that produced this revision: the packet footer says,
+  in bold, *"STAY IDLE AFTER REPORTING — do NOT exit"*, and an executor closed its own tab anyway;
+  another was told to clean up its throwaway tabs and two lingered. **Do not build on this.**
+- **Hook-triggered** — the harness fires the executor's `Stop` hook on idle. The model is not
+  consulted and cannot forget. Deterministic by construction.
+
+Residual prompt-dependency, honestly named: the executor's model must still **write the report
+file**. That is unchanged from today, and it fails *loudly* (no file = obviously not done), unlike a
+skipped nudge which is invisible. We are converting an invisible failure into an already-visible one.
+
+### 9.4 `asyncRewake` mostly goes away
+
+`asyncRewake` exists to run a hook in the **background for a long time** and wake the session on exit
+2. The push needs neither half: the executor's hook is a few hundred ms of osascript, synchronous,
+exit 0. With the lead-side poller gone there is no long-running watcher to host.
+
+Everything downstream of background execution goes with it: the `1900s` hook `timeout`,
+`poll_seconds`, the `poll_seconds < hook-timeout` coupling rule, the 30-minute cliff, and the
+"silent auto-wake death" failure mode (a killed background process leaving a stale lock).
+
+### 9.5 What gets deleted
+
+**Dies completely:**
+
+| Component | Why |
+|---|---|
+| `hooks/executor_escalation.py` (~206 lines) | Replaced by a ~20-line synchronous send |
+| `escalation_decision` (6-branch tree) | Only consumer was that hook |
+| escalation ledger (`load/save_escalation`, `escalation.json`) | Only consumer was that hook |
+| escalation lock (`acquire/heartbeat/release_escalation_lock`) | No long-running process to serialize |
+| lead-side background poller in `stop_lead_watch.py` | Push replaces pull |
+| `poll.lock` machinery (`acquire/heartbeat/release_poll_lock`, `poll_lock_state`) | Only existed to serialize that poller |
+| `has_inflight_executors` | Usage-traced: its only consumers are the poller's two call sites |
+| `stalled`-counts-as-in-flight + `stall_threshold_seconds` decouple | Only mattered because `has_inflight_executors` gated the poller |
+| Config: `poll_seconds`, `poll_interval`, `executor_escalation_grace_seconds`, `_poll_interval`, `_max_runtime_seconds` | Nothing left to tune |
+| `WAKE` column's `stuck` state | Derived from `poll_lock_state` |
+
+**Shrinks / becomes optional:** `surfaced_reports.json` + `mark_surfaced`/`new_reports_for` (a
+lead-side dedup ledger becomes a one-bit "already sent" flag on the executor); `lead_turn_state` +
+`stamp_lead_state` + the `UserPromptSubmit` hook (they exist to power `nudge-lead`'s busy-guard —
+see 9.6); `relay nudge-lead` itself is **kept and simplified**.
+
+**Stays:** `_notify` (the one fallback — lead's tab gone → tell the human); the lead Stop hook's
+*other* jobs (commit surfacing, handoff nudge, `touch_lead`); `relay send` / id-based addressing /
+the tab-label fix, which are the transport the push rides on.
+
+### 9.6 Open questions to settle before building
+
+1. **Busy lead: send anyway, or guard?** Claude Code *queues* typed input and submits it at
+   turn-end, so sending into a busy lead is probably harmless and arguably correct. Today's
+   `nudge-lead` *refuses* when busy, which manufactures a miss. If we send-always, `lead_turn_state`
+   and the `UserPromptSubmit` hook stop being load-bearing. **Needs a live check.**
+2. **Do we delete the lead-side fast path entirely, or keep the synchronous at-Stop report check?**
+   Keeping it is cheap and covers "report already present when the lead ends a turn", but it
+   reintroduces a second mechanism (and therefore dedup). Leaning: delete, keep one path.
+3. **Executor spawned by an older relay has no hook, permanently** — it cannot be retrofitted into a
+   running session (this is exactly the `fix-dcompose` incident). Do we detect and surface
+   un-armed in-flight executors so the gap is *visible* rather than silent?
+4. **Report written but executor killed before its Stop fires** — narrow, but real. Is
+   reconcile-on-return (any relay command surfaces unhandled reports) enough as the floor?
+
+### 9.7 How this gets tested without touching `main`
+
+- relay resolves the executor hook path from **whichever `bin/relay` is invoked**, so running
+  `./bin/relay spawn …` from the `wake-push` checkout arms executors with **the branch's** hooks —
+  no install, no effect on `main`.
+- The plugin marketplace is `{"source": "github", "repo": "spacegrowth/claude-relay"}` with **no
+  branch field**, pinned to `main` — so `/plugin install` cannot pull a branch. If lead-side hook
+  changes need real-install testing, add the **local checkout** as a marketplace
+  (`/plugin marketplace add /Users/vamsi/development/claude-relay`) so the checked-out branch is what runs.
+
+---
+
 ## Appendix — code anchors
 
 - `asyncRewake` poller + arm + timeout: `hooks/stop_lead_watch.py:225-242`; synchronous fast-path
