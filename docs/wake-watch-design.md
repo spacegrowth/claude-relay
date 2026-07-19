@@ -343,134 +343,21 @@ the tab-label fix, which are the transport the push rides on.
 
 ---
 
-## 10. Arming is not durable across exit→resume (upstream of everything in §9)
+## 10. Arming durability — SOLVED, moved out
 
-**Status:** finding + proposed fix, on branch `wake-push`. Discovered live while writing §9.
+While drafting §9 we found a problem *upstream* of the wake: a routine quit (`prompt_input_exit`)
+deleted the lead marker, so quit→resume returned a silently **unarmed** session — gate off, wake
+structurally impossible, and the model still believing it was the lead. "The wake didn't fire" and
+"nothing was armed" are indistinguishable from outside, so an unknown share of past wake incidents
+may have been this rather than the wake.
 
-### 10.1 What happens
+It was split onto its own track precisely because it was smaller and more certain than the wake
+rework, and it **shipped in 0.3.23–0.3.25**: `SessionEnd(exit|prompt_input_exit)` tombstones instead
+of deleting, `SessionStart(resume)` re-arms losslessly (name preserved), and armed/paused is now
+visible in `relay status` / `relay list`.
 
-`hooks/sessionend_lead_cleanup.py` clears the lead marker when `SessionEnd` fires with a reason in:
-
-```python
-REAL_END_REASONS = {"clear", "logout", "prompt_input_exit", "exit"}
-```
-
-`prompt_input_exit` — quitting from the prompt — is **the most common way a human leaves a session**.
-Claude Code sessions are *resumable*: `--resume` restores the same session id **and the full
-conversation**. So the routine cycle *quit → resume* deletes the lead marker and brings the session
-back **unarmed, silently.**
-
-### 10.2 Evidence (this session's own ledger)
-
-```
-07-13 09:15:39  lead_started                                          ← armed
-07-14 06:20:09  session_end  reason=prompt_input_exit  was_lead=TRUE  ← UNARM #1
-07-14 07:25:02  lead_started                                          ← re-armed BY HAND (masked it)
-07-14 20:10:29  session_end  reason=prompt_input_exit  was_lead=TRUE  ← UNARM #2 (stuck)
-07-14 20:10:58  session_end  reason=prompt_input_exit  was_lead=false ← nothing left to clear
-07-17 19:04:01  session_end  reason=prompt_input_exit  was_lead=false ← still unarmed
-```
-
-No corruption, no reload churn, no prune (the only `pruned` events are executors from 07-11). **The
-hook did exactly what it was written to do.** It happened *twice*; the first time it was manually
-re-armed, which hid the problem.
-
-### 10.3 Why this is upstream of §9
-
-If the lead is not armed then, for that session:
-
-- the **routing gate** never fires (`pretool_route_guard` fast-exits on `is_lead`),
-- the **wake is structurally impossible** — `stop_lead_watch.py` fast-exits on `is_lead`, so no
-  report can wake anything, no matter how well §9 is built,
-- **ownership breaks** for anything spawned afterward (`owner_lead` points at a sid with no marker →
-  the `owner-missing` branch).
-
-So **"the wake didn't fire" and "nothing was armed" are indistinguishable from the outside.** Some
-share of the recurring "the wake missed again" reports may be this, not the wake. Any wake redesign
-that doesn't fix arming durability is building on sand.
-
-Worse, there is a split-brain: **the model still believes it is the lead** (its conversation context
-says so — it keeps announcing, proposing packets, spawning executors) while relay's on-disk truth
-says it is not. Nothing reconciles them. In this session the discrepancy surfaced only by accident,
-when a `route retain` call happened to error.
-
-### 10.4 The reason-bucket error
-
-The four reasons are not equivalent:
-
-| Reason | What happens to context | Should it unarm? |
-|---|---|---|
-| `clear` | conversation wiped — model returns with **no lead context** | **Yes.** Staying armed would mean gate+wake on a model that has no idea why |
-| `logout` | session genuinely over | **Yes** |
-| `exit` / `prompt_input_exit` | **resumable** — same id, full conversation restored | **No.** This is a *pause*, not a death |
-
-Lumping them together is the bug. The current code treats a **pause as a death**.
-
-### 10.5 The principle
-
-**Liveness should be derived, not destroyed.** relay *already* works this way everywhere else:
-`relay list` renders a `LAST ACTIVE` age so a probably-dead lead is *visible*; `relay prune` sweeps
-genuinely-old ghosts; unique-naming ignores stale leads (`LEAD_LIVE_WINDOW_SECONDS`); and a
-**crashed** lead's marker is deliberately *preserved* — that is the entire basis of `/relay:resume`
-for a crashed lead.
-
-Which exposes an inconsistency: **crash → marker survives → resume comes back armed. Clean exit →
-marker deleted → resume comes back unarmed.** The tidier exit path is the one that loses state.
-
-### 10.6 The `SessionStart` hook exists, and it carries `source`
-
-relay registers only `PreToolUse`, `UserPromptSubmit`, `Stop`, `SessionEnd`. **`SessionStart` is a
-supported event relay simply doesn't use** — confirmed on disk (Anthropic's own
-`learning-output-style` plugin ships one; same `{matcher, hooks:[{type:"command", command}]}` shape).
-
-Documented payload (`command` hooks get full stdin and may run any shell command):
-
-```json
-{ "session_id": "...", "transcript_path": "...", "cwd": "...",
-  "hook_event_name": "SessionStart",
-  "source": "startup" | "resume" | "clear" | "compact",
-  "model": "...", "agent_type": "...", "session_title": "..." }   // last three optional
-```
-
-Two facts make the fix trivial:
-
-- **It fires on `--resume` / `--continue` / `/resume`.**
-- **`--resume` preserves the same `session_id`**, so per-session state keys straight through.
-
-> **Verification status:** the above is from the official hook docs, **not yet empirically confirmed
-> on this machine's Claude Code build.** Given this project's history of doc-vs-reality gaps, prove it
-> with a throwaway `SessionStart` hook that just logs its payload, exactly like the `asyncRewake`
-> spike (`async-rewake-findings.md`). Cheap, and it de-risks the whole section.
-
-### 10.7 Proposed fix — a closed state machine
-
-`SessionEnd.reason` and `SessionStart.source` are complementary, which turns arming into a proper
-lifecycle instead of a one-way delete:
-
-| Event | Value | Action |
-|---|---|---|
-| `SessionEnd` | `clear`, `logout` | **hard-clear** — context is genuinely gone |
-| `SessionEnd` | `exit`, `prompt_input_exit` | **tombstone** (`ended: true` + ts) — a pause, not a death |
-| `SessionStart` | `resume` | **re-arm** from the tombstone (or warn loudly) |
-| `SessionStart` | `clear` | stay unarmed — the model has no lead context to resume |
-| `SessionStart` | `startup`, `compact` | no-op |
-
-Three properties worth stating:
-
-1. **It's hook-driven end to end** — no instruction to any model, consistent with §9.3.
-2. **The `source` field is a refinement, not a prerequisite.** Even without it, the hook could just
-   ask *"is there a tombstone for this sid?"* — disk state already answers "was this a lead". `source`
-   lets us be precise about `clear` vs `resume` rather than inferring.
-3. **Minimum bar is loudness, not automation.** `sessionend_lead_cleanup` already writes
-   `was_lead: true` to the ledger at the exact instant it unarms a lead — the warning information
-   existed and went into a log nobody reads. Auto-re-arm is the convenience; **visibility is the
-   requirement.**
-
-### 10.8 Relationship to §9
-
-§9 makes report-delivery deterministic. §10 makes *being a lead at all* durable. **§10 must land
-first or alongside** — a perfect push mechanism still delivers nothing if the receiving session was
-silently unarmed by a routine quit.
+**Full write-up, evidence and spike results: [`lead-arming-durability.md`](lead-arming-durability.md).**
+Kept here only as a pointer — that document is the single source of truth.
 
 ---
 
