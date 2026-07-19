@@ -77,7 +77,14 @@ def main():
 
     try:
         import lead_guard as lg
-        sid = payload.get("session_id")
+        # The hook is TOLD its relay name as argv[1] (baked in by lead_guard.build_escalation_settings
+        # at spawn). It cannot derive it: Claude Code's payload carries the CLAUDE session id, while
+        # relay files an executor's state under its relay NAME, and nothing in the payload maps one
+        # to the other. Deriving it from payload["session_id"] is exactly the bug that kept this
+        # hook from EVER firing in production — the lookup missed, so it concluded "not a relay
+        # executor" and exited silently every time. Payload id is kept only as a last-resort
+        # fallback for a settings file written before names were passed.
+        sid = sys.argv[1] if len(sys.argv) > 1 else payload.get("session_id")
         if not sid:
             sys.exit(0)
         s = lg.read_session_json(STATE_ROOT, sid)

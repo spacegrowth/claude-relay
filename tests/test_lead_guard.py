@@ -565,9 +565,13 @@ class TestExecutorEscalationHookSendPath:
         spec.loader.exec_module(mod)
         return mod
 
-    def _run_main(self, hook_mod, root, payload, monkeypatch, calls):
+    def _run_main(self, hook_mod, root, payload, monkeypatch, calls, argv_name="exec-1"):
         import io
         monkeypatch.setattr(hook_mod, "STATE_ROOT", str(root))
+        # Simulate the REAL invocation: relay bakes the executor's relay NAME into the hook command
+        # as argv[1] (lead_guard.build_escalation_settings). The payload carries the CLAUDE session
+        # id, which does NOT name any relay state dir.
+        monkeypatch.setattr("sys.argv", ["executor_escalation.py", argv_name])
         monkeypatch.setattr(hook_mod.subprocess, "run",
                              lambda *a, **k: calls.append(a[0]) or SimpleNamespace(returncode=0))
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
@@ -590,10 +594,33 @@ class TestExecutorEscalationHookSendPath:
         lg.marker_path(root, "lead-1").write_text(json.dumps(m))
 
         calls = []
-        rc = self._run_main(hook_mod, root, {"session_id": "exec-1"}, monkeypatch, calls)
+        # NOTE the payload carries a CLAUDE session id that matches NO relay state dir — exactly
+        # what Claude Code sends. Identity must come from argv, not the payload.
+        rc = self._run_main(hook_mod, root,
+                            {"session_id": "f0a5e989-ba22-440a-80a2-fe38c5f73146"},
+                            monkeypatch, calls, argv_name="exec-1")
         assert rc == 0
         assert calls and "nudge-lead" in calls[0]
         assert lg.load_escalation(root, "exec-1")["1"]["status"] == "sent"
+
+    def test_identity_comes_from_argv_not_the_payload_session_id(self, hook_mod, root, monkeypatch):
+        """REGRESSION: the hook once derived its identity from payload["session_id"] (the CLAUDE
+        id) and looked up ~/.relay-tasks/<claude-id>/, which never exists — so it exited as "not a
+        relay executor" EVERY time and the push never fired in production. Unit tests missed it
+        because they passed the relay name in the payload. This pins the real contract."""
+        d = root / "exec-2"; (d / "packets").mkdir(parents=True)
+        (d / "session.json").write_text(json.dumps({
+            "session_id": "exec-2", "current_packet": 1, "status": "busy",
+            "owner_lead": "lead-1", "claude_session": "cccccccc-0000-0000-0000-000000000000"}))
+        (d / "packets" / "001-report.md").write_text("done")
+        lg.write_marker(root, "lead-1", tab_label="[Lead] alpha")
+        calls = []
+        rc = self._run_main(hook_mod, root,
+                            {"session_id": "cccccccc-0000-0000-0000-000000000000"},
+                            monkeypatch, calls, argv_name="exec-2")
+        assert rc == 0
+        assert calls and "nudge-lead" in calls[0], "push did not fire — identity lookup regressed"
+        assert lg.load_escalation(root, "exec-2")["1"]["status"] == "sent"
 
 
 # ---- bin/relay commands driving the above ------------------------------------------------------
@@ -930,21 +957,40 @@ class TestEscalationSettings:
     Stop hook now (wake-watch design §9.4) — no `asyncRewake`, nothing long-running to host."""
 
     def test_settings_shape_registers_plain_stop_hook(self, tmp_path):
-        settings = lg.build_escalation_settings(str(tmp_path), timeout=1234)
+        settings = lg.build_escalation_settings(str(tmp_path), "exec-7", timeout=1234)
         hook = settings["hooks"]["Stop"][0]["hooks"][0]
-        assert hook["command"] == str(tmp_path / "hooks" / "executor_escalation.py")
+        assert hook["command"] == f"{tmp_path / 'hooks' / 'executor_escalation.py'} exec-7"
         assert "asyncRewake" not in hook
         assert hook["timeout"] == 1234
 
-    def test_write_creates_file_and_returns_path(self, root, tmp_path):
-        p = lg.write_escalation_settings(root, str(tmp_path))
+    def test_command_carries_the_executor_relay_name(self, tmp_path):
+        """The hook CANNOT derive which executor it is: Claude Code's payload carries the CLAUDE
+        session id, relay files state under the relay NAME, and nothing maps one to the other.
+        Passing the name as argv is what makes the push fire at all — deriving it from the payload
+        is the bug that kept this hook from ever firing in production."""
+        settings = lg.build_escalation_settings(str(tmp_path), "push2-exec")
+        assert settings["hooks"]["Stop"][0]["hooks"][0]["command"].endswith(" push2-exec")
+
+    def test_write_creates_per_executor_file_in_its_own_state_dir(self, root, tmp_path):
+        p = lg.write_escalation_settings(root, str(tmp_path), "exec-7")
         assert p is not None
+        assert Path(p) == Path(root) / "exec-7" / "settings.json"  # per-executor, not shared
         content = json.loads(Path(p).read_text())
-        assert "asyncRewake" not in content["hooks"]["Stop"][0]["hooks"][0]
+        hook = content["hooks"]["Stop"][0]["hooks"][0]
+        assert "asyncRewake" not in hook
+        assert hook["command"].endswith(" exec-7")
+
+    def test_two_executors_get_distinct_settings_files(self, root, tmp_path):
+        """Shared-file would be wrong now: each file names its own executor."""
+        a = lg.write_escalation_settings(root, str(tmp_path), "exec-a")
+        b = lg.write_escalation_settings(root, str(tmp_path), "exec-b")
+        assert a != b
+        assert json.loads(Path(a).read_text())["hooks"]["Stop"][0]["hooks"][0]["command"].endswith(" exec-a")
+        assert json.loads(Path(b).read_text())["hooks"]["Stop"][0]["hooks"][0]["command"].endswith(" exec-b")
 
     def test_write_refreshes_on_repeat_call(self, root, tmp_path):
-        lg.write_escalation_settings(root, str(tmp_path / "v1"))
-        p = lg.write_escalation_settings(root, str(tmp_path / "v2"))
+        lg.write_escalation_settings(root, str(tmp_path / "v1"), "exec-7")
+        p = lg.write_escalation_settings(root, str(tmp_path / "v2"), "exec-7")
         content = json.loads(Path(p).read_text())
         assert "v2" in content["hooks"]["Stop"][0]["hooks"][0]["command"]
 

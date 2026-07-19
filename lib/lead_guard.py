@@ -1031,12 +1031,19 @@ def escalation_decision(state_root, exec_sid, packet, owner_lead):
 # must generate a settings file and pass it via `claude --settings <file>` (threaded through
 # scripts/iterm.py's build_claude_cmd/spawn).
 
-def build_escalation_settings(plugin_root, timeout=30):
+def build_escalation_settings(plugin_root, exec_name, timeout=30):
     """The `--settings` JSON content that arms an EXECUTOR with hooks/executor_escalation.py as a
     PLAIN synchronous Stop hook (wake-watch design §9.4) — no `asyncRewake`. The push is a
     single-shot: read some on-disk state, maybe type into a tab, exit — a few hundred ms of work,
     not a long-running background watcher, so there's nothing left to host asynchronously. `timeout`
-    is just a safety margin above that, not a budget for grace/backoff sleeping (there is none)."""
+    is just a safety margin above that, not a budget for grace/backoff sleeping (there is none).
+
+    `exec_name` is passed to the hook AS AN ARGUMENT because the hook cannot otherwise learn which
+    executor it is: Claude Code's payload carries the CLAUDE session id, while relay files an
+    executor's state under its relay NAME (`~/.relay-tasks/<name>/`). Nothing in the payload maps
+    one to the other, so without this the hook looks up a directory that doesn't exist, concludes
+    "not a relay executor", and exits — silently, every time. Found live: the push never fired in
+    production until the name was passed explicitly."""
     hook_path = str(Path(plugin_root) / "hooks" / "executor_escalation.py")
     return {
         "hooks": {
@@ -1045,7 +1052,7 @@ def build_escalation_settings(plugin_root, timeout=30):
                     "hooks": [
                         {
                             "type": "command",
-                            "command": hook_path,
+                            "command": f"{hook_path} {exec_name}",
                             "timeout": timeout,
                         }
                     ]
@@ -1055,17 +1062,19 @@ def build_escalation_settings(plugin_root, timeout=30):
     }
 
 
-def write_escalation_settings(state_root, plugin_root, timeout=30):
-    """Write (or refresh) the shared executor-escalation settings file used by every spawn —
-    regenerated (idempotent overwrite) on each call so it always points at the CURRENTLY live
-    plugin_root/version rather than whatever was live at a previous spawn. Returns the path (str),
-    or None on any failure — a write failure must fall back to spawning WITHOUT escalation armed
-    rather than failing the whole spawn."""
+def write_escalation_settings(state_root, plugin_root, exec_name, timeout=30):
+    """Write this executor's own `--settings` file into its state dir. PER-EXECUTOR (not shared),
+    because the file carries that executor's relay name as a hook argument — see
+    build_escalation_settings for why the hook can't derive it. Regenerated on each call so it
+    always points at the CURRENTLY live plugin_root/version. Returns the path (str), or None on any
+    failure — a write failure must fall back to spawning WITHOUT escalation armed rather than
+    failing the whole spawn."""
     try:
-        root = Path(state_root)
-        root.mkdir(parents=True, exist_ok=True)
-        p = root / "executor-settings.json"
-        p.write_text(json.dumps(build_escalation_settings(plugin_root, timeout=timeout), indent=2))
+        d = Path(state_root) / str(exec_name)
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "settings.json"
+        p.write_text(json.dumps(
+            build_escalation_settings(plugin_root, exec_name, timeout=timeout), indent=2))
         return str(p)
     except Exception:
         return None

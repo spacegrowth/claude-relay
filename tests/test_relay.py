@@ -348,7 +348,8 @@ class TestSpawnExecutorEscalation:
         assert settings_file is not None
         content = json.loads(Path(settings_file).read_text())
         hook = content["hooks"]["Stop"][0]["hooks"][0]
-        assert hook["command"].endswith("hooks/executor_escalation.py")
+        assert "hooks/executor_escalation.py" in hook["command"]
+        assert hook["command"].endswith(" s1")  # relay NAME passed as argv — see lead_guard
         assert "asyncRewake" not in hook  # plain synchronous push (§9.4) — nothing to host async
 
     def test_kill_switch_omits_settings_file(self, relay, tmp_path):
@@ -359,7 +360,7 @@ class TestSpawnExecutorEscalation:
         # End-to-end through the real (unmocked) build_claude_cmd: --settings actually lands in the
         # launched command line, pointed at the written file.
         settings_path = relay.lead_guard.write_escalation_settings(
-            relay.STATE_ROOT, relay._plugin_root())
+            relay.STATE_ROOT, relay._plugin_root(), "s1")
         cmd = relay.iterm.build_claude_cmd("do the thing", settings_file=settings_path)
         assert f"--settings {settings_path}" in cmd
 

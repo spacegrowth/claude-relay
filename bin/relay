@@ -82,14 +82,18 @@ RELAY_BIN = str(Path(__file__).resolve())
 EXECUTOR_ESCALATION_TIMEOUT_SECONDS = 30
 
 
-def _maybe_escalation_settings_file():
+def _maybe_escalation_settings_file(exec_name):
     """The `--settings` file to launch an executor with (arms hooks/executor_escalation.py), or
     None if the config kill-switch is off or the settings file couldn't be written — a write
-    failure must degrade to spawning WITHOUT escalation armed, never block the spawn itself."""
+    failure must degrade to spawning WITHOUT escalation armed, never block the spawn itself.
+
+    `exec_name` (the RELAY name) is baked into the hook command: the hook can't derive its own
+    identity from Claude Code's payload, which carries the Claude session id while relay files
+    state under the relay name. See lead_guard.build_escalation_settings."""
     cfg = lead_guard.load_config(STATE_ROOT)
     if not cfg.get("executor_escalation", True):
         return None
-    return lead_guard.write_escalation_settings(STATE_ROOT, _plugin_root(),
+    return lead_guard.write_escalation_settings(STATE_ROOT, _plugin_root(), exec_name,
                                                 timeout=EXECUTOR_ESCALATION_TIMEOUT_SECONDS)
 
 TEMPLATE_FOOTER = """
@@ -571,7 +575,7 @@ def cmd_spawn(args):
 
     # Arm the executor-side wake escalation (wake-watch design §4): a plain `claude` launch gets NO
     # hooks, so this executor only gets the escalation Stop hook if we pass it explicitly here.
-    settings_file = _maybe_escalation_settings_file()
+    settings_file = _maybe_escalation_settings_file(session_id)
 
     iterm.spawn(
         cwd=worktree,
@@ -664,7 +668,7 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
         session_uuid=session_uuid,
         resume_id=resume_id,
         tab_color=tab_color,
-        settings_file=_maybe_escalation_settings_file(),  # re-arm escalation on the fresh tab too —
+        settings_file=_maybe_escalation_settings_file(session_id),  # re-arm escalation on the fresh tab too —
                                                           # a resumed/restarted executor must not
                                                           # silently lose wake coverage
     )
