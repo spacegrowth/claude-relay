@@ -135,6 +135,7 @@ Interactive session in a real tab, exited with `/exit`, then resumed:
 | `session_id` preserved across resume | ✅ **identical** in all four events |
 | Interactive exit yields the marker-clearing reason | ✅ `/exit` → `reason=prompt_input_exit` |
 | Hook can run an arbitrary command | ✅ (the rig is a shell script) |
+| Compaction does not unarm | ✅ `SessionStart(compact)` fires, **no `SessionEnd`** — see §11 |
 
 ### 7.2 Doc-vs-reality gaps the spike caught
 
@@ -205,8 +206,31 @@ Three properties worth stating:
    leads, tests, version bump.
 3. **Merge to `main`** once verified. This branch stays independent of `wake-push`.
 
-## 11. Remaining open question
+## 11. `compact` — VERIFIED (2026-07-19)
 
-- **`compact`** — the spike did not exercise a compaction. Confirm a compaction doesn't unarm
-  anything today and that `SessionStart(compact)` needs no action. Low risk (compaction doesn't fire
-  `SessionEnd`, so there should be no tombstone to act on), but unverified.
+Exercised directly: an interactive session was driven through enough turns to make `/compact`
+actually run (a short session is declined with *"Not enough messages to compact"* — an easy way to
+get a false negative), then compacted for real (*"Compacted (ctrl+o to see full summary)"*).
+
+```
+07:45:42  [SessionStart]  source=startup
+07:48:49  [SessionStart]  source=compact     ← fires
+                                             ← NO SessionEnd, at any point
+```
+
+**Findings:**
+
+1. **Compaction fires `SessionStart` with `source=compact`.**
+2. **Compaction does NOT fire `SessionEnd` at all.** Therefore it **cannot** clear a lead marker —
+   `clear_lead` is only ever reached from `SessionEnd`. **Compaction does not unarm a lead today,
+   and won't under the new design either.** This closes the last open question, and rules out
+   auto-compaction as a contributor to the mystery unarming (it was a plausible suspect: compaction
+   happens unattended in long sessions, which is exactly the profile of a lead).
+3. **Implication for the implementation:** the new `SessionStart` hook **will run on every
+   compaction**, not just on startup/resume. It must be **cheap** and must **no-op on
+   `source=compact`**. (It would naturally no-op anyway — no `SessionEnd` means no tombstone to act
+   on — but the hook should be explicit rather than relying on that coincidence.)
+
+**Spike caveat worth keeping:** the first `/compact` attempt was silently declined for having too
+few messages. Any future test of compaction behavior must confirm compaction *actually occurred*
+(terminal output or the `compact` event) rather than assuming the command did something.
