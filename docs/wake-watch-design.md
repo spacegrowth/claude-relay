@@ -371,14 +371,84 @@ the session is genuinely mid-turn, not merely activity-glyphed.
 1. ~~**Busy lead: send anyway, or guard?**~~ — **SETTLED by spike, see §9.5b. Always send.** The
    busy-guard protected nothing and caused misses; `lead_turn_state`, the `UserPromptSubmit` stamp,
    and the escalation's wait/backoff/stale branches are all deletable.
-2. **Do we delete the lead-side fast path entirely, or keep the synchronous at-Stop report check?**
-   Keeping it is cheap and covers "report already present when the lead ends a turn", but it
-   reintroduces a second mechanism (and therefore dedup). Leaning: delete, keep one path.
+2. ~~**Delete the lead-side fast path, or keep it?**~~ — **SETTLED: KEEP BOTH PATHS.** The lead's
+   synchronous at-Stop check stays. Rationale is a product one, not a technical one: *it is worth
+   seeing the LEAD say "I found something" rather than always hearing it second-hand from the
+   executor.* The lead noticing its own executor's work is the natural, legible thing; the push is
+   the safety net beneath it.
+
+   This does reintroduce the dedup question the "one mechanism" option would have avoided — but the
+   answer already exists and is cheap: the executor checks whether its report key is in the owning
+   lead's `surfaced_reports.json`, and the ~60s grace window gives the lead first crack. So keeping
+   both paths is safe *because* the executor can tell the lead already picked it up. See 9.6a.
+
 3. **Executor spawned by an older relay has no hook, permanently** — it cannot be retrofitted into a
    running session (this is exactly the `fix-dcompose` incident). Do we detect and surface
    un-armed in-flight executors so the gap is *visible* rather than silent?
 4. **Report written but executor killed before its Stop fires** — narrow, but real. Is
    reconcile-on-return (any relay command surfaces unhandled reports) enough as the floor?
+
+### 9.6a `resolved` must SAY so, not exit silently
+
+Today, when the executor's watcher finds the report already in the lead's `surfaced_reports.json`,
+`escalation_decision` returns `resolved` and the hook simply exits. Correct behaviour, invisible
+execution.
+
+Given everything this document is about, a silent non-event is the wrong default. The executor
+should record/announce **"lead already picked this up (packet NNN)"** rather than vanishing. Two
+reasons:
+
+1. **It is the dedup working.** With both paths kept (9.6 #2), `resolved` is the mechanism that stops
+   double-announcing — the single most important thing to be able to *observe* when diagnosing "did
+   the wake work?". Silence makes a working dedup and a dead hook look identical.
+2. **It closes the diagnostic gap that made this whole investigation slow.** Every incident in §1 was
+   hard to attribute because the non-events left no trace. `lead_tombstoned` / `lead_rearmed` in the
+   ledger proved their worth immediately (they are how the arming fix was verified in production);
+   `escalation_resolved` earns its keep the same way.
+
+Cheap: one ledger line. No behavioural change, no new failure mode.
+
+### 9.6b `source="fork"` — a FIFTH silent-unarm route, observed live (2026-07-19)
+
+A background session forked from this lead's transcript took over the `claude-relay` lead role, and
+this session lost it **with no signal** — discovered only because the user asked why a message went
+unanswered.
+
+```
+10:23:27  384c39f1  lead_stepped_down
+10:23:32  c65b2bca  lead_started        ← predecessor: None → NOT a handoff
+```
+
+The fork was launched as:
+
+```
+claude.exe --bg-pty-host …/pty/c65b2bca.sock
+claude --session-id c65b2bca --fork-session --resume …/384c39f1.jsonl --reply-on-resume
+```
+
+**Spiked directly**, and it produced an undocumented `source` value:
+
+| Invocation | `session_id` | `source` |
+|---|---|---|
+| fresh start | A | `startup` |
+| `claude --resume A` | **A (preserved)** | `resume` |
+| `claude --fork-session --resume <transcript>` | **NEW id** | **`fork`** |
+
+Two things follow:
+
+- **The docs' `source` list (`startup\|resume\|clear\|compact`) is incomplete — `fork` is a fifth
+  value.** Third doc-vs-reality gap this project has hit; consistent with the rule of spiking rather
+  than trusting.
+- **Our arming design is *correct* here but incomplete.** A fork has a new id, so no tombstone exists
+  for it and `sessionstart_lead_rearm` rightly no-ops (`fork` ∉ `REVIVE_SOURCES`). A fork inheriting
+  lead arming would be worse — two live leads for one project. But the fork can still *separately*
+  arm itself, which is exactly what happened, and the original then holds a stale belief that it is
+  the lead while `is_lead` says otherwise.
+
+**Implication (not yet built):** `source="fork"` deserves an explicit branch that says so — the fork
+is a different conversation and is NOT the armed lead, and staying silent about that is what cost an
+hour here. Note the auto-suffix DID behave correctly once the original re-armed (`claude-relay` was
+taken by the live fork → `claude-relay-2`), which is how the collision became visible at all.
 
 ### 9.7 How this gets tested without touching `main`
 
