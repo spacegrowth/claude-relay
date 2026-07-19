@@ -417,19 +417,56 @@ for a crashed lead.
 Which exposes an inconsistency: **crash → marker survives → resume comes back armed. Clean exit →
 marker deleted → resume comes back unarmed.** The tidier exit path is the one that loses state.
 
-### 10.6 Proposed fix
+### 10.6 The `SessionStart` hook exists, and it carries `source`
 
-1. **Split the reasons.** Clear only on `clear`/`logout`. On `exit`/`prompt_input_exit`, keep the
-   marker (optionally stamped `ended: true` + timestamp) so a resume is recognizable.
-2. **Register a `SessionStart` hook** (relay currently registers only PreToolUse, UserPromptSubmit,
-   Stop, SessionEnd). On start, if this sid has a lead marker/tombstone → re-arm, or at minimum
-   print loudly: *"this session was a lead and is not armed — run `/relay:mode`."*
-   Same principle as §9.3: **hook, not instruction.**
-3. **Minimum bar: make it loud.** The hook already records `was_lead: true` in the ledger at the
-   exact moment it unarms a lead — the information to warn the operator existed and went into a log
-   nobody reads. Auto-re-arm is the convenience; *visibility* is the requirement.
+relay registers only `PreToolUse`, `UserPromptSubmit`, `Stop`, `SessionEnd`. **`SessionStart` is a
+supported event relay simply doesn't use** — confirmed on disk (Anthropic's own
+`learning-output-style` plugin ships one; same `{matcher, hooks:[{type:"command", command}]}` shape).
 
-### 10.7 Relationship to §9
+Documented payload (`command` hooks get full stdin and may run any shell command):
+
+```json
+{ "session_id": "...", "transcript_path": "...", "cwd": "...",
+  "hook_event_name": "SessionStart",
+  "source": "startup" | "resume" | "clear" | "compact",
+  "model": "...", "agent_type": "...", "session_title": "..." }   // last three optional
+```
+
+Two facts make the fix trivial:
+
+- **It fires on `--resume` / `--continue` / `/resume`.**
+- **`--resume` preserves the same `session_id`**, so per-session state keys straight through.
+
+> **Verification status:** the above is from the official hook docs, **not yet empirically confirmed
+> on this machine's Claude Code build.** Given this project's history of doc-vs-reality gaps, prove it
+> with a throwaway `SessionStart` hook that just logs its payload, exactly like the `asyncRewake`
+> spike (`async-rewake-findings.md`). Cheap, and it de-risks the whole section.
+
+### 10.7 Proposed fix — a closed state machine
+
+`SessionEnd.reason` and `SessionStart.source` are complementary, which turns arming into a proper
+lifecycle instead of a one-way delete:
+
+| Event | Value | Action |
+|---|---|---|
+| `SessionEnd` | `clear`, `logout` | **hard-clear** — context is genuinely gone |
+| `SessionEnd` | `exit`, `prompt_input_exit` | **tombstone** (`ended: true` + ts) — a pause, not a death |
+| `SessionStart` | `resume` | **re-arm** from the tombstone (or warn loudly) |
+| `SessionStart` | `clear` | stay unarmed — the model has no lead context to resume |
+| `SessionStart` | `startup`, `compact` | no-op |
+
+Three properties worth stating:
+
+1. **It's hook-driven end to end** — no instruction to any model, consistent with §9.3.
+2. **The `source` field is a refinement, not a prerequisite.** Even without it, the hook could just
+   ask *"is there a tombstone for this sid?"* — disk state already answers "was this a lead". `source`
+   lets us be precise about `clear` vs `resume` rather than inferring.
+3. **Minimum bar is loudness, not automation.** `sessionend_lead_cleanup` already writes
+   `was_lead: true` to the ledger at the exact instant it unarms a lead — the warning information
+   existed and went into a log nobody reads. Auto-re-arm is the convenience; **visibility is the
+   requirement.**
+
+### 10.8 Relationship to §9
 
 §9 makes report-delivery deterministic. §10 makes *being a lead at all* durable. **§10 must land
 first or alongside** — a perfect push mechanism still delivers nothing if the receiving session was
