@@ -343,6 +343,100 @@ the tab-label fix, which are the transport the push rides on.
 
 ---
 
+## 10. Arming is not durable across exit→resume (upstream of everything in §9)
+
+**Status:** finding + proposed fix, on branch `wake-push`. Discovered live while writing §9.
+
+### 10.1 What happens
+
+`hooks/sessionend_lead_cleanup.py` clears the lead marker when `SessionEnd` fires with a reason in:
+
+```python
+REAL_END_REASONS = {"clear", "logout", "prompt_input_exit", "exit"}
+```
+
+`prompt_input_exit` — quitting from the prompt — is **the most common way a human leaves a session**.
+Claude Code sessions are *resumable*: `--resume` restores the same session id **and the full
+conversation**. So the routine cycle *quit → resume* deletes the lead marker and brings the session
+back **unarmed, silently.**
+
+### 10.2 Evidence (this session's own ledger)
+
+```
+07-13 09:15:39  lead_started                                          ← armed
+07-14 06:20:09  session_end  reason=prompt_input_exit  was_lead=TRUE  ← UNARM #1
+07-14 07:25:02  lead_started                                          ← re-armed BY HAND (masked it)
+07-14 20:10:29  session_end  reason=prompt_input_exit  was_lead=TRUE  ← UNARM #2 (stuck)
+07-14 20:10:58  session_end  reason=prompt_input_exit  was_lead=false ← nothing left to clear
+07-17 19:04:01  session_end  reason=prompt_input_exit  was_lead=false ← still unarmed
+```
+
+No corruption, no reload churn, no prune (the only `pruned` events are executors from 07-11). **The
+hook did exactly what it was written to do.** It happened *twice*; the first time it was manually
+re-armed, which hid the problem.
+
+### 10.3 Why this is upstream of §9
+
+If the lead is not armed then, for that session:
+
+- the **routing gate** never fires (`pretool_route_guard` fast-exits on `is_lead`),
+- the **wake is structurally impossible** — `stop_lead_watch.py` fast-exits on `is_lead`, so no
+  report can wake anything, no matter how well §9 is built,
+- **ownership breaks** for anything spawned afterward (`owner_lead` points at a sid with no marker →
+  the `owner-missing` branch).
+
+So **"the wake didn't fire" and "nothing was armed" are indistinguishable from the outside.** Some
+share of the recurring "the wake missed again" reports may be this, not the wake. Any wake redesign
+that doesn't fix arming durability is building on sand.
+
+Worse, there is a split-brain: **the model still believes it is the lead** (its conversation context
+says so — it keeps announcing, proposing packets, spawning executors) while relay's on-disk truth
+says it is not. Nothing reconciles them. In this session the discrepancy surfaced only by accident,
+when a `route retain` call happened to error.
+
+### 10.4 The reason-bucket error
+
+The four reasons are not equivalent:
+
+| Reason | What happens to context | Should it unarm? |
+|---|---|---|
+| `clear` | conversation wiped — model returns with **no lead context** | **Yes.** Staying armed would mean gate+wake on a model that has no idea why |
+| `logout` | session genuinely over | **Yes** |
+| `exit` / `prompt_input_exit` | **resumable** — same id, full conversation restored | **No.** This is a *pause*, not a death |
+
+Lumping them together is the bug. The current code treats a **pause as a death**.
+
+### 10.5 The principle
+
+**Liveness should be derived, not destroyed.** relay *already* works this way everywhere else:
+`relay list` renders a `LAST ACTIVE` age so a probably-dead lead is *visible*; `relay prune` sweeps
+genuinely-old ghosts; unique-naming ignores stale leads (`LEAD_LIVE_WINDOW_SECONDS`); and a
+**crashed** lead's marker is deliberately *preserved* — that is the entire basis of `/relay:resume`
+for a crashed lead.
+
+Which exposes an inconsistency: **crash → marker survives → resume comes back armed. Clean exit →
+marker deleted → resume comes back unarmed.** The tidier exit path is the one that loses state.
+
+### 10.6 Proposed fix
+
+1. **Split the reasons.** Clear only on `clear`/`logout`. On `exit`/`prompt_input_exit`, keep the
+   marker (optionally stamped `ended: true` + timestamp) so a resume is recognizable.
+2. **Register a `SessionStart` hook** (relay currently registers only PreToolUse, UserPromptSubmit,
+   Stop, SessionEnd). On start, if this sid has a lead marker/tombstone → re-arm, or at minimum
+   print loudly: *"this session was a lead and is not armed — run `/relay:mode`."*
+   Same principle as §9.3: **hook, not instruction.**
+3. **Minimum bar: make it loud.** The hook already records `was_lead: true` in the ledger at the
+   exact moment it unarms a lead — the information to warn the operator existed and went into a log
+   nobody reads. Auto-re-arm is the convenience; *visibility* is the requirement.
+
+### 10.7 Relationship to §9
+
+§9 makes report-delivery deterministic. §10 makes *being a lead at all* durable. **§10 must land
+first or alongside** — a perfect push mechanism still delivers nothing if the receiving session was
+silently unarmed by a routine quit.
+
+---
+
 ## Appendix — code anchors
 
 - `asyncRewake` poller + arm + timeout: `hooks/stop_lead_watch.py:225-242`; synchronous fast-path
