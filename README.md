@@ -52,6 +52,7 @@ wakes you when an executor finishes.
 | Clickable notifications | yes, nothing to install | only with terminal-notifier |
 | `relay focus` | jumps to tab/pane, leads too | brings the window forward |
 | `relay close` | closes the tab | window may linger (Cmd-W it) |
+| Lead push-wake (`nudge-lead`) | yes | no — Terminal.app can't inject text into a running process; a Terminal-hosted lead degrades to its own at-Stop check + desktop notification |
 
 Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
 
@@ -148,6 +149,9 @@ And the three nouns:
 /relay:handoff <handoff.md>                 succeed this lead: pre-armed successor tab, then step down
 relay close-predecessor                    successor-only: close the outgoing lead's tab, on user go
 relay status [session_id] [--statusline]   read-only, statusline-safe one-liner (see below)
+relay whoami [<token>] [--json]            "who am I, who is my lead" — token: a lead's session id,
+                                            an executor's relay name, or its claude_session uuid;
+                                            defaults to $CLAUDE_CODE_SESSION_ID when omitted
 ```
 
 Anywhere a command above takes a session id, you can pass the executor's name (its id, set at
@@ -239,14 +243,17 @@ the lead **wakes**, announces what's ready, and **waits for your direction** —
 or auto-commits. You also get a macOS notification naming the project and executor. Three tiers,
 first one that applies wins:
 
-**A second layer underneath.** Every spawned executor is also armed with its own background watcher.
-After it files its report, it gives the lead's own fast path a grace window to win; if the report is
-still unsurfaced after that, it escalates based on the owning lead's state: nudges the tab if the
-lead is idle, waits patiently if the lead is busy (a busy lead's own Stop hook surfaces the report at
-its next turn-end anyway), and notifies you directly if the lead is unowned, gone, or wedged mid-turn
-(a busy stamp that's gone stale). This is a net under the lead's poller, not a replacement for it —
-on a healthy lead the grace window makes it a no-op. (The nudge itself is `relay nudge-lead` — internal
-plumbing the escalation watcher calls, not something you run by hand.)
+**A second layer underneath.** Every spawned executor is also armed with its own Stop hook — a
+one-shot PUSH, not a background watcher. Once its report lands and it goes idle, it fires exactly
+once: if the lead already surfaced the report itself, nothing more happens (logged as
+`escalation_resolved`, not silent); if the report's owning lead has no owner or its marker is gone
+(crashed/closed/pruned), you get notified directly; otherwise it types a message straight into the
+lead's tab — **unconditionally**, even if the lead is mid-turn (a spike proved that's safe: the
+message queues in the input box and is delivered intact at the lead's next turn-end, so there's no
+busy check to wait on). No grace window, no polling, no retry — it acts once and exits. This is a net
+under the lead's own poller, not a replacement for it — a healthy idle lead already surfaces its own
+reports before this hook even runs. (The push itself is `relay nudge-lead` — internal plumbing this
+hook calls, not something you run by hand; `relay whoami` is, though — see [Commands](#commands).)
 
 1. **iTerm native** (no external tool needed): the hook writes the notification straight to the
    lead's own tty using iTerm's OSC 777 escape. Clicking it **focuses the lead's session natively**
@@ -338,10 +345,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
 | `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) for the handoff nudge — a proxy for session weight, not context-window occupancy; calibrated on real sessions (a full working day ≈ 3MB, the heaviest marathon session ever ≈ 6MB) |
-| `executor_escalation` | true | Arm every spawned executor with the second-layer wake watcher (see [Auto-wake and notifications](#auto-wake-and-notifications)) |
-| `executor_escalation_grace_seconds` | 60 | How long the escalation watcher waits after a report lands before acting, so a healthy lead's own fast path gets first crack at it |
-| `executor_escalation_poll_interval` | 15 | How often the escalation watcher re-checks while waiting |
-| `executor_escalation_max_runtime_seconds` | 1800 | The watcher exits cleanly before this to beat its own hook timeout; a later executor turn re-arms and resumes from its persisted state |
+| `executor_escalation` | true | Arm every spawned executor with the second-layer one-shot push (see [Auto-wake and notifications](#auto-wake-and-notifications)) |
 | `stall_threshold_seconds` | 2700 | How long an executor can be `busy` with no report before `stalled` — kept independent of `poll_seconds` so the two don't flip at the same instant |
 
 `poll_seconds` must stay under the `Stop` hook's `timeout` in `hooks/hooks.json` (currently 1900s) — the harness kills the hook's background poller at that timeout regardless of `poll_seconds`, so raising one without the other silently breaks auto-wake (see [async-rewake-findings.md](docs/async-rewake-findings.md#addendum-silent-auto-wake-death-2026-07-10)).
