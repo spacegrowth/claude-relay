@@ -196,13 +196,25 @@ a variable and re-pipe it to `relay status --statusline`:
 }
 ```
 
+A marketplace install lands at a **versioned** path
+(`~/.claude/plugins/cache/claude-relay/relay/<version>/bin/relay`) with no `latest`/`current`
+symlink, and `<version>` changes on every `/plugin update` — hardcoding it silently breaks your
+status line's relay segment on the next update (no error, it just stops appearing). Resolve it
+version-agnostically instead:
+
 ```bash
 #!/bin/bash
 # ~/.claude/statusline.sh
 input=$(cat)
 # ... your existing statusline bits, reading from $input ...
-echo "$input" | ~/path/to/relay status --statusline
+relay_bin=$(ls -d "$HOME/.claude/plugins/cache/claude-relay/relay"/*/bin/relay 2>/dev/null \
+            | sort -V | tail -1)
+echo "$input" | "$relay_bin" status --statusline
 ```
+
+A ready-to-copy, POSIX-`sh` version of this — plus the resolver's "not found" case (so a stale path
+is visible instead of silently dropping the segment) and both the plain and `🚦:(...)`-wrapped
+rendering of relay's segment: [`examples/statusline.sh`](examples/statusline.sh).
 
 If you'd rather not thread stdin through, `--statusline` is optional: `relay status
 "$CLAUDE_CODE_SESSION_ID"` (or with no argument at all, since `relay status` falls back to that same
