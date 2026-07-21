@@ -458,7 +458,7 @@ taken by the live fork → `claude-relay-2`), which is how the collision became 
 - The plugin marketplace is `{"source": "github", "repo": "spacegrowth/claude-relay"}` with **no
   branch field**, pinned to `main` — so `/plugin install` cannot pull a branch. If lead-side hook
   changes need real-install testing, add the **local checkout** as a marketplace
-  (`/plugin marketplace add /Users/vamsi/development/claude-relay`) so the checked-out branch is what runs.
+  (`/plugin marketplace add $HOME/dev/claude-relay`) so the checked-out branch is what runs.
 
 ---
 
