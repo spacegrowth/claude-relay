@@ -10,7 +10,11 @@ handoff nudge) and the healthy move is a fresh context, not more of this one.
 
 **First, write the handoff file** — a short packet-file-style summary under `~/.relay-tasks/`
 (gate-exempt), covering: what's in flight, what's reviewed/committed, open questions, next steps.
-Write it like a memo to your successor, not a transcript dump.
+Write it like a memo to your successor, not a transcript dump. Carry forward every `[discipline]`
+marker your own predecessor's doc had (relay warns if one goes missing — see the linter note
+below), and on every queue item name an EXECUTOR to do it (or write "delegate this") — never phrase
+box/deploy/ops work as this lead's own to pick up (§10's `[ops-not-lead-work]` incident: a dropped
+marker plus ops phrased as the lead's task is exactly how a successor drifted into implementation).
 
 **Then run:**
 
@@ -40,3 +44,8 @@ predecessor's tab identity travels in the successor's marker for exactly this.
 
 Optional flags: `--project NAME` and `--model NAME` override the successor's project/model
 (default: inherited from this lead's own marker).
+
+**Linter note.** `relay handoff` compares the doc THIS lead itself inherited against the doc it's
+handing off and warns if any `[discipline]` marker went missing (`dropped_discipline_markers`) —
+silent when nothing was dropped, or when this is the first-ever lead with no inherited doc to
+compare against.

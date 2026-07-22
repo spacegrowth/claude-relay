@@ -183,13 +183,39 @@ You were pre-armed by relay handoff under pinned session id {successor_sid}.
 """
 
 
+# Matches an aftercare section previously appended by build_handoff_copy, from its leading "---"
+# through the end of the string (it is always the last thing in the file). Strips a stale one
+# before appending a fresh one, so re-handoff of an already-processed doc (#19 — e.g. the source
+# passed to `relay handoff` is itself a prior successor's relay-owned copy) can never stack a
+# second section instead of replacing the first.
+AFTERCARE_RE = re.compile(r"\n*---\n\(relay — SUCCESSOR AFTERCARE.*\Z", re.DOTALL)
+
+
+DISCIPLINE_MARKER_RE = re.compile(r"\[[a-z-]+\]")
+
+
+def dropped_discipline_markers(predecessor_body, new_body):
+    """d4 — the handoff-time linter half. `[discipline]` markers (e.g. `[ops-not-lead-work]`) that
+    appear in the doc the outgoing lead itself inherited must survive into the doc it hands to its
+    OWN successor, verbatim — see §10's incident, where one such marker silently dropped between
+    handoffs and the successor re-derived its absence the hard way. Returns the markers present in
+    `predecessor_body` but missing from `new_body`, in first-seen order, deduped; empty if none
+    dropped (including when there's no predecessor doc to compare against)."""
+    if not predecessor_body:
+        return []
+    seen = dict.fromkeys(DISCIPLINE_MARKER_RE.findall(predecessor_body))
+    return [m for m in seen if m not in new_body]
+
+
 def build_handoff_copy(body, successor_sid):
     """The relay-owned handoff.md a successor actually reads: the user's authored content
     unmodified, plus an appended SUCCESSOR AFTERCARE section — same relationship as
     build_packet/TEMPLATE_FOOTER. Written under the successor's OWN lead dir so the user's source
     file is never touched, and the seed prompt can stay a short pointer at this copy instead of
-    inlining the aftercare (see cmd_handoff's truncation postmortem)."""
-    return body.rstrip() + AFTERCARE_FOOTER.format(successor_sid=successor_sid)
+    inlining the aftercare (see cmd_handoff's truncation postmortem). Idempotent (#19): any
+    aftercare section already present in `body` (from a prior handoff of this same doc) is
+    stripped before the fresh one is appended, so re-handoff never stacks a second section."""
+    return AFTERCARE_RE.sub("", body.rstrip()).rstrip() + AFTERCARE_FOOTER.format(successor_sid=successor_sid)
 
 
 def path_to_file_url(path):
@@ -2152,13 +2178,26 @@ def cmd_handoff(args):
                             autonomous=False, autonomous_source="config")
     lead_guard.write_head(STATE_ROOT, successor_sid, lead_guard.git_head(cwd))
 
+    # d4 linter: the doc THIS caller itself inherited (if it was ever a successor) is the predecessor
+    # doc in the lineage; warn on any `[discipline]` marker it carried that the doc being handed
+    # onward has dropped (same warning-stamp style as cmd_list's stale-hooks check, §10). A first-ever
+    # lead (no inherited copy) has nothing to compare against — dropped_discipline_markers no-ops.
+    new_body = handoff_path.read_text()
+    inherited_copy_path = lead_guard.lead_dir(STATE_ROOT, caller) / "handoff.md"
+    inherited_body = inherited_copy_path.read_text() if inherited_copy_path.is_file() else ""
+    dropped = dropped_discipline_markers(inherited_body, new_body)
+    if dropped:
+        print(c(f"  ⚠ discipline markers dropped: {', '.join(dropped)} — present in the doc you "
+                f"inherited but missing from the doc you're handing off. If still true, carry them "
+                f"forward verbatim.", "red"))
+
     # Relay-owned copy of the handoff file, aftercare appended — see build_handoff_copy. The user's
     # source md is never modified (same relationship as packet source → packets/NNN-packet.md).
     # Writing it is treated exactly like a failed spawn below: it must NOT leave the pre-written
     # successor marker behind as an unreachable ghost, and must NOT step the caller down.
     handoff_copy_path = lead_guard.lead_dir(STATE_ROOT, successor_sid) / "handoff.md"
     try:
-        handoff_copy_path.write_text(build_handoff_copy(handoff_path.read_text(), successor_sid))
+        handoff_copy_path.write_text(build_handoff_copy(new_body, successor_sid))
     except Exception as e:
         lead_guard.clear_lead(STATE_ROOT, successor_sid)  # best-effort — drop the pre-written ghost
         sys.exit(f"handoff: failed to write successor's handoff copy ({e}) — this session remains "

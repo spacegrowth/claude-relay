@@ -2733,6 +2733,57 @@ class TestHandoff:
         assert "close-predecessor" in copy_text
         assert "do NOT run /relay:mode" not in copy_text
 
+    def test_build_handoff_copy_reappend_is_idempotent(self, relay):
+        # #19 repro: re-handoff of an ALREADY-PROCESSED doc (the source passed to `relay handoff`
+        # is itself a prior successor's relay-owned copy, aftercare already appended) must replace
+        # the stale aftercare section, never stack a second one on top of it.
+        once = relay.build_handoff_copy("what's in flight", "aaaa")
+        assert once.count("SUCCESSOR AFTERCARE") == 1
+        twice = relay.build_handoff_copy(once, "bbbb")
+        assert twice.count("SUCCESSOR AFTERCARE") == 1
+        assert "bbbb" in twice
+        assert "aaaa" not in twice   # the stale pin from the first pass must not survive
+        assert twice.startswith("what's in flight")
+
+    def test_dropped_discipline_markers_flags_missing(self, relay):
+        # d4: a marker present in the predecessor doc but absent from the new doc is flagged.
+        pred = "queue item: box setup [ops-not-lead-work] — delegate to an executor"
+        new = "queue item: box setup — get it done"
+        assert relay.dropped_discipline_markers(pred, new) == ["[ops-not-lead-work]"]
+
+    def test_dropped_discipline_markers_silent_when_carried_forward(self, relay):
+        pred = "queue item: box setup [ops-not-lead-work] — delegate to an executor"
+        new = "queue item: box setup [ops-not-lead-work] — delegate to an executor, per usual"
+        assert relay.dropped_discipline_markers(pred, new) == []
+
+    def test_dropped_discipline_markers_silent_with_no_predecessor_doc(self, relay):
+        # First-ever lead: nothing inherited, nothing to compare against — must not false-positive.
+        assert relay.dropped_discipline_markers("", "queue item: box setup — get it done") == []
+
+    def test_handoff_warns_when_inherited_marker_dropped(self, relay, tmp_path, monkeypatch, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        # Simulate lead-1 itself having been a successor: its own inherited copy carried a marker.
+        inherited_dir = relay.lead_guard.lead_dir(relay.STATE_ROOT, "lead-1")
+        inherited_dir.mkdir(parents=True, exist_ok=True)
+        (inherited_dir / "handoff.md").write_text("prior queue item [ops-not-lead-work] ssh in and build it")
+        md = self._md(tmp_path, text="new queue item: ssh in and build it")   # marker dropped
+        self._run(relay, md)
+        out = capsys.readouterr().out
+        assert "[ops-not-lead-work]" in out
+        assert "dropped" in out.lower()
+
+    def test_handoff_silent_when_inherited_marker_carried_forward(self, relay, tmp_path, monkeypatch, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        inherited_dir = relay.lead_guard.lead_dir(relay.STATE_ROOT, "lead-1")
+        inherited_dir.mkdir(parents=True, exist_ok=True)
+        (inherited_dir / "handoff.md").write_text("prior queue item [ops-not-lead-work] ssh in and build it")
+        md = self._md(tmp_path, text="new queue item [ops-not-lead-work] — delegate, ssh in and build it")
+        self._run(relay, md)
+        out = capsys.readouterr().out
+        assert "dropped" not in out.lower()
+
     def test_handoff_copy_write_failure_preserves_caller(self, relay, tmp_path, monkeypatch):
         # Same invariant as a failed spawn: writing the relay-owned copy is on the critical path
         # BEFORE the successor's tab exists, so a failure there must leave the caller as lead and
