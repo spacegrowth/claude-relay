@@ -89,6 +89,19 @@ def _push_to_lead(owner_lead, sid, packet):
         return False
 
 
+def _deliver_queued(sid):
+    """Hand any `--when-idle` queued packet to `relay _deliver-queued` (task #18). Invoked as the
+    CLI, exactly like this hook's other two subprocess calls, so the queue has ONE delivery
+    implementation rather than a hook-local copy. Skips the subprocess entirely when there's no
+    queue file — the overwhelmingly common Stop. Never raises."""
+    try:
+        if not os.path.exists(os.path.join(STATE_ROOT, sid, "queue.json")):
+            return
+        subprocess.run([RELAY_BIN, "_deliver-queued", sid], capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+
 def _mark(lg, sid, packet, status):
     """Record this packet's terminal state so a later Stop (repeated executor idles) gates out
     before re-checking anything — the whole of what `escalation.json` needs to be now that there is
@@ -122,6 +135,15 @@ def main():
         who = _whoami(sid)
         if not who:
             sys.exit(0)  # not a relay executor session → silent, zero impact
+
+        # --when-idle queue (#18): this Stop IS the idle transition a queued packet waits for, so
+        # deliver here — the PRIMARY trigger, and the reason #18 needs no poller of its own (a
+        # lead's `relay check` is only the net). Deliberately ahead of the escalation kill-switch
+        # and the once-per-packet gate below: queue delivery is a separate feature from the wake
+        # push and must not inherit its gating. Cheap file check first so the common no-queue Stop
+        # doesn't pay for a subprocess. `relay` decides whether the session is actually idle enough
+        # (deliver_queued re-checks); a failure here is swallowed, per this hook's HARD RULE.
+        _deliver_queued(sid)
 
         cfg = lg.load_config(STATE_ROOT)
         if not cfg.get("executor_escalation", True):

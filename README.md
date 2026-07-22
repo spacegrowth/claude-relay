@@ -137,6 +137,8 @@ And the three nouns:
 /relay:mode                          adopt the lead role (arms the gate + auto-wake)
 /relay:spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL] [--seed SID|PATH]
 /relay:send  <session_id> <packet.md>      follow-up into the SAME session (reuse > respawn)
+             [--when-idle]                 busy target? queue it; delivers when it next goes idle
+relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --when-idle
 /relay:check [<session_id> | --all]        busy / reported / stalled / dead
 /relay:list                                leads + active executors (closed hidden; --closed shows)
 /relay:close <session_id> [--supersede <new_id>]
@@ -350,6 +352,26 @@ This is a different tool from `relay resume`/`restart`: **resume/restart is for 
 recovery** (reopens the identical conversation, same context back). **Handoff is for WEIGHT**
 (deliberately starts a fresh context on a NEW session id). Use whichever matches the problem —
 a crashed tab needs its old context back; a bloated one needs to shed it.
+
+### Queueing a packet for a busy executor
+
+`relay send` refuses a `busy`/`stalled` session on purpose — typing into a session mid-turn can
+corrupt it. The workaround leads reached for was a shell loop (`until relay check … ; do sleep 60;
+done`), which burns the lead's turn, is invisible to relay, and dies whenever that turn ends.
+
+`relay send <sid> <packet.md> --when-idle` replaces it: the packet is persisted under the session's
+state dir and delivered automatically the next time that session goes idle. The trigger is the
+executor's **own Stop hook** — the same one that pushes its report to the lead — so there is no
+poller anywhere; a lead's `relay check` is only a net for sessions whose hook isn't armed. Delivery
+runs the normal send path, so a queued packet is numbered, GATES-stamped at delivery time, and
+ledgered (`packet_queued` and `queue_delivered` are separate events — a queued packet that never
+landed can never look like one that did).
+
+Queued packets deliver **oldest-first, one per idle transition** — delivering two at once would
+inject the second mid-turn, which is the whole thing being avoided. `--when-idle` against an
+already-idle session simply sends immediately, and it does not soften the other refusals
+(`superseded`, `launch-failed`). `relay check` shows a 📥 queued count; `relay queue <sid>` lists
+what's pending, and `relay queue <sid> --cancel <id|all>` is the cancel path.
 
 ### Retiring a heavy executor
 

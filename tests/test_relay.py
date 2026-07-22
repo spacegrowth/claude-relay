@@ -2289,6 +2289,339 @@ class TestSend:
         spawn.assert_not_called()
 
 
+class TestWhenIdleQueue:
+    """`relay send --when-idle` (task #18): queue a packet for a busy executor instead of refusing,
+    and deliver it on the session's own idle transition — replacing the shell `until relay check`
+    loops leads were hand-rolling. iterm.send/is_alive are mocked; no real iTerm is touched."""
+
+    def _mk(self, relay, sid="e1", status="busy", pid=None, report=False):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": "/w", "topic": "t", "scope": "t",
+            "tab_label": "relay-e1", "model": None, "pid": pid if pid is not None else os.getpid(),
+            "iterm_session": "w0t0p0:OLD", "claude_session": "cs-x", "status": status,
+            "current_packet": 1, "busy_since": relay.now(), "created": relay.now(),
+            "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("first packet")
+        if report:
+            (relay.packets_dir(sid) / "001-report.md").write_text("done")
+
+    def _packet(self, relay, tmp_path, text="# Follow-up\n\nDo the next thing.", name="next.md"):
+        p = tmp_path / name
+        p.write_text(text)
+        return str(p)
+
+    def _queue(self, relay, tmp_path, sid="e1", **kw):
+        """A --when-idle send into a busy session (the queueing path)."""
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send, \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id=sid, when_idle=True,
+                                           packet=self._packet(relay, tmp_path, **kw)))
+        return send
+
+    def _deliver(self, relay, sid="e1", trigger="test"):
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send, \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            item = relay.deliver_queued(sid, trigger=trigger)
+        return item, send
+
+    def _events(self, relay, name):
+        f = relay.STATE_ROOT / "sessions.jsonl"
+        if not f.exists():
+            return []
+        return [json.loads(l) for l in f.read_text().splitlines() if json.loads(l)["event"] == name]
+
+    # ── queueing instead of refusing ─────────────────────────────────────────
+    def test_busy_session_queues_instead_of_refusing(self, relay, tmp_path):
+        self._mk(relay, status="busy", report=False)          # genuinely mid-turn
+        send = self._queue(relay, tmp_path)
+        send.assert_not_called()                              # NOT injected mid-turn
+        q = relay.read_queue("e1")
+        assert len(q) == 1 and q[0]["id"] == 1
+        assert relay.read_session("e1")["current_packet"] == 1  # no packet delivered
+        assert not (relay.packets_dir("e1") / "002-packet.md").exists()
+
+    def test_queueing_is_ledgered(self, relay, tmp_path):
+        self._mk(relay)
+        self._queue(relay, tmp_path)
+        assert [e["queue_id"] for e in self._events(relay, "packet_queued")] == [1]
+
+    def test_stalled_session_also_queues(self, relay, tmp_path):
+        self._mk(relay, status="stalled", report=False)
+        self._queue(relay, tmp_path)
+        assert len(relay.read_queue("e1")) == 1
+
+    def test_when_idle_on_an_already_idle_session_sends_now(self, relay, tmp_path):
+        # --when-idle is "queue IF you must", not "always queue" — an idle session takes the packet
+        # immediately, and nothing is left queued.
+        self._mk(relay, status="busy", report=True)           # report on disk → refreshes to reported
+        send = self._queue(relay, tmp_path)
+        send.assert_called_once()
+        assert relay.read_queue("e1") == []
+        assert relay.read_session("e1")["current_packet"] == 2
+
+    def test_queued_body_is_captured_at_queue_time(self, relay, tmp_path):
+        # the source .md may be edited or deleted between queueing and delivery
+        self._mk(relay)
+        src = self._packet(relay, tmp_path, text="# Original\n\nthe queued work")
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=src, when_idle=True))
+        Path(src).unlink()                                    # source gone before delivery
+        (relay.packets_dir("e1") / "001-report.md").write_text("done")
+        item, send = self._deliver(relay)
+        assert item is not None
+        assert "the queued work" in (relay.packets_dir("e1") / "002-packet.md").read_text()
+
+    # ── delivery on the idle transition ──────────────────────────────────────
+    def test_no_delivery_while_still_busy(self, relay, tmp_path):
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        item, send = self._deliver(relay)
+        assert item is None                                   # this is the whole point
+        send.assert_not_called()
+        assert len(relay.read_queue("e1")) == 1                # still queued
+
+    def test_delivers_once_the_session_reports(self, relay, tmp_path):
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        (relay.packets_dir("e1") / "001-report.md").write_text("done")   # the real transition
+        item, send = self._deliver(relay, trigger="stop-hook")
+        assert item is not None
+        send.assert_called_once()
+        assert relay.read_queue("e1") == []
+        assert relay.read_session("e1")["current_packet"] == 2
+
+    def test_delivery_goes_through_the_normal_send_path(self, relay, tmp_path):
+        # a queued packet is not a second kind of packet: same numbering, same GATES/REPORT FORMAT
+        # footer, and the footer is applied at DELIVERY time so it names packet 002's own paths.
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        (relay.packets_dir("e1") / "001-report.md").write_text("done")
+        self._deliver(relay)
+        packet = (relay.packets_dir("e1") / "002-packet.md").read_text()
+        assert "Do the next thing." in packet
+        assert "GATES" in packet and "REPORT FORMAT" in packet
+        assert "002-report.md" in packet and "002-diff.html" in packet
+        assert [e["packet"] for e in self._events(relay, "packet_sent")] == [2]
+
+    def test_delivery_is_ledgered_separately_from_queueing(self, relay, tmp_path):
+        # "delivery must be provable, not assumed" — a queued packet that never lands must not look
+        # like one that did.
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        (relay.packets_dir("e1") / "001-report.md").write_text("done")
+        self._deliver(relay, trigger="stop-hook")
+        delivered = self._events(relay, "queue_delivered")
+        assert len(delivered) == 1
+        assert delivered[0]["queue_id"] == 1 and delivered[0]["packet"] == 2
+        assert delivered[0]["trigger"] == "stop-hook" and delivered[0]["remaining"] == 0
+        assert len(self._events(relay, "packet_queued")) == 1     # and the two are distinct events
+
+    def test_multiple_queued_deliver_oldest_first_ONE_per_idle(self, relay, tmp_path):
+        # delivering both at once would inject the second mid-turn — the exact unsafety --when-idle
+        # exists to prevent — so it's strictly one per idle transition, FIFO.
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path, text="# First\n\nfirst queued", name="a.md")
+        self._queue(relay, tmp_path, text="# Second\n\nsecond queued", name="b.md")
+        (relay.packets_dir("e1") / "001-report.md").write_text("done")
+        item, _ = self._deliver(relay)
+        assert item["id"] == 1
+        assert "first queued" in (relay.packets_dir("e1") / "002-packet.md").read_text()
+        remaining = relay.read_queue("e1")
+        assert [i["id"] for i in remaining] == [2]                # #2 waits for the NEXT idle
+        assert not (relay.packets_dir("e1") / "003-packet.md").exists()
+        # ...and it does not deliver while the session is busy again with 002
+        assert self._deliver(relay)[0] is None
+        (relay.packets_dir("e1") / "002-report.md").write_text("done")
+        item2, _ = self._deliver(relay)
+        assert item2["id"] == 2
+        assert "second queued" in (relay.packets_dir("e1") / "003-packet.md").read_text()
+
+    def test_empty_queue_delivers_nothing(self, relay):
+        self._mk(relay, status="busy", report=True)
+        assert self._deliver(relay)[0] is None
+
+    # ── failure handling ─────────────────────────────────────────────────────
+    def test_failed_delivery_puts_the_packet_back(self, relay, tmp_path):
+        # a refusal at delivery time (here: superseded) must not swallow the packet
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        s = relay.read_session("e1")
+        s["status"] = "superseded"; s["superseded_by"] = "e2"
+        relay.write_session("e1", s)
+        item, send = self._deliver(relay)
+        assert item is None
+        send.assert_not_called()
+        q = relay.read_queue("e1")
+        assert len(q) == 1 and "superseded" in q[0]["last_error"]
+        assert len(self._events(relay, "queue_delivery_failed")) == 1
+
+    def test_repeated_identical_failures_are_ledgered_once(self, relay, tmp_path):
+        # otherwise every `relay check` while the session stays superseded writes a ledger line
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        s = relay.read_session("e1")
+        s["status"] = "superseded"; s["superseded_by"] = "e2"
+        relay.write_session("e1", s)
+        for _ in range(3):
+            self._deliver(relay)
+        assert len(self._events(relay, "queue_delivery_failed")) == 1
+        assert len(relay.read_queue("e1")) == 1                   # still preserved
+
+    def test_a_held_lock_blocks_a_concurrent_delivery(self, relay, tmp_path):
+        # both triggers (Stop hook + a lead's `relay check`) can fire on the same idle transition
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        (relay.packets_dir("e1") / "001-report.md").write_text("done")
+        (relay.session_dir("e1") / "queue.lock").write_text("999999")   # someone else mid-delivery
+        item, send = self._deliver(relay)
+        assert item is None
+        send.assert_not_called()
+        assert len(relay.read_queue("e1")) == 1                   # untouched, not lost
+
+    def test_a_stale_lock_is_broken(self, relay, tmp_path):
+        # a deliverer killed mid-flight must not wedge the queue forever
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        (relay.packets_dir("e1") / "001-report.md").write_text("done")
+        lock = relay.session_dir("e1") / "queue.lock"
+        lock.write_text("999999")
+        os.utime(lock, (time.time() - 9999, time.time() - 9999))
+        item, _ = self._deliver(relay)
+        assert item is not None                                   # broke the stale lock, delivered
+        assert not lock.exists()                                  # and released it
+
+    def test_lock_is_released_after_a_normal_delivery(self, relay, tmp_path):
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        (relay.packets_dir("e1") / "001-report.md").write_text("done")
+        self._deliver(relay)
+        assert not (relay.session_dir("e1") / "queue.lock").exists()
+
+    # ── --when-idle must not soften the OTHER refusals ───────────────────────
+    def test_superseded_still_refuses_with_when_idle(self, relay, tmp_path):
+        self._mk(relay, status="superseded")
+        s = relay.read_session("e1"); s["superseded_by"] = "e2"; relay.write_session("e1", s)
+        with pytest.raises(SystemExit) as ei:
+            self._queue(relay, tmp_path)
+        assert "superseded" in str(ei.value)
+        assert relay.read_queue("e1") == []
+
+    def test_launch_failed_still_refuses_with_when_idle(self, relay, tmp_path):
+        self._mk(relay, status=relay.LAUNCH_FAILED)
+        with pytest.raises(SystemExit) as ei:
+            self._queue(relay, tmp_path)
+        assert relay.LAUNCH_FAILED in str(ei.value) and "relay restart" in str(ei.value)
+        assert relay.read_queue("e1") == []
+
+    def test_unknown_session_still_refuses_with_when_idle(self, relay, tmp_path):
+        with pytest.raises(SystemExit) as ei:
+            self._queue(relay, tmp_path, sid="ghost")
+        assert "no such session: ghost" in str(ei.value)
+
+    def test_plain_send_without_the_flag_is_unchanged(self, relay, tmp_path):
+        # the whole feature is opt-in: no --when-idle → the same hard refusal as before
+        self._mk(relay, status="busy", report=False)
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_send(SimpleNamespace(session_id="e1",
+                                               packet=self._packet(relay, tmp_path)))
+        assert "refusing to send" in str(ei.value)
+        assert relay.read_queue("e1") == []
+
+    # ── visibility + cancel ──────────────────────────────────────────────────
+    def test_check_reports_the_queue_depth(self, relay, tmp_path, capsys):
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        self._queue(relay, tmp_path)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=False))
+        assert "2 queued" in capsys.readouterr().out
+
+    def test_check_json_carries_the_queue_depth(self, relay, tmp_path, capsys):
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        capsys.readouterr()          # drop the queueing step's output; assert on cmd_check alone
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=True))
+        assert json.loads(capsys.readouterr().out)[0]["queued"] == 1
+
+    def test_check_json_stays_pure_json_while_delivering(self, relay, tmp_path, capsys):
+        # A delivery triggered BY `check --json` is chatty (the send path prints, and so does the
+        # Preconditions nag). That output must not land in a machine-read payload — but the
+        # delivery must still happen. Assert both halves in one run.
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        (relay.packets_dir("e1") / "001-report.md").write_text("done")
+        capsys.readouterr()
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send, \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=True))
+        out = capsys.readouterr()
+        assert json.loads(out.out)[0]["session_id"] == "e1"     # stdout parses — nothing leaked in
+        send.assert_called_once()                               # and the delivery still happened
+        assert relay.read_queue("e1") == []
+
+    def test_check_delivers_as_the_net_trigger(self, relay, tmp_path):
+        # the fallback for sessions whose Stop hook isn't armed (executor_escalation off)
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        (relay.packets_dir("e1") / "001-report.md").write_text("done")
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send, \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=False))
+        send.assert_called_once()
+        assert self._events(relay, "queue_delivered")[0]["trigger"] == "check"
+
+    def test_queue_command_lists_pending_packets(self, relay, tmp_path, capsys):
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path, text="# Toast\n\nadd the progress toast")
+        relay.cmd_queue(SimpleNamespace(session_id="e1", cancel=None))
+        out = capsys.readouterr().out
+        assert "1 queued packet(s)" in out and "Toast" in out and "--cancel" in out
+
+    def test_queue_command_on_an_empty_queue(self, relay, capsys):
+        self._mk(relay)
+        relay.cmd_queue(SimpleNamespace(session_id="e1", cancel=None))
+        assert "nothing queued" in capsys.readouterr().out
+
+    def test_cancel_one_by_id(self, relay, tmp_path):
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path, name="a.md")
+        self._queue(relay, tmp_path, name="b.md")
+        relay.cmd_queue(SimpleNamespace(session_id="e1", cancel="1"))
+        assert [i["id"] for i in relay.read_queue("e1")] == [2]
+        assert [e["queue_id"] for e in self._events(relay, "queue_cancelled")] == [1]
+
+    def test_cancel_all(self, relay, tmp_path):
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path, name="a.md")
+        self._queue(relay, tmp_path, name="b.md")
+        relay.cmd_queue(SimpleNamespace(session_id="e1", cancel="all"))
+        assert relay.read_queue("e1") == []
+        assert not relay.queue_path("e1").exists()
+
+    def test_cancel_an_id_that_is_not_queued(self, relay, tmp_path):
+        self._mk(relay, status="busy", report=False)
+        self._queue(relay, tmp_path)
+        with pytest.raises(SystemExit) as ei:
+            relay.cmd_queue(SimpleNamespace(session_id="e1", cancel="7"))
+        assert "no queued packet #7" in str(ei.value)
+        assert len(relay.read_queue("e1")) == 1        # refused, nothing dropped
+
+    def test_queue_command_unknown_session(self, relay):
+        with pytest.raises(SystemExit) as ei:
+            relay.cmd_queue(SimpleNamespace(session_id="ghost", cancel=None))
+        assert "no such session: ghost" in str(ei.value)
+
+    def test_corrupt_queue_file_reads_as_empty(self, relay):
+        # a hand-edited queue.json must never take down check/list
+        self._mk(relay)
+        relay.queue_path("e1").write_text("{not json")
+        assert relay.read_queue("e1") == []
+
+
 class TestSessionPidAlive:
     """The pid-reuse guard: a recorded process start time that no longer matches means the OS
     recycled the pid to an unrelated process → NOT our executor (and never SIGTERM it)."""

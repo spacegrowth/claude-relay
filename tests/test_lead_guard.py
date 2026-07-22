@@ -660,6 +660,115 @@ class TestExecutorEscalationHookSendPath:
                    for e in events)
 
 
+class TestExecutorEscalationHookQueueDelivery:
+    """The PRIMARY --when-idle delivery trigger (task #18): this Stop hook IS the idle transition a
+    queued packet is waiting for, so it hands off to `relay _deliver-queued`. Same in-process load
+    pattern as TestExecutorEscalationHookSendPath — the hook's own subprocess boundary can't be
+    mocked from a shelled-out child. `relay whoami` is let through for real; only the two outbound
+    relay commands are intercepted."""
+
+    @pytest.fixture
+    def hook_mod(self):
+        import importlib.util
+        path = str(REPO_ROOT / "hooks" / "executor_escalation.py")
+        spec = importlib.util.spec_from_file_location("executor_escalation_queue_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _executor(self, root, sid="exec-q", queued=False):
+        d = root / sid
+        (d / "packets").mkdir(parents=True)
+        (d / "session.json").write_text(json.dumps({
+            "session_id": sid, "current_packet": 1, "status": "busy", "owner_lead": "lead-1"}))
+        (d / "packets" / "001-report.md").write_text("done")     # reported → it just went idle
+        lg.write_marker(root, "lead-1", tab_label="[Lead] alpha")
+        if queued:
+            (d / "queue.json").write_text(json.dumps({"items": [{"id": 1, "body_path": "x.md"}]}))
+
+    def _run(self, hook_mod, root, monkeypatch, sid="exec-q"):
+        import io
+        real_run = hook_mod.subprocess.run
+        calls = []
+        monkeypatch.setattr(hook_mod, "STATE_ROOT", str(root))
+        monkeypatch.setattr("sys.argv", ["executor_escalation.py", sid])
+        monkeypatch.setenv("HOME", str(root.parent))
+        monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
+
+        def fake_run(cmd, **kwargs):
+            if len(cmd) > 1 and cmd[1] in ("_deliver-queued", "nudge-lead"):
+                calls.append(cmd)
+                return SimpleNamespace(returncode=0)
+            return real_run(cmd, **kwargs)                        # whoami runs for real
+
+        monkeypatch.setattr(hook_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "claude-uuid"})))
+        with pytest.raises(SystemExit) as ei:
+            hook_mod.main()
+        return ei.value.code, calls
+
+    def test_hook_delivers_a_queued_packet_on_idle(self, tmp_path, hook_mod, monkeypatch):
+        root = tmp_path / ".relay-tasks"
+        self._executor(root, queued=True)
+        rc, calls = self._run(hook_mod, root, monkeypatch)
+        assert rc == 0
+        assert ["_deliver-queued", "exec-q"] == calls[0][1:3]
+
+    def test_hook_skips_the_subprocess_when_nothing_is_queued(self, tmp_path, hook_mod, monkeypatch):
+        # the overwhelmingly common Stop must not pay for a subprocess it has no use for
+        root = tmp_path / ".relay-tasks"
+        self._executor(root, queued=False)
+        rc, calls = self._run(hook_mod, root, monkeypatch)
+        assert rc == 0
+        assert not any(c[1] == "_deliver-queued" for c in calls)
+
+    def test_delivery_runs_even_when_the_escalation_killswitch_is_off(self, tmp_path, hook_mod,
+                                                                     monkeypatch):
+        # queue delivery is a separate feature from the wake push and must not inherit its gating
+        root = tmp_path / ".relay-tasks"
+        self._executor(root, queued=True)
+        (root / "lead").mkdir(parents=True, exist_ok=True)
+        (root / "lead" / "config.json").write_text(json.dumps({"executor_escalation": False}))
+        rc, calls = self._run(hook_mod, root, monkeypatch)
+        assert rc == 0
+        assert any(c[1] == "_deliver-queued" for c in calls)
+        assert not any(c[1] == "nudge-lead" for c in calls)       # push correctly stayed off
+
+    def test_delivery_runs_even_when_the_packet_was_already_pushed(self, tmp_path, hook_mod,
+                                                                   monkeypatch):
+        # the once-per-packet escalation gate must not swallow a later queue delivery
+        root = tmp_path / ".relay-tasks"
+        self._executor(root, queued=True)
+        lg.save_escalation(root, "exec-q", {"1": {"status": "sent"}})
+        rc, calls = self._run(hook_mod, root, monkeypatch)
+        assert rc == 0
+        assert any(c[1] == "_deliver-queued" for c in calls)
+
+    def test_a_failing_delivery_never_breaks_the_hook(self, tmp_path, hook_mod, monkeypatch):
+        # HARD RULE: any error → exit 0, the executor's own Stop must be undisturbed
+        import io
+        root = tmp_path / ".relay-tasks"
+        self._executor(root, queued=True)
+        monkeypatch.setattr(hook_mod, "STATE_ROOT", str(root))
+        monkeypatch.setattr("sys.argv", ["executor_escalation.py", "exec-q"])
+        monkeypatch.setenv("HOME", str(root.parent))
+        monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
+        real_run = hook_mod.subprocess.run
+
+        def boom(cmd, **kwargs):
+            if len(cmd) > 1 and cmd[1] == "_deliver-queued":
+                raise OSError("boom")
+            if len(cmd) > 1 and cmd[1] == "nudge-lead":
+                return SimpleNamespace(returncode=0)
+            return real_run(cmd, **kwargs)
+
+        monkeypatch.setattr(hook_mod.subprocess, "run", boom)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "claude-uuid"})))
+        with pytest.raises(SystemExit) as ei:
+            hook_mod.main()
+        assert ei.value.code == 0
+
+
 # ---- bin/relay commands driving the above ------------------------------------------------------
 
 class TestRelayLeadCommands:

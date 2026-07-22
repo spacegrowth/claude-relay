@@ -23,6 +23,21 @@ shot (full context + staged work back) — so you do NOT need `/relay:resume` fi
 closed/dead session with NO captured conversation needs a fresh `/relay:spawn`. Run
 `/relay:check $session_id` first if unsure of status.
 
+**Busy target? Queue it with `--when-idle`** instead of waiting or retrying:
+
+`${CLAUDE_PLUGIN_ROOT}/bin/relay send $session_id $packet --when-idle`
+
+The packet is persisted and delivered automatically the moment that session next goes idle — via
+its own Stop hook, so nothing has to poll. **Never write a shell `until relay check …; do sleep N;
+done` loop for this**: that burns your turn, relay can't see it, and it dies when your turn ends.
+Queued packets deliver oldest-first, **one per idle transition** (a second one in the same breath
+would inject mid-turn, which is the exact thing this avoids). `--when-idle` on a session that is
+*already* idle just sends immediately. It does not soften the other refusals — `superseded` and
+`launch-failed` still refuse.
+
+Inspect or cancel with `${CLAUDE_PLUGIN_ROOT}/bin/relay queue $session_id [--cancel <id|all>]`;
+`/relay:check` shows a 📥 queued count.
+
 **Terminal.app backend note**: Terminal cannot type into a running session (no iTerm `write text`
 equivalent), so there `relay send` automatically closes the old window and reopens the SAME
 conversation via `claude --resume` in a fresh window with the packet delivered — context is fully

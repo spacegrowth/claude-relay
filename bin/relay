@@ -22,6 +22,7 @@ Commands:
   relay nudge-lead <lead> "<message>"        # type a message into a LEAD's own tab; always sends
 """
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -371,6 +372,70 @@ def next_packet_number(session_id):
     return int(existing[-1]) + 1 if existing else 1
 
 
+# ── the --when-idle queue (task #18) ───────────────────────────────────────────────────────────
+# `relay send` refuses a busy session (injecting mid-turn is unsafe), which pushed leads into
+# hand-rolled shell `until relay check … ; do sleep N; done` loops — a poller relay never sees,
+# can't ledger, and which dies with the lead's turn. --when-idle persists the packet instead and
+# lets the EXISTING idle transition deliver it. The BODY is copied to disk at queue time (the
+# source .md may be edited or deleted before delivery), but the GATES/REPORT FORMAT footer is
+# applied at DELIVERY time by the normal send path, so a queued packet is never stamped with a
+# stale footer.
+QUEUE_FILE = "queue.json"
+QUEUE_DIR = "queue"
+
+
+def queue_path(session_id):
+    return session_dir(session_id) / QUEUE_FILE
+
+
+def read_queue(session_id):
+    """The pending queue as a list, oldest first. A missing/corrupt file reads as empty — a
+    hand-edited queue.json must never take down `relay list`/`check`."""
+    p = queue_path(session_id)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text())
+        return data.get("items", []) if isinstance(data, dict) else []
+    except Exception:
+        return []
+
+
+def write_queue(session_id, items):
+    """Persist (or remove, when empty) the queue. Written via a temp file + os.replace so a reader
+    never sees a half-written queue."""
+    p = queue_path(session_id)
+    if not items:
+        for f in (p, p.with_suffix(".claiming")):
+            try:
+                f.unlink()
+            except FileNotFoundError:
+                pass
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"items": items}, indent=2))
+    os.replace(tmp, p)
+
+
+def enqueue_packet(session_id, body, source, heavy_override=None):
+    """Append one packet to the session's queue and return the stored item. The body lands in its
+    own file under <session>/queue/ so a queued packet is inspectable on disk (and diffable)
+    rather than buried inside a JSON string."""
+    items = read_queue(session_id)
+    qid = max([i.get("id", 0) for i in items], default=0) + 1
+    bd = session_dir(session_id) / QUEUE_DIR
+    bd.mkdir(parents=True, exist_ok=True)
+    body_path = bd / f"{qid:03d}-queued.md"
+    body_path.write_text(body)
+    item = {"id": qid, "queued_at": now(), "source": str(source), "body_path": str(body_path),
+            "summary": packet_summary(body), "heavy_override": heavy_override, "last_error": None}
+    items.append(item)
+    write_queue(session_id, items)
+    append_ledger("packet_queued", session_id=session_id, queue_id=qid, source=str(source))
+    return item
+
+
 def build_packet(body, report_path, diff_cmd, diff_url):
     return body.rstrip() + TEMPLATE_FOOTER.format(report_path=report_path, diff_cmd=diff_cmd, diff_url=diff_url)
 
@@ -387,6 +452,15 @@ def packet_missing_preconditions(body):
     blocks the send, just nags — the point isn't the section existing, it's the world-state walk
     that AUTHORING it forces on the lead (§7-h1)."""
     return PRECONDITIONS_HEADING_RE.search(body) is None
+
+
+def warn_missing_preconditions(body, verb):
+    """Print the §7-h1 nag if `body` has no Preconditions section. One helper for all three
+    outgoing-packet paths (spawn / send / --when-idle queue) so the wording can't drift between
+    them; only the trailing verb differs."""
+    if packet_missing_preconditions(body):
+        print(c("  ⚠ no ## Preconditions section: authoring one forces the world-state walk "
+                f"before send (checkout pulled? code live? DDL applied?) — {verb} anyway.", "red"))
 
 
 def packet_summary(body, limit=160):
@@ -702,9 +776,7 @@ def resolve_seed(value):
 
 def cmd_spawn(args):
     body = Path(args.packet).read_text()
-    if packet_missing_preconditions(body):
-        print(c("  ⚠ no ## Preconditions section: authoring one forces the world-state walk "
-                "before send (checkout pulled? code live? DDL applied?) — spawning anyway.", "red"))
+    warn_missing_preconditions(body, "spawning")
     # A successor seed is inherited CONTEXT appended to the packet body, before the GATES footer.
     # (After the Preconditions nag on purpose: the nag judges the AUTHORED packet, and a seed
     # append never adds a Preconditions section of its own.)
@@ -1164,6 +1236,20 @@ def cmd_send(args):
     _check_one(args.session_id)
     s = read_session(args.session_id)
     if s["status"] in ("busy", "stalled"):
+        # --when-idle (#18): don't refuse — PERSIST the packet and let the session's own idle
+        # transition deliver it (see deliver_queued). This is the supported replacement for the
+        # shell `until relay check …; do sleep N; done` loops leads were writing, which relay
+        # couldn't see, couldn't ledger, and which died with the lead's turn.
+        if getattr(args, "when_idle", False):
+            body = Path(args.packet).read_text()
+            warn_missing_preconditions(body, "queueing")
+            item = enqueue_packet(args.session_id, body, args.packet,
+                                  heavy_override=getattr(args, "heavy_override", None))
+            pending = len(read_queue(args.session_id))
+            print(f"'{args.session_id}' is {s['status']} — queued as #{item['id']}, delivers when it "
+                  f"next goes idle" + (f" ({pending} queued, oldest first)" if pending > 1 else "")
+                  + f"\n  inspect/cancel: {RELAY_BIN} queue {args.session_id} [--cancel <id|all>]")
+            return
         sys.exit(f"session '{args.session_id}' is {s['status']} — refusing to send (would inject mid-turn). Only reported/idle sessions are safe send targets.")
     if s["status"] == "superseded":
         sys.exit(f"session '{args.session_id}' is superseded by {s.get('superseded_by')} — refusing to send into an abandoned session.")
@@ -1209,9 +1295,7 @@ def cmd_send(args):
 
     n = next_packet_number(args.session_id)
     body = Path(args.packet).read_text()
-    if packet_missing_preconditions(body):
-        print(c("  ⚠ no ## Preconditions section: authoring one forces the world-state walk "
-                "before send (checkout pulled? code live? DDL applied?) — sending anyway.", "red"))
+    warn_missing_preconditions(body, "sending")
     report_path = str(packets_dir(args.session_id) / f"{n:03d}-report.md")
     diff_cmd = f"{RELAY_BIN} diff {args.session_id}"
     diff_path = packets_dir(args.session_id) / f"{n:03d}-diff.html"
@@ -1260,6 +1344,140 @@ def cmd_send(args):
     write_session(args.session_id, s)
     append_ledger("packet_sent", session_id=args.session_id, packet=n)
     print(f"sent packet {n:03d} to session '{args.session_id}' (existing tab)")
+
+
+def _queue_lock(session_id, stale_seconds=120):
+    """Claim the right to deliver from this session's queue, or None if someone else holds it.
+    O_EXCL create — the two delivery triggers (the executor's Stop hook and a lead's `relay check`)
+    can fire within the same second on the same idle transition, and delivering the same packet
+    twice would inject mid-turn, which is the exact unsafety --when-idle exists to prevent.
+    A lock older than `stale_seconds` is broken and re-taken, so a killed deliverer can't wedge the
+    queue forever (the queue file itself is never moved, only read/rewritten under the lock)."""
+    lock = session_dir(session_id) / "queue.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in (1, 2):
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return lock
+        except FileExistsError:
+            try:
+                if attempt == 1 and time.time() - lock.stat().st_mtime > stale_seconds:
+                    lock.unlink()          # stale holder (killed mid-delivery) → break and retry
+                    continue
+            except FileNotFoundError:
+                continue                   # holder released it between our open and our stat
+            return None
+    return None
+
+
+def deliver_queued(session_id, trigger):
+    """Deliver ONE queued packet if the session is idle enough to receive it. Returns the delivered
+    queue item, or None.
+
+    ONE per idle transition, oldest first (FIFO), by necessity rather than taste: the normal send
+    path marks the session `busy` again, so delivering a second packet in the same breath would be
+    the mid-turn injection --when-idle exists to avoid. The rest wait for the next idle.
+
+    Delivery IS the normal `cmd_send` path — same packet numbering, same GATES/REPORT FORMAT footer
+    applied at delivery time, same ledger `packet_sent`, same tab-gone→resume fallback. A queued
+    packet is not a second kind of packet.
+
+    Never raises: a queue that can't deliver (session heavy, superseded, tab unreachable) puts its
+    item BACK at the head with the error recorded, so nothing is silently swallowed."""
+    if not read_queue(session_id):
+        return None
+    s = _check_one(session_id)             # decide on FRESH status, exactly as cmd_send does
+    if "error" in s or s.get("status") in ("busy", "stalled"):
+        return None                        # still working → leave it queued, this is the point
+
+    lock = _queue_lock(session_id)
+    if lock is None:
+        return None                        # another trigger is mid-delivery on this same session
+    try:
+        items = read_queue(session_id)
+        if not items:
+            return None
+        item, rest = items[0], items[1:]
+        write_queue(session_id, rest)      # off the queue BEFORE the attempt — a crash mid-send
+        try:                               # must not re-deliver, and the restore below covers the
+                                           # recoverable failures.
+            cmd_send(SimpleNamespace(session_id=session_id, packet=item["body_path"],
+                                     when_idle=False, heavy_override=item.get("heavy_override")))
+        except SystemExit as e:            # cmd_send refuses by exiting — capture, don't die
+            err = str(e) or "send refused"
+            prev_error = item.get("last_error")   # BEFORE mutating: `item` IS items[0]
+            item["last_error"] = err
+            write_queue(session_id, [item] + rest)
+            # Ledger the failure once per distinct error, not once per poll: a heavy or superseded
+            # session would otherwise write a ledger line every time anyone runs `relay check`.
+            if err != prev_error:
+                append_ledger("queue_delivery_failed", session_id=session_id,
+                              queue_id=item["id"], trigger=trigger, error=err[:300])
+            return None
+        n = read_session(session_id).get("current_packet")
+        append_ledger("queue_delivered", session_id=session_id, queue_id=item["id"],
+                      packet=n, trigger=trigger, remaining=len(rest))
+        print(f"delivered queued packet (queue #{item['id']}) to '{session_id}' as packet "
+              f"{n:03d} — triggered by {trigger}"
+              + (f"; {len(rest)} still queued" if rest else ""))
+        return item
+    finally:
+        try:
+            lock.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def cmd_deliver_queued(args):
+    """Internal: the executor-side delivery trigger, invoked by hooks/executor_escalation.py when
+    an executor goes idle with its report written. Fail-open like everything else that hook calls —
+    a queue problem must never disturb the executor's own Stop behavior."""
+    try:
+        deliver_queued(args.session_id, trigger="stop-hook")
+    except Exception as e:
+        print(f"deliver-queued: {e}", file=sys.stderr)
+
+
+def cmd_queue(args):
+    """Show — or cancel — a session's pending --when-idle packets. This is the cancel path: there
+    is no separate un-send command."""
+    if not read_session(args.session_id):
+        sys.exit(f"no such session: {args.session_id}")
+    items = read_queue(args.session_id)
+    if args.cancel is not None:
+        if not items:
+            print(f"'{args.session_id}' has nothing queued — nothing to cancel")
+            return
+        if args.cancel == "all":
+            kept, dropped = [], items
+        else:
+            try:
+                target = int(args.cancel)
+            except ValueError:
+                sys.exit(f"queue: --cancel takes a queue id or 'all', not '{args.cancel}'")
+            kept = [i for i in items if i.get("id") != target]
+            dropped = [i for i in items if i.get("id") == target]
+            if not dropped:
+                sys.exit(f"'{args.session_id}' has no queued packet #{target} "
+                         f"(queued: {', '.join('#' + str(i['id']) for i in items) or 'none'})")
+        write_queue(args.session_id, kept)
+        for i in dropped:
+            append_ledger("queue_cancelled", session_id=args.session_id, queue_id=i["id"])
+        print(f"cancelled {len(dropped)} queued packet(s) for '{args.session_id}'"
+              + (f" — {len(kept)} still queued" if kept else ""))
+        return
+    if not items:
+        print(f"'{args.session_id}': nothing queued")
+        return
+    print(f"'{args.session_id}': {len(items)} queued packet(s), delivered oldest-first as it goes idle")
+    for i in items:
+        print(f"  #{i['id']}  queued {i['queued_at']}  {i.get('summary') or '(no summary)'}")
+        print(c(f"       body: {i['body_path']}", "dim"))
+        if i.get("last_error"):
+            print(c(f"       last delivery attempt failed: {i['last_error']}", "red"))
+    print(c(f"  cancel with: {RELAY_BIN} queue {args.session_id} --cancel <id|all>", "dim"))
 
 
 def cmd_adopt(args):
@@ -1381,10 +1599,26 @@ def c(text, *styles):
 
 def cmd_check(args):
     ids = all_session_ids() if args.all else [args.session_id]
+    # The NET delivery trigger for the --when-idle queue. The PRIMARY one is the executor's own
+    # escalation Stop hook (fires the instant it goes idle, with no lead involvement — see
+    # deliver_queued's callers); this covers the sessions that hook can't: `executor_escalation`
+    # switched off, or an executor spawned before it was armed. `check` is the right net because
+    # recomputing liveness is already its entire job, and it's what a woken lead runs first.
+    # Deliberately NOT inside _check_one: cmd_send calls that, and delivering from there would
+    # re-enter cmd_send mid-send.
+    # --json must emit ONLY json: delivery is chatty (the send path prints, and may print the
+    # Preconditions nag), and that would land in the middle of a machine-read payload. The delivery
+    # still HAPPENS in json mode — only its human output moves to stderr.
+    sink = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
+    with sink:
+        for sid in ids:
+            if sid:
+                deliver_queued(sid, trigger="check")
     results = [_check_one(sid) for sid in ids if sid]
     for s in results:
         if "error" not in s:
             _mark_report_surfaced(s)  # the lead just looked at this report — dedup it (§5b)
+            s["queued"] = len(read_queue(s["session_id"]))
     if args.json:
         print(json.dumps(results, indent=2))
         return
@@ -1396,7 +1630,9 @@ def cmd_check(args):
         reported = (packets_dir(s["session_id"]) / f"{n:03d}-report.md").exists()
         status_c = c(s["status"], *_STATUS_STYLE.get(s["status"], ()))
         rep_c = c("✅ report ready", "green", "bold") if reported else c("not yet", "dim")
-        print(f"{s['session_id']}: status={status_c} packet={n:03d} {rep_c}")
+        q = s.get("queued") or 0
+        q_c = c(f" 📥 {q} queued", "yellow") if q else ""
+        print(f"{s['session_id']}: status={status_c} packet={n:03d} {rep_c}{q_c}")
 
 
 def _resolve_status_payload(args):
@@ -3069,7 +3305,21 @@ def main():
                     help="required to send into a session whose transcript is past the heaviness "
                          "threshold (§6e e2) — the reason is ledgered (model_ceiling_override's "
                          "sibling)")
+    sd.add_argument("--when-idle", dest="when_idle", action="store_true",
+                    help="if the session is busy/stalled, QUEUE this packet instead of refusing; "
+                         "it is delivered automatically the next time the session goes idle "
+                         "(inspect/cancel with `relay queue <sid>`)")
     sd.set_defaults(func=cmd_send)
+
+    q = sub.add_parser("queue", help="show (or cancel) a session's --when-idle queued packets")
+    q.add_argument("session_id")
+    q.add_argument("--cancel", nargs="?", const="all", metavar="ID|all",
+                   help="cancel a queued packet by id, or all of them when given no value")
+    q.set_defaults(func=cmd_queue)
+
+    dq = sub.add_parser("_deliver-queued", help=argparse.SUPPRESS)  # internal: see cmd_deliver_queued
+    dq.add_argument("session_id")
+    dq.set_defaults(func=cmd_deliver_queued)
 
     ck = sub.add_parser("check")
     ck.add_argument("session_id", nargs="?")
@@ -3208,7 +3458,7 @@ def main():
     RESOLVE_FIELDS = {
         "send": ["session_id"], "check": ["session_id"], "status": ["session_id"],
         "close": ["session_id", "supersede", "self_session"], "stop": ["session_id"],
-        "retire": ["session_id"],
+        "retire": ["session_id"], "queue": ["session_id"], "_deliver-queued": ["session_id"],
         "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
         "auto": ["session"],
         "diff": ["session_id"], "focus": ["session_id"], "restart": ["session_id"],
