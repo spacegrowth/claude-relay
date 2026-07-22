@@ -50,29 +50,30 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 |---|---|---|---|
 | 1 | BUG | Stamp `backend` at the 3 `write_marker` sites that miss it ✅ LANDED v0.3.30 | §1 |
 | 2 | BUG | Make tab-label assertion identity-aware, not label-aware (repro first) ✅ LANDED v0.3.30 | §2 |
-| 3 | BUG | Lead status in `relay list` (live/unreachable/ghost) + own transcript-MB column | §3, §9 |
+| 3 | BUG | Lead status in `relay list` (live/unreachable/ghost) + own transcript-MB column ✅ LANDED v0.3.31 | §3, §9 |
 | 4 | CAP | Retitle predecessor tab `[ex-Lead]` on step-down — dissolves the suffix question | §4 |
 | 5 | — | *Superseded by #17* — the "woken twice" investigation; §5b confirmed the bug | §5 |
 | 6 | CAP | Required TL;DR block in report format (UNVERIFIED list mandatory) ✅ LANDED v0.3.29 | §6a, §9 |
 | 7 | CAP | Plugin-side verifier — with the "counts-match ≠ true" caveat | §6b, §9 |
 | 8 | DEC | Approved-plan autopilot `relay plan approve` (subset of #16) — *superseded by #16 phase 1* | §6c |
 | 9 | CAP | `relay land` deploy pipeline — *likely out of scope* | §6d |
-| 10 | CAP | Executor context/heaviness awareness (price/gate/escape e1–e2) | §6e |
-| 11 | CAP | `relay retire` + `successor-seed.md` (the sleeper) | §6e-e3 |
+| 10 | CAP | Executor context/heaviness awareness (price/gate/escape e1–e2) ✅ LANDED v0.3.31 | §6e |
+| 11 | CAP | `relay retire` + `successor-seed.md` (the sleeper) ✅ LANDED v0.3.31 | §6e-e3 |
 | 12 | DOC | "Treat this packet cold" GATES line ✅ LANDED v0.3.30 | §6e-e4 |
-| 13 | CAP | `relay send` Preconditions nag | §7-h1 |
+| 13 | CAP | `relay send` Preconditions nag ✅ LANDED v0.3.31 | §7-h1 |
 | 14 | DOC | STOP-and-report GATES paragraph (broaden to ALL blocking questions) ✅ LANDED v0.3.30 | §7-h2, §9 |
 | 15 | DOC | Packet self-sufficiency doctrine ✅ LANDED v0.3.30 | §8 |
 | 16 | DEC | Autonomous/"confident" mode (hard-deps on #7 + #6) — ✅ PHASE 1 LANDED v0.3.29 (auto-commit awaits #7) | §6f, §9 |
 | 17 | BUG | **Asymmetric surfaced_reports dedup** → re-wake after review (high priority) ✅ LANDED v0.3.30 | §5b |
 | 18 | CAP | `relay send --when-idle` queue (replaces unsafe until-loop) | §9 |
-| 19 | BUG | Handoff double SUCCESSOR AFTERCARE section | §9 |
+| 19 | BUG | Handoff double SUCCESSOR AFTERCARE section ✅ LANDED v0.3.31 | §9 |
 | 20 | BUG | Spawn writes a live marker when the launch never happened (no PID + no title) ✅ LANDED v0.3.30 | §12 |
 | 21 | BUG | Resume loops on a never-created conversation id; claims success on a dead tab ✅ LANDED v0.3.30 | §12 |
+| 22 | BUG | Wake dedup stamps surfaced on announce ATTEMPT, not delivery — busy-lead wake lost forever | §13 |
 | d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) | §10 |
 | d2 | DOC | Mutation-budget tripwire line in `/relay:mode` ✅ LANDED v0.3.30 | §10 |
 | d3 | DOC | Standing ops-hands pattern (spawn an ops executor up front) ✅ LANDED v0.3.30 | §10 |
-| d4 | BUG | Discipline markers must survive handoff + handoff-linter | §10 |
+| d4 | BUG | Discipline markers must survive handoff + handoff-linter ✅ LANDED v0.3.31 | §10 |
 
 **Definition of done for every behavioral fix (#1, #2, #17, d1, d4):** land it with a §0-style
 *evidence table* — observed-live rows, not just a green suite. That evidence discipline is the best
@@ -632,3 +633,25 @@ defects compounded from there:
 
 Also more field evidence for **#2** (identity-aware tab tracking): the label was the only handle,
 and it was the thing that failed.
+
+## 13. Lost wake for a busy lead — mark-surfaced-on-attempt (#22, observed live 2026-07-22)
+
+**The incident.** rl-flow's report landed at 22:37:54 while its lead was mid-turn. The executor's
+one-shot escalation nudge fired at 22:38:00 against the busy tab (spent, undelivered). No lead
+wake ever announced the report across ~95 minutes of subsequent idle windows — a later wake (~00:00)
+announced a DIFFERENT executor's fresh report but not rl-flow's, proving `rl-flow:1` was already in
+`surfaced_reports.json` by then, though nothing legitimate (check/diff/close/delivered-wake) had
+stamped it. The human noticed the executors were done; the tooling didn't.
+
+**Diagnosis (evidence-fit, not yet code-traced to the exact line).** The Stop-hook announce path
+stamps `mark_surfaced` when it fires, then relies on its exit-2/stderr reaching the lead — but a
+firing that cannot actually be delivered (lead busy / turn raced / harness dropped it) still keeps
+the stamp. Mark-on-attempt, not mark-on-delivery. The mirror image of #17 (which stamped too little
+→ duplicate wakes); this stamps too early → silently swallowed reports, strictly worse. The one-shot
+escalation (wake-watch §9) is also spent against a busy tab, so both layers die on the same busy
+window and nothing retries.
+
+**Fix directions to evaluate (#22):** stamp surfaced only at a point that proves delivery (e.g. the
+lead's own next-turn acknowledgment, or check/diff/close per #17); or make the announce idempotent
+across polls until something #17-shaped confirms the lead saw it; and make the executor escalation
+re-arm when the nudge landed on a demonstrably busy lead instead of burning its one shot.
