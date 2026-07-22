@@ -11,6 +11,8 @@ Commands:
   relay status [session_id] [--statusline]    # read-only, statusline-safe one-liner; never writes
   relay list [--lead <session_id> | --all] [--json]
   relay report <session_id> [--packet N]      # print an executor's report, framed in green
+  relay verify <session_id> [--packet N] [--rerun]   # machine-check a report against its staged
+                                              # reality: MALFORMED/MISMATCH/INCONCLUSIVE/COUNTS-MATCH
   relay close <session_id> [--supersede <new_session_id>]
   relay close --self <session_id>            # step down from lead mode
   relay stop <session_id>                    # step down from lead mode (alias for close --self)
@@ -42,6 +44,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 import backend
 import diff_render
 import lead_guard
+import report_verify
 import iterm as iterm_backend  # the REAL scripts/iterm.py module, always -- distinct from the
                                # `iterm` name below (this invocation's SELECTED backend, which can
                                # resolve to terminal_app). _background_label_loop is iTerm-specific
@@ -2323,6 +2326,84 @@ def cmd_diff(args):
         subprocess.run(["open", str(out_path)])
 
 
+# ── verify: machine-check a report against staged reality (backlog §6b / #7) ──────────────────
+# The epistemics live in lib/report_verify.py's module docstring and in report_verify.CAVEAT —
+# read those before touching this. Everything here is I/O: gather git facts, hand them to the pure
+# verifier, colour its lines, ledger the verdict. Deliberately no judgement in this layer.
+
+def _git_lines(worktree, *argv):
+    """`git -C worktree <argv>` split into non-empty lines; [] on any failure. A missing worktree
+    must degrade the verify (fewer facts), never crash it."""
+    try:
+        r = subprocess.run(["git", "-C", worktree, *argv], capture_output=True, text=True)
+        return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()] if r.returncode == 0 else []
+    except Exception:
+        return []
+
+
+def _rerun_declared(worktree, commands, declared_passed):
+    """Re-run the report's declared test commands in its worktree and read back each `N passed`.
+    Only reached under --rerun. `commands` is already allowlisted by report_verify.rerunnable, and
+    these run WITHOUT a shell (argv only) — a report is untrusted text."""
+    results = []
+    for cmd in commands:
+        argv = shlex.split(cmd)
+        try:
+            r = subprocess.run(argv, cwd=worktree, capture_output=True, text=True)
+            out = (r.stdout or "") + (r.stderr or "")
+        except Exception as e:
+            out = f"(failed to run: {e})"
+        results.append({"cmd": cmd, "passed": report_verify.passed_count(out),
+                        "declared": declared_passed})
+    return results
+
+
+def cmd_verify(args):
+    """`relay verify <sid> [--packet N] [--rerun]` — check an executor's report against the staged
+    reality in its worktree, and stamp MALFORMED / MISMATCH / COUNTS-MATCH. Never "PASS": see
+    report_verify.CAVEAT, which this prints on every run."""
+    s = read_session(args.session_id)
+    if not s:
+        sys.exit(f"no such session: {args.session_id}")
+    n = args.packet or s.get("current_packet", 1)
+    rp = packets_dir(args.session_id) / f"{n:03d}-report.md"
+    if not rp.exists():
+        sys.exit(f"no report yet for '{args.session_id}' packet {n:03d} — nothing to verify")
+    worktree = s.get("worktree")
+    if not worktree:
+        sys.exit(f"session '{args.session_id}' has no recorded worktree")
+
+    text = rp.read_text()
+    reality = {
+        "staged": _git_lines(worktree, "diff", "--cached", "--name-only"),
+        "modified": _git_lines(worktree, "diff", "--name-only"),
+        "untracked": _git_lines(worktree, "ls-files", "--others", "--exclude-standard"),
+        # Top-level repo entries, so an extension-less claim like `bin/relay` stays checkable
+        # while English prose that merely contains a slash ("bulleted/ornamented") does not get
+        # mistaken for a path — see report_verify.plausible_claims.
+        "repo_entries": set(_git_lines(worktree, "ls-tree", "--name-only", "HEAD")),
+        # Advisory only (see report_verify): a reused session's LEAD legitimately commits earlier
+        # packets, so this can never be a hard finding.
+        "commits_since": len(_git_lines(worktree, "log", "--format=%h",
+                                        f"--since={s.get('busy_since') or s.get('created') or ''}"))
+                          if (s.get("busy_since") or s.get("created")) else 0,
+        "rerun": None,
+    }
+    if args.rerun:
+        cmds = report_verify.declared_commands(text)
+        declared = next((c for c, k in report_verify.declared_counts(text) if k == "passed"), None)
+        reality["rerun"] = _rerun_declared(worktree, cmds, declared)
+
+    result = report_verify.verify(text, reality)
+    for line, styles in report_verify.render(result, args.session_id, n):
+        print(c(line, *styles) if styles else line)
+
+    append_ledger("report_verify", session_id=args.session_id, packet=n,
+                  verdict=result["verdict"], rerun=bool(args.rerun),
+                  mismatches=len([f for f in result["findings"] if f["level"] == "mismatch"]))
+    sys.exit(report_verify.EXIT_CODES[result["verdict"]])
+
+
 def cmd_close(args):
     # No positional session_id → "step down from lead mode for THIS session" (needs --self, the
     # current session's own id, since a bare CLI invocation has no ambient session identity).
@@ -3401,6 +3482,17 @@ def main():
                     "(default: scoped to files mentioned in the session's current packet report)")
     df.set_defaults(func=cmd_diff)
 
+    vf = sub.add_parser("verify", help="machine-check an executor's report against its staged "
+                        "reality: MALFORMED / MISMATCH / COUNTS-MATCH (never \"PASS\" — a "
+                        "counts match must never be read as \"the report is true\")")
+    vf.add_argument("session_id")
+    vf.add_argument("--packet", type=int)
+    vf.add_argument("--rerun", action="store_true",
+                    help="also re-run the pytest-shaped commands the report declares, in its "
+                         "worktree, and compare the passed counts (off by default so verify stays "
+                         "fast; non-pytest and shell-metacharacter commands are never run)")
+    vf.set_defaults(func=cmd_verify)
+
     fc = sub.add_parser("focus")
     fc.add_argument("session_id")
     fc.set_defaults(func=cmd_focus)
@@ -3461,7 +3553,8 @@ def main():
         "retire": ["session_id"], "queue": ["session_id"], "_deliver-queued": ["session_id"],
         "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
         "auto": ["session"],
-        "diff": ["session_id"], "focus": ["session_id"], "restart": ["session_id"],
+        "diff": ["session_id"], "verify": ["session_id"], "focus": ["session_id"],
+        "restart": ["session_id"],
         "resume": ["session_id"], "spawn": ["lead"], "list": ["lead"],
         "nudge-lead": ["lead"],
     }

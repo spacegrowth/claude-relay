@@ -152,6 +152,9 @@ relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --whe
 /relay:auto on|off|status                  autonomous posture: proceed by default on routine in-plan
                                             steps instead of asking (per-session; committing still stops)
 /relay:diff <session_id>                   render staged changes to an HTML review page and open it
+/relay:verify <session_id> [--rerun]       machine-check a report against its staged reality:
+                                            MALFORMED / MISMATCH / INCONCLUSIVE / COUNTS-MATCH
+                                            (never "PASS" — see below for why that matters)
 /relay:handoff <handoff.md>                 succeed this lead: pre-armed successor tab, then step down
 relay close-predecessor                    successor-only: close the outgoing lead's tab, on user go
 relay status [session_id] [--statusline]   read-only, statusline-safe one-liner (see below)
@@ -253,6 +256,41 @@ files are exempt — writing packets is the lead's job. Every block and retain i
 Honest limits: it does **not** gate `Bash` (`git commit`, `sed -i`, heredocs pass ungated — that
 discipline stays on the lead), and it only acts in `/relay:mode` sessions — every other session on
 the machine is untouched (the hook fast-exits, fail-open).
+
+## Verifying a report (and why it can't tell you the report is true)
+
+`relay verify <session_id>` machine-checks an executor's report against the staged reality in its
+worktree, and stamps one of four verdicts:
+
+| Verdict | Exit | Means |
+|---|---|---|
+| `COUNTS-MATCH` | 0 | The checkable numbers agree. **That is all it means.** |
+| `MISMATCH` | 1 | A claim contradicts staged reality — a file claimed but never staged, a "staged" confirmation over an empty index, a declared test count that doesn't reproduce. |
+| `MALFORMED` | 2 | The report breaks the REPORT FORMAT's TL;DR contract — usually a missing `UNVERIFIED:` line, which reads as *malformed*, never as "nothing to report". |
+| `INCONCLUSIVE` | 3 | A check you asked for didn't complete. Not a pass with a caveat — nothing was compared. |
+
+It checks the TL;DR block's four mandatory fields; the files the report claims under "What changed"
+against `git diff --cached --name-only`; that the work is staged and uncommitted; and the test
+counts and commands the report declares. It **echoes the report's risk flags and UNVERIFIED lines
+verbatim** on every run — surfacing them, never absorbing them, and never letting them change the
+verdict, because grading them is your job. Each run lands a `report_verify` event in the ledger.
+
+Declared test commands are **not re-run by default**, so verify stays fast; `--rerun` runs them.
+Only pytest-shaped commands with no shell metacharacters are ever executed, argv-only and never
+through a shell — a report is text an executor wrote, and this must not become a way for one to run
+arbitrary commands in your worktree.
+
+**Now the important part.** A `COUNTS-MATCH` **must never be read as "the report is true."** Across
+~15 real executor reports, a counts-verifier would have caught exactly **one** thing (a lint miss).
+Every *dangerous* problem was premise-level — wrong oracle, wrong write-side, suite green in the
+wrong venv — and all of those are **invisible** to re-running the declared commands. So the tool
+says what it can prove and no more; there is deliberately no "PASS", no "VERIFIED" and no "clean"
+anywhere in its vocabulary, and the caveat is printed on every single run, not just failures.
+
+Use it as a cheap pre-filter that tells you where to look harder — **the lead's judgement on the
+staged diff stays the real check.** A verifier that displaces that judgement makes relay *less*
+safe, because it trades the thing that caught the real problems for the thing that catches lint
+misses. That is also why a zero exit code is not, by itself, permission to commit.
 
 ## Autonomous mode
 

@@ -2882,6 +2882,184 @@ class TestDiff:
         assert unquoted == str(expected_path)
 
 
+class TestVerify:
+    """`relay verify <sid> [--packet N] [--rerun]` (backlog §6b / #7) — the CLI seam only: real git
+    repos in tmp_path, ledger events, and exit codes. The verdict LOGIC (and the §9 temper it
+    encodes) is unit-tested in tests/test_report_verify.py against the pure functions.
+
+    Exit codes are load-bearing rather than cosmetic: #16 phase 2 (autonomous auto-commit) is
+    supposed to build on this, and it can only ever be allowed to key off a zero exit."""
+
+    def _git(self, repo, *args):
+        import subprocess
+        subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+    def _repo(self, tmp_path, staged=("src.py",)):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / "src.py").write_text("one\n")
+        (repo / "other.py").write_text("two\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "init")
+        for name in staged:
+            (repo / name).write_text("changed\n")
+            self._git(repo, "add", name)
+        return repo
+
+    REPORT = ("Changed the source file; suite green, staged.\n\n"
+              "Status: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: src.py\n\n"
+              "## What changed\n- src.py:1 — changed it.\n\n"
+              "My changes are staged, not committed, ready for the lead to review.\n")
+
+    def _mk(self, relay, sid, repo, report_text):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": str(repo), "topic": "t",
+            "scope": "t", "tab_label": f"relay-{sid}", "status": "reported",
+            "current_packet": 1, "busy_since": relay.now()})
+        if report_text is not None:
+            (relay.packets_dir(sid) / "001-report.md").write_text(report_text)
+
+    def _run(self, relay, sid, rerun=False, packet=None):
+        with pytest.raises(SystemExit) as e:
+            relay.cmd_verify(SimpleNamespace(session_id=sid, packet=packet, rerun=rerun))
+        return e.value.code
+
+    def test_truthful_report_exits_zero_and_ledgers_counts_match(self, relay, tmp_path, capsys):
+        self._mk(relay, "e1", self._repo(tmp_path), self.REPORT)
+        assert self._run(relay, "e1") == 0
+        out = capsys.readouterr().out
+        assert "COUNTS-MATCH" in out
+        assert 'must NEVER be read as "the report is true"' in out
+        events = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
+        rec = [e for e in events if e["event"] == "report_verify"][-1]
+        assert rec["session_id"] == "e1" and rec["packet"] == 1
+        assert rec["verdict"] == "COUNTS-MATCH" and rec["mismatches"] == 0
+
+    def test_claimed_file_never_staged_exits_one_and_names_it(self, relay, tmp_path, capsys):
+        report = self.REPORT.replace("- src.py:1 — changed it.",
+                                     "- src.py:1 — changed it.\n- other.py:1 — changed it too.")
+        self._mk(relay, "e1", self._repo(tmp_path), report)
+        assert self._run(relay, "e1") == 1
+        out = capsys.readouterr().out
+        assert "MISMATCH" in out and "other.py" in out
+        rec = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()][-1]
+        assert rec["verdict"] == "MISMATCH" and rec["mismatches"] == 1
+
+    def test_missing_unverified_line_exits_two_as_malformed(self, relay, tmp_path, capsys):
+        self._mk(relay, "e1", self._repo(tmp_path), self.REPORT.replace("UNVERIFIED: none\n", ""))
+        assert self._run(relay, "e1") == 2
+        assert "MALFORMED" in capsys.readouterr().out
+        assert [json.loads(l) for l in relay.LEDGER.read_text().splitlines()][-1]["verdict"] == "MALFORMED"
+
+    def test_risk_flags_are_echoed_in_the_output(self, relay, tmp_path, capsys):
+        report = self.REPORT.replace("Risk flags: none",
+                                     "Risk flags: weakened a parity assertion")
+        self._mk(relay, "e1", self._repo(tmp_path), report)
+        self._run(relay, "e1")
+        assert "weakened a parity assertion" in capsys.readouterr().out
+
+    def test_no_report_yet_is_a_clean_refusal(self, relay, tmp_path):
+        self._mk(relay, "e1", self._repo(tmp_path), None)
+        with pytest.raises(SystemExit) as e:
+            relay.cmd_verify(SimpleNamespace(session_id="e1", packet=None, rerun=False))
+        assert "no report yet" in str(e.value.code)
+
+    def test_unknown_session_is_a_clean_refusal(self, relay):
+        with pytest.raises(SystemExit) as e:
+            relay.cmd_verify(SimpleNamespace(session_id="nope", packet=None, rerun=False))
+        assert "no such session" in str(e.value.code)
+
+    def test_packet_flag_selects_the_report(self, relay, tmp_path, capsys):
+        self._mk(relay, "e1", self._repo(tmp_path), self.REPORT)
+        (relay.packets_dir("e1") / "002-report.md").write_text(
+            self.REPORT.replace("UNVERIFIED: none\n", ""))
+        assert self._run(relay, "e1", packet=2) == 2  # packet 2 is the malformed one
+        assert "packet 002" in capsys.readouterr().out
+
+    def test_default_run_does_not_execute_anything(self, relay, tmp_path, capsys):
+        """Without --rerun nothing is executed, and the output says so — 'did not run' must never
+        be mistakable for 'ran and matched' (§9.6a)."""
+        report = self.REPORT.replace("## What changed",
+                                     "Ran `python3 -m pytest tests -q` — 5 passed.\n\n## What changed")
+        self._mk(relay, "e1", self._repo(tmp_path), report)
+        with mock.patch.object(relay, "_rerun_declared") as rr:
+            assert self._run(relay, "e1") == 0
+        rr.assert_not_called()
+        assert "NOT RE-RUN" in capsys.readouterr().out
+
+    def test_rerun_only_executes_allowlisted_commands(self, relay, tmp_path):
+        """The security boundary: a report is untrusted text. Anything not pytest-shaped, and
+        anything carrying shell metacharacters, must never reach subprocess."""
+        report = self.REPORT.replace(
+            "## What changed",
+            "Ran `python3 -m pytest tests -q`, then `rm -rf /` and `npm test`.\n\n## What changed")
+        self._mk(relay, "e1", self._repo(tmp_path), report)
+        seen = []
+
+        def fake(worktree, commands, declared):
+            seen.extend(commands)
+            return [{"cmd": c, "passed": 5, "declared": declared} for c in commands]
+
+        with mock.patch.object(relay, "_rerun_declared", side_effect=fake):
+            self._run(relay, "e1", rerun=True)
+        assert seen == ["python3 -m pytest tests -q"]
+
+    def test_rerun_executes_argv_without_a_shell(self, relay, tmp_path):
+        """argv-only, never `shell=True` — the other half of the boundary above."""
+        report = self.REPORT.replace("## What changed",
+                                     "Ran `python3 -m pytest tests -q` — 5 passed.\n\n## What changed")
+        self._mk(relay, "e1", self._repo(tmp_path), report)
+        calls = []
+        real_run = relay.subprocess.run
+
+        def spy(argv, **kw):
+            calls.append((argv, kw))
+            if argv and argv[0] == "git":
+                return real_run(argv, **kw)
+            return SimpleNamespace(returncode=0, stdout="5 passed in 0.1s", stderr="")
+
+        with mock.patch.object(relay.subprocess, "run", side_effect=spy):
+            assert self._run(relay, "e1", rerun=True) == 0
+        pytest_calls = [(a, k) for a, k in calls if a and a[0] != "git"]
+        assert pytest_calls, "the declared pytest command was never run"
+        for argv, kw in pytest_calls:
+            assert isinstance(argv, list)          # argv, not a string
+            assert not kw.get("shell")             # and never through a shell
+
+    def test_rerun_that_produces_no_count_is_inconclusive_not_zero(self, relay, tmp_path, capsys):
+        """The live failure this verdict exists for: a re-run that yields no `N passed` must not
+        exit 0, or an autonomous caller would read a suite that never ran as agreement."""
+        report = self.REPORT.replace("## What changed",
+                                     "Ran `python3 -m pytest tests -q` — 5 passed.\n\n## What changed")
+        self._mk(relay, "e1", self._repo(tmp_path), report)
+        with mock.patch.object(relay, "_rerun_declared",
+                               return_value=[{"cmd": "python3 -m pytest tests -q",
+                                              "passed": None, "declared": 5}]):
+            assert self._run(relay, "e1", rerun=True) == 3
+        assert "INCONCLUSIVE" in capsys.readouterr().out
+
+    def test_missing_worktree_is_a_clean_refusal(self, relay, tmp_path):
+        relay.packets_dir("e1").mkdir(parents=True, exist_ok=True)
+        relay.write_session("e1", {"session_id": "e1", "worktree": None, "status": "reported",
+                                   "current_packet": 1})
+        (relay.packets_dir("e1") / "001-report.md").write_text(self.REPORT)
+        with pytest.raises(SystemExit) as e:
+            relay.cmd_verify(SimpleNamespace(session_id="e1", packet=None, rerun=False))
+        assert "no recorded worktree" in str(e.value.code)
+
+    def test_gone_worktree_degrades_instead_of_crashing(self, relay, tmp_path):
+        """_git_lines swallows git failures on purpose: a deleted worktree must yield fewer facts,
+        never a traceback in the lead's face."""
+        repo = self._repo(tmp_path)
+        self._mk(relay, "e1", repo, self.REPORT)
+        import shutil as _sh
+        _sh.rmtree(repo)
+        assert self._run(relay, "e1") == 1  # claims a file nothing can confirm → MISMATCH, no crash
+
+
 class TestSurfacedDedupOnReview:
     """§5b / task #17: the at-Stop wake path (lg.new_reports_for + lg.mark_surfaced) is the ONLY
     writer of a lead's surfaced_reports.json before this fix. Reviewing a report through any other
