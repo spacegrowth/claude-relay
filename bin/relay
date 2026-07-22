@@ -122,6 +122,16 @@ GATES
 - ONE LOGICAL DELIVERABLE. This packet is scoped to a single atomic, reviewable-in-one-sitting
   change. If you find the work actually splits into unrelated concerns, stop and report that
   instead of doing both.
+- TREAT THIS PACKET COLD. Re-read every file you touch; trust no memory of prior packets or
+  conversations — earlier state may have been landed, reverted, or superseded since this packet
+  was written. If the packet text alone wasn't enough to complete the work, say so explicitly in
+  your report.
+- STOP AND REPORT, NEVER ASK IN THE TAB. If a step cannot be executed against currently
+  deployed/committed/applied state (needs a restart, un-applied DDL, an unpulled checkout, an
+  unlanded commit) OR needs any judgement call this packet can't resolve, STOP at that point.
+  Write a partial report naming the blocker and end your turn — never improvise the step, and
+  never raise an interactive question for it. The report → lead-wake channel is your only
+  escalation path; the human is never the recipient of an executor's question.
 - STAY IDLE AFTER REPORTING. After you write your report, remain idle — do NOT exit, and do NOT
   commit (the lead reviews and commits). The lead may reuse this session for a follow-up packet, and
   will `relay close` it when done. Closing the tab yourself throws away the reusable context.

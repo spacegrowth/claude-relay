@@ -90,6 +90,24 @@ class TestTemplateFooterConsistency:
         # TL;DR block must precede the detailed report body it summarizes.
         assert p.index("Status: clean") < p.index("What changed (file:line")
 
+    def test_footer_contains_treat_cold_line(self, relay):
+        """#12 (§6e-e4): the GATES text must tell the executor to treat the packet as its ONLY
+        context and distrust memory of prior packets/conversations."""
+        p = relay.build_packet("do the thing", "/tmp/x/001-report.md", "/path/to/relay diff sess-x", "file:///tmp/x/001-diff.html")
+        assert "TREAT THIS PACKET COLD" in p
+        assert "trust no memory of prior packets" in p
+        assert "say so explicitly in\n  your report" in p or "say so explicitly in your report" in p
+
+    def test_footer_contains_stop_and_report_paragraph(self, relay):
+        """#14 (§7-h2, broadened per §9): the GATES text must cover ALL blocking questions, not
+        just world-state ones, and must route them through the report (never an interactive
+        question in the tab)."""
+        p = relay.build_packet("do the thing", "/tmp/x/001-report.md", "/path/to/relay diff sess-x", "file:///tmp/x/001-diff.html")
+        assert "STOP AND REPORT, NEVER ASK IN THE TAB" in p
+        assert "currently\n  deployed/committed/applied state" in p or "currently deployed/committed/applied state" in p
+        assert "any judgement call this packet can't resolve" in p
+        assert "never raise\n  an interactive question for it" in p or "never raise an interactive question for it" in p
+
     def test_sentinel_line_contains_correct_diff_url(self, relay):
         p = relay.build_packet("task body", "/tmp/sess-a/001-report.md", "/path/to/relay diff sess-a", "file:///tmp/sess-a/001-diff.html")
         # Verify sentinel line contains the diff URL
