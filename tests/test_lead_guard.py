@@ -766,6 +766,264 @@ class TestRelayLeadCommands:
         assert isinstance(m["stop_hook_timeout"], int)            # repo declares a real timeout (fixed)
 
 
+class TestAutonomousPosture:
+    """§6f / task #16 phase 1: `relay auto on|off|status`, the `autonomous_mode` config default, and
+    the marker state both write to. The invariants worth protecting are (a) OFF is the default and
+    survives every path that doesn't explicitly ask for auto, (b) the posture is per-session and
+    RESETS on a fresh arm rather than silently persisting, and (c) every flip is reconstructable
+    from the ledger, because the whole point is that the human wasn't asked."""
+
+    @pytest.fixture(autouse=True)
+    def _armable(self, relay, monkeypatch):
+        # Same isolation the sibling lead-command tests use: never touch the real terminal.
+        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: "/x/terminal-notifier")
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+        monkeypatch.setattr(relay.iterm, "rename_by_id", lambda *a, **k: True)
+
+    def _cfg(self, root, **kv):
+        p = lg.config_path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(kv))
+
+    def _arm(self, relay, sid="sess-1", project="webapp"):
+        relay.cmd_lead_start(SimpleNamespace(session_id=sid, model=None, project=project))
+
+    def _auto(self, relay, action, sid="sess-1"):
+        relay.cmd_auto(SimpleNamespace(action=action, session=sid))
+
+    # ---- config default ------------------------------------------------------------------------
+
+    def test_config_default_is_off(self, root):
+        # The safe default must STAY the default — this is the one assertion in this class that is
+        # really about policy rather than mechanism.
+        assert lg.LEAD_DEFAULTS["autonomous_mode"] is False
+        assert lg.load_config(root)["autonomous_mode"] is False
+
+    def test_config_true_is_read_back(self, root):
+        self._cfg(root, autonomous_mode=True)
+        assert lg.load_config(root)["autonomous_mode"] is True
+
+    # ---- marker state --------------------------------------------------------------------------
+
+    def test_fresh_arm_defaults_to_manual_from_config(self, relay, root):
+        self._arm(relay)
+        m = lg.read_marker(root, "sess-1")
+        assert m["autonomous"] is False
+        assert lg.autonomous_state(m) == (False, "config")
+
+    def test_arm_honors_config_autonomous_mode(self, relay, root):
+        self._cfg(root, autonomous_mode=True)
+        self._arm(relay)
+        assert lg.autonomous_state(lg.read_marker(root, "sess-1")) == (True, "config")
+
+    def test_arm_in_auto_announces_itself(self, relay, root, capsys):
+        # An inverted posture nobody announced is the silent-autonomy failure §6f exists to prevent.
+        self._cfg(root, autonomous_mode=True)
+        self._arm(relay)
+        assert "AUTONOMOUS MODE ON" in capsys.readouterr().out
+
+    def test_arm_in_manual_is_quiet_about_posture(self, relay, root, capsys):
+        self._arm(relay)
+        assert "AUTONOMOUS MODE ON" not in capsys.readouterr().out
+
+    def test_missing_key_reads_as_manual(self, root):
+        # A lead armed before this feature existed has no key at all → must read as the safe default,
+        # never as auto.
+        assert lg.autonomous_state({"session_id": "old"}) == (False, "config")
+
+    def test_autonomous_state_is_defensive(self):
+        assert lg.autonomous_state(None) == (False, "config")
+        assert lg.autonomous_state({}) == (False, "config")
+        assert lg.autonomous_state({"autonomous": True, "autonomous_source": "bogus"}) == (True, "config")
+
+    # ---- the command ---------------------------------------------------------------------------
+
+    def test_auto_on_flips_marker_and_stamps_command_source(self, relay, root):
+        self._arm(relay)
+        self._auto(relay, "on")
+        assert lg.autonomous_state(lg.read_marker(root, "sess-1")) == (True, "command")
+
+    def test_auto_off_flips_back(self, relay, root):
+        self._arm(relay)
+        self._auto(relay, "on")
+        self._auto(relay, "off")
+        assert lg.autonomous_state(lg.read_marker(root, "sess-1")) == (False, "command")
+
+    def test_command_overrides_config_in_both_directions(self, relay, root):
+        # Config says auto; the command must still be able to pull this session back to manual.
+        self._cfg(root, autonomous_mode=True)
+        self._arm(relay)
+        self._auto(relay, "off")
+        assert lg.autonomous_state(lg.read_marker(root, "sess-1")) == (False, "command")
+        self._auto(relay, "on")
+        assert lg.autonomous_state(lg.read_marker(root, "sess-1")) == (True, "command")
+
+    def test_flip_preserves_every_other_marker_field(self, relay, root):
+        self._arm(relay, project="webapp")
+        before = lg.read_marker(root, "sess-1")
+        self._auto(relay, "on")
+        after = lg.read_marker(root, "sess-1")
+        for k in ("session_id", "project", "cwd", "tab_label", "color", "started",
+                  "plugin_version", "stop_hook_timeout", "backend"):
+            assert after[k] == before[k], f"`auto on` clobbered marker field {k!r}"
+
+    def test_status_does_not_change_the_posture(self, relay, root):
+        self._arm(relay)
+        self._auto(relay, "on")
+        self._auto(relay, "status")
+        assert lg.autonomous_state(lg.read_marker(root, "sess-1")) == (True, "command")
+
+    def test_status_reports_posture_and_origin(self, relay, root, capsys):
+        self._arm(relay)
+        capsys.readouterr()
+        self._auto(relay, "status")
+        out = capsys.readouterr().out
+        assert "OFF" in out and "config" in out          # origin: inherited from config
+        self._auto(relay, "on")
+        capsys.readouterr()
+        self._auto(relay, "status")
+        out = capsys.readouterr().out
+        assert "ON" in out and "relay auto" in out        # origin: set by command this session
+
+    def test_auto_on_output_names_the_commit_boundary(self, relay, root, capsys):
+        # Turning it on must SAY that committing still stops — the phase-1 boundary is worthless if
+        # the human only learns it by reading the source.
+        self._arm(relay)
+        capsys.readouterr()
+        self._auto(relay, "on")
+        assert "COMMITTING executor work always stops" in capsys.readouterr().out
+
+    def test_auto_refuses_non_lead(self, relay):
+        with pytest.raises(SystemExit):
+            self._auto(relay, "on", sid="never-a-lead")
+
+    def test_auto_refuses_empty_session(self, relay):
+        with pytest.raises(SystemExit):
+            relay.cmd_auto(SimpleNamespace(action="on", session=""))
+
+    # ---- reset on re-arm -----------------------------------------------------------------------
+
+    def test_rearm_resets_posture_to_config_default(self, relay, root):
+        # THE headline invariant: you opt in each time you're confident, so an arm must clear a
+        # posture the command set — it must not silently outlive the plan it was scoped to.
+        self._arm(relay)
+        self._auto(relay, "on")
+        assert lg.autonomous_state(lg.read_marker(root, "sess-1"))[0] is True
+        self._arm(relay)
+        assert lg.autonomous_state(lg.read_marker(root, "sess-1")) == (False, "config")
+
+    def test_rearm_resets_to_config_auto_when_configured(self, relay, root):
+        # ...and the reset target is the CONFIG value, not a hardcoded False.
+        self._cfg(root, autonomous_mode=True)
+        self._arm(relay)
+        self._auto(relay, "off")
+        self._arm(relay)
+        assert lg.autonomous_state(lg.read_marker(root, "sess-1")) == (True, "config")
+
+    def test_rearm_still_preserves_started_and_predecessor(self, relay, root):
+        # The posture resets on arm; the fields that must NOT reset still don't. Guards against a
+        # future refactor sweeping `autonomous` in with predecessor/started preservation.
+        self._arm(relay)
+        m = lg.read_marker(root, "sess-1")
+        m["predecessor"] = {"session_id": "old-lead"}
+        lg.marker_path(root, "sess-1").write_text(json.dumps(m))
+        started = m["started"]
+        self._arm(relay)
+        after = lg.read_marker(root, "sess-1")
+        assert after["started"] == started
+        assert after["predecessor"] == {"session_id": "old-lead"}
+
+    def test_heartbeat_preserves_the_posture(self, relay, root):
+        # touch_lead runs once per lead turn — it must not quietly drop the posture mid-session.
+        self._arm(relay)
+        self._auto(relay, "on")
+        lg.touch_lead(root, "sess-1")
+        assert lg.autonomous_state(lg.read_marker(root, "sess-1")) == (True, "command")
+
+    # ---- set_autonomous helper -----------------------------------------------------------------
+
+    def test_set_autonomous_returns_false_without_a_marker(self, root):
+        assert lg.set_autonomous(root, "no-such-lead", True) is False
+
+    # ---- ledger --------------------------------------------------------------------------------
+
+    def _events(self, root):
+        return [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+
+    def test_flips_are_logged_to_the_ledger(self, relay, root):
+        self._arm(relay)
+        self._auto(relay, "on")
+        self._auto(relay, "off")
+        names = [e["event"] for e in self._events(root)]
+        assert "auto_mode_on" in names and "auto_mode_off" in names
+
+    def test_status_logs_nothing(self, relay, root):
+        self._arm(relay)
+        before = len(self._events(root))
+        self._auto(relay, "status")
+        assert len(self._events(root)) == before
+
+    def test_lead_started_event_records_the_posture(self, relay, root):
+        self._cfg(root, autonomous_mode=True)
+        self._arm(relay)
+        started = [e for e in self._events(root) if e["event"] == "lead_started"]
+        assert started and started[-1]["autonomous"] is True
+
+    # ---- relay list visibility -------------------------------------------------------------------
+
+    def test_list_stamps_auto_leads_and_dashes_manual_ones(self, relay, root, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "all_session_ids", lambda: [])
+        self._arm(relay, sid="lead-manual", project="webapp")
+        self._cfg(root, autonomous_mode=True)
+        self._arm(relay, sid="lead-auto", project="datapipe")
+        capsys.readouterr()
+        relay.cmd_list(SimpleNamespace(json=False, closed=False, lead=None, all=True))
+        out = capsys.readouterr().out
+        assert "AUTO" in out                       # the column exists
+        # ...and the footnote names the auto lead specifically, not the manual one.
+        footnote = [l for l in out.splitlines() if "proceeding without asking" in l]
+        assert footnote, "no AUTO footnote — an autonomous lead must be MORE visible, not less"
+        assert "datapipe" in footnote[0] and "webapp" not in footnote[0]
+
+    def test_list_has_no_auto_footnote_when_all_leads_are_manual(self, relay, root, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "all_session_ids", lambda: [])
+        self._arm(relay, sid="lead-manual", project="webapp")
+        capsys.readouterr()
+        relay.cmd_list(SimpleNamespace(json=False, closed=False, lead=None, all=True))
+        assert "proceeding without asking" not in capsys.readouterr().out
+
+    # ---- the auto-wake instruction ---------------------------------------------------------------
+    # The wake is the exact beat autonomous mode redefines ("announce and WAIT" -> "announce, act,
+    # and record"), and the Stop hook INJECTS its instruction text into the lead. If that text stayed
+    # hardcoded to "WAIT / do NOT act", it would silently override the posture the user just granted
+    # and the toggle would look broken. These pin both branches.
+
+    def _wake_text(self, root, sid, monkeypatch, capsys):
+        sys.path.insert(0, str(REPO_ROOT / "hooks"))
+        import stop_lead_watch as slw
+        monkeypatch.setattr(slw, "STATE_ROOT", str(root))
+        monkeypatch.setattr(slw, "_notify", lambda *a, **k: None)
+        with pytest.raises(SystemExit):
+            slw._announce_and_wake(lg, {}, sid, ["exec-1 reported"], [], "msg")
+        return capsys.readouterr().err
+
+    def test_wake_tells_a_manual_lead_to_wait(self, relay, root, monkeypatch, capsys):
+        self._arm(relay)
+        err = self._wake_text(root, "sess-1", monkeypatch, capsys)
+        assert "WAIT for their direction" in err
+        assert "AUTONOMOUS MODE" not in err
+
+    def test_wake_tells_an_auto_lead_to_act(self, relay, root, monkeypatch, capsys):
+        self._arm(relay)
+        self._auto(relay, "on")
+        err = self._wake_text(root, "sess-1", monkeypatch, capsys)
+        assert "AUTONOMOUS MODE" in err
+        assert "WAIT for their direction" not in err
+        # ...and it must carry the boundaries with it, not just the licence to proceed.
+        assert "COMMITTING an executor's work ALWAYS stops" in err
+        assert "would have asked" in err
+
+
 class TestWakeHookState:
     """lead_guard.wake_hook_state: is a lead's background wake poller safe from an early harness
     kill, judged from the Stop-hook timeout stamped in its marker vs the configured poll window."""

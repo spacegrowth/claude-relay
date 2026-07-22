@@ -145,6 +145,8 @@ And the three nouns:
 /relay:resume <session_id>                 reopen a dead tab's conversation, context intact
 /relay:restart <session_id>                re-run a dead session's packet fresh (loses context)
 /relay:route retain "<reason>"             open a grace window when the gate blocks lead work
+/relay:auto on|off|status                  autonomous posture: proceed by default on routine in-plan
+                                            steps instead of asking (per-session; committing still stops)
 /relay:diff <session_id>                   render staged changes to an HTML review page and open it
 /relay:handoff <handoff.md>                 succeed this lead: pre-armed successor tab, then step down
 relay close-predecessor                    successor-only: close the outgoing lead's tab, on user go
@@ -248,11 +250,49 @@ Honest limits: it does **not** gate `Bash` (`git commit`, `sed -i`, heredocs pas
 discipline stays on the lead), and it only acts in `/relay:mode` sessions — every other session on
 the machine is untouched (the hook fast-exits, fail-open).
 
+## Autonomous mode
+
+Sometimes you're confident about the plan and the approval round-trips are pure ceremony. `/relay:auto
+on` inverts the lead's **default posture** for that session: instead of waiting on every routine beat,
+it **proceeds and announces**. Same judgement, burden flipped — it still asks the moment it judges it
+needs you.
+
+```
+/relay:auto on        # proceed by default on routine, in-plan steps
+/relay:auto off       # back to announce-and-wait (the default)
+/relay:auto status    # current posture + where it came from (command vs config)
+```
+
+What gets automated is only the reflexive-yes beats: sending the obvious next packet in an approved
+plan, spawning an executor that plan already names, reviewing a clean report. **This is not the lead
+deciding things unilaterally** — it never expands the plan, and it stops on all of:
+
+- a report with a risk flag / failing tests / UNVERIFIED claim bearing on correctness;
+- core logic, ledgers, parity/golden tests, migrations, deploys (the sign-off gate, unchanged);
+- irreversible or outward-facing actions (push to a shared branch, delete, external send);
+- new work not in the approved plan;
+- genuine ambiguity the packet or plan can't resolve.
+
+**Committing executor work always stops for you** — in every posture, no exception. Auto-commit is
+deliberately not built yet; it waits on an automated report-verifier, because "the report looked
+clean to me" is exactly the judgement that needs a machine check before running unattended.
+
+Autonomy never becomes silence: every autonomous action is announced *with the round-trip it
+replaced* ("proceeded: sent packet 003 — under manual mode this would have waited for your go"),
+logged to `~/.relay-tasks/sessions.jsonl`, and stamped on the lead's row in `relay list` (an `AUTO`
+column plus a footnote naming it) — a proceeded-without-you lead is **more** visible, not less.
+
+The posture lives in that lead's own marker, so it's per-session and **resets on every fresh arm**
+(`/relay:mode`) to whatever `autonomous_mode` config says — it can't silently outlive the plan you
+scoped it to. Set `autonomous_mode: true` if you always work this way; the command still overrides it
+either direction.
+
 ## Auto-wake and notifications
 
 While the lead sits idle, a Stop hook watches in the background. When an executor's report lands,
 the lead **wakes**, announces what's ready, and **waits for your direction** — it never auto-reviews
-or auto-commits. You also get a macOS notification naming the project and executor. Three tiers,
+or auto-commits (unless you've turned on [autonomous mode](#autonomous-mode), which still never
+auto-commits). You also get a macOS notification naming the project and executor. Three tiers,
 first one that applies wins:
 
 **A second layer underneath.** Every spawned executor is also armed with its own Stop hook — a
@@ -358,6 +398,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
 | `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) for the handoff nudge — a proxy for session weight, not context-window occupancy; calibrated on real sessions (a full working day ≈ 3MB, the heaviest marathon session ever ≈ 6MB) |
 | `executor_escalation` | true | Arm every spawned executor with the second-layer one-shot push (see [Auto-wake and notifications](#auto-wake-and-notifications)) |
+| `autonomous_mode` | false | Posture a newly-armed lead holds. false = wait for you on every approval beat (safe default). true = new leads start in autonomous mode. `/relay:auto on\|off` flips it mid-session either way (see [Autonomous mode](#autonomous-mode)) |
 | `stall_threshold_seconds` | 2700 | How long an executor can be `busy` with no report before `stalled` — kept independent of `poll_seconds` so the two don't flip at the same instant |
 
 `poll_seconds` must stay under the `Stop` hook's `timeout` in `hooks/hooks.json` (currently 1900s) — the harness kills the hook's background poller at that timeout regardless of `poll_seconds`, so raising one without the other silently breaks auto-wake (see [async-rewake-findings.md](docs/async-rewake-findings.md#addendum-silent-auto-wake-death-2026-07-10)).

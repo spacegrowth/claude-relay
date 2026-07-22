@@ -1255,6 +1255,15 @@ def cell(text, width):
     return (s[: width - 1] + "…") if len(s) > width else s.ljust(width)
 
 
+def _lead_auto_cell(m):
+    """`relay list`'s AUTO cell for one lead marker: `(text, styles)`, same shape as _WAKE_CELL's
+    entries. "AUTO" in bold yellow when this lead proceeds without asking, a dim "-" when it holds
+    the ordinary wait-for-human posture — the loud/quiet asymmetry is the point (§6f: a
+    proceeded-without-you lead must be MORE visible, not less)."""
+    on, _source = lead_guard.autonomous_state(m)
+    return ("AUTO", ("yellow", "bold")) if on else ("-", ("dim",))
+
+
 def cmd_list(args):
     # LEADS are ALWAYS shown in full — you always want to see/restore any project, regardless of
     # which lead is asking. Executor scoping is separate (below).
@@ -1337,6 +1346,10 @@ def cmd_list(args):
             ("MODEL", 8, [m.get("model") or "-" for m in leads]),
             ("VER", 8, [m.get("plugin_version") or "?" for m in leads]),
             ("WAKE", 5, [_WAKE_CELL[wake_states[m.get("session_id")]][0] for m in leads]),
+            # AUTO: which leads are proceeding WITHOUT asking (§6f). Autonomy must not become
+            # silence — a lead acting on its own has to be MORE visible here, not less — so an auto
+            # lead gets a loud stamp while the ordinary manual posture renders as a quiet dash.
+            ("AUTO", 4, [_lead_auto_cell(m)[0] for m in leads]),
             ("LAST ACTIVE", 12, [_lead_age_cell(m) for m in leads]),
         ]
         lead_widths = {name: min(cap, max(len(name), max((len(str(v)) for v in vals), default=0)))
@@ -1347,12 +1360,14 @@ def cmd_list(args):
         # Data rows
         for m in leads:
             wake_text, wake_styles = _WAKE_CELL[wake_states[m.get("session_id")]]
+            auto_text, auto_styles = _lead_auto_cell(m)
             row_parts = [
                 cell(m.get("project") or "-", lead_widths["PROJECT"]),
                 cell(m.get("session_id") or "-", lead_widths["SESSION"]),
                 cell(m.get("model") or "-", lead_widths["MODEL"]),
                 cell(m.get("plugin_version") or "?", lead_widths["VER"]),
                 c(cell(wake_text, lead_widths["WAKE"]), *wake_styles),
+                c(cell(auto_text, lead_widths["AUTO"]), *auto_styles),
                 cell(_lead_age_cell(m), lead_widths["LAST ACTIVE"]),
             ]
             print(" ".join(row_parts))
@@ -1363,6 +1378,14 @@ def cmd_list(args):
                     "are held, and resuming re-arms it automatically.", "dim"))
         # Footnote only when something needs action — a stale (or unknown) wake hook is exactly the
         # silent condition that used to cost a forensic investigation to find.
+        # Autonomy must never be quiet: if any lead is proceeding without asking, say so in words
+        # right here, not only as a four-character column a skimming eye slides past.
+        auto_leads = [m for m in leads if lead_guard.autonomous_state(m)[0]]
+        if auto_leads:
+            names = ", ".join((m.get("project") or (m.get("session_id") or "?")[:8]) for m in auto_leads)
+            print(c(f"  ⚡ AUTO: {names} — proceeding without asking on routine in-plan steps. "
+                    f"Committing executor work still stops for you. `relay auto off --session <id>` "
+                    f"reverts.", "yellow"))
         if any(st == "stuck" for st in wake_states.values()):
             print(c("  ⚠ WAKE=stuck: a dead watcher's lock is blocking wakes for this lead — it "
                     "will self-heal on the lead's next turn (the lock is now auto-broken), and any "
@@ -1794,6 +1817,13 @@ def cmd_lead_start(args):
                             tab_label=tab_label, color=color,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
                             predecessor=existing.get("predecessor"), started=existing.get("started"),
+                            # Autonomous posture (§6f, #16 phase 1) is stamped FRESH on every arm from
+                            # config — deliberately NOT preserved like predecessor/started. Arming is
+                            # the reset point: you opt into auto for a plan you're confident about, and
+                            # a re-arm puts the posture back to the account-wide default (False unless
+                            # `autonomous_mode: true`) rather than letting it silently outlive its plan.
+                            autonomous=cfg.get("autonomous_mode", False),
+                            autonomous_source="config",
                             backend=iterm.NAME)  # which terminal app THIS lead-start ran under (D2,
                                                 # wake-watch design "cross-backend nudge" fix) — the
                                                 # same field/values cmd_spawn already writes for
@@ -1802,9 +1832,15 @@ def cmd_lead_start(args):
     # Record the cwd's current git HEAD as the baseline, so the Stop-hook commit-surfacing (App 2)
     # only reports commits made AFTER lead mode began — not the repo's entire prior history.
     lead_guard.write_head(STATE_ROOT, args.session_id, lead_guard.git_head(os.getcwd()))
-    append_ledger("lead_started", session_id=args.session_id, model=args.model)
+    auto_on = bool(cfg.get("autonomous_mode", False))
+    append_ledger("lead_started", session_id=args.session_id, model=args.model, autonomous=auto_on)
     print(f"lead mode active for session '{args.session_id}'"
           + (f" (model {args.model})" if args.model else ""))
+    # A lead that armed straight into auto must SAY so — an unannounced inverted posture is exactly
+    # the silent-autonomy failure §6f warns against. (Manual is the default and needs no announcement.)
+    if auto_on:
+        print("AUTONOMOUS MODE ON (config autonomous_mode: true) — this lead proceeds by default on "
+              "routine in-plan steps instead of waiting. `relay auto off` reverts it for this session.")
 
 
 def cmd_handoff(args):
@@ -1963,6 +1999,56 @@ def cmd_route(args):
     lead_guard.set_grace(STATE_ROOT, args.session, cfg["grace_seconds"])
     append_ledger("retained", session_id=args.session, reason=args.reason)
     print(f"retain window open for {cfg['grace_seconds']}s — reason: {args.reason}")
+
+
+def cmd_auto(args):
+    """`relay auto on|off|status` (invoked by /relay:auto) — the lead's AUTONOMOUS POSTURE toggle
+    (§6f, task #16 phase 1). It does not change what the lead is allowed to do; it changes the
+    DEFAULT: manual = wait for the human on every routine in-plan approval beat, auto = proceed on
+    those and announce afterwards. The judgement calls (the stop-list in skills/mode/SKILL.md) stop
+    either way, and committing executor work ALWAYS stops for the human in phase 1 — auto-commit
+    waits on the #7 verifier.
+
+    State lives in the lead's own marker, so it is per-session and resets to the `autonomous_mode`
+    config value on every fresh arm: you opt in when you're confident about THIS plan, rather than a
+    posture silently outliving the plan it was scoped to. `status` is read-only (no ledger event);
+    `on`/`off` each log one durable ledger event, because "the human wasn't asked" must still be
+    reconstructable afterwards."""
+    if not args.session:
+        sys.exit("auto: session id is empty (is $CLAUDE_CODE_SESSION_ID set?)")
+    if not lead_guard.is_lead(STATE_ROOT, args.session):
+        sys.exit(f"auto: session '{args.session}' is not in lead mode — run /relay:mode first")
+    marker = lead_guard.read_marker(STATE_ROOT, args.session)
+    on, source = lead_guard.autonomous_state(marker)
+    project = marker.get("project") or args.session
+
+    if args.action == "status":
+        origin = ("set by `relay auto` this session" if source == "command"
+                  else f"from config autonomous_mode: {json.dumps(bool(on))}")
+        if on:
+            print(f"autonomous mode is ON for lead '{project}' ({origin}) — proceeding by default on "
+                  f"routine in-plan steps; the stop-list still stops, and committing executor work "
+                  f"always waits for you.")
+        else:
+            print(f"autonomous mode is OFF for lead '{project}' ({origin}) — waiting for you on "
+                  f"every approval beat. `relay auto on` flips it for this session.")
+        return
+
+    want = (args.action == "on")
+    if not lead_guard.set_autonomous(STATE_ROOT, args.session, want):
+        sys.exit(f"auto: no lead marker for '{args.session}' — run /relay:mode first")
+    append_ledger("auto_mode_on" if want else "auto_mode_off", session_id=args.session,
+                  project=marker.get("project"), was=on)
+    if want:
+        print(f"autonomous mode ON for lead '{project}' — proceed by default WITHIN the approved "
+              f"plan; announce every autonomous action with what would have been asked. Still stops: "
+              f"risk-flagged/failing/UNVERIFIED reports, core logic/ledgers/parity/migrations/deploys, "
+              f"irreversible or outward-facing actions, work not in the plan, genuine ambiguity — and "
+              f"COMMITTING executor work always stops for the human. `relay auto off` reverts; a fresh "
+              f"`/relay:mode` arm resets to config.")
+    else:
+        print(f"autonomous mode OFF for lead '{project}' — back to announce-and-wait on every "
+              f"approval beat.")
 
 
 def cmd_focus(args):
@@ -2319,6 +2405,12 @@ def main():
     rt.add_argument("--session", required=True)
     rt.set_defaults(func=cmd_route)
 
+    at = sub.add_parser("auto", help="autonomous posture for this lead: proceed-by-default on "
+                        "routine in-plan steps, or wait for the human (default)")
+    at.add_argument("action", choices=["on", "off", "status"])
+    at.add_argument("--session", required=True)
+    at.set_defaults(func=cmd_auto)
+
     rpt = sub.add_parser("report")
     rpt.add_argument("session_id")
     rpt.add_argument("--packet", type=int)
@@ -2389,6 +2481,7 @@ def main():
         "send": ["session_id"], "check": ["session_id"], "status": ["session_id"],
         "close": ["session_id", "supersede", "self_session"], "stop": ["session_id"],
         "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
+        "auto": ["session"],
         "diff": ["session_id"], "focus": ["session_id"], "restart": ["session_id"],
         "resume": ["session_id"], "spawn": ["lead"], "list": ["lead"],
         "nudge-lead": ["lead"],
