@@ -100,6 +100,71 @@ class TestExceedsGate:
         assert lg.exceeds_gate(1, True, self.cfg(block_on_new_file=False)) is False
 
 
+# ---- classify_bash_command (pure) — task d1 (§10) verb taxonomy --------------------------------
+
+class TestClassifyBashCommand:
+    """Field calibration: the incident's implementation verbs must all match a rule name; a full
+    healthy-day custody/read command list must all pass as None (free-pass). Both lists are derived
+    straight from §10's own text (docs/post-0.3.27-backlog.md §10, bullet d1)."""
+
+    INCIDENT = [
+        ("npm install express", "npm-install"),
+        ("npm ci", "npm-install"),
+        ("npm run build", "npm-run-build"),
+        ("yarn install", "package-install"),
+        ("pip install requests", "package-install"),
+        ("tsc --build", "compiler"),
+        ("go build ./...", "compiler"),
+        ("cargo build --release", "compiler"),
+        ("make", "compiler"),
+        ("git clone git@github.com:x/y.git /opt/svc", "git-clone"),
+        ("sudo tee /etc/systemd/system/myapp.service <<EOF", "service-file-write"),
+        ("systemctl daemon-reload", "service-file-write"),
+        ("sed -i s/foo/bar/ config.yml", "sed-inplace"),
+        ("cat <<EOF > /opt/svc/app.env", "heredoc"),
+        ("tee -a /opt/svc/config.ini <<< data", "tee-mutation"),
+        ("rsync -av ./dist/ box:/opt/svc/", "rsync"),
+    ]
+
+    HEALTHY = [
+        'git commit -m "land staged work"',
+        "git push origin main",
+        "systemctl restart api",
+        "systemctl status api",
+        "ssh box clickhouse-client < migration.sql",
+        "pytest tests/",
+        "npm test",
+        "npm run test:unit",
+        "go test ./...",
+        "cargo test",
+        "make test",
+        "git status",
+        "git diff",
+        "git log --oneline -5",
+        "cat README.md",
+        "ls -la",
+        "grep -rn foo .",
+    ]
+
+    @pytest.mark.parametrize("cmd,expected_rule", INCIDENT)
+    def test_incident_commands_match_implementation_rule(self, cmd, expected_rule):
+        assert lg.classify_bash_command(cmd) == expected_rule
+
+    @pytest.mark.parametrize("cmd", HEALTHY)
+    def test_healthy_day_commands_free_pass(self, cmd):
+        assert lg.classify_bash_command(cmd) is None
+
+    def test_custody_wins_on_pattern_overlap(self):
+        # "npm run test:build" contains "build" but is a test invocation — custody (checked first)
+        # must win over the npm-run-build implementation pattern.
+        assert lg.classify_bash_command("npm run test:build") is None
+
+    def test_unparseable_input_free_passes(self):
+        assert lg.classify_bash_command(None) is None
+        assert lg.classify_bash_command("") is None
+        assert lg.classify_bash_command(123) is None
+
+
 # ---- load_config ------------------------------------------------------------------------------
 
 class TestLoadConfig:
@@ -448,6 +513,64 @@ class TestPreToolHookPacketExemption:
         lg.write_marker(root, "lead-1")
         rc, out = self._run(tmp_path, self._payload("lead-1", str(tmp_path / "cli.py")))
         assert rc == 0 and '"deny"' in out            # blocked with guidance
+
+
+class TestPreToolBashGateHook:
+    """Drive hooks/pretool_bash_gate.py exactly as Claude Code would (JSON on stdin, tmp HOME).
+    task d1 (§10): LOGGING ONLY — every case here must exit 0 with empty stdout (never a deny),
+    the only observable difference is whether a would_have_blocked record lands in the ledger."""
+
+    def _run(self, home, payload):
+        import subprocess
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "pretool_bash_gate.py")],
+            input=json.dumps(payload), capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)})
+        return p.returncode, p.stdout
+
+    def _payload(self, sid, command):
+        return {"session_id": sid, "tool_name": "Bash", "tool_input": {"command": command}}
+
+    def _ledger_events(self, root):
+        p = root / "sessions.jsonl"
+        if not p.exists():
+            return []
+        return [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
+
+    def test_implementation_verb_ledgers_and_allows(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        rc, out = self._run(tmp_path, self._payload("lead-1", "npm install left-pad"))
+        assert rc == 0 and out.strip() == ""           # never a deny, even on a match
+        events = self._ledger_events(root)
+        assert len(events) == 1
+        assert events[0]["event"] == "would_have_blocked"
+        assert events[0]["session_id"] == "lead-1"
+        assert events[0]["rule"] == "npm-install"
+        assert events[0]["command"] == "npm install left-pad"
+
+    def test_custody_verb_passes_with_no_ledger_event(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        rc, out = self._run(tmp_path, self._payload("lead-1", 'git commit -m "x"'))
+        assert rc == 0 and out.strip() == ""
+        assert self._ledger_events(root) == []
+
+    def test_non_lead_session_zero_side_effects(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        # no marker written — this session is not a lead at all
+        rc, out = self._run(tmp_path, self._payload("stranger-1", "npm install left-pad"))
+        assert rc == 0 and out.strip() == ""
+        assert not root.exists() or self._ledger_events(root) == []
+
+    def test_kill_switch_silences_logging(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        (root / "lead").mkdir(parents=True, exist_ok=True)
+        (root / "lead" / "config.json").write_text(json.dumps({"bash_gate_logging": False}))
+        rc, out = self._run(tmp_path, self._payload("lead-1", "npm install left-pad"))
+        assert rc == 0 and out.strip() == ""
+        assert self._ledger_events(root) == []
 
 
 class TestExecutorEscalationHook:
