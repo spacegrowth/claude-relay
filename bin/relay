@@ -76,6 +76,21 @@ def _stall_threshold_seconds():
 
 RELAY_BIN = str(Path(__file__).resolve())
 
+# The status a session carries when relay KNOWS claude never came up for it (backlog §12, #20/#21):
+# spawn got neither of its two launch signals back even after a retry, or a resume's relaunched
+# process was already gone a grace window later. Deliberately NOT `busy` (a lie — nothing is
+# working) and NOT `dead` (which reads as "it ran and then died", and hides the fact that the
+# pinned conversation id was never registered with Claude Code, so `relay resume` can never work).
+# `relay restart` is the recovery: it mints a fresh conversation id in a fresh tab.
+LAUNCH_FAILED = "launch-failed"
+
+# How long a freshly (re)launched claude must survive before we'll call the launch real. The shell
+# writes the pidfile BEFORE exec'ing claude, so a pid we just read proves only that the shell ran —
+# `claude --resume <id-that-was-never-created>` exits within milliseconds ("A session ended very
+# soon after starting"), which is how resume came to print "resumed … pid N" for an already-gone
+# pid. Only the healthy path actually waits this out: the probe returns the moment the pid is gone.
+LAUNCH_GRACE_SECONDS = 3.0
+
 # `--settings` timeout for the executor escalation Stop hook (wake-watch design §9) — the hook is a
 # plain synchronous push now (no asyncRewake, nothing long-running to host), so this is just a
 # safety margin above its few-hundred-ms of work, not a budget for grace/backoff sleeping.
@@ -397,6 +412,55 @@ def session_pid_alive(s):
     return True
 
 
+def conversation_transcript_exists(claude_session):
+    """Whether Claude Code has a transcript on disk for `claude_session` — i.e. whether that
+    conversation was ever actually created. Transcripts live at
+    <config-dir>/projects/<cwd-slug>/<session-uuid>.jsonl; the cwd slug is derived from the
+    launching directory, so this scans every project dir rather than reconstructing it (a session
+    can legitimately have been opened from a path that no longer resolves the same way).
+
+    Returns True, False, or None for "can't tell" — no projects root, or an unreadable one. Callers
+    must treat None and False differently: a pinned id with no transcript is the §12 #21 signature
+    (the launch died before Claude Code ever registered the id), but transcripts are also pruned on
+    a retention schedule, so this is evidence for a WARNING, never grounds to refuse a resume on its
+    own. The authority on "did this launch actually work" is _launch_survived."""
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")) / "projects"
+    try:
+        project_dirs = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        return None
+    if not project_dirs:
+        return None
+    return any((d / f"{claude_session}.jsonl").exists() for d in project_dirs)
+
+
+def _launch_survived(pid, grace=None, sleep_fn=time.sleep, clock_fn=time.time, interval=0.25):
+    """Did a just-(re)launched claude still exist a grace window later? See LAUNCH_GRACE_SECONDS
+    for why a freshly-read pid proves nothing on its own. A None pid (the pidfile never appeared)
+    is a failed launch by definition. Polls rather than sleeping flat so the failure case — the one
+    a human is waiting on a wrong success message for — returns immediately; only a genuinely
+    healthy launch waits out the full window."""
+    if pid is None:
+        return False
+    deadline = clock_fn() + (LAUNCH_GRACE_SECONDS if grace is None else grace)
+    while True:
+        if not pid_alive(pid):
+            return False
+        if clock_fn() >= deadline:
+            return True
+        sleep_fn(interval)
+
+
+def _mark_launch_failed(session_id, s):
+    """Rewrite a session's marker to say the launch didn't happen, and ledger it. Sticky: _check_one
+    leaves LAUNCH_FAILED alone, so the row keeps saying so in `relay list` until a `relay restart`
+    (or resume) actually relaunches it."""
+    s["status"] = LAUNCH_FAILED
+    s["updated"] = now()
+    write_session(session_id, s)
+    append_ledger("launch_failed", session_id=session_id)
+
+
 def _ensure_tab_label(bk, handle, label, attempts=3, delay=1.5):
     """Verify the tab label actually took, retrying the rename if not. iTerm's spawn types
     `/rename` after a FIXED startup delay; a slow claude start (cold cache, heavy MCP init) can
@@ -588,23 +652,42 @@ def cmd_spawn(args):
     # hooks, so this executor only gets the escalation Stop hook if we pass it explicitly here.
     settings_file = _maybe_escalation_settings_file(session_id)
 
-    iterm.spawn(
-        cwd=worktree,
-        prompt=build_pointer_message(str(packet_path), packet_summary(body)),
-        label=label,
-        pidfile=str(pid_path(session_id)),
-        model=resolved_model,
-        skip_perms=skip_perms,
-        iterm_id_file=str(iterm_id_path(session_id)),
-        session_uuid=claude_session,
-        tab_color=tab_color,
-        settings_file=settings_file,
-        lead_handle=owner_marker.get("iterm_session"),
-        layout=layout,
-    )
-    pid = read_pid(session_id)
-    iterm_session = read_iterm_id(session_id)  # backend handle (iTerm session id / Terminal "twid:N")
-    label_ok = _ensure_tab_label(iterm, iterm_session, label)
+    def launch_attempt():
+        """One full launch: open the tab, then read back the two INDEPENDENT signals that say it
+        actually happened — the pidfile the spawned shell writes, and whether the tab label took.
+        Clears both capture files first so a retry can't read the previous attempt's leftovers."""
+        for f in (pid_path(session_id), iterm_id_path(session_id)):
+            try:
+                f.unlink()
+            except FileNotFoundError:
+                pass
+        iterm.spawn(
+            cwd=worktree,
+            prompt=build_pointer_message(str(packet_path), packet_summary(body)),
+            label=label,
+            pidfile=str(pid_path(session_id)),
+            model=resolved_model,
+            skip_perms=skip_perms,
+            iterm_id_file=str(iterm_id_path(session_id)),
+            session_uuid=claude_session,
+            tab_color=tab_color,
+            settings_file=settings_file,
+            lead_handle=owner_marker.get("iterm_session"),
+            layout=layout,
+        )
+        pid = read_pid(session_id)
+        handle = read_iterm_id(session_id)  # backend handle (iTerm session id / Terminal "twid:N")
+        return pid, handle, _ensure_tab_label(iterm, handle, label)
+
+    pid, iterm_session, label_ok = launch_attempt()
+    # BOTH signals missing means nothing came back from the launch at all — the observed signature
+    # of the §12 launch race (a human typing into iTerm during the AppleScript tab setup). Either
+    # signal alone is just a degraded-but-live tab, so only the both-failed case retries here.
+    if pid is None and not label_ok:
+        print(f"spawn: no PID and the tab title '{label}' didn't take — the launch may not have "
+              f"happened at all; retrying it once…", file=sys.stderr)
+        pid, iterm_session, label_ok = launch_attempt()
+    launch_failed = pid is None and not label_ok
 
     write_session(session_id, {
         "session_id": session_id,
@@ -622,7 +705,8 @@ def cmd_spawn(args):
         "iterm_session": iterm_session,
         "backend": iterm.NAME,  # which terminal app owns this tab — ops keep addressing it there
         "claude_session": claude_session,
-        "status": "busy",
+        # Never `busy` for a launch nothing came back from — see LAUNCH_FAILED.
+        "status": LAUNCH_FAILED if launch_failed else "busy",
         "current_packet": n,
         "busy_since": now(),
         "busy_since_epoch": time.time(),  # DST-proof elapsed math; the ISO string stays for humans
@@ -632,6 +716,15 @@ def cmd_spawn(args):
     })
     append_ledger("spawned", session_id=session_id, worktree=worktree, topic=args.topic, tab_label=label)
     append_ledger("packet_sent", session_id=session_id, packet=n)
+    if launch_failed:
+        append_ledger("launch_failed", session_id=session_id, attempts=2)
+        print(f"spawn: claude did NOT launch for '{session_id}' — no PID and the tab title "
+              f"'{label}' never took, on the first attempt AND the retry. The session is recorded "
+              f"{LAUNCH_FAILED} (not busy): nothing is working on packet {n:03d}, and its pinned "
+              f"conversation id was never registered, so `relay resume` cannot help.\n"
+              f"  Recover with: relay restart {session_id}   "
+              f"(fresh tab, fresh conversation id, same packet)", file=sys.stderr)
+        sys.exit(1)  # message already printed; a spawn that launched nothing must not exit 0
     if pid is None:
         print(f"spawned session '{session_id}' (tab '{label}') with packet {n:03d} — WARNING: could not read PID, aliveness/stall detection will rely on tab title only")
     else:
@@ -864,12 +957,39 @@ def cmd_resume(args):
                  f"capture). Use `relay restart {sid}` to re-run its packet as a fresh session.")
     if session_pid_alive(s) and not args.force:
         sys.exit(f"session '{sid}' still looks alive (pid {s.get('pid')}) — close it first or pass --force")
+    # A conversation id that was never created can NEVER become valid, so resuming it is an
+    # infinite loop of identical failures (§12 #21). When spawn already recorded that the launch
+    # never happened, that's definitive — refuse here rather than relaunch into the same wall.
+    if s.get("status") == LAUNCH_FAILED and not args.force:
+        sys.exit(f"cannot resume '{sid}': its launch never happened (recorded {LAUNCH_FAILED}), so "
+                 f"the pinned conversation {cs} was never created — `claude --resume` would exit "
+                 f"instantly, and would do so on every retry forever.\n"
+                 f"  Use: relay restart {sid}   (mints a FRESH conversation id and re-runs its "
+                 f"packet)\n"
+                 f"  --force resumes anyway if you believe the conversation does exist.")
+    # Weaker, pre-fix-era version of the same signal: no transcript on disk for the pinned id.
+    # Only a warning — transcripts are also pruned on a retention schedule (see the helper).
+    if conversation_transcript_exists(cs) is False:
+        print(f"WARNING: no Claude Code transcript exists for '{sid}'s conversation {cs} — it may "
+              f"never have been created (a launch that died before Claude Code registered the id). "
+              f"If this resume dies immediately, use `relay restart {sid}` instead.", file=sys.stderr)
     nudge = ("You were resumed after your relay tab closed — your staged work in this worktree is "
              "intact. Pick up your packet where you left off, finish it, then write your report to "
              "the same report path as before.")
     s = _maybe_adopt(sid, s)
     pid, label = _relaunch(sid, s, nudge, resume_id=cs)
     append_ledger("resumed", session_id=sid, claude_session=cs)
+    # _relaunch has already written a `busy` marker off the freshly-read pid. Only report success
+    # once that pid has actually survived a grace window — otherwise say plainly that it died and
+    # leave the marker honest, instead of printing "resumed … pid N" over a dead tab (§12 #21).
+    if not _launch_survived(pid):
+        _mark_launch_failed(sid, s)
+        sys.exit(f"resume of '{sid}' FAILED: the relaunched claude exited immediately"
+                 f"{f' (pid {pid} is already gone)' if pid else ' (no PID was ever written)'} — "
+                 f"the conversation {cs} was almost certainly never created, so every retry will "
+                 f"fail identically. Recorded {LAUNCH_FAILED}.\n"
+                 f"  Use: relay restart {sid}   (mints a FRESH conversation id and re-runs its "
+                 f"packet)")
     print(f"resumed '{sid}' (tab '{label}', pid {pid}) — reopened conversation with full context")
 
 
@@ -889,6 +1009,12 @@ def cmd_send(args):
         sys.exit(f"session '{args.session_id}' is {s['status']} — refusing to send (would inject mid-turn). Only reported/idle sessions are safe send targets.")
     if s["status"] == "superseded":
         sys.exit(f"session '{args.session_id}' is superseded by {s.get('superseded_by')} — refusing to send into an abandoned session.")
+    # No tab and no valid conversation to fall back on — both delivery paths below are doomed, and
+    # the resume one would loop forever on a conversation id that was never created (§12 #21).
+    if s["status"] == LAUNCH_FAILED:
+        sys.exit(f"session '{args.session_id}' is {LAUNCH_FAILED} — claude never launched for it, so "
+                 f"there is no tab to send to and no conversation to resume. Bring it up first with: "
+                 f"relay restart {args.session_id}")
     # A session whose tab is gone — `dead` (crashed / tab closed) OR `closed` (deliberately retired by
     # the lead, then wanted back for follow-up) — is still deliverable when we pinned its Claude
     # conversation at spawn: skip the doomed live-tab send and RESUME it, reopening the same
@@ -1010,7 +1136,10 @@ def _check_one(session_id):
     if not s:
         return {"session_id": session_id, "error": "no such session"}
 
-    if s["status"] not in ("dead", "superseded", "closed"):
+    # LAUNCH_FAILED is sticky like the other terminal states: it records something the aliveness
+    # probes below cannot re-derive (claude never came up, so the pinned conversation id is void).
+    # Letting it be recomputed would relabel it `dead`, which reads as "it ran and then died".
+    if s["status"] not in ("dead", "superseded", "closed", LAUNCH_FAILED):
         n = s["current_packet"]
         report = packets_dir(session_id) / f"{n:03d}-report.md"
         proc_alive = session_pid_alive(s)
@@ -1056,7 +1185,8 @@ _ANSI = {"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
          "green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m"}
 # status → styles. `reported` (an executor is DONE) is bright green+bold so it pops at a glance.
 _STATUS_STYLE = {"reported": ("green", "bold"), "busy": ("yellow",), "stalled": ("red",),
-                 "dead": ("dim", "red"), "closed": ("dim",), "superseded": ("dim",)}
+                 "dead": ("dim", "red"), "closed": ("dim",), "superseded": ("dim",),
+                 LAUNCH_FAILED: ("red", "bold")}  # needs action (relay restart) — as loud as reported
 
 
 def _color_on():
@@ -1321,7 +1451,10 @@ def cmd_list(args):
 
     # Orphans: live executors (among the rows this invocation is about to display) owned by a lead
     # that's no longer armed (marker gone) — the wake-loss bug's blind spot.
-    orphans = [s for s in rows if s["status"] not in ("closed", "superseded", "dead")
+    # LAUNCH_FAILED is excluded alongside the terminal states: nothing is running to lose a wake,
+    # and the orphan line's "just relay send/resume, which adopt automatically" advice is wrong for
+    # it (both refuse — `relay restart` is its only route back).
+    orphans = [s for s in rows if s["status"] not in ("closed", "superseded", "dead", LAUNCH_FAILED)
                and s.get("owner_lead") and not lead_guard.read_marker(STATE_ROOT, s["owner_lead"])]
 
     if args.json:
@@ -1472,7 +1605,8 @@ def cmd_list(args):
     # Calculate dynamic widths for EXECUTORS table with per-column caps.
     exec_cols = [
         ("SESSION", 36, [s["session_id"] for s in rows]),
-        ("STATUS", 10, rendered_statuses),
+        ("STATUS", len(LAUNCH_FAILED), rendered_statuses),  # cap fits the longest status verbatim —
+                                                            # a truncated "launch-fai" defeats the point
         ("TOPIC", 40, [s["topic"] for s in rows]),
         ("SCOPE", 14, [s.get("scope", "") or "-" for s in rows]),
         ("PROJECT", 14, [str(s.get("owner_project") or "-") for s in rows]),
