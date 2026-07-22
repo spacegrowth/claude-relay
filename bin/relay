@@ -2255,6 +2255,22 @@ def cmd_list(args):
                 f"<sid>` and a fresh spawn keeps the next packet's context cheap; `relay send "
                 f"--heavy-override \"<reason>\"` keeps going in this one.", "yellow"))
 
+    # #23 belt-and-braces (field incident 2026-07-22): a report that exists but was never PROVEN to
+    # have reached its owning lead — never surfaced, or announced-but-unproven (still pending) — is
+    # invisible today unless the wake path works, which is exactly what fails when a foreign Stop
+    # hook interferes. Say it in words here so a lead that merely POLLS `relay list` still finds it.
+    # new_reports_for is the same ownership-scoped "not proven surfaced" set the wake itself uses,
+    # so this line and the wake can never disagree about what counts as unannounced.
+    unannounced = []
+    for m in leads:
+        lsid = m.get("session_id")
+        for key, exsid, packet, _path in lead_guard.new_reports_for(STATE_ROOT, lsid):
+            unannounced.append(f"{exsid} (packet {packet:03d})")
+    if unannounced:
+        print(c(f"  🚦 {len(unannounced)} report(s) NOT yet proven delivered to their lead: "
+                f"{', '.join(unannounced)} — read with `relay report <sid>`; the wake will retry, "
+                f"but do not wait for it.", "red", "bold"))
+
     if orphans:
         sids = ", ".join(s["session_id"] for s in orphans)
         print(c(f"  ⚠ {len(orphans)} executor(s) owned by retired leads (wake won't fire): {sids} — "

@@ -1688,6 +1688,91 @@ class TestPendingWakes:
         assert lg.new_reports_for(root, "lead-1") == []            # proven → deduped
 
 
+class TestAnnounceClaim:
+    """#23 (field incident 2026-07-22): relay's OWN delivery receipt. #22 read the harness's global
+    stop_hook_active flag as proof its wake landed — but ANY blocking Stop hook sets that flag, so a
+    foreign one (a rules-check blocking on edit turns) both suppressed relay's announce and stamped
+    never-delivered wakes as delivered. Delivery is now proven only by relay's own outstanding
+    announce claim plus the wake text actually appearing in the transcript."""
+
+    @pytest.fixture
+    def root(self, tmp_path):
+        return tmp_path / ".relay-tasks"
+
+    def _transcript(self, tmp_path, text=""):
+        p = tmp_path / "transcript.jsonl"
+        p.write_text(text)
+        return p
+
+    def test_no_claim_means_somebody_elses_continuation(self, root):
+        # THE incident: a foreign hook's block sets stop_hook_active with no relay announce out
+        assert lg.relay_announce_delivered(root, "lead-1") is False
+
+    def test_announced_but_wake_text_never_landed_is_not_delivered(self, root, tmp_path):
+        t = self._transcript(tmp_path, '{"type":"user","message":"unrelated"}\n')
+        lg.record_announce_claim(root, "lead-1", "async", str(t))
+        t.write_text(t.read_text() + '{"type":"user","message":"a foreign hook blocked"}\n')
+        assert lg.relay_announce_delivered(root, "lead-1") is False
+
+    def test_wake_text_in_the_transcript_proves_delivery(self, root, tmp_path):
+        t = self._transcript(tmp_path, '{"type":"user","message":"old turn"}\n')
+        lg.record_announce_claim(root, "lead-1", "async", str(t))
+        # what a DELIVERED wake really looks like: the hook's stderr, verbatim, JSON-escaped emoji
+        t.write_text(t.read_text() + json.dumps(
+            {"type": "user", "message": {"role": "user", "content":
+             "\U0001f6a6 [relay] — review needed: " + lg.WAKE_DELIVERY_NEEDLE + ":"}}) + "\n")
+        assert lg.relay_announce_delivered(root, "lead-1") is True
+
+    def test_the_needle_is_ascii(self):
+        # transcripts are JSON: the 🚦 is escaped to 🚦, so the proof must not depend on it
+        assert lg.WAKE_DELIVERY_NEEDLE.isascii()
+
+    def test_an_older_wake_before_the_offset_does_not_count(self, root, tmp_path):
+        t = self._transcript(tmp_path, "a previous wake: " + lg.WAKE_DELIVERY_NEEDLE + "\n")
+        lg.record_announce_claim(root, "lead-1", "async", str(t))   # offset = end of that old text
+        assert lg.relay_announce_delivered(root, "lead-1") is False
+
+    def test_claim_is_one_shot(self, root, tmp_path):
+        t = self._transcript(tmp_path)
+        lg.record_announce_claim(root, "lead-1", "sync", str(t))
+        t.write_text(lg.WAKE_DELIVERY_NEEDLE)
+        assert lg.relay_announce_delivered(root, "lead-1") is True
+        assert lg.relay_announce_delivered(root, "lead-1") is False  # consumed — one continuation
+        assert lg.load_announce_claim(root, "lead-1") == {}
+
+    def test_sync_claim_with_no_transcript_is_trusted(self, root):
+        # no transcript_path in the payload → nothing to check against; a SYNC announce answered a
+        # live Stop the harness was waiting on, so it is taken as delivered
+        lg.record_announce_claim(root, "lead-1", "sync", None)
+        assert lg.relay_announce_delivered(root, "lead-1") is True
+
+    def test_async_claim_with_no_transcript_is_not_trusted(self, root):
+        # the droppable exit-2 with no evidence either way → retry (capped), never a silent stamp
+        lg.record_announce_claim(root, "lead-1", "async", None)
+        assert lg.relay_announce_delivered(root, "lead-1") is False
+
+    def test_corrupt_claim_reads_as_no_claim(self, root):
+        lg.record_announce_claim(root, "lead-1", "sync", None)
+        lg._announce_claim_path(root, "lead-1").write_text("{not json")
+        assert lg.load_announce_claim(root, "lead-1") == {}
+        assert lg.relay_announce_delivered(root, "lead-1") is False
+
+    def test_claim_is_per_lead(self, root):
+        lg.record_announce_claim(root, "lead-1", "sync", None)
+        assert lg.relay_announce_delivered(root, "lead-2") is False
+        assert lg.relay_announce_delivered(root, "lead-1") is True   # lead-1's is untouched
+
+    def test_missing_transcript_file_falls_back_to_kind(self, root, tmp_path):
+        lg.record_announce_claim(root, "lead-1", "sync", str(tmp_path / "gone.jsonl"))
+        assert lg.relay_announce_delivered(root, "lead-1") is True
+
+    def test_rotated_shorter_transcript_still_scans(self, root, tmp_path):
+        t = self._transcript(tmp_path, "x" * 500)
+        lg.record_announce_claim(root, "lead-1", "async", str(t))    # offset 500
+        t.write_text(lg.WAKE_DELIVERY_NEEDLE)                        # rotated: now shorter
+        assert lg.relay_announce_delivered(root, "lead-1") is True   # offset > size → scan the tail
+
+
 class TestEscalationLedger:
     """The executor's OWN escalation-state ledger — separate from the lead's surfaced_reports.json
     (design §4.4), so the executor's 'I notified/nudged' bookkeeping never suppresses the lead's own
@@ -2143,18 +2228,74 @@ class TestStopHookLivePayload:
         rc2, err2 = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path)})
         assert rc2 == 2 and "exec-1" in err2                    # re-announced, not swallowed
 
-    def test_stop_hook_active_is_silent(self, tmp_path):
+    def test_stop_hook_active_from_a_foreign_hook_still_announces(self, tmp_path):
+        """#23 REGRESSION REPRO (field incident 2026-07-22). REPLACES test_stop_hook_active_is_silent,
+        which asserted exactly the buggy behaviour: that a visible report stays silent on any
+        stop_hook_active Stop. It does not — this flag is GLOBAL, and another plugin's blocking Stop
+        hook (here: a rules-check that blocks on edit turns) sets it with no relay announce
+        outstanding. Pre-fix this returned 0 and the report was never mentioned again."""
         root = tmp_path / ".relay-tasks"
         lg.write_marker(root, "lead-1")
         ed = root / "exec-1"; (ed / "packets").mkdir(parents=True)
         (ed / "session.json").write_text(json.dumps(
             {"session_id": "exec-1", "current_packet": 1, "status": "reported", "owner_lead": "lead-1"}))
         (ed / "packets" / "001-report.md").write_text("done")
-        # stop_hook_active skips the SYNCHRONOUS re-announce (no loop); the executor already reported
-        # (not busy) so there's nothing left to poll → silent. (A still-busy one WOULD be polled —
-        # see test_stop_active_still_polls_for_late_report.)
-        rc, _ = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path), "stop_hook_active": True})
-        assert rc == 0
+        assert lg.load_announce_claim(root, "lead-1") == {}      # relay announced nothing
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                       "stop_hook_active": True})
+        assert rc == 2 and "exec-1" in err                       # announced, not swallowed
+        assert lg.load_surfaced(root, "lead-1") == set()         # and NOT stamped by that foreign run
+
+    def test_a_foreign_continuation_never_promotes_a_pending_wake(self, tmp_path):
+        """The other half of the incident: an async wake that was DROPPED (lead mid-turn) followed by
+        a foreign hook's block. Pre-fix that stop_hook_active run promoted the pending key to
+        surfaced — stamping a wake that was never delivered, so the report went silent forever."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        ed = root / "exec-1"; (ed / "packets").mkdir(parents=True)
+        (ed / "session.json").write_text(json.dumps(
+            {"session_id": "exec-1", "current_packet": 1, "status": "reported", "owner_lead": "lead-1"}))
+        (ed / "packets" / "001-report.md").write_text("done")
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text('{"type":"user","message":"mid-turn"}\n')
+        # 1. relay announces; the exit-2 is DROPPED — nothing of ours reaches the transcript
+        rc1, _ = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                      "transcript_path": str(transcript)})
+        assert rc1 == 2
+        assert "exec-1:1" in lg.load_pending(root, "lead-1")
+        # 2. the user's rules-check hook blocks on an edit turn → stop_hook_active, foreign origin
+        transcript.write_text(transcript.read_text() + '{"type":"user","message":"rules check"}\n')
+        rc2, err2 = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                         "stop_hook_active": True, "transcript_path": str(transcript)})
+        assert lg.load_surfaced(root, "lead-1") == set()   # NOT stamped: our wake never landed
+        assert rc2 == 2 and "exec-1" in err2               # re-announced instead of going silent
+
+    def test_a_genuine_relay_re_run_promotes_exactly_once(self, tmp_path):
+        """The counterpart: when relay's wake IS delivered its text lands in the transcript, and
+        THAT — not the bare flag — promotes the pending key. One wake, one promotion, then quiet."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        ed = root / "exec-1"; (ed / "packets").mkdir(parents=True)
+        (ed / "session.json").write_text(json.dumps(
+            {"session_id": "exec-1", "current_packet": 1, "status": "reported", "owner_lead": "lead-1"}))
+        (ed / "packets" / "001-report.md").write_text("done")
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text('{"type":"user","message":"earlier"}\n')
+        rc1, err1 = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                         "transcript_path": str(transcript)})
+        assert rc1 == 2
+        # the harness delivers it: the hook's own stderr is written into the lead's transcript
+        transcript.write_text(transcript.read_text() + json.dumps({"type": "user", "message": err1}) + "\n")
+        rc2, _ = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                      "stop_hook_active": True, "transcript_path": str(transcript)})
+        assert rc2 == 0                                          # promoted → nothing left to say
+        assert lg.load_surfaced(root, "lead-1") == {"exec-1:1"}
+        assert lg.load_pending(root, "lead-1") == {}
+        events = [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+        assert [e for e in events if e["event"] == "wake_delivered"] != []
+        # a third Stop stays silent — no #17 duplicate-wake regression
+        assert self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                    "transcript_path": str(transcript)})[0] == 0
 
 
 class TestHandoffNudge:

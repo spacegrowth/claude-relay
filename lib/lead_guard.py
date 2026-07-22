@@ -767,11 +767,11 @@ def mark_surfaced(state_root, lead_sid, keys):
 # (lost wakes), which is strictly worse.
 #
 # The fix is a two-phase stamp. An announce records the keys as PENDING, which does NOT suppress a
-# later announce — so an undelivered wake naturally retries on the lead's next Stop. Delivery is
-# PROVEN by the harness itself: when our exit-2 actually continues the session, Claude Code re-runs
-# the Stop hook with `stop_hook_active: true`, and that re-run promotes pending → surfaced. If the
-# wake was dropped instead, no such re-run happens, the key stays pending, and the next Stop
-# re-announces it.
+# later announce — so an undelivered wake naturally retries on the lead's next Stop. Only PROVEN
+# delivery promotes pending → surfaced; if the wake was dropped, the key stays pending and the next
+# Stop re-announces it. (What counts as proof was #22's one mistake: it read the harness's global
+# `stop_hook_active` flag, which any other plugin's blocking Stop hook also sets. See the #23 block
+# below for relay's own receipt, which replaced it.)
 WAKE_RETRY_CAP = 3  # give up (and stamp) after this many unproven announces — a lead whose harness
                     # never sets stop_hook_active must not be re-announced at forever.
 
@@ -854,6 +854,105 @@ def promote_pending(state_root, lead_sid):
         return []
     _save_pending(state_root, lead_sid, {})
     return keys
+
+
+# ---- #23: WHOSE continuation is this? (relay's own delivery receipt) ---------------------------
+# Field incident 2026-07-22 (~/.relay-tasks/incident-wake-miss-2026-07-22.md — diagnosis by the
+# field lead, credited): #22 above read the harness's GLOBAL `stop_hook_active` flag as proof that
+# RELAY's wake was delivered. It is no such thing — Claude Code sets that flag whenever the session
+# was continued by ANY blocking Stop hook, and this environment runs a second one (a personal
+# rules-check that blocks on edit turns). So every post-block turn looked like relay's own post-wake
+# re-run: the synchronous announce was suppressed AND never-delivered pending wakes were stamped
+# delivered. Two executor reports sat silent for ~2 hours.
+#
+# The fix: relay keeps its OWN receipt-in-waiting. Every announce records an announce CLAIM (nonce +
+# the transcript's byte offset at announce time). A stop_hook_active run promotes pending only when
+# that claim is outstanding AND relay's own wake text actually landed in the transcript past that
+# offset — a delivered wake is written into the lead's transcript verbatim (observed: as a
+# queue-operation/user entry carrying this hook's stderr). No outstanding claim → somebody else's
+# continuation → treat it as an ordinary Stop. The needle is deliberately ASCII: transcripts are
+# JSON and escape the 🚦 as 🚦.
+WAKE_DELIVERY_NEEDLE = "new activity while you were idle"
+_TRANSCRIPT_SCAN_MAX = 4 * 1024 * 1024  # never read more than this much transcript tail
+
+
+def _announce_claim_path(state_root, lead_sid):
+    return lead_dir(state_root, lead_sid) / "announce_claim.json"
+
+
+def load_announce_claim(state_root, lead_sid):
+    """The outstanding announce claim ({} when relay has no un-consumed announce out)."""
+    try:
+        p = _announce_claim_path(state_root, lead_sid)
+        return json.loads(p.read_text()) if p.exists() else {}
+    except Exception:
+        return {}
+
+
+def clear_announce_claim(state_root, lead_sid):
+    try:
+        p = _announce_claim_path(state_root, lead_sid)
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def record_announce_claim(state_root, lead_sid, kind, transcript_path=None):
+    """Stamp relay's receipt-in-waiting for an announce that is firing right now. `kind` is "sync"
+    (announced while answering a live Stop event) or "async" (the background poller's late exit-2,
+    the one the harness can drop). Records where the transcript ENDS at this moment, so the later
+    delivery check only ever matches text written after this announce."""
+    claim = {"kind": kind, "at": time.time(), "nonce": f"{int(time.time() * 1000)}-{os.getpid()}",
+             "transcript": str(transcript_path or ""), "offset": 0}
+    try:
+        if transcript_path:
+            claim["offset"] = os.path.getsize(transcript_path)
+    except Exception:
+        pass
+    try:
+        d = lead_dir(state_root, lead_sid)
+        d.mkdir(parents=True, exist_ok=True)
+        _announce_claim_path(state_root, lead_sid).write_text(json.dumps(claim, indent=2))
+    except Exception:
+        pass
+    return claim
+
+
+def _transcript_has(path, offset, needle):
+    """Does `needle` appear in `path` after byte `offset`? Bytes-level substring search — the
+    transcript is JSONL and this deliberately makes no assumption about its entry shape (the wake
+    has been seen as both a queue-operation and a user entry). Reads at most the last
+    _TRANSCRIPT_SCAN_MAX bytes; a shrunken/rotated file falls back to scanning that tail."""
+    try:
+        size = os.path.getsize(path)
+        start = offset if isinstance(offset, int) and 0 <= offset <= size else 0
+        if size - start > _TRANSCRIPT_SCAN_MAX:
+            start = size - _TRANSCRIPT_SCAN_MAX
+        with open(path, "rb") as f:
+            f.seek(start)
+            return needle.encode() in f.read()
+    except Exception:
+        return False
+
+
+def relay_announce_delivered(state_root, lead_sid):
+    """Did RELAY's own announce cause this stop_hook_active continuation? One-shot: the claim is
+    consumed either way (a claim answers exactly one continuation; a retry writes a fresh one).
+
+    True only when a claim is outstanding AND its wake text is visible in the transcript past the
+    offset it recorded. When the claim has no transcript to check against (no transcript_path in the
+    payload — chiefly the test harness), a "sync" claim is still trusted: that announce answered a
+    live Stop event the harness was waiting on. An unprovable "async" claim reads as NOT delivered,
+    which merely costs a retry (capped) — the safe side of the incident."""
+    claim = load_announce_claim(state_root, lead_sid)
+    clear_announce_claim(state_root, lead_sid)
+    if not claim:
+        return False  # some OTHER Stop hook continued this session — not relay's re-run
+    path = claim.get("transcript")
+    if path and os.path.exists(path):
+        return _transcript_has(path, claim.get("offset", 0), WAKE_DELIVERY_NEEDLE)
+    return claim.get("kind") == "sync"
 
 
 # ---- Stop-hook: handoff nudge (transcript-size proxy) ------------------------------------------

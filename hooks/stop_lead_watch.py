@@ -101,7 +101,8 @@ def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_sess
         pass
 
 
-def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg):
+def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg, kind="sync",
+                       transcript_path=None):
     # #22 (§13): record the announce as PENDING, never as surfaced. Firing is not delivering — this
     # exit-2 only wakes the lead if the harness is still listening to THIS hook process, and a
     # stale poller announcing while the lead is mid-turn is exactly the case that got dropped and
@@ -151,8 +152,17 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg):
             "user, and WAIT for their direction. Do NOT auto-review, auto-commit, or otherwise act "
             "on them yourself until the user asks. If a report needs reviewing, tell the user it's "
             "ready and ask whether to review it.\n")
+    # #23: relay's OWN receipt-in-waiting for THIS announce (nonce + transcript offset). The next
+    # stop_hook_active run promotes pending only if this claim is outstanding and its wake text
+    # actually landed — never on the global flag alone, which any other blocking Stop hook sets.
+    try:
+        lg.record_announce_claim(STATE_ROOT, sid, kind, transcript_path)
+    except Exception:
+        pass
     sys.stderr.write(
-        "🚦 [relay] — review needed: new activity while you were idle:\n"
+        # The needle below is what proves delivery later (it reappears verbatim in the lead's
+        # transcript), so it comes FROM lead_guard rather than being spelled out twice.
+        f"🚦 [relay] — review needed: {lg.WAKE_DELIVERY_NEEDLE}:\n"
         + "\n".join(lines)
         + instruction
     )
@@ -215,60 +225,69 @@ def main():
             pass
         cfg = lg.load_config(STATE_ROOT)
 
-        # Synchronous announce of what's ALREADY visible at stop time — SKIPPED on the post-wake
-        # re-run (stop_hook_active) to avoid a tight re-announce loop. Crucially we then fall THROUGH
-        # to arm the background watcher below even when stop_hook_active, so a report that lands while
-        # the lead sits idle awaiting your answer is still caught (this used to early-exit and miss
-        # it — a #2-reported-then-#3-reported-while-you-decide bug). mark_surfaced dedups either way.
-        # #22: THIS re-run is the delivery proof. Claude Code only sets stop_hook_active when the
-        # session was continued by a Stop hook — i.e. our own exit-2 landed and the lead actually
-        # woke. Promote everything we announced-but-couldn't-prove; a wake that was DROPPED never
-        # produces this re-run, so its keys stay pending and the announce below retries them.
+        transcript_path = payload.get("transcript_path")
+
+        # #22: promote announced-but-unproven wakes once delivery is PROVEN.
+        # #23 (field incident 2026-07-22, diagnosis credited in lead_guard's #23 block): the proof
+        # is NOT the bare stop_hook_active flag — Claude Code sets that for ANY blocking Stop hook,
+        # and a foreign one (a rules-check that blocks on edit turns) was stamping never-delivered
+        # wakes as delivered. relay_announce_delivered consults RELAY's own announce claim instead:
+        # an outstanding claim whose wake text actually reached the transcript. A stop_hook_active
+        # run with no outstanding claim is somebody else's continuation and promotes nothing.
         if payload.get("stop_hook_active"):
             try:
-                promoted = lg.promote_pending(STATE_ROOT, sid)
-                if promoted:
-                    lg.append_ledger(STATE_ROOT, "wake_delivered", session_id=sid, keys=promoted)
+                if lg.relay_announce_delivered(STATE_ROOT, sid):
+                    promoted = lg.promote_pending(STATE_ROOT, sid)
+                    if promoted:
+                        lg.append_ledger(STATE_ROOT, "wake_delivered", session_id=sid, keys=promoted)
             except Exception:
                 pass
 
-        if not payload.get("stop_hook_active"):
-            lines, surfaced_keys = [], []
-            cwd = payload.get("cwd") or os.getcwd()
-            prev_head = lg.read_head(STATE_ROOT, sid)
-            cur_head = lg.git_head(cwd)
-            if cfg.get("surface_commits", False):  # App 2 — default OFF (see LEAD_DEFAULTS)
-                commits = lg.new_commits(cwd, prev_head)
-                if commits:
-                    lines.append(f"  \U0001f4dd you made {len(commits)} commit(s) this turn in {cwd}:")
-                    lines += [f"       {c}" for c in commits]
-            if cur_head and cur_head != prev_head:
-                lg.write_head(STATE_ROOT, sid, cur_head)  # surface each commit once
-            if cfg.get("auto_wake", True):  # App 1 fast path — a report already exists at stop time
-                rlines, rkeys = _report_lines(lg, sid)
-                lines += rlines
-                surfaced_keys += rkeys
-            # Handoff nudge — a heavy transcript is a PROXY for session weight (not context-window
-            # occupancy: compaction shrinks context but the file keeps growing), so this fires ONCE
-            # ever per lead (flag file, not the surfaced_keys dedup — it isn't a report) and rides
-            # whatever wake already fires below rather than opening a second exit-2 path.
-            try:
-                if cfg.get("handoff_nudge", True) and not lg.handoff_nudged(STATE_ROOT, sid):
-                    mb = lg.transcript_mb(payload.get("transcript_path"))
-                    if mb >= float(cfg.get("handoff_nudge_mb", 5)):
-                        lg.mark_handoff_nudged(STATE_ROOT, sid)  # mark FIRST — a crash after this
-                                                                  # can't double-nudge; worst case one
-                                                                  # nudge is silently skipped
-                        lines.append(
-                            f"  \U0001f501 this lead session is getting heavy (~{mb:.1f}MB transcript). "
-                            "Consider handing off: write a handoff md, then run /relay:handoff "
-                            "<md> — it opens a pre-armed successor and steps this session down."
-                        )
-                        lg.append_ledger(STATE_ROOT, "handoff_nudged", session_id=sid, mb=round(mb, 1))
-            except Exception:
-                pass  # fail-open — the nudge is best-effort, never worth breaking the hook over
-            if lines:
-                _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, _notify_summary(lines))  # exits 2
+        # Synchronous announce of what's ALREADY visible at stop time. #23: this runs on EVERY Stop,
+        # including stop_hook_active ones. It used to be skipped there "to avoid a tight re-announce
+        # loop", which is what silenced reports for hours on every turn a foreign hook blocked. The
+        # loop it feared is closed by the two-phase stamp instead: a wake that WAS delivered is
+        # promoted to surfaced by the block above (in this same run, before this) and so isn't
+        # re-announced, while a wake that was never delivered is exactly the thing that must retry.
+        # Either way we then fall THROUGH to arm the background watcher below, so a report landing
+        # while the lead sits idle awaiting your answer is still caught.
+        lines, surfaced_keys = [], []
+        cwd = payload.get("cwd") or os.getcwd()
+        prev_head = lg.read_head(STATE_ROOT, sid)
+        cur_head = lg.git_head(cwd)
+        if cfg.get("surface_commits", False):  # App 2 — default OFF (see LEAD_DEFAULTS)
+            commits = lg.new_commits(cwd, prev_head)
+            if commits:
+                lines.append(f"  \U0001f4dd you made {len(commits)} commit(s) this turn in {cwd}:")
+                lines += [f"       {c}" for c in commits]
+        if cur_head and cur_head != prev_head:
+            lg.write_head(STATE_ROOT, sid, cur_head)  # surface each commit once
+        if cfg.get("auto_wake", True):  # App 1 fast path — a report already exists at stop time
+            rlines, rkeys = _report_lines(lg, sid)
+            lines += rlines
+            surfaced_keys += rkeys
+        # Handoff nudge — a heavy transcript is a PROXY for session weight (not context-window
+        # occupancy: compaction shrinks context but the file keeps growing), so this fires ONCE
+        # ever per lead (flag file, not the surfaced_keys dedup — it isn't a report) and rides
+        # whatever wake already fires below rather than opening a second exit-2 path.
+        try:
+            if cfg.get("handoff_nudge", True) and not lg.handoff_nudged(STATE_ROOT, sid):
+                mb = lg.transcript_mb(transcript_path)
+                if mb >= float(cfg.get("handoff_nudge_mb", 5)):
+                    lg.mark_handoff_nudged(STATE_ROOT, sid)  # mark FIRST — a crash after this
+                                                              # can't double-nudge; worst case one
+                                                              # nudge is silently skipped
+                    lines.append(
+                        f"  \U0001f501 this lead session is getting heavy (~{mb:.1f}MB transcript). "
+                        "Consider handing off: write a handoff md, then run /relay:handoff "
+                        "<md> — it opens a pre-armed successor and steps this session down."
+                    )
+                    lg.append_ledger(STATE_ROOT, "handoff_nudged", session_id=sid, mb=round(mb, 1))
+        except Exception:
+            pass  # fail-open — the nudge is best-effort, never worth breaking the hook over
+        if lines:
+            _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, _notify_summary(lines),
+                               kind="sync", transcript_path=transcript_path)  # exits 2
 
         # Nothing instant. If an executor is still busy, become a BACKGROUND poller that waits for
         # its report and wakes when it lands. One poller per lead (lock); a later Stop while it runs
@@ -287,7 +306,11 @@ def main():
                     sys.exit(0)  # lead stepped down / session ended while we waited
                 rlines, rkeys = _report_lines(lg, sid)
                 if rlines:
-                    _announce_and_wake(lg, cfg, sid, rlines, rkeys, _notify_summary(rlines))  # exits 2
+                    # kind="async": THIS exit-2 is the droppable one (a stale poller firing while
+                    # the lead is mid-turn), so its claim is only ever honoured against transcript
+                    # evidence that the wake really landed — never trusted on faith.
+                    _announce_and_wake(lg, cfg, sid, rlines, rkeys, _notify_summary(rlines),
+                                       kind="async", transcript_path=transcript_path)  # exits 2
                 if not lg.has_inflight_executors(STATE_ROOT, sid):
                     sys.exit(0)  # nothing left of OURS in flight → stop waiting
             sys.exit(0)  # timed out; a later lead turn will re-arm

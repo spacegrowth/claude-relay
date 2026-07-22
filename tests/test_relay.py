@@ -3501,6 +3501,34 @@ class TestAdoption:
         assert "⚠" in out and "e1" in out
         assert "relay adopt" in out
 
+    def test_list_footnotes_reports_never_proven_delivered(self, relay, capsys, monkeypatch):
+        """#23 belt-and-braces (field incident 2026-07-22): a report whose wake was never PROVEN to
+        land must be visible to a lead that merely POLLS `relay list` — that poll was the incident's
+        only working channel. Loud, in words, not just a REPORTED=yes column."""
+        monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        self._mk(relay, owner_lead="lead-1", status="reported")     # report exists, never surfaced
+        relay.lead_guard.mark_pending(relay.STATE_ROOT, "lead-1", ["e1:1"])  # announced, unproven
+        relay.cmd_list(SimpleNamespace(json=False, lead=None, all=False, closed=False))
+        out = capsys.readouterr().out
+        assert "NOT yet proven delivered" in out and "e1 (packet 001)" in out
+
+    def test_list_stays_quiet_once_the_wake_is_proven(self, relay, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        self._mk(relay, owner_lead="lead-1", status="reported")
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-1", ["e1:1"])
+        relay.cmd_list(SimpleNamespace(json=False, lead=None, all=False, closed=False))
+        assert "NOT yet proven delivered" not in capsys.readouterr().out
+
+    def test_list_does_not_footnote_another_leads_report(self, relay, capsys, monkeypatch):
+        # ownership-scoped exactly like the wake itself — no cross-lead noise
+        monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        self._mk(relay, owner_lead="other-lead", status="reported")
+        relay.cmd_list(SimpleNamespace(json=False, lead=None, all=False, closed=False))
+        assert "NOT yet proven delivered" not in capsys.readouterr().out
+
     def test_same_project_handoff_auto_transfers(self, relay, tmp_path, monkeypatch):
         # A real regression: old + new lead share the SAME project (and thus the same
         # derived tab_label), but the old lead has no live pid and an unresolvable iterm_session —
