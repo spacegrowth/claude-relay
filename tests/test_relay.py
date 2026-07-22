@@ -74,6 +74,22 @@ class TestTemplateFooterConsistency:
         assert "sess-x" in p
         assert "diff: file://" in p
 
+    def test_footer_contains_required_tldr_block(self, relay):
+        """§6a (task #6): the auto-appended REPORT FORMAT must require a TL;DR block with
+        Status/Risk flags/UNVERIFIED/Changed fields, and the UNVERIFIED line must be called out
+        as mandatory-even-when-none so its absence is machine-detectable."""
+        p = relay.build_packet("do the thing", "/tmp/x/001-report.md", "/path/to/relay diff sess-x", "file:///tmp/x/001-diff.html")
+        assert "TL;DR" in p
+        assert "Status: clean / clean-with-caveats / blocked / partial" in p
+        assert "Risk flags:" in p
+        assert "Risk flags: none" in p
+        assert "UNVERIFIED:" in p
+        assert "UNVERIFIED: none" in p
+        assert "MANDATORY" in p
+        assert "Changed:" in p
+        # TL;DR block must precede the detailed report body it summarizes.
+        assert p.index("Status: clean") < p.index("What changed (file:line")
+
     def test_sentinel_line_contains_correct_diff_url(self, relay):
         p = relay.build_packet("task body", "/tmp/sess-a/001-report.md", "/path/to/relay diff sess-a", "file:///tmp/sess-a/001-diff.html")
         # Verify sentinel line contains the diff URL

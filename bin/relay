@@ -120,12 +120,23 @@ Before you stop, write your full report to {report_path} (not just stdout/chat).
   label — this exact line becomes the desktop notification and the lead's wake message, so write
   it for a human glancing at a banner, e.g.:
       Split-pane layout works behind a config flag; 9 new tests, suite green, staged.
-Then include:
+- Immediately after that first line, a REQUIRED TL;DR block — the lead reads this always, the
+  full report only when a risk flag is up, so these four fields must be present verbatim and in
+  this order:
+      Status: clean / clean-with-caveats / blocked / partial
+      Risk flags: <failing tests, weakened tests, scope creep, anything touching core
+          logic/ledgers/parity tests> — or exactly `Risk flags: none` when there are none.
+      UNVERIFIED: <every claim you did not verify live — ran but didn't observe, assumed env,
+          untested path> — or exactly `UNVERIFIED: none` when truly none. This line is MANDATORY
+          and must NEVER be omitted, even when none — its absence must read as malformed, not as
+          "nothing to report."
+      Changed: <one-line what-changed summary>
+Then include the full detail:
 - What changed (file:line for each substantive change).
 - What you verified, and with which command/result.
 - Acceptance-criteria outcomes, if the packet listed any.
-- Anything you could NOT verify — name it explicitly as UNVERIFIED. An honest gap is fine; a
-  hidden one is not.
+- Anything you could NOT verify — name it explicitly as UNVERIFIED (same claims as the TL;DR's
+  UNVERIFIED line, expanded). An honest gap is fine; a hidden one is not.
 - Confirmation that your changes are staged (not committed) and ready for the lead to review.
 
 AFTER writing your report, run:
