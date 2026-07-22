@@ -70,6 +70,7 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 20 | BUG | Spawn writes a live marker when the launch never happened (no PID + no title) ✅ LANDED v0.3.30 | §12 |
 | 21 | BUG | Resume loops on a never-created conversation id; claims success on a dead tab ✅ LANDED v0.3.30 | §12 |
 | 22 | BUG | Wake dedup stamps surfaced on announce ATTEMPT, not delivery — busy-lead wake lost forever ✅ LANDED v0.3.32 (two-phase stamp; §13 diagnosis code-confirmed) | §13 |
+| 23 | BUG | #22's delivery proof read the GLOBAL stop_hook_active flag — a foreign blocking Stop hook (rules-check) silenced wakes for hours ✅ LANDED v0.3.34 (relay-owned claim + transcript evidence) | §14 |
 | d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) ✅ PHASE 1 (logging-only) LANDED v0.3.32 — blocking mode waits on tuned logs | §10 |
 | d2 | DOC | Mutation-budget tripwire line in `/relay:mode` ✅ LANDED v0.3.30 | §10 |
 | d3 | DOC | Standing ops-hands pattern (spawn an ops executor up front) ✅ LANDED v0.3.30 | §10 |
@@ -655,3 +656,27 @@ window and nothing retries.
 lead's own next-turn acknowledgment, or check/diff/close per #17); or make the announce idempotent
 across polls until something #17-shaped confirms the lead saw it; and make the executor escalation
 re-arm when the nudge landed on a demonstrably busy lead instead of burning its one shot.
+
+## 14. The #22 fix's own regression — a foreign hook's continuation read as relay's (#23, field incident 2026-07-22)
+
+Full incident write-up (evidence, mechanism, fixes): ~/.relay-tasks/incident-wake-miss-2026-07-22.md
+— authored by the field lead who diagnosed it from the ledger and the hook source; the diagnosis was
+verified correct line-for-line. Summary: v0.3.33's #22 fix used `stop_hook_active` as proof that
+relay's wake was delivered, but Claude Code sets that flag for ANY blocking Stop hook's
+continuation. In an environment running a personal rules-check Stop hook that blocks on edit turns,
+every post-block turn masqueraded as relay's post-wake re-run: the sync announce was suppressed and
+never-delivered pending wakes were promoted to surfaced. Two executor reports sat silent ~2 hours;
+the human was the detector — again.
+
+Fixed in v0.3.34 per the write-up's three recommendations: relay keeps its own announce claim
+(nonce + transcript byte offset) and promotes only when its wake text is provably in the lead's
+transcript past that offset; pending wakes re-announce on every Stop regardless of why the session
+continued (promote-before-announce closes the loop the old skip feared); `relay list` footnotes
+reports never proven delivered. Lesson for the record: a harness-global signal is never a
+plugin-private receipt, and the missing test environment (a SECOND blocking Stop hook) is now
+simulated permanently in the suite.
+
+Loose end from the same cycle: `relay verify`'s claim-plausibility filter false-positives on bare
+basenames and dotted identifiers in report prose (observed on rl-wake's own report — MISMATCH on
+`lead_guard.py`, `lg.relay`, `e.g`). Tuning item, not urgent: the failure direction is a false
+STOP, which costs a question, never trust.
