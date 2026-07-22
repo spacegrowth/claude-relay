@@ -63,7 +63,7 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 13 | CAP | `relay send` Preconditions nag ✅ LANDED v0.3.31 | §7-h1 |
 | 14 | DOC | STOP-and-report GATES paragraph (broaden to ALL blocking questions) ✅ LANDED v0.3.30 | §7-h2, §9 |
 | 15 | DOC | Packet self-sufficiency doctrine ✅ LANDED v0.3.30 | §8 |
-| 16 | DEC | Autonomous/"confident" mode (hard-deps on #7 + #6) — ✅ PHASE 1 LANDED v0.3.29 (auto-commit awaits #7) | §6f, §9 |
+| 16 | DEC | Autonomous/"confident" mode (hard-deps on #7 + #6) — ✅ COMPLETE: phase 1 v0.3.29, phase 2 (five-condition auto-commit clearance) v0.3.33 | §6f, §9 |
 | 17 | BUG | **Asymmetric surfaced_reports dedup** → re-wake after review (high priority) ✅ LANDED v0.3.30 | §5b |
 | 18 | CAP | `relay send --when-idle` queue (replaces unsafe until-loop) ✅ LANDED v0.3.32 | §9 |
 | 19 | BUG | Handoff double SUCCESSOR AFTERCARE section ✅ LANDED v0.3.31 | §9 |
