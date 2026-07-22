@@ -216,6 +216,29 @@ def tty_by_id(iterm_id):
     return out if r.returncode == 0 and out.startswith("/dev/") else None
 
 
+def title_by_id(iterm_id):
+    """The CURRENT title of the iTerm session whose id matches `iterm_id` ("w#t#p#:UUID"), or None.
+
+    The identity-aware counterpart to live_session_names(): that one answers "does ANY live tab
+    carry this title", which is the wrong question whenever two tabs can legitimately share a label
+    — a handoff predecessor/successor pair both titled "[Lead] <project>" is the case backlog §2 is
+    about, where the successor's label loop read the PREDECESSOR's title as proof its own tab was
+    fine and never re-titled itself.
+
+    None means "no answer": the session id didn't resolve (tab closed), the osascript call failed,
+    or the title came back empty. Callers must NOT read None as "the title is wrong" or as "the tab
+    is fine" — it is unknown, and the safe response is to leave the tab alone rather than act on a
+    guess about a tab you can't see."""
+    if not iterm_id:
+        return None
+    uuid = iterm_id.split(":")[-1]
+    script = _for_session_by_id(uuid, "          return name of s\n") + 'return ""'
+    r = run_osascript(script, timeout=5)
+    if r.returncode != 0:
+        return None
+    return (r.stdout or "").strip() or None
+
+
 def pid_on_tty(tty_path, binary_suffix=CLAUDE_BIN):
     """The pid of the process named `binary_suffix` (default "claude") attached to `tty_path`
     (a "/dev/ttysNNN" from tty_by_id), or None. Used to SIGTERM a predecessor lead's claude process

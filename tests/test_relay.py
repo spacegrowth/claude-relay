@@ -1196,12 +1196,15 @@ class TestFocus:
         assert "resume" in str(ei.value) and "restart" in str(ei.value)  # points to revival
 
     def test_lead_is_focusable_by_its_tab_label(self, relay):
-        # Leads now get a stable relay-controlled tab label at /relay:mode → focusable like executors.
+        # Leads now get a stable relay-controlled tab label at /relay:mode → focusable like
+        # executors. The handle goes with it (backlog §2): this marker has none, so it's None here
+        # — the label-only fallback — while a marker WITH one threads it through (see
+        # TestLeadTabIdentityAddressing.test_focus_lead_passes_handle_to_the_recorded_backend).
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="alpha",
                                       tab_label="[Lead] alpha")
         with mock.patch.object(relay.iterm, "focus", return_value=True) as focus:
             relay.cmd_focus(SimpleNamespace(session_id="lead-1"))
-        focus.assert_called_once_with("[Lead] alpha")
+        focus.assert_called_once_with("[Lead] alpha", None)
 
     def test_lead_with_no_label_errors(self, relay):
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1")  # armed before rename → no label
@@ -3288,6 +3291,133 @@ class TestEnsureTabLabelBackgroundHandoff:
         bk.is_alive.assert_not_called()
 
 
+class TestLabelHoldsForTab:
+    """_label_holds_for_tab: "is MY tab called this?" (identity) vs the old "is ANY tab called
+    this?" (label) — backlog §2. The bounded matcher itself (iterm.title_is_live) is left REAL
+    throughout; only the title READ is mocked."""
+
+    def test_matching_title_on_my_tab_holds(self, relay):
+        with mock.patch.object(relay.iterm_backend, "title_by_id", return_value="[Exec] e1") as by_id, \
+             mock.patch.object(relay.iterm_backend, "live_session_names") as any_tab:
+            assert relay._label_holds_for_tab("h1", "[Exec] e1") is True
+        by_id.assert_called_once_with("h1")
+        any_tab.assert_not_called()      # identity answered it; no any-tab scan
+
+    def test_matches_claude_status_suffix_on_my_tab(self, relay):
+        # Claude Code appends its own status text; the real bounded matcher must still say yes.
+        title = "[Exec] e1" + relay.iterm_backend.TAB_TITLE_SEP + "working"
+        with mock.patch.object(relay.iterm_backend, "title_by_id", return_value=title):
+            assert relay._label_holds_for_tab("h1", "[Exec] e1") is True
+
+    def test_different_title_on_my_tab_does_not_hold(self, relay):
+        with mock.patch.object(relay.iterm_backend, "title_by_id", return_value="claude"):
+            assert relay._label_holds_for_tab("h1", "[Exec] e1") is False
+
+    def test_sibling_tab_with_my_label_does_not_count(self, relay):
+        # THE §2 CASE: a sibling carries my label byte-for-byte, my own tab does not. The old
+        # any-tab scan said True here and the tab was never re-titled.
+        with mock.patch.object(relay.iterm_backend, "title_by_id", return_value="claude"), \
+             mock.patch.object(relay.iterm_backend, "live_session_names",
+                               return_value={"[Lead] webapp", "claude"}):
+            assert relay._label_holds_for_tab("mine", "[Lead] webapp") is False
+
+    def test_unreadable_tab_does_not_count_as_labeled(self, relay):
+        # None = "couldn't read it" (closed tab, or a failed probe). An unreadable tab is not a
+        # correctly-titled tab: say False so the caller re-asserts (a rename against a gone session
+        # is a harmless no-op) rather than declaring victory over a tab nobody can see.
+        with mock.patch.object(relay.iterm_backend, "title_by_id", return_value=None):
+            assert relay._label_holds_for_tab("h1", "[Exec] e1") is False
+
+    def test_without_handle_falls_back_to_any_tab_scan(self, relay):
+        # Legacy/pre-capture sessions have no identity to ask about — the old behavior is the
+        # fallback, not the default.
+        with mock.patch.object(relay.iterm_backend, "title_by_id") as by_id, \
+             mock.patch.object(relay.iterm_backend, "live_session_names",
+                               return_value={"[Exec] e1"}) as any_tab:
+            assert relay._label_holds_for_tab(None, "[Exec] e1") is True
+        by_id.assert_not_called()
+        any_tab.assert_called_once()
+
+    def test_without_handle_fallback_can_still_say_no(self, relay):
+        with mock.patch.object(relay.iterm_backend, "live_session_names", return_value={"claude"}):
+            assert relay._label_holds_for_tab(None, "[Exec] e1") is False
+
+
+class TestLeadTabTarget:
+    """_lead_tab_target: resolve a LEAD marker to (backend, label, handle). Both identities come
+    from the marker — the backend that hosts the tab, and the handle that identifies it within that
+    backend — so no lead-tab call site has to remember to pass the handle (backlog §2)."""
+
+    def test_uses_recorded_backend_and_handle(self, relay):
+        marker = {"tab_label": "[Lead] webapp", "iterm_session": "w0t0p0:X", "backend": "terminal"}
+        bk, label, handle = relay._lead_tab_target(marker)
+        assert bk.NAME == "terminal"          # the marker's backend, not the caller's ambient one
+        assert (label, handle) == ("[Lead] webapp", "w0t0p0:X")
+
+    def test_probes_when_backend_unrecorded(self, relay):
+        # Pre-stamping markers: probe which backend actually has the tab rather than guessing.
+        marker = {"tab_label": "[Lead] webapp", "iterm_session": "w0t0p0:X"}
+        probed = mock.Mock(NAME="probed")
+        with mock.patch.object(relay, "_probe_backend_for_tab", return_value=probed) as probe:
+            bk, _label, _handle = relay._lead_tab_target(marker)
+        assert bk is probed
+        probe.assert_called_once_with("[Lead] webapp", "w0t0p0:X")
+
+    def test_ambient_fallback_when_probe_is_ambiguous(self, relay):
+        marker = {"tab_label": "[Lead] webapp"}
+        with mock.patch.object(relay, "_probe_backend_for_tab", return_value=None):
+            bk, _label, handle = relay._lead_tab_target(marker)
+        assert bk is relay.iterm            # last resort, unchanged from before
+        assert handle is None               # handle-less marker stays handle-less
+
+
+class TestLeadTabIdentityAddressing:
+    """The two lead-tab call sites that used to address by LABEL ALONE while the handle sat unused
+    on the marker (backlog §2): `relay focus <lead>` and cmd_resume_lead's already-alive guard. A
+    handoff pair shares a tab title byte-for-byte, so label-only could act on the WRONG lead."""
+
+    def test_focus_lead_passes_handle_to_the_recorded_backend(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd="/w",
+                                      tab_label="[Lead] webapp", iterm_session="w0t0p0:MINE",
+                                      backend="iterm")
+        with mock.patch.object(relay.iterm, "focus", return_value=True) as focus:
+            relay.cmd_focus(SimpleNamespace(session_id="lead-1"))
+        focus.assert_called_once_with("[Lead] webapp", "w0t0p0:MINE")
+        assert "focused lead 'webapp'" in capsys.readouterr().out
+
+    def test_focus_lead_without_handle_still_works(self, relay):
+        # Legacy marker (no captured handle): label-only, exactly as before — the fallback must not
+        # regress into "can't focus pre-capture leads".
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd="/w",
+                                      tab_label="[Lead] webapp", backend="iterm")
+        with mock.patch.object(relay.iterm, "focus", return_value=True) as focus:
+            relay.cmd_focus(SimpleNamespace(session_id="lead-1"))
+        focus.assert_called_once_with("[Lead] webapp", None)
+
+    def test_resume_lead_alive_guard_is_identity_aware(self, relay):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd="/w",
+                                      tab_label="[Lead] webapp", iterm_session="w0t0p0:MINE",
+                                      backend="iterm")
+        with mock.patch.object(relay.iterm, "spawn"), \
+             mock.patch.object(relay, "read_iterm_id_at", return_value=None), \
+             mock.patch.object(relay, "pid_alive", return_value=False), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=False) as is_alive:
+            relay.cmd_resume_lead("lead-1")
+        is_alive.assert_called_once_with("[Lead] webapp", "w0t0p0:MINE")
+
+    def test_resume_lead_refuses_when_its_own_tab_is_alive(self, relay):
+        # The guard still guards — identity-aware doesn't mean permissive.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd="/w",
+                                      tab_label="[Lead] webapp", iterm_session="w0t0p0:MINE",
+                                      backend="iterm")
+        with mock.patch.object(relay.iterm, "spawn") as spawn, \
+             mock.patch.object(relay, "pid_alive", return_value=False), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            with pytest.raises(SystemExit):
+                relay.cmd_resume_lead("lead-1")
+        spawn.assert_not_called()
+
+
 class TestBackgroundLabelLoop:
     """_background_label_loop: the polling logic that runs inside the detached `relay
     _ensure-label` subprocess. Uses injectable clock_fn/sleep_fn so the bounded window is
@@ -3304,9 +3434,12 @@ class TestBackgroundLabelLoop:
             return ticks[i]
         return clock
 
+    # These drive the loop through the IDENTITY seam it now reads (iterm.title_by_id — "what is MY
+    # tab called", §2) instead of the old any-tab scan. title_is_live is deliberately left REAL so
+    # the bounded match is exercised for real rather than stubbed to a bare True/False.
+
     def test_noop_when_already_labeled_two_checks_in_a_row(self, relay):
-        with mock.patch.object(relay.iterm_backend, "live_session_names", return_value={"[Exec] e1"}), \
-             mock.patch.object(relay.iterm_backend, "title_is_live", return_value=True), \
+        with mock.patch.object(relay.iterm_backend, "title_by_id", return_value="[Exec] e1"), \
              mock.patch.object(relay.iterm_backend, "rename_by_id") as rename:
             ok = relay._background_label_loop(
                 "h1", "[Exec] e1", window=30, interval=3,
@@ -3315,11 +3448,10 @@ class TestBackgroundLabelLoop:
         rename.assert_not_called()
 
     def test_reasserts_until_clobber_fixed_then_holds(self, relay):
-        # First two polls see the title clobbered away from [Exec]; from the third poll on it
-        # reads [Exec] again (as if the background rename just landed) and must hold for 2 in a row.
-        reads = [False, False, True, True, True]
-        with mock.patch.object(relay.iterm_backend, "live_session_names", return_value=set()), \
-             mock.patch.object(relay.iterm_backend, "title_is_live", side_effect=reads), \
+        # First two polls see MY tab's title clobbered away from [Exec]; from the third on it reads
+        # [Exec] again (as if the background rename just landed) and must hold for 2 in a row.
+        reads = ["claude", "claude", "[Exec] e1", "[Exec] e1", "[Exec] e1"]
+        with mock.patch.object(relay.iterm_backend, "title_by_id", side_effect=reads), \
              mock.patch.object(relay.iterm_backend, "rename_by_id") as rename:
             ok = relay._background_label_loop(
                 "h1", "[Exec] e1", window=30, interval=3,
@@ -3329,14 +3461,35 @@ class TestBackgroundLabelLoop:
         rename.assert_called_with("h1", "[Exec] e1")
 
     def test_gives_up_after_window_if_never_holds(self, relay):
-        with mock.patch.object(relay.iterm_backend, "live_session_names", return_value=set()), \
-             mock.patch.object(relay.iterm_backend, "title_is_live", return_value=False), \
+        with mock.patch.object(relay.iterm_backend, "title_by_id", return_value="claude"), \
              mock.patch.object(relay.iterm_backend, "rename_by_id") as rename:
             ok = relay._background_label_loop(
                 "h1", "[Exec] e1", window=10, interval=3,
                 clock_fn=self._fake_clock([0, 3, 6, 9, 12]), sleep_fn=lambda s: None)
         assert ok is False
         assert rename.call_count >= 1
+
+    def test_ignores_an_identically_titled_sibling_tab(self, relay):
+        """§2, the whole point: a handoff pair shares `[Lead] <project>` byte-for-byte. MY tab is
+        still called "claude"; the SIBLING's is correctly titled. The old any-tab scan saw the
+        sibling and declared victory, leaving my tab mislabeled forever (its wake silently dead)."""
+        titles = {"mine": "claude", "sibling": "[Lead] webapp"}
+
+        def rename(handle, new_name):
+            titles[handle] = new_name
+            return True
+
+        with mock.patch.object(relay.iterm_backend, "title_by_id", side_effect=titles.get), \
+             mock.patch.object(relay.iterm_backend, "live_session_names",
+                               side_effect=lambda: set(titles.values())) as any_tab, \
+             mock.patch.object(relay.iterm_backend, "rename_by_id", side_effect=rename):
+            ok = relay._background_label_loop(
+                "mine", "[Lead] webapp", window=30, interval=3,
+                clock_fn=self._fake_clock([0, 1, 2, 3, 4, 5, 6]), sleep_fn=lambda s: None)
+        assert ok is True
+        assert titles["mine"] == "[Lead] webapp"     # MY tab got titled, not just some tab
+        assert titles["sibling"] == "[Lead] webapp"  # the sibling was never touched
+        any_tab.assert_not_called()                  # never fell back to the any-tab scan
 
 
 class TestCmdEnsureLabel:

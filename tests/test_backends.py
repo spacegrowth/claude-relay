@@ -276,6 +276,35 @@ class TestIdBasedFocus:
         assert "id of s" not in script
 
 
+class TestTitleById:
+    """title_by_id: the identity-aware title read (backlog §2). live_session_names answers "does
+    ANY tab carry this title", which is the wrong question when two tabs legitimately share a label
+    (a handoff predecessor/successor pair). This asks ONE session what it is currently called."""
+
+    def test_returns_that_sessions_title(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("[Lead] webapp\n")) as osa_run:
+            assert iterm.title_by_id("w1t5p0:SOME-UUID") == "[Lead] webapp"
+        script = osa_run.call_args[0][0]
+        assert 'id of s) is "SOME-UUID"' in script     # matched by identity, not by title
+        assert "name of s" in script
+
+    def test_no_handle_is_none_without_calling_osascript(self):
+        with mock.patch.object(iterm, "run_osascript") as osa_run:
+            assert iterm.title_by_id(None) is None
+            assert iterm.title_by_id("") is None
+        osa_run.assert_not_called()
+
+    def test_unresolved_session_is_none(self):
+        # The AppleScript's `return ""` fallthrough: no session has that id (tab closed).
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")):
+            assert iterm.title_by_id("w1t5p0:GONE") is None
+
+    def test_osascript_failure_is_none(self):
+        with mock.patch.object(iterm, "run_osascript",
+                                return_value=subprocess.CompletedProcess(["osascript"], 1, "", "boom")):
+            assert iterm.title_by_id("w1t5p0:SOME-UUID") is None
+
+
 class TestPidOnTty:
     def test_matches_pid_by_tty_and_comm(self):
         ps_out = "  123 ttys000 login\n  456 ttys000 claude\n  789 ttys001 claude\n"
