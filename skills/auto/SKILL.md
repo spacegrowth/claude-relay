@@ -36,7 +36,16 @@ here on. Use the `🚦 [relay]` marker like every other lead message.
   the `autonomous_mode` config default).
 
 **Two things to say plainly whenever you turn it ON**, so nobody mistakes its scope:
-- **Committing executor work still stops for the human** — always, in phase 1, no exception.
+- **Committing executor work is gated separately** (#16 phase 2) — turning auto on does *not* by
+  itself license a commit. It is permitted without asking only when all five conditions hold:
+  (1) `relay verify` says `COUNTS-MATCH`; (2) the report's TL;DR is `Status: clean`, `Risk flags:
+  none`, `UNVERIFIED: none` — `clean-with-caveats` stops; (3) the packet was in the approved plan;
+  (4) nothing sign-off-gated is touched (core logic, ledgers, parity/golden tests, migrations,
+  deploys — and for relay itself, `hooks/`, `lib/lead_guard.py`, ledger formats); (5) you have
+  ACTUALLY READ the staged diff. Check it with
+  `${CLAUDE_PLUGIN_ROOT}/bin/relay verify <sid> --for-autocommit --in-plan --diff-reviewed` —
+  it prints `CLEARED` or `NOT-CLEARED-BECAUSE-<reason>`. Conditions 3 and 5 are *your* attestations;
+  pass those flags only if they are true. Anything not cleared → stop and ask, naming the condition.
 - The posture is **scoped to this session and this plan**: it resets to the config default the next
   time lead mode is armed (`/relay:mode`), so it can't silently outlive the plan it was scoped to.
 

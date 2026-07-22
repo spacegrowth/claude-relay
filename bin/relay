@@ -2384,10 +2384,33 @@ def _rerun_declared(worktree, commands, declared_passed):
     return results
 
 
+def _diff_stat(worktree):
+    """{files, insertions, deletions} for the staged diff, from --numstat. Recorded in the
+    auto_commit ledger event so "the human wasn't asked" stays reconstructable in size terms, not
+    just by name. Binary files (numstat "-") count toward `files` only."""
+    stat = {"files": 0, "insertions": 0, "deletions": 0}
+    for line in _git_lines(worktree, "diff", "--cached", "--numstat"):
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        stat["files"] += 1
+        for key, raw in (("insertions", parts[0]), ("deletions", parts[1])):
+            if raw.isdigit():
+                stat[key] += int(raw)
+    return stat
+
+
 def cmd_verify(args):
-    """`relay verify <sid> [--packet N] [--rerun]` — check an executor's report against the staged
-    reality in its worktree, and stamp MALFORMED / MISMATCH / COUNTS-MATCH. Never "PASS": see
-    report_verify.CAVEAT, which this prints on every run."""
+    """`relay verify <sid> [--packet N] [--rerun] [--for-autocommit]` — check an executor's report
+    against the staged reality in its worktree, and stamp MALFORMED / MISMATCH / INCONCLUSIVE /
+    COUNTS-MATCH. Never "PASS": see report_verify.CAVEAT, which this prints on every run.
+
+    `--for-autocommit` adds the #16-phase-2 clearance block: the five conditions that must ALL hold
+    before an autonomous lead may commit an executor's work without asking. Two of them are the
+    lead's own attestations (`--in-plan`, `--diff-reviewed`) because they are not machine-knowable;
+    without them the answer is NOT-CLEARED, so a bare invocation can never accidentally clear.
+    Nothing in this command commits anything — the commit stays the lead's action in its own
+    session."""
     s = read_session(args.session_id)
     if not s:
         sys.exit(f"no such session: {args.session_id}")
@@ -2427,7 +2450,31 @@ def cmd_verify(args):
     append_ledger("report_verify", session_id=args.session_id, packet=n,
                   verdict=result["verdict"], rerun=bool(args.rerun),
                   mismatches=len([f for f in result["findings"] if f["level"] == "mismatch"]))
-    sys.exit(report_verify.EXIT_CODES[result["verdict"]])
+
+    if not getattr(args, "for_autocommit", False):
+        sys.exit(report_verify.EXIT_CODES[result["verdict"]])
+
+    staged_diff = subprocess.run(["git", "-C", worktree, "diff", "--cached"],
+                                 capture_output=True, text=True).stdout
+    clr = report_verify.clearance(result, staged_diff,
+                                  in_plan=bool(getattr(args, "in_plan", False)),
+                                  diff_reviewed=bool(getattr(args, "diff_reviewed", False)))
+    for line, styles in report_verify.render_clearance(clr):
+        print(c(line, *styles) if styles else line)
+
+    # The audit record of the clearance DECISION, written at the beat immediately before the lead
+    # commits (or doesn't). §6f's "autonomy must not become silence": the human was not asked, so
+    # the reconstruction has to exist on disk instead.
+    stat = _diff_stat(worktree)
+    append_ledger("auto_commit" if clr["cleared"] else "auto_commit_blocked",
+                  session_id=args.session_id, packet=n, verdict=result["verdict"],
+                  cleared=clr["cleared"], reason=clr["reason"],
+                  in_plan=bool(getattr(args, "in_plan", False)),
+                  diff_reviewed=bool(getattr(args, "diff_reviewed", False)),
+                  files=stat["files"], insertions=stat["insertions"], deletions=stat["deletions"])
+    # In --for-autocommit mode the exit code answers ONE question: may the lead auto-commit? Only a
+    # full clearance is 0; a COUNTS-MATCH that failed a clearance condition must not exit 0.
+    sys.exit(0 if clr["cleared"] else (report_verify.EXIT_CODES[result["verdict"]] or 1))
 
 
 def cmd_close(args):
@@ -3058,8 +3105,9 @@ def cmd_auto(args):
     (§6f, task #16 phase 1). It does not change what the lead is allowed to do; it changes the
     DEFAULT: manual = wait for the human on every routine in-plan approval beat, auto = proceed on
     those and announce afterwards. The judgement calls (the stop-list in skills/mode/SKILL.md) stop
-    either way, and committing executor work ALWAYS stops for the human in phase 1 — auto-commit
-    waits on the #7 verifier.
+    either way. Committing executor work is the ONE beat with its own gate on top of the posture
+    (#16 phase 2): permitted without asking only when all five auto-commit conditions hold — see
+    `relay verify <sid> --for-autocommit`, which prints CLEARED / NOT-CLEARED-BECAUSE-<reason>.
 
     State lives in the lead's own marker, so it is per-session and resets to the `autonomous_mode`
     config value on every fresh arm: you opt in when you're confident about THIS plan, rather than a
@@ -3080,7 +3128,8 @@ def cmd_auto(args):
         if on:
             print(f"autonomous mode is ON for lead '{project}' ({origin}) — proceeding by default on "
                   f"routine in-plan steps; the stop-list still stops, and committing executor work "
-                  f"always waits for you.")
+                  f"needs all five auto-commit conditions "
+                  f"(`relay verify <sid> --for-autocommit`) or it stops too.")
         else:
             print(f"autonomous mode is OFF for lead '{project}' ({origin}) — waiting for you on "
                   f"every approval beat. `relay auto on` flips it for this session.")
@@ -3095,9 +3144,14 @@ def cmd_auto(args):
         print(f"autonomous mode ON for lead '{project}' — proceed by default WITHIN the approved "
               f"plan; announce every autonomous action with what would have been asked. Still stops: "
               f"risk-flagged/failing/UNVERIFIED reports, core logic/ledgers/parity/migrations/deploys, "
-              f"irreversible or outward-facing actions, work not in the plan, genuine ambiguity — and "
-              f"COMMITTING executor work always stops for the human. `relay auto off` reverts; a fresh "
-              f"`/relay:mode` arm resets to config.")
+              f"irreversible or outward-facing actions, work not in the plan, genuine ambiguity.\n"
+              f"  COMMITTING an executor's work now has its own gate (#16 phase 2) rather than always "
+              f"stopping: it is permitted without asking ONLY when all five hold — (1) verify says "
+              f"COUNTS-MATCH, (2) TL;DR is clean/none/none, (3) the packet was in the approved plan, "
+              f"(4) nothing sign-off-gated is touched, (5) you have READ the staged diff. Check it "
+              f"with: relay verify <sid> --for-autocommit --in-plan --diff-reviewed  (pass the last "
+              f"two only if true). Anything else → stop and ask, naming the condition.\n"
+              f"  `relay auto off` reverts; a fresh `/relay:mode` arm resets to config.")
     else:
         print(f"autonomous mode OFF for lead '{project}' — back to announce-and-wait on every "
               f"approval beat.")
@@ -3545,6 +3599,15 @@ def main():
                     help="also re-run the pytest-shaped commands the report declares, in its "
                          "worktree, and compare the passed counts (off by default so verify stays "
                          "fast; non-pytest and shell-metacharacter commands are never run)")
+    vf.add_argument("--for-autocommit", dest="for_autocommit", action="store_true",
+                    help="also evaluate the five #16-phase-2 auto-commit conditions and print "
+                         "CLEARED / NOT-CLEARED-BECAUSE-<reason>. Exits 0 only when fully cleared")
+    vf.add_argument("--in-plan", dest="in_plan", action="store_true",
+                    help="lead's attestation (condition 3): this packet was in the approved plan. "
+                         "Not machine-knowable — without it, clearance is refused")
+    vf.add_argument("--diff-reviewed", dest="diff_reviewed", action="store_true",
+                    help="lead's attestation (condition 5): the lead has READ the staged diff. "
+                         "Not machine-knowable — without it, clearance is refused")
     vf.set_defaults(func=cmd_verify)
 
     fc = sub.add_parser("focus")

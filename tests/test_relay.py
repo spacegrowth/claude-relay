@@ -3130,6 +3130,109 @@ class TestVerify:
         assert self._run(relay, "e1") == 1  # claims a file nothing can confirm → MISMATCH, no crash
 
 
+class TestVerifyForAutocommit:
+    """`relay verify <sid> --for-autocommit` (#16 phase 2) — the CLI seam of the auto-commit gate.
+    The clearance LOGIC is unit-tested in tests/test_report_verify.py; this pins the wiring: the
+    attestation flags, the exit code, and the ledger record.
+
+    Nothing here (or in the command) ever commits: the commit stays the lead's own action."""
+
+    def _run(self, relay, sid, **flags):
+        args = SimpleNamespace(session_id=sid, packet=None, rerun=False, for_autocommit=True,
+                               in_plan=flags.get("in_plan", False),
+                               diff_reviewed=flags.get("diff_reviewed", False))
+        with pytest.raises(SystemExit) as e:
+            relay.cmd_verify(args)
+        return e.value.code
+
+    def _events(self, relay, name):
+        return [json.loads(l) for l in relay.LEDGER.read_text().splitlines()
+                if json.loads(l)["event"] == name]
+
+    def _setup(self, relay, tmp_path, report=None, staged=("src.py",)):
+        tv = TestVerify()
+        repo = tv._repo(tmp_path, staged=staged)
+        tv._mk(relay, "e1", repo, report if report is not None else tv.REPORT)
+        return repo
+
+    def test_fully_cleared_exits_zero_and_prints_cleared(self, relay, tmp_path, capsys):
+        self._setup(relay, tmp_path)
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) == 0
+        assert "AUTO-COMMIT: CLEARED" in capsys.readouterr().out
+
+    def test_cleared_run_writes_an_auto_commit_event_with_verdict_and_diff_stat(
+            self, relay, tmp_path, capsys):
+        self._setup(relay, tmp_path)
+        self._run(relay, "e1", in_plan=True, diff_reviewed=True)
+        rec = self._events(relay, "auto_commit")[-1]
+        assert rec["session_id"] == "e1" and rec["packet"] == 1
+        assert rec["verdict"] == "COUNTS-MATCH" and rec["cleared"] is True
+        assert rec["files"] == 1 and rec["insertions"] >= 1
+        assert rec["in_plan"] is True and rec["diff_reviewed"] is True
+
+    def test_missing_attestations_do_not_clear_and_are_ledgered_as_blocked(
+            self, relay, tmp_path, capsys):
+        self._setup(relay, tmp_path)
+        assert self._run(relay, "e1") != 0
+        assert "NOT-CLEARED-BECAUSE-not-attested-in-plan" in capsys.readouterr().out
+        rec = self._events(relay, "auto_commit_blocked")[-1]
+        assert rec["cleared"] is False and rec["reason"] == "not-attested-in-plan"
+        assert not self._events(relay, "auto_commit")
+
+    def test_counts_match_that_fails_a_condition_still_exits_nonzero(self, relay, tmp_path, capsys):
+        """The trap this guards: the verdict is fine, so the verdict's own exit code is 0. In
+        --for-autocommit mode the exit code answers 'may the lead commit?', not 'is the verdict
+        clean?' — conflating them would auto-clear every unattested run."""
+        self._setup(relay, tmp_path)
+        assert self._run(relay, "e1", in_plan=True) != 0
+        assert "NOT-CLEARED-BECAUSE-not-attested-diff-reviewed" in capsys.readouterr().out
+
+    def test_signoff_gated_path_blocks_even_when_fully_attested(self, relay, tmp_path, capsys):
+        report = TestVerify.REPORT.replace("- src.py:1 — changed it.",
+                                           "- hooks/hook.py:1 — changed it.")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        tv = TestVerify()
+        tv._git(repo, "init", "-q")
+        (repo / "hooks").mkdir()
+        (repo / "hooks" / "hook.py").write_text("one\n")
+        tv._git(repo, "add", "-A")
+        tv._git(repo, "commit", "-m", "init")
+        (repo / "hooks" / "hook.py").write_text("changed\n")
+        tv._git(repo, "add", "hooks/hook.py")
+        tv._mk(relay, "e1", repo, report)
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) != 0
+        out = capsys.readouterr().out
+        assert "NOT-CLEARED-BECAUSE-signoff-gated-path-touched" in out
+        assert "hooks/hook.py" in out
+
+    def test_malformed_report_blocks_the_gate(self, relay, tmp_path, capsys):
+        self._setup(relay, tmp_path, report=TestVerify.REPORT.replace("UNVERIFIED: none\n", ""))
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) == 2
+        assert "NOT-CLEARED-BECAUSE-verdict-is-MALFORMED" in capsys.readouterr().out
+
+    def test_without_the_flag_no_clearance_block_and_no_auto_commit_event(
+            self, relay, tmp_path, capsys):
+        """A plain `relay verify` must stay exactly what it was — no clearance, nothing ledgered
+        about committing."""
+        self._setup(relay, tmp_path)
+        with pytest.raises(SystemExit):
+            relay.cmd_verify(SimpleNamespace(session_id="e1", packet=None, rerun=False,
+                                             for_autocommit=False, in_plan=False,
+                                             diff_reviewed=False))
+        assert "AUTO-COMMIT" not in capsys.readouterr().out
+        assert not self._events(relay, "auto_commit")
+        assert not self._events(relay, "auto_commit_blocked")
+
+    def test_the_caveat_still_prints_above_a_cleared_line(self, relay, tmp_path, capsys):
+        """The clearance block must never be readable on its own as 'the work is fine'."""
+        self._setup(relay, tmp_path)
+        self._run(relay, "e1", in_plan=True, diff_reviewed=True)
+        out = capsys.readouterr().out
+        assert 'must NEVER be read as "the report is true"' in out
+        assert "clears the AUTOMATION only" in out
+
+
 class TestSurfacedDedupOnReview:
     """§5b / task #17: the at-Stop wake path (lg.new_reports_for + lg.mark_surfaced) is the ONLY
     writer of a lead's surfaced_reports.json before this fix. Reviewing a report through any other

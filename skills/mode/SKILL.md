@@ -147,12 +147,43 @@ action is *more* visible than a normal one, not less.
 - genuine **ambiguity** the packet/plan can't resolve — i.e. exactly the exec→lead-question class,
   escalated one level up to lead→human.
 
-**AND — committing executor work ALWAYS stops for the human. No exception, in any posture.**
-Autonomous mode does *not* auto-commit. You may review a clean report and say what you'd commit, but
-the commit itself waits for the user's explicit go, every time. This is a deliberate phase-1
-boundary: auto-commit is deferred until the automated report-verifier exists, because "the report
-looked clean to me" is exactly the judgement that needs a machine check before it's worth trusting
-unattended. Do not treat `/relay:auto on` as approval to commit.
+**AND — committing executor work has its own gate on top of the posture (#16 phase 2).** It is not
+covered by `/relay:auto on` by itself. In autonomous mode you may commit an executor's work without
+asking **only when ALL FIVE of these hold**:
+
+1. **`relay verify` says `COUNTS-MATCH`.** `MISMATCH`, `MALFORMED` and `INCONCLUSIVE` always stop.
+2. **The report's TL;DR is `Status: clean`, `Risk flags: none`, `UNVERIFIED: none`.** Any other
+   value stops — **`clean-with-caveats` stops.** The caveats are the point.
+3. **The packet was in the approved plan.** Autonomy is *within* a plan, never expands it.
+4. **Nothing sign-off-gated is touched** — core logic, ledgers, parity/golden tests, migrations,
+   deploys. When working on relay itself, that also means `hooks/`, `lib/lead_guard.py`, and ledger
+   formats: the wake and gate paths autonomy itself rides on.
+5. **You have ACTUALLY READ the staged diff.** Not skimmed the report — read the diff, with
+   `/relay:diff <sid>`. The verifier gates the *automation*; it never replaces this step.
+
+Check it, don't eyeball it:
+
+```
+${CLAUDE_PLUGIN_ROOT}/bin/relay verify <session_id> --for-autocommit --in-plan --diff-reviewed
+```
+
+It prints `AUTO-COMMIT: CLEARED` or `AUTO-COMMIT: NOT-CLEARED-BECAUSE-<reason>`, and exits 0 only
+when cleared. Conditions 3 and 5 are **your attestations** — the tool cannot check them, so it
+refuses to clear unless you pass those flags. **Pass them only if they are actually true.** Passing
+`--diff-reviewed` without having read the diff is not a shortcut, it is a false statement in the
+ledger, and it defeats the only condition that was ever protecting the work.
+
+**On `NOT-CLEARED`: fall back to today's behaviour — stop and ask the user, naming the failed
+condition.** On `CLEARED`: commit, then announce with what you would have asked *and* the verify
+verdict line, e.g.:
+> `🚦 [relay] — proceeded: committed `tk-slug` packet 003 (COUNTS-MATCH, 6 files +212/-8, diff read)
+> — under manual mode this would have waited for your go.`
+
+**What a `CLEARED` does and does not mean.** It clears the *automation*, not the work. `COUNTS-MATCH`
+means some numbers agreed; it never means the report is true — premise-level wrongness (wrong
+oracle, wrong write-side, suite green in the wrong venv) is invisible to it. You own the commit and
+everything in it. If you find yourself reaching for `--diff-reviewed` to move faster, that is the
+signal to turn autonomous mode off, not to pass the flag.
 
 When you hit anything on that list, stop and ask — and say which item stopped you. Stopping is not a
 failure of the posture; it IS the posture working.

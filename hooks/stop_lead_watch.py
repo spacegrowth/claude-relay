@@ -134,8 +134,17 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg):
             "STOP and ask anyway if any of these applies: a risk flag / failing tests / UNVERIFIED "
             "claim bearing on correctness; core logic, ledgers, parity tests, migrations or deploys; "
             "an irreversible or outward-facing action; work not in the approved plan; genuine "
-            "ambiguity. AND COMMITTING an executor's work ALWAYS stops for the user — announce what "
-            "you would commit and ask. Say which stop-list item stopped you when one does.\n")
+            "ambiguity. Say which stop-list item stopped you when one does.\n\n"
+            "COMMITTING an executor's work is permitted without asking ONLY when ALL FIVE hold: "
+            "(1) `relay verify` says COUNTS-MATCH; (2) the report's TL;DR is Status: clean, Risk "
+            "flags: none, UNVERIFIED: none — clean-with-caveats STOPS; (3) the packet was in the "
+            "approved plan; (4) nothing sign-off-gated is touched (core logic, ledgers, "
+            "parity/golden tests, migrations, deploys — and in this repo hooks/, lib/lead_guard.py, "
+            "ledger formats); (5) you have ACTUALLY READ the staged diff. Run `relay verify "
+            "<sid> --for-autocommit --in-plan --diff-reviewed` and pass the last two flags only if "
+            "they are TRUE — it prints CLEARED or NOT-CLEARED-BECAUSE-<reason>. On NOT-CLEARED, "
+            "stop and ask, naming the condition. The verifier gates the AUTOMATION; it never "
+            "replaces your reading of the diff, and COUNTS-MATCH never means the report is true.\n")
     else:
         instruction = (
             "\n\nOpen your reply with the marker '🚦 [relay] — review needed:', surface these to the "

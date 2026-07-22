@@ -155,6 +155,8 @@ relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --whe
 /relay:verify <session_id> [--rerun]       machine-check a report against its staged reality:
                                             MALFORMED / MISMATCH / INCONCLUSIVE / COUNTS-MATCH
                                             (never "PASS" — see below for why that matters)
+relay verify <sid> --for-autocommit        the auto-commit gate: CLEARED / NOT-CLEARED-BECAUSE-…
+             [--in-plan] [--diff-reviewed]  (the two flags are the lead's own attestations)
 /relay:handoff <handoff.md>                 succeed this lead: pre-armed successor tab, then step down
 relay close-predecessor                    successor-only: close the outgoing lead's tab, on user go
 relay status [session_id] [--statusline]   read-only, statusline-safe one-liner (see below)
@@ -315,9 +317,29 @@ deciding things unilaterally** — it never expands the plan, and it stops on al
 - new work not in the approved plan;
 - genuine ambiguity the packet or plan can't resolve.
 
-**Committing executor work always stops for you** — in every posture, no exception. Auto-commit is
-deliberately not built yet; it waits on an automated report-verifier, because "the report looked
-clean to me" is exactly the judgement that needs a machine check before running unattended.
+**Committing executor work has its own gate on top of the posture.** Turning autonomous mode on does
+not by itself license a commit. In auto, the lead may commit without asking **only when all five of
+these hold**:
+
+1. `relay verify` says `COUNTS-MATCH` (`MISMATCH` / `MALFORMED` / `INCONCLUSIVE` always stop);
+2. the report's TL;DR is `Status: clean`, `Risk flags: none`, `UNVERIFIED: none` — **`clean-with-caveats` stops**;
+3. the packet was in the approved plan;
+4. nothing sign-off-gated is touched — core logic, ledgers, parity/golden tests, migrations, deploys (and, for relay's own repo, `hooks/`, `lib/lead_guard.py`, ledger formats);
+5. **the lead has actually read the staged diff.**
+
+```
+relay verify <session_id> --for-autocommit --in-plan --diff-reviewed
+```
+
+prints `AUTO-COMMIT: CLEARED` or `AUTO-COMMIT: NOT-CLEARED-BECAUSE-<reason>`, exits 0 only when
+cleared, and records an `auto_commit` ledger event with the verdict and diff stat. Conditions 3 and
+5 are not machine-knowable, so they are **the lead's explicit attestations** — without both flags
+the answer is always NOT-CLEARED, and a bare invocation can never clear by accident. Every
+NOT-CLEARED path falls back to stopping and asking, naming the failed condition.
+
+This is the one place the verifier's own caveat matters most: **it gates the automation, it does not
+replace the review.** `COUNTS-MATCH` means some numbers agreed — never that the report is true. That
+is exactly why condition 5 exists and why no amount of green output removes it.
 
 Autonomy never becomes silence: every autonomous action is announced *with the round-trip it
 replaced* ("proceeded: sent packet 003 — under manual mode this would have waited for your go"),
@@ -333,8 +355,9 @@ either direction.
 
 While the lead sits idle, a Stop hook watches in the background. When an executor's report lands,
 the lead **wakes**, announces what's ready, and **waits for your direction** — it never auto-reviews
-or auto-commits (unless you've turned on [autonomous mode](#autonomous-mode), which still never
-auto-commits). You also get a macOS notification naming the project and executor. Three tiers,
+or auto-commits (unless you've turned on [autonomous mode](#autonomous-mode), where committing still
+needs all five auto-commit conditions above). You also get a macOS notification naming the project
+and executor. Three tiers,
 first one that applies wins:
 
 **A second layer underneath.** Every spawned executor is also armed with its own Stop hook — a

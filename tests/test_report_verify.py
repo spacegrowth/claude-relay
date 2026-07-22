@@ -432,3 +432,127 @@ class TestRenderShape:
     def test_header_names_session_and_packet(self):
         out = rendered(rv.verify(GOOD_REPORT, reality()), sid="rl-verify", packet=7)
         assert "rl-verify" in out and "packet 007" in out
+
+
+# ── auto-commit clearance (#16 phase 2) ───────────────────────────────────────────────────────
+def cleared_lines(clr):
+    return "\n".join(line for line, _ in rv.render_clearance(clr))
+
+
+def clr_for(report=GOOD_REPORT, staged=("src/app.py",), staged_diff="", **attest):
+    attest.setdefault("in_plan", True)
+    attest.setdefault("diff_reviewed", True)
+    return rv.clearance(rv.verify(report, reality(staged=staged)), staged_diff, **attest)
+
+
+class TestClearanceConditions:
+    """The gate that lets an autonomous lead commit without asking. All five must hold; the
+    headline names the FIRST failure in numeric order so the announce can cite one condition."""
+
+    def test_all_five_holding_clears(self):
+        clr = clr_for()
+        assert clr["cleared"] is True
+        assert clr["reason"] is None
+        assert "AUTO-COMMIT: CLEARED" in cleared_lines(clr)
+
+    @pytest.mark.parametrize("staged,expected_verdict", [
+        (["other.py"], rv.MISMATCH),  # report claims src/app.py, nothing staged matches
+    ])
+    def test_condition_1_non_counts_match_verdict_stops(self, staged, expected_verdict):
+        clr = clr_for(staged=staged)
+        assert clr["cleared"] is False
+        assert clr["reason"] == f"verdict-is-{expected_verdict}"
+
+    def test_condition_1_malformed_stops(self):
+        clr = clr_for(report=GOOD_REPORT.replace("UNVERIFIED: none\n", ""))
+        assert clr["reason"] == "verdict-is-MALFORMED"
+
+    def test_condition_2_clean_with_caveats_stops(self):
+        """Named explicitly in the doctrine: the caveats are the point."""
+        clr = clr_for(report=GOOD_REPORT.replace("Status: clean", "Status: clean-with-caveats"))
+        assert clr["cleared"] is False
+        assert clr["reason"] == "status-not-clean"
+
+    def test_condition_2_risk_flags_stop(self):
+        clr = clr_for(report=GOOD_REPORT.replace("Risk flags: none",
+                                                 "Risk flags: weakened a parity assertion"))
+        assert clr["reason"] == "risk-flags-present"
+
+    def test_condition_2_unverified_claims_stop(self):
+        clr = clr_for(report=GOOD_REPORT.replace("UNVERIFIED: none",
+                                                 "UNVERIFIED: assumed the CI venv matches"))
+        assert clr["reason"] == "unverified-claims-present"
+
+    def test_condition_3_requires_the_in_plan_attestation(self):
+        clr = clr_for(in_plan=False)
+        assert clr["cleared"] is False
+        assert clr["reason"] == "not-attested-in-plan"
+
+    def test_condition_5_requires_the_diff_reviewed_attestation(self):
+        clr = clr_for(diff_reviewed=False)
+        assert clr["cleared"] is False
+        assert clr["reason"] == "not-attested-diff-reviewed"
+
+    def test_a_bare_call_can_never_clear(self):
+        """The safety property: attestations default off, so nothing that forgets to assert them
+        can be read as clearance."""
+        clr = rv.clearance(rv.verify(GOOD_REPORT, reality()), "")
+        assert clr["cleared"] is False
+
+    def test_attestations_are_marked_as_uncheckable_in_the_output(self):
+        out = cleared_lines(clr_for())
+        assert out.count("[lead's attestation — this tool cannot check it]") == 2
+
+    def test_cleared_output_says_it_clears_automation_not_correctness(self):
+        out = cleared_lines(clr_for())
+        assert "clears the AUTOMATION only" in out
+        assert "not a statement that the work is correct" in out
+
+    def test_not_cleared_output_says_fall_back_to_asking(self):
+        out = cleared_lines(clr_for(in_plan=False))
+        assert "NOT-CLEARED-BECAUSE-not-attested-in-plan" in out
+        assert "stop and ask" in out
+
+    def test_first_failure_in_numeric_order_is_the_headline(self):
+        """Verdict (1) outranks the attestations (3, 5) so the lead is pointed at the earliest
+        problem rather than the last one evaluated."""
+        clr = clr_for(report=GOOD_REPORT.replace("UNVERIFIED: none\n", ""), in_plan=False,
+                      diff_reviewed=False)
+        assert clr["reason"] == "verdict-is-MALFORMED"
+
+    def test_every_condition_is_reported_even_when_one_fails(self):
+        clr = clr_for(in_plan=False)
+        assert [c["n"] for c in clr["conditions"]] == [1, 2, 3, 4, 5]
+
+
+class TestSignoffGating:
+    """Condition 4. Blunt substring matching on purpose: a false 'sign-off needed' costs one
+    question, a false clearance costs trust."""
+
+    @pytest.mark.parametrize("path", [
+        "hooks/stop_lead_watch.py", "lib/lead_guard.py", "db/migrations/001.sql",
+        "tests/test_parity.py", "tests/golden/out.json", "schema/user.sql", "deploy/run.sh"])
+    def test_signoff_gated_paths_stop_clearance(self, path):
+        report = GOOD_REPORT.replace("- src/app.py:2 — appended the new line.",
+                                     f"- {path}:1 — changed it.")
+        clr = clr_for(report=report, staged=[path])
+        assert clr["cleared"] is False
+        assert clr["reason"] == "signoff-gated-path-touched"
+        assert path in cleared_lines(clr)
+
+    def test_ordinary_paths_do_not_trip_it(self):
+        assert rv.signoff_hits(["src/app.py", "README.md"]) == []
+
+    def test_ledger_format_edits_stop_clearance(self):
+        """A ledger change is a shape of edit, not a path — detected in the staged diff."""
+        clr = clr_for(staged_diff="+    append_ledger(\"auto_commit\", session_id=x)\n")
+        assert clr["cleared"] is False
+        assert clr["reason"] == "signoff-gated-path-touched"
+        assert "ledger format" in cleared_lines(clr)
+
+    def test_an_unrelated_diff_does_not_trip_the_ledger_check(self):
+        assert rv.signoff_hits(["src/app.py"], "+    print('hello')\n") == []
+
+    def test_signoff_hit_reports_a_reason_per_path(self):
+        hits = rv.signoff_hits(["hooks/x.py"])
+        assert len(hits) == 1 and "wake/gate" in hits[0][1]

@@ -66,8 +66,10 @@ LEAD_DEFAULTS = {
                                   # way `relay auto on|off` flips it mid-session; the posture lives
                                   # in the lead's own marker, so it is per-session and resets to
                                   # this config value on every fresh arm rather than persisting
-                                  # silently. Auto NEVER covers committing executor work — see
-                                  # cmd_auto in bin/relay and skills/mode/SKILL.md's stop-list.
+                                  # silently. Auto does NOT by itself cover committing executor work:
+                                  # that has its own five-condition gate (#16 phase 2) — see
+                                  # report_verify.clearance, `relay verify --for-autocommit`, and
+                                  # skills/mode/SKILL.md's stop-list.
     "executor_escalation": True,  # arm every spawned executor with the escalation Stop hook
                                   # (wake-watch design §9): once its report lands and it goes idle,
                                   # push a nudge into the owning lead's tab, once. A net UNDER the

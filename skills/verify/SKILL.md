@@ -78,5 +78,32 @@ where to look harder:
   check the premise (was the executor even solving the right problem?), and check the risk flags
   it echoed back at you.
 
-**Do not wire this into an auto-commit path.** #16 phase 2 is a separate, user-approved step; a
-zero exit code from this command is not, on its own, permission to commit anything.
+## The auto-commit gate (`--for-autocommit`, #16 phase 2)
+
+A plain zero exit from this command is **not** permission to commit anything. Auto-commit has its
+own gate: five conditions that must ALL hold before an autonomous lead may commit an executor's work
+without asking.
+
+```
+${CLAUDE_PLUGIN_ROOT}/bin/relay verify $session_id --for-autocommit --in-plan --diff-reviewed
+```
+
+1. this command's verdict is `COUNTS-MATCH`;
+2. the report's TL;DR is `Status: clean`, `Risk flags: none`, `UNVERIFIED: none` (**`clean-with-caveats` stops**);
+3. the packet was in the approved plan;
+4. nothing sign-off-gated is touched (core logic, ledgers, parity/golden tests, migrations, deploys —
+   and for relay's own repo, `hooks/`, `lib/lead_guard.py`, ledger formats);
+5. the lead has **actually read the staged diff**.
+
+It prints `AUTO-COMMIT: CLEARED` or `AUTO-COMMIT: NOT-CLEARED-BECAUSE-<reason>`, exits 0 only when
+fully cleared, and writes an `auto_commit` (or `auto_commit_blocked`) ledger event with the verdict
+and diff stat.
+
+Conditions 3 and 5 are **not machine-knowable**, so they are your explicit attestations via
+`--in-plan` and `--diff-reviewed`. Without both, the answer is always NOT-CLEARED — a bare
+invocation can never clear by accident. **Pass them only if they are true.** `--diff-reviewed` when
+you have not read the diff is a false statement recorded in the ledger, and it defeats the one
+condition protecting the work.
+
+And the point that governs all five: **this gates the automation, not the review.** A `COUNTS-MATCH`
+means some numbers agreed. It never means the report is true.

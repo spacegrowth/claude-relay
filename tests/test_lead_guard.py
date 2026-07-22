@@ -1219,12 +1219,29 @@ class TestAutonomousPosture:
         assert "ON" in out and "relay auto" in out        # origin: set by command this session
 
     def test_auto_on_output_names_the_commit_boundary(self, relay, root, capsys):
-        # Turning it on must SAY that committing still stops — the phase-1 boundary is worthless if
-        # the human only learns it by reading the source.
+        # Turning it on must SAY where the commit boundary now sits — a boundary the human only
+        # learns by reading the source is worthless. Phase 1's boundary was a flat "committing
+        # always stops"; #16 phase 2 replaces it with the five-condition gate, so the message has
+        # to carry the conditions and how to check them. Weaker text here would hand someone a
+        # proceed-by-default posture without telling them what still gates the commit.
         self._arm(relay)
         capsys.readouterr()
         self._auto(relay, "on")
-        assert "COMMITTING executor work always stops" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "COMMITTING an executor's work now has its own gate" in out
+        assert "ONLY when all five hold" in out
+        assert "--for-autocommit" in out
+        assert "--in-plan" in out and "--diff-reviewed" in out
+        assert "only if true" in out          # the attestations are not a formality
+        assert "stop and ask" in out          # and the fallback is still the old behaviour
+
+    def test_auto_status_on_names_the_commit_gate_too(self, relay, root, capsys):
+        self._arm(relay)
+        self._auto(relay, "on")
+        capsys.readouterr()
+        self._auto(relay, "status")
+        out = capsys.readouterr().out
+        assert "five auto-commit conditions" in out and "--for-autocommit" in out
 
     def test_auto_refuses_non_lead(self, relay):
         with pytest.raises(SystemExit):
@@ -1353,8 +1370,54 @@ class TestAutonomousPosture:
         assert "AUTONOMOUS MODE" in err
         assert "WAIT for their direction" not in err
         # ...and it must carry the boundaries with it, not just the licence to proceed.
-        assert "COMMITTING an executor's work ALWAYS stops" in err
         assert "would have asked" in err
+
+    # The phase-1 rule this replaced was "COMMITTING an executor's work ALWAYS stops for the user".
+    # #16 phase 2 retires that flat stop in favour of a five-condition gate, so the wake text now
+    # has to carry the CONDITIONS — a wake that only said "you may commit now" would be strictly
+    # more dangerous than the text it replaced.
+
+    def test_wake_carries_all_five_auto_commit_conditions(self, relay, root, monkeypatch, capsys):
+        self._arm(relay)
+        self._auto(relay, "on")
+        err = self._wake_text(root, "sess-1", monkeypatch, capsys)
+        assert "ONLY when ALL FIVE hold" in err
+        assert "COUNTS-MATCH" in err                       # 1
+        assert "clean-with-caveats STOPS" in err           # 2
+        assert "approved plan" in err                      # 3
+        assert "sign-off-gated" in err                     # 4
+        assert "ACTUALLY READ the staged diff" in err      # 5
+
+    def test_wake_names_the_clearance_command_and_the_not_cleared_fallback(
+            self, relay, root, monkeypatch, capsys):
+        self._arm(relay)
+        self._auto(relay, "on")
+        err = self._wake_text(root, "sess-1", monkeypatch, capsys)
+        assert "--for-autocommit" in err
+        assert "--in-plan" in err and "--diff-reviewed" in err
+        assert "only if they are TRUE" in err
+        assert "NOT-CLEARED" in err and "stop and ask" in err
+
+    def test_wake_keeps_the_verifier_temper_at_the_commit_beat(
+            self, relay, root, monkeypatch, capsys):
+        """§9, binding hardest here: the machine check gates the AUTOMATION, it never replaces the
+        lead reading the diff, and COUNTS-MATCH never means the report is true."""
+        self._arm(relay)
+        self._auto(relay, "on")
+        err = self._wake_text(root, "sess-1", monkeypatch, capsys)
+        assert "gates the AUTOMATION" in err
+        assert "never replaces your reading of the diff" in err
+        assert "COUNTS-MATCH never means the report is true" in err
+
+    def test_manual_wake_is_unchanged_by_the_auto_commit_gate(
+            self, relay, root, monkeypatch, capsys):
+        """A manual lead must not learn about auto-commit from its wake — that posture still
+        waits on everything."""
+        self._arm(relay)
+        err = self._wake_text(root, "sess-1", monkeypatch, capsys)
+        assert "--for-autocommit" not in err
+        assert "ALL FIVE" not in err
+        assert "WAIT for their direction" in err
 
 
 class TestWakeHookState:

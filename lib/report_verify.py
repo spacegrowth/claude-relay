@@ -404,6 +404,135 @@ def verify(report_text, reality):
             "declared_commands": declared_commands(report_text), "rerun": rerun}
 
 
+# ── auto-commit clearance (task #16 phase 2, §6f + §9) ────────────────────────────────────────
+# The gate that lets an autonomous lead commit an executor's work WITHOUT asking. Five conditions,
+# ALL required. This module can only ever check three of them; the other two are the lead's, and
+# the design point is that it must say so rather than quietly scoring 3/5 as a pass.
+#
+# §9 is binding here more than anywhere else in this file: **the verifier gates the AUTOMATION, it
+# never replaces the lead reading the diff.** A COUNTS-MATCH is the ceiling of what the machine
+# knows (see CAVEAT) — it is a necessary condition for auto-commit, never a sufficient one. That is
+# exactly why conditions 3 and 5 exist and why they are attestations rather than inferences: if
+# this tool guessed at them, it would be manufacturing the very "the report looked clean" judgement
+# that #16 phase 2 was blocked on until #7 existed.
+CLEARED = "CLEARED"
+
+# Condition 4's sign-off list. The generic entries are the §6f stop-list ("core logic, ledgers,
+# parity/golden tests, migrations, deploys"); the relay/* entries are THIS repo's own dogfooding
+# instances of it, named by the packet. Substring match on the repo-relative path — deliberately
+# blunt, because a false "sign-off needed" costs one question and a false clearance costs trust.
+SIGNOFF_PATH_MARKERS = [
+    ("hooks/", "relay's hooks — the wake/gate paths autonomy itself rides on"),
+    ("lib/lead_guard.py", "relay's lead-guard: wake, gate and marker state"),
+    ("migration", "migrations"),
+    ("parity", "parity tests"),
+    ("golden", "golden tests"),
+    ("schema", "schema definitions"),
+    ("deploy", "deploy paths"),
+]
+# Ledger FORMAT changes are sign-off-gated too, and they are not a path — they are a shape of edit.
+# Cheap deterministic proxy: the staged diff adds or removes a ledger-write call.
+_LEDGER_EDIT_RE = re.compile(r"^[+-].*append_ledger\s*\(", re.MULTILINE)
+
+
+def signoff_hits(staged, staged_diff=""):
+    """[(path_or_marker, why)] for every sign-off-gated thing this staged work touches. Empty list
+    ⇒ condition 4 holds."""
+    hits = []
+    for path in staged:
+        for marker, why in SIGNOFF_PATH_MARKERS:
+            if marker in path:
+                hits.append((path, why))
+                break
+    if staged_diff and _LEDGER_EDIT_RE.search(staged_diff):
+        hits.append(("(ledger format)", "the staged diff adds or removes an append_ledger call"))
+    return hits
+
+
+def clearance(result, staged_diff="", in_plan=False, diff_reviewed=False):
+    """Evaluate the five auto-commit conditions. Returns
+    {cleared: bool, reason: str|None, conditions: [{n, name, ok, detail, checkable}]}.
+
+    `reason` is the slug for the NOT-CLEARED-BECAUSE-<reason> line — the FIRST failed condition in
+    numeric order, so the headline is stable and the lead is pointed at the earliest problem.
+    Pure: the caller supplies the attestations, this never infers them."""
+    tldr = result["tldr"]
+    conds = []
+
+    v = result["verdict"]
+    conds.append({"n": 1, "name": "verify verdict is COUNTS-MATCH", "checkable": True,
+                  "ok": v == COUNTS_MATCH, "detail": f"verdict is {v}",
+                  "slug": f"verdict-is-{v}"})
+
+    # Condition 2 — all three TL;DR fields, each failing with its own slug so the announce can name
+    # WHICH one stopped it. `clean-with-caveats` stops: the caveats are the point.
+    status_ok = (tldr["status"] or "").strip().rstrip(".").lower() == "clean"
+    risk_ok = is_none_value(tldr["risk_flags"])
+    unver_ok = is_none_value(tldr["unverified"])
+    if not status_ok:
+        detail, slug = f"Status is {tldr['status']!r}, not 'clean'", "status-not-clean"
+    elif not risk_ok:
+        detail, slug = f"Risk flags: {tldr['risk_flags']}", "risk-flags-present"
+    elif not unver_ok:
+        detail, slug = f"UNVERIFIED: {tldr['unverified']}", "unverified-claims-present"
+    else:
+        detail, slug = "Status: clean / Risk flags: none / UNVERIFIED: none", "tldr-not-clean"
+    conds.append({"n": 2, "name": "TL;DR is clean / none / none", "checkable": True,
+                  "ok": status_ok and risk_ok and unver_ok, "detail": detail, "slug": slug})
+
+    conds.append({"n": 3, "name": "the packet was in the approved plan", "checkable": False,
+                  "ok": bool(in_plan), "slug": "not-attested-in-plan",
+                  "detail": ("attested by the lead (--in-plan)" if in_plan else
+                             "NOT attested — autonomy is within the plan, never expands it")})
+
+    hits = signoff_hits(result["staged"], staged_diff)
+    conds.append({"n": 4, "name": "nothing sign-off-gated is touched", "checkable": True,
+                  "ok": not hits, "slug": "signoff-gated-path-touched",
+                  "detail": ("; ".join(f"{p} ({w})" for p, w in hits) if hits
+                             else "no sign-off-gated path in the staged set")})
+
+    conds.append({"n": 5, "name": "the lead has READ the staged diff", "checkable": False,
+                  "ok": bool(diff_reviewed), "slug": "not-attested-diff-reviewed",
+                  "detail": ("attested by the lead (--diff-reviewed)" if diff_reviewed else
+                             "NOT attested — the verifier gates the automation, it never "
+                             "replaces reading the diff")})
+
+    failed = [c for c in conds if not c["ok"]]
+    return {"cleared": not failed, "reason": failed[0]["slug"] if failed else None,
+            "conditions": conds, "signoff_hits": hits}
+
+
+def render_clearance(clr):
+    """The --for-autocommit block as (line, styles) pairs, appended under the normal verify output.
+
+    Note what CLEARED does and does not assert: conditions 3 and 5 are the LEAD's attestations,
+    passed in as flags. A CLEARED line therefore means "the machine-checkable conditions hold AND
+    the lead asserted the other two" — it is a record of a decision, not a discovery. The block
+    says so on every run so the line can't be quoted out of that context later."""
+    L = []
+
+    def add(text="", *styles):
+        L.append((text, styles))
+
+    add("─" * 74, "dim")
+    add("  AUTO-COMMIT CLEARANCE (#16 phase 2) — all five conditions must hold", "bold")
+    for c in clr["conditions"]:
+        mark = "✓" if c["ok"] else "✗"
+        who = "" if c["checkable"] else "  [lead's attestation — this tool cannot check it]"
+        add(f"    {mark} {c['n']}. {c['name']}{who}", *(("dim",) if c["ok"] else ("red",)))
+        add(f"         {c['detail']}", "dim")
+    add()
+    if clr["cleared"]:
+        add(f"  AUTO-COMMIT: {CLEARED}", "yellow", "bold")
+        add("  This clears the AUTOMATION only. It is not a statement that the work is correct —", "yellow")
+        add("  see the caveat above. The lead owns the commit and everything in it.", "yellow")
+    else:
+        add(f"  AUTO-COMMIT: NOT-CLEARED-BECAUSE-{clr['reason']}", "red", "bold")
+        add("  Fall back to today's behaviour: stop and ask the user, naming the condition above.", "red")
+    add("─" * 74, "dim")
+    return L
+
+
 # ── rendering ─────────────────────────────────────────────────────────────────────────────────
 # Returns (text, styles) pairs so bin/relay can colour without this module importing a terminal
 # layer — and so tests can assert on the text of every line, including the caveat.
