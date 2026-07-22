@@ -1593,6 +1593,253 @@ class TestCloseTab:
         kill.assert_not_called()
 
 
+REPORT_001 = """Export button ships behind the existing exporter; 4 tests, suite green, staged.
+
+Status: clean
+Risk flags: none
+UNVERIFIED: the Safari download path — only tested in Chrome.
+Changed: toolbar + exporter wiring.
+
+## What changed
+- src/toolbar.tsx:88 — new button
+"""
+
+
+class TestReportTldr:
+    """_report_tldr lifts exactly the lead-facing fields out of a report: the first-line outcome
+    plus the three mandated TL;DR lines. Everything else in a report is detail the seed links to."""
+
+    def test_extracts_outcome_and_tldr_fields(self, relay):
+        t = relay._report_tldr(REPORT_001)
+        assert t["outcome"] == "Export button ships behind the existing exporter; 4 tests, suite green, staged."
+        assert t["status"] == "clean"
+        assert t["risk"] == "none"
+        assert t["unverified"] == "the Safari download path — only tested in Chrome."
+
+    def test_missing_fields_are_none_not_an_error(self, relay):
+        # a malformed report (no TL;DR block at all) must degrade to a thinner entry, never raise
+        t = relay._report_tldr("it worked I think\n\nsome prose\n")
+        assert t["outcome"] == "it worked I think"
+        assert (t["status"], t["risk"], t["unverified"]) == (None, None, None)
+
+    def test_bulleted_tldr_lines_are_read(self, relay):
+        # real reports sometimes bullet the TL;DR block; the leading marker must not hide the field
+        t = relay._report_tldr("done\n\n- Status: partial\n- UNVERIFIED: none\n")
+        assert t["status"] == "partial" and t["unverified"] == "none"
+
+    def test_first_match_wins_over_later_prose(self, relay):
+        # the TL;DR block is authoritative; a later section repeating "Status:" must not overwrite it
+        t = relay._report_tldr("done\nStatus: clean\n\n## Detail\nStatus: not really\n")
+        assert t["status"] == "clean"
+
+
+class TestSuccessorSeed:
+    """`relay retire` (backlog §6e-e3): the seed is derived from what is already on disk — the
+    session's packets and their reports — so retiring costs nothing from the session being retired
+    (and works on a dead/stalled one, which is exactly when it's needed most)."""
+
+    def _mk(self, relay, sid="e1", packets=(("001", REPORT_001), ("002", None)), status="reported"):
+        d = relay.packets_dir(sid)
+        d.mkdir(parents=True, exist_ok=True)
+        for n, report in packets:
+            (d / f"{n}-packet.md").write_text(f"Task {n} — do the {n} thing.\n\nmore detail\n")
+            if report is not None:
+                (d / f"{n}-report.md").write_text(report)
+        relay.write_session(sid, {"session_id": sid, "status": status, "tab_label": "[Exec] e1",
+            "pid": None, "current_packet": int(packets[-1][0]) if packets else 1, "topic": "csv export",
+            "scope": "export", "worktree": "/w", "model": "sonnet", "superseded_by": None,
+            "busy_since": relay.now()})
+
+    def _args(self, **over):
+        base = dict(session_id="e1", force=False, keep_tab=True)
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def _retire(self, relay, **over):
+        with mock.patch.object(relay.iterm, "close", return_value=True), \
+             mock.patch.object(relay, "pid_alive", return_value=False), \
+             mock.patch.object(relay.time, "sleep"):
+            relay.cmd_retire(self._args(**over))
+        return (relay.session_dir("e1") / relay.SEED_FILENAME).read_text()
+
+    # ── the seed's content contract ──────────────────────────────────────────
+    def test_entries_are_ordered_and_flag_the_unreported_one(self, relay):
+        self._mk(relay)
+        entries = relay.seed_entries("e1")
+        assert [e["n"] for e in entries] == ["001", "002"]
+        assert entries[0]["tldr"]["status"] == "clean"
+        assert entries[1]["tldr"] is None                     # 002 was never reported
+        assert entries[1]["report_path"] is None
+
+    def test_seed_has_every_contract_section(self, relay):
+        self._mk(relay)
+        seed = self._retire(relay)
+        for section in ("# Successor seed — e1", "## Territory", "## Packet index", "## Inherit with care"):
+            assert section in seed
+
+    def test_seed_carries_the_reported_packets_summaries(self, relay):
+        self._mk(relay)
+        seed = self._retire(relay)
+        assert "### 001 — Task 001 — do the 001 thing." in seed
+        assert "Export button ships behind the existing exporter" in seed   # outcome
+        assert "- Status: clean" in seed
+        assert "the Safari download path" in seed                            # the gotcha survives
+
+    def test_seed_flags_the_unreported_packet_as_no_report(self, relay):
+        self._mk(relay)
+        seed = self._retire(relay)
+        assert "### 002" in seed and "NO REPORT" in seed
+        assert "Packets worked: 2 (1 reported, 1 unreported)" in seed
+
+    def test_seed_records_the_inherited_territory(self, relay):
+        self._mk(relay)
+        seed = self._retire(relay)
+        assert "- Worktree: /w" in seed and "- Topic: csv export" in seed and "- Model: sonnet" in seed
+
+    def test_seed_is_not_a_transcript_dump(self, relay):
+        # the guarantee that makes the seed cheap to read: report DETAIL stays behind a link
+        self._mk(relay)
+        seed = self._retire(relay)
+        assert "src/toolbar.tsx:88" not in seed and "## What changed" not in seed
+        assert str(relay.packets_dir("e1") / "001-report.md") in seed      # linked, not inlined
+
+    def test_seed_survives_a_session_with_no_packets(self, relay):
+        self._mk(relay, packets=())
+        seed = self._retire(relay)
+        assert "Packets worked: 0" in seed and "there is no" in seed
+
+    # ── retire as a close variant ────────────────────────────────────────────
+    def test_retire_closes_as_superseded_by_seed(self, relay):
+        self._mk(relay)
+        self._retire(relay)
+        s = relay.read_session("e1")
+        assert s["status"] == "superseded"
+        assert s["superseded_by"] == relay.SEED_RETIRED_BY_SEED
+
+    def test_retire_closes_the_tab_like_close_does(self, relay):
+        self._mk(relay)
+        with mock.patch.object(relay.iterm, "close", return_value=True) as close, \
+             mock.patch.object(relay, "pid_alive", return_value=False), \
+             mock.patch.object(relay.time, "sleep"):
+            relay.cmd_retire(self._args(keep_tab=False))
+        close.assert_called_once()
+
+    def test_retire_is_ledgered_with_its_seed(self, relay):
+        self._mk(relay)
+        self._retire(relay)
+        events = [json.loads(l) for l in (relay.STATE_ROOT / "sessions.jsonl").read_text().splitlines()]
+        retired = [e for e in events if e["event"] == "retired"]
+        assert len(retired) == 1 and retired[0]["packets"] == 2 and retired[0]["forced"] is False
+        assert retired[0]["seed"].endswith(relay.SEED_FILENAME)
+
+    # ── refusals ─────────────────────────────────────────────────────────────
+    def test_refuses_unknown_session(self, relay):
+        with pytest.raises(SystemExit) as ei:
+            relay.cmd_retire(self._args(session_id="ghost"))
+        assert "no such session: ghost" in str(ei.value)
+
+    def test_refuses_busy_session_with_an_unreported_packet(self, relay):
+        # retiring mid-flight kills that packet unreported — the seed can't summarise what was
+        # never written, so this is the last moment the lead can choose to wait instead.
+        self._mk(relay, packets=(("001", REPORT_001), ("002", None)), status="busy")
+        with pytest.raises(SystemExit) as ei:
+            relay.cmd_retire(self._args())
+        assert "still busy on packet 002" in str(ei.value) and "--force" in str(ei.value)
+        assert not (relay.session_dir("e1") / relay.SEED_FILENAME).exists()   # refused = no seed
+        assert relay.read_session("e1")["status"] == "busy"                   # and not closed
+
+    def test_force_retires_a_busy_session_and_seeds_it_as_no_report(self, relay):
+        self._mk(relay, packets=(("001", REPORT_001), ("002", None)), status="busy")
+        seed = self._retire(relay, force=True)
+        assert "NO REPORT" in seed
+        assert relay.read_session("e1")["status"] == "superseded"
+
+    def test_busy_but_already_reported_needs_no_force(self, relay):
+        # busy alone isn't the problem — an unreported CURRENT packet is. A session that reported
+        # and is idling (still stamped busy until the next check) retires without ceremony.
+        self._mk(relay, packets=(("001", REPORT_001),), status="busy")
+        seed = self._retire(relay)
+        assert "NO REPORT" not in seed
+
+    def test_refuses_double_retire(self, relay):
+        self._mk(relay)
+        self._retire(relay)
+        with pytest.raises(SystemExit) as ei:
+            relay.cmd_retire(self._args())
+        assert "already retired" in str(ei.value) and relay.SEED_FILENAME in str(ei.value)
+
+
+class TestSpawnSeed:
+    """`relay spawn --seed`: how a fresh session consumes a retired one's seed. The seed is
+    inherited CONTEXT appended to the packet body — never a replacement for the task, and never
+    ahead of the GATES footer."""
+
+    def _spawn(self, relay, tmp_path, seed, sid="new-1"):
+        pkt = tmp_path / "packet.md"; pkt.write_text("Finish the export work.")
+        with mock.patch.object(relay.iterm, "spawn"), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt),
+                model=None, name=sid, scope=None, skip_perms=None, pane=None, seed=seed))
+        return (relay.packets_dir(sid) / "001-packet.md").read_text()
+
+    def _retired(self, relay, sid="old-1"):
+        """A retired session on disk, returning the path of its seed."""
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        (relay.packets_dir(sid) / "001-packet.md").write_text("Task 001 — do the 001 thing.")
+        (relay.packets_dir(sid) / "001-report.md").write_text(REPORT_001)
+        relay.write_session(sid, {"session_id": sid, "status": "reported", "tab_label": "l",
+            "pid": None, "current_packet": 1, "topic": "csv export", "scope": "export",
+            "worktree": "/w", "model": "sonnet", "superseded_by": None, "busy_since": relay.now()})
+        with mock.patch.object(relay.iterm, "close", return_value=True), \
+             mock.patch.object(relay, "pid_alive", return_value=False), \
+             mock.patch.object(relay.time, "sleep"):
+            relay.cmd_retire(SimpleNamespace(session_id=sid, force=False, keep_tab=True))
+        return relay.session_dir(sid) / relay.SEED_FILENAME
+
+    def test_seed_by_path_lands_in_the_packet(self, relay, tmp_path):
+        seed_path = self._retired(relay)
+        packet = self._spawn(relay, tmp_path, str(seed_path))
+        assert "# Successor seed — old-1" in packet
+        assert "Export button ships behind the existing exporter" in packet
+
+    def test_seed_by_retired_session_id_resolves(self, relay, tmp_path):
+        # the ergonomic form: `--seed old-1`, exactly what the retire message tells you to run
+        self._retired(relay)
+        assert "# Successor seed — old-1" in self._spawn(relay, tmp_path, "old-1")
+
+    def test_task_comes_first_and_gates_come_last(self, relay, tmp_path):
+        # ordering is load-bearing: the seed must never sit between the executor and its GATES
+        self._retired(relay)
+        packet = self._spawn(relay, tmp_path, "old-1")
+        assert packet.index("Finish the export work.") < packet.index("INHERITED CONTEXT") \
+            < packet.index("# Successor seed") < packet.index("GATES") < packet.index("REPORT FORMAT")
+
+    def test_seed_is_framed_as_context_not_instructions(self, relay, tmp_path):
+        self._retired(relay)
+        packet = self._spawn(relay, tmp_path, "old-1")
+        assert "not part of your task" in packet and "not a transcript and not" in packet
+
+    def test_unseeded_spawn_is_byte_identical_to_before(self, relay, tmp_path):
+        # --seed is strictly additive: omitting it must change nothing about a normal packet
+        with_none = self._spawn(relay, tmp_path, None, sid="a")
+        assert "INHERITED CONTEXT" not in with_none
+        assert with_none == relay.build_packet(
+            "Finish the export work.", str(relay.packets_dir("a") / "001-report.md"),
+            f"{relay.RELAY_BIN} diff a", relay.path_to_file_url(relay.packets_dir("a") / "001-diff.html"))
+
+    def test_refuses_a_seed_that_does_not_exist(self, relay, tmp_path):
+        with pytest.raises(SystemExit) as ei:
+            self._spawn(relay, tmp_path, "no-such-session")
+        assert "neither a readable file nor a retired session" in str(ei.value)
+
+    def test_a_bad_seed_refuses_before_any_session_is_created(self, relay, tmp_path):
+        # fail before the tab/session exist, so a typo'd --seed leaves no half-spawned wreckage
+        with pytest.raises(SystemExit):
+            self._spawn(relay, tmp_path, "no-such-session", sid="ghost")
+        assert relay.read_session("ghost") is None
+
+
 class TestRestartResume:
     """cmd_restart (fresh session, re-run packet) / cmd_resume (--resume, keep context). iterm.spawn,
     auto_trust, read_pid, read_iterm_id, pid_alive are mocked — no real iTerm/claude."""

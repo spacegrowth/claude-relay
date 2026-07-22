@@ -54,6 +54,7 @@ stateDiagram-v2
     stalled --> dead: tab also gone
     reported --> closed: relay close
     reported --> superseded: relay close --supersede
+    reported --> superseded: relay retire (+ successor-seed.md)
     busy --> closed: relay close (manual)
     dead --> [*]: relay prune (--days)
     closed --> [*]: relay prune (--days)

@@ -27,6 +27,11 @@ executor inherits your ownership — it's stamped with your lead id and project.
 (Call relay via `${CLAUDE_PLUGIN_ROOT}/bin/relay` — Claude Code substitutes the plugin's absolute
 path — not bare `relay`, which often isn't on the Bash tool's non-interactive PATH.)
 
+**Succeeding a retired session?** Pass `--seed <retired_session_id>` (or a path to its
+`successor-seed.md`) to inherit what that session did on this territory — its packet index and each
+report's outcome/risk/UNVERIFIED lines get appended to this packet as context, ahead of the GATES.
+See `/relay:retire`.
+
 (`--model` optional — omit for the default. Add `--name <label>` for a custom session name, or
 `--scope <tag>` for the short area tag shown in `/relay:list`. Add `--pane` to open this executor
 as a split pane in your own window instead of a tab (`--tab` to force a tab), overriding the

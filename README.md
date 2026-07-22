@@ -135,11 +135,13 @@ And the three nouns:
 
 ```
 /relay:mode                          adopt the lead role (arms the gate + auto-wake)
-/relay:spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL]
+/relay:spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL] [--seed SID|PATH]
 /relay:send  <session_id> <packet.md>      follow-up into the SAME session (reuse > respawn)
 /relay:check [<session_id> | --all]        busy / reported / stalled / dead
 /relay:list                                leads + active executors (closed hidden; --closed shows)
 /relay:close <session_id> [--supersede <new_id>]
+/relay:retire <session_id> [--force]       close it AND leave a successor-seed.md, so respawning
+                                            fresh over the same territory is cheap
 /relay:stop                                unarm: step down from lead mode (gate + auto-wake off)
 /relay:focus <session_id>                  jump to that session's tab/pane/window (executor or lead)
 /relay:resume <session_id>                 reopen a dead tab's conversation, context intact
@@ -348,6 +350,25 @@ This is a different tool from `relay resume`/`restart`: **resume/restart is for 
 recovery** (reopens the identical conversation, same context back). **Handoff is for WEIGHT**
 (deliberately starts a fresh context on a NEW session id). Use whichever matches the problem —
 a crashed tab needs its old context back; a bloated one needs to shed it.
+
+### Retiring a heavy executor
+
+Handoff is for a heavy **lead**. `/relay:retire <session_id>` is the same idea one level down, for a
+heavy **executor**: it closes the session exactly like `/relay:close`, but first writes a
+`successor-seed.md` into its state dir — an index of every packet it was sent, each with its
+report's outcome line, `Status`, `Risk flags` and `UNVERIFIED`, plus the worktree and topic it
+owned. It's an index, not a transcript: the detail stays in the linked reports, and it's generated
+from what's already on disk, so retiring costs the retired session nothing (and works fine on one
+that's already dead or stalled).
+
+Then spawn the successor with `relay spawn <worktree> <topic> <packet.md> --seed <retired_id>` — the
+seed is appended to the fresh executor's packet as inherited context (task first, seed second, GATES
+last), so it starts knowing the territory. The point is economics: picking up where a retired
+executor left off costs one packet-read instead of archaeology, which is what makes rotating a heavy
+session something you'll actually do rather than piling one more packet onto it.
+
+Retire refuses on a session that's still busy with an unreported packet — that work would die
+unsummarised — unless you pass `--force` (the packet is then seeded as `NO REPORT`).
 
 ## Telling tabs apart
 
