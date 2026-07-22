@@ -1705,6 +1705,55 @@ class TestResumeLead:
         cap = self._run(relay, "lead-1", force=True)
         assert cap["resume_id"] == "lead-1"              # launched despite the live pid
 
+    # ---- arm-time field stamping (§1) ---------------------------------------------------------
+    # write_marker rewrites the WHOLE marker, so any field cmd_resume_lead omits is DROPPED from a
+    # restored lead. These pin each field's intended re-stamp/preserve/reset semantics.
+
+    def test_lead_resume_records_backend(self, relay):
+        # §1: a restored lead used to carry no `backend` at all, so every nudge to it fell back to
+        # _probe_backend_for_tab (or, on 0/2+ matches, the caller's ambient guess — Defect A).
+        # cmd_resume_lead opened the new tab itself, so it can record this rather than guess.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="p", cwd="/w")
+        self._run(relay, "lead-1")
+        marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert marker["backend"] == relay.iterm.NAME
+        assert marker["backend"] in ("iterm", "terminal")
+
+    def test_lead_resume_restamps_stale_backend(self, relay):
+        # Re-stamped, not preserved: the restore spawns the tab under THIS invocation's backend,
+        # which may differ from whatever the crashed instance ran under (§1's open question).
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="p", cwd="/w",
+                                      backend="stale-backend")
+        self._run(relay, "lead-1")
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")["backend"] == relay.iterm.NAME
+
+    def test_lead_resume_preserves_started(self, relay):
+        # `started` means "when this lead began" and a restore is the SAME lead — it used to be
+        # silently reset to the restore time.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="p", cwd="/w",
+                                      started="2020-01-01T00:00:00")
+        self._run(relay, "lead-1")
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")["started"] == "2020-01-01T00:00:00"
+
+    def test_lead_resume_preserves_predecessor(self, relay):
+        # Dropping this stranded the handoff-zombie tab permanently: the successor's marker is the
+        # ONLY record of it, and `relay close-predecessor` reads it from there.
+        pred = {"session_id": "old-lead", "tab_label": "[Lead] p", "iterm_session": "w1t1p0:OLD"}
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="p", cwd="/w",
+                                      predecessor=pred)
+        self._run(relay, "lead-1")
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")["predecessor"] == pred
+
+    def test_lead_resume_resets_autonomous_posture(self, relay):
+        # §6f: the posture is per-session and opt-in-each-time — never preserved across an arm. A
+        # lead that had `relay auto on` comes back in the safe wait-for-human posture.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="p", cwd="/w",
+                                      autonomous=True, autonomous_source="command")
+        self._run(relay, "lead-1")
+        marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert marker["autonomous"] is False
+        assert marker["autonomous_source"] == "config"
+
     def test_executor_resume_unchanged_uses_claude_session(self, relay):
         # An executor sid still routes to the executor path (claude_session, not the sid).
         relay.packets_dir("e1").mkdir(parents=True, exist_ok=True)
@@ -2681,6 +2730,81 @@ class TestHandoff:
         assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1") != {}   # caller intact
         successors = [sid for sid in self._leads(relay) if sid != "lead-1"]
         assert successors == []                                                # no ghost
+
+    # ---- arm-time field stamping (§1) ---------------------------------------------------------
+    # cmd_handoff writes the successor's marker TWICE (pre-arm, then a refresh once the tab's
+    # iterm_session is known). Both must stamp the full field set — write_marker rewrites the whole
+    # marker, so a field passed only to the first write is dropped by the second.
+
+    def _successor(self, relay, tmp_path, monkeypatch, caller_marker_kwargs=None):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp",
+                                      cwd=str(tmp_path), **(caller_marker_kwargs or {}))
+        self._env(monkeypatch, "lead-1")
+        self._run(relay, self._md(tmp_path))
+        return [m for sid, m in self._leads(relay).items() if sid != "lead-1"][0]
+
+    def test_successor_records_backend(self, relay, tmp_path, monkeypatch):
+        # §1: the successor's marker used to have no `backend`, so every nudge to a handed-off lead
+        # went through _probe_backend_for_tab instead of being addressed. cmd_handoff spawns the
+        # successor's tab itself, so it knows the answer.
+        succ = self._successor(relay, tmp_path, monkeypatch)
+        assert succ["backend"] == relay.iterm.NAME
+        assert succ["backend"] in ("iterm", "terminal")
+
+    def test_successor_backend_survives_the_post_spawn_refresh(self, relay, tmp_path, monkeypatch):
+        # The second write (adding iterm_session) must not drop what the pre-arm stamped — proven
+        # by asserting both fields are present on the FINAL marker at once.
+        succ = self._successor(relay, tmp_path, monkeypatch)
+        assert succ["backend"] == relay.iterm.NAME
+        assert succ["iterm_session"] == "w1t1p0:NEW"
+
+    def test_successor_started_is_stable_across_both_writes(self, relay, tmp_path, monkeypatch):
+        # One `started` for one lead: the pre-arm and the refresh must not each default to their own
+        # now(), or the field would mean "when the tab finished opening".
+        stamps = iter(["2030-01-01T00:00:00", "2030-06-06T06:06:06"])
+        with mock.patch.object(relay, "now", lambda: next(stamps)):
+            succ = self._successor(relay, tmp_path, monkeypatch)
+        assert succ["started"] == "2030-01-01T00:00:00"
+
+    def test_successor_does_not_inherit_autonomous_posture(self, relay, tmp_path, monkeypatch):
+        # §6f: the posture is per-session and opt-in-each-time. A successor silently inheriting its
+        # predecessor's auto posture is exactly the unannounced inversion §6f warns against — the
+        # successor's aftercare /relay:mode is what applies (and announces) the config default.
+        succ = self._successor(relay, tmp_path, monkeypatch,
+                               {"autonomous": True, "autonomous_source": "command"})
+        assert succ["autonomous"] is False
+        assert succ["autonomous_source"] == "config"
+
+
+class TestLeadListTermColumn:
+    """`relay list`'s TERM cell: which terminal app hosts each lead's tab. A "?" is the degraded
+    state §1 is about — nudges to that lead are probe-or-guess rather than addressed — and it used
+    to be findable only by reading marker JSON."""
+
+    def _render(self, relay, capsys, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        capsys.readouterr()
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        return capsys.readouterr().out
+
+    def test_renders_recorded_backend(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd="/w",
+                                      backend="iterm")
+        out = self._render(relay, capsys, monkeypatch)
+        assert "TERM" in out                      # the column exists
+        assert "iterm" in out
+
+    def test_unrecorded_backend_renders_question_mark(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="legacy", cwd="/w")
+        out = self._render(relay, capsys, monkeypatch)
+        header, row = [l for l in out.splitlines() if "TERM" in l][0], \
+                      [l for l in out.splitlines() if l.startswith("legacy")][0]
+        assert row.split()[header.split().index("TERM")] == "?"
+
+    def test_term_cell_helper(self, relay):
+        assert relay._lead_term_cell({"backend": "terminal"}) == "terminal"
+        assert relay._lead_term_cell({"backend": None}) == "?"
+        assert relay._lead_term_cell({}) == "?"
 
 
 class TestClosePredecessor:

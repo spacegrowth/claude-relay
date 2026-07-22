@@ -933,9 +933,31 @@ def cmd_resume_lead(sid, force=False):
     # used to break `relay focus <lead>` after a restore) so last_active updates and the restored
     # lead looks fresh in `relay list`. iterm_session is captured above; None only on a capture
     # timeout, in which case behavior degrades to exactly what it was before this fix.
+    #
+    # write_marker writes the WHOLE marker, so every field this call omits is silently DROPPED from
+    # a lead that had it — the §1 disease. Each one below is therefore deliberate:
+    #   backend      — re-stamped, not preserved: `iterm.spawn` above just created this lead's new
+    #                  tab, so the backend hosting it is THIS invocation's, whatever the crashed
+    #                  instance ran under. That also settles §1's open "should a revive re-stamp
+    #                  backend" question for this path — we're not guessing, we opened the tab.
+    #   started      — PRESERVED: it means "when this lead began", and a restore is the same lead.
+    #   predecessor  — PRESERVED: it's the only record of the handoff-zombie tab `relay
+    #                  close-predecessor` closes, and dropping it stranded that tab permanently.
+    #   autonomous   — RESET to the safe wait-for-human posture, never preserved (§6f: it is
+    #                  opt-in-each-time and resets on arm; see write_marker's own docstring). Left
+    #                  at False rather than read from `autonomous_mode` config on purpose:
+    #                  cmd_lead_start is the one site that applies that config, and it ANNOUNCES an
+    #                  auto arm in its output. Stamping auto from here would arm a lead into the
+    #                  inverted posture with nothing said — the silent autonomy §6f warns against.
+    #                  The restore nudge tells the lead to re-run `relay lead-start`, which applies
+    #                  the config default and announces it, so nothing is lost by waiting for that.
     lead_guard.write_marker(STATE_ROOT, sid, model=model, project=project, cwd=cwd,
                             tab_label=label, color=color, iterm_session=iterm_session,
-                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout())
+                            plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
+                            backend=iterm.NAME,
+                            started=marker.get("started"),
+                            predecessor=marker.get("predecessor"),
+                            autonomous=False, autonomous_source="config")
     append_ledger("lead_resumed", session_id=sid, project=project)
     print(f"restored lead '{project}' (session {sid}) — reopening its conversation")
 
@@ -1426,6 +1448,15 @@ def _lead_auto_cell(m):
     return ("AUTO", ("yellow", "bold")) if on else ("-", ("dim",))
 
 
+def _lead_term_cell(m):
+    """`relay list`'s TERM cell for one lead marker: which terminal app hosts its tab. A dim "?"
+    means the marker has no recorded `backend`, so every nudge to that lead has to fall back to
+    _probe_backend_for_tab — which only resolves when exactly one backend has a matching tab, and
+    otherwise degrades to the caller's ambient guess (§1, Defect A). Rendering it makes that
+    degraded state visible instead of something you only find by reading marker JSON."""
+    return m.get("backend") or "?"
+
+
 def cmd_list(args):
     # LEADS are ALWAYS shown in full — you always want to see/restore any project, regardless of
     # which lead is asking. Executor scoping is separate (below).
@@ -1515,6 +1546,10 @@ def cmd_list(args):
             # silence — a lead acting on its own has to be MORE visible here, not less — so an auto
             # lead gets a loud stamp while the ordinary manual posture renders as a quiet dash.
             ("AUTO", 4, [_lead_auto_cell(m)[0] for m in leads]),
+            # TERM: which terminal app hosts this lead's tab, from its marker. "?" = unrecorded, so
+            # nudges to it are probe-or-guess rather than addressed (§1) — the same "you can only
+            # find this by reading JSON" blind spot the VER/WAKE cells already exist to remove.
+            ("TERM", 8, [_lead_term_cell(m) for m in leads]),
             ("LAST ACTIVE", 12, [_lead_age_cell(m) for m in leads]),
         ]
         lead_widths = {name: min(cap, max(len(name), max((len(str(v)) for v in vals), default=0)))
@@ -1526,6 +1561,7 @@ def cmd_list(args):
         for m in leads:
             wake_text, wake_styles = _WAKE_CELL[wake_states[m.get("session_id")]]
             auto_text, auto_styles = _lead_auto_cell(m)
+            term_text = _lead_term_cell(m)
             row_parts = [
                 cell(m.get("project") or "-", lead_widths["PROJECT"]),
                 cell(m.get("session_id") or "-", lead_widths["SESSION"]),
@@ -1533,6 +1569,10 @@ def cmd_list(args):
                 cell(m.get("plugin_version") or "?", lead_widths["VER"]),
                 c(cell(wake_text, lead_widths["WAKE"]), *wake_styles),
                 c(cell(auto_text, lead_widths["AUTO"]), *auto_styles),
+                # A recorded backend is unremarkable; an unrecorded one is the degraded state, so
+                # only the "?" gets styling (dim — informational, not an error).
+                cell(term_text, lead_widths["TERM"]) if term_text != "?"
+                else c(cell(term_text, lead_widths["TERM"]), "dim"),
                 cell(_lead_age_cell(m), lead_widths["LAST ACTIVE"]),
             ]
             print(" ".join(row_parts))
@@ -2049,12 +2089,29 @@ def cmd_handoff(args):
     predecessor = {"session_id": caller, "tab_label": caller_marker.get("tab_label"),
                    "iterm_session": caller_marker.get("iterm_session")}
 
-    # PRE-ARM: write the successor's marker (same stamping as cmd_lead_start) BEFORE it ever runs a
-    # turn, so its gate + auto-wake are live from the moment the tab opens — no /relay:mode needed.
+    # When this successor began. Captured ONCE and passed to both marker writes below: the pre-arm
+    # and the post-spawn refresh are two writes of one lead, and letting the second re-default
+    # `started` to its own now() would make the field mean "when the tab finished opening".
+    successor_started = now()
+
+    # PRE-ARM: write the successor's marker BEFORE it ever runs a turn, so its gate + auto-wake are
+    # live from the moment the tab opens — no /relay:mode needed. Stamping matches cmd_lead_start
+    # except for the fields that are not knowable yet or not applicable:
+    #   iterm_session — the tab doesn't exist yet; the post-spawn refresh below fills it in.
+    #   backend       — knowable NOW: `iterm.spawn` below opens the successor's tab under THIS
+    #                   invocation's backend, so it is recorded rather than left for
+    #                   _probe_backend_for_tab to guess at the first cross-backend nudge (§1).
+    #   autonomous    — False/"config", never inherited from the outgoing lead: §6f makes the
+    #                   posture per-session and opt-in-each-time, and a successor arming silently
+    #                   into auto because its predecessor happened to be in auto is exactly the
+    #                   unannounced inversion §6f warns against. The successor's aftercare
+    #                   /relay:mode re-arm applies the `autonomous_mode` config and announces it.
     lead_guard.write_marker(STATE_ROOT, successor_sid, model=model, project=project, cwd=cwd,
                             tab_label=tab_label, color=color,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
-                            predecessor=predecessor)
+                            predecessor=predecessor, started=successor_started,
+                            backend=iterm.NAME,
+                            autonomous=False, autonomous_source="config")
     lead_guard.write_head(STATE_ROOT, successor_sid, lead_guard.git_head(cwd))
 
     # Relay-owned copy of the handoff file, aftercare appended — see build_handoff_copy. The user's
@@ -2099,10 +2156,15 @@ def cmd_handoff(args):
                  f"nothing was stepped down.")
 
     iterm_session = read_iterm_id_at(iterm_id_file)  # best-effort; None on timeout is non-fatal
+    # Refresh with the now-known iterm_session. Every other field must be re-passed identically to
+    # the pre-arm above — write_marker rewrites the WHOLE marker, so anything omitted here would be
+    # dropped from a marker that was already correct seconds ago (§1).
     lead_guard.write_marker(STATE_ROOT, successor_sid, model=model, project=project, cwd=cwd,
                             tab_label=tab_label, color=color, iterm_session=iterm_session,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
-                            predecessor=predecessor)
+                            predecessor=predecessor, started=successor_started,
+                            backend=iterm.NAME,
+                            autonomous=False, autonomous_source="config")
 
     # Step the caller down — the FINAL act, only after the spawn call has returned successfully.
     lead_guard.clear_lead(STATE_ROOT, caller)
