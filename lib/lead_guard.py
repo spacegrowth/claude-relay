@@ -17,6 +17,7 @@ Design notes:
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -72,6 +73,13 @@ LEAD_DEFAULTS = {
                                   # push a nudge into the owning lead's tab, once. A net UNDER the
                                   # lead's own fast-path check, not a replacement — kill-switch
                                   # matches the auto_wake/notify_on_wake pattern above.
+    "bash_gate_logging": True,   # task d1 (§10): logging-only Bash gate for armed leads — ledgers
+                                  # `would_have_blocked` on an implementation-verb Bash command, NEVER
+                                  # denies (dry-run-first, per §10's "Fable punchlist item 2": tune the
+                                  # custody allowlist against real logs before this is ever allowed to
+                                  # block). Default True because logging has no user-visible effect —
+                                  # same "safe to default on" reasoning as auto_wake. Flip off to
+                                  # silence the ledger without a release.
 }
 
 # Distinguishable, colorblind-tolerant tab colors — brightened so they remain visible when dimmed
@@ -304,6 +312,69 @@ def exceeds_gate(lines, new_file, config):
     if new_file and config["block_on_new_file"]:
         return True
     return False
+
+
+# ---- Bash gate: custody-vs-implementation taxonomy (task d1, §10) ------------------------------
+# LOGGING-ONLY (dry-run-first, §10's "Fable punchlist item 2"): this taxonomy decides what GETS
+# LOGGED as would-have-blocked, never what gets blocked — there is no blocking code path yet.
+# Deliberately ONE tunable structure (module-level, ordered, per-rule named) because the whole
+# point of this phase is tuning it against real lead-day logs before it's ever allowed to refuse
+# anything. Ordering matters: CUSTODY_RULES are checked first and win on overlap (§10: "start
+# permissive on custody, strict on provisioning") — e.g. `npm run build` (implementation) vs
+# `npm test`/`npm run test:*` (custody) both start with `npm`, so the custody test-invocation
+# pattern must be checked before the implementation npm pattern would otherwise even come into play
+# for a command it was never meant to match; kept as an explicit ordering rule regardless, since a
+# future implementation rule could easily overlap a custody one by accident.
+#
+# CUSTODY_RULES: the lead's own assigned, mutating work (§10) — free-pass, never ledgered.
+# Reads (cat/ls/grep/git status/git diff/git log/...) aren't listed here at all: they simply never
+# match any IMPLEMENTATION_RULES pattern, so they free-pass by construction without needing an
+# explicit rule.
+CUSTODY_RULES = [
+    {"name": "git-commit-push", "pattern": r"\bgit\s+(commit|push)\b"},
+    {"name": "systemctl-restart-status", "pattern": r"\bsystemctl\s+(restart|status)\b"},
+    {"name": "ssh-clickhouse-sql", "pattern": r"\bclickhouse-client\b"},
+    {"name": "test-suite", "pattern":
+        r"\b(pytest|py\.test|npm\s+(run\s+)?test\b|yarn\s+test\b|go\s+test\b|cargo\s+test\b|"
+        r"make\s+test\b|tox\b)"},
+]
+
+# IMPLEMENTATION_RULES: box-provisioning verbs (§10) — the incident class this gate exists to catch.
+IMPLEMENTATION_RULES = [
+    {"name": "npm-install", "pattern": r"\bnpm\s+(install|ci)\b"},
+    {"name": "npm-run-build", "pattern": r"\bnpm\s+run\s+build\b"},
+    {"name": "package-install", "pattern": r"\b(yarn\s+(install|add)\b|pip3?\s+install\b)"},
+    {"name": "compiler", "pattern":
+        r"\b(tsc|gcc|g\+\+|clang(\+\+)?|go\s+build|cargo\s+build|make)\b"},
+    {"name": "git-clone", "pattern": r"\bgit\s+clone\b"},
+    {"name": "service-file-write", "pattern":
+        r"(/etc/systemd/system/\S*\.service|systemctl\s+(enable|daemon-reload)\b)"},
+    {"name": "sed-inplace", "pattern": r"\bsed\s+-i\b"},
+    {"name": "heredoc", "pattern": r"(?<!<)<<(?!<)-?~?\s*['\"]?\w+"},
+    {"name": "tee-mutation", "pattern": r"\btee\b"},
+    {"name": "rsync", "pattern": r"\brsync\b"},
+]
+
+
+def classify_bash_command(cmd):
+    """The d1 verb-taxonomy verdict for a single Bash command string: the matched rule's name if
+    it's an IMPLEMENTATION verb (the caller should ledger would_have_blocked), or None if it's a
+    CUSTODY verb OR anything unclassified (free-pass either way — this function never signals
+    "block", only "log or don't"). CUSTODY_RULES are checked first so any pattern overlap resolves
+    toward the free-pass, per §10's permissive-on-custody instruction. Never raises: an
+    unparseable/non-string `cmd` degrades to None (unclassified → free-pass, the safe direction for
+    a logging-only gate)."""
+    try:
+        s = str(cmd or "")
+        for rule in CUSTODY_RULES:
+            if re.search(rule["pattern"], s):
+                return None
+        for rule in IMPLEMENTATION_RULES:
+            if re.search(rule["pattern"], s):
+                return rule["name"]
+        return None
+    except Exception:
+        return None
 
 
 # ---- lead-mode state (marker + grace window) --------------------------------------------------

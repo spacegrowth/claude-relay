@@ -7,6 +7,12 @@
         "hooks": [
           {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretool_route_guard.py"}
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretool_bash_gate.py"}
+        ]
       }
     ],
     "Stop": [
