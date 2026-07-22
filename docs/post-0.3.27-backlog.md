@@ -67,6 +67,8 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 17 | BUG | **Asymmetric surfaced_reports dedup** → re-wake after review (high priority) | §5b |
 | 18 | CAP | `relay send --when-idle` queue (replaces unsafe until-loop) | §9 |
 | 19 | BUG | Handoff double SUCCESSOR AFTERCARE section | §9 |
+| 20 | BUG | Spawn writes a live marker when the launch never happened (no PID + no title) | §12 |
+| 21 | BUG | Resume loops on a never-created conversation id; claims success on a dead tab | §12 |
 | d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) | §10 |
 | d2 | DOC | Mutation-budget tripwire line in `/relay:mode` | §10 |
 | d3 | DOC | Standing ops-hands pattern (spawn an ops executor up front) | §10 |
@@ -605,3 +607,28 @@ code, it's heuristic tuning, so land it behind field-tested siblings.
 - **~80 closed/superseded executor sessions** — `relay prune --dry-run` to see what's clearable.
 - **This session** was on 0.3.25 for most of the day and restarted onto 0.3.27; its marker still has
   no `backend` (see §1), so it continues to exercise the probe fallback.
+
+## 12. Spawn/resume launch-race incident (Fable successor lead, 2026-07-21, observed live)
+
+**The incident.** A `relay spawn` (rl-auto, opus) hit a launch race — plausibly because the user
+was actively typing in iTerm during the AppleScript tab setup. Symptoms: "tab title didn't take"
++ "could not read PID". The claude process in the tab never started, so the pre-pinned
+`claude_session` UUID (passed via `--session-id`) was never registered with Claude Code. Two
+defects compounded from there:
+
+- **#20 — spawn writes a live marker for a launch that never happened.** `cmd_spawn` treats
+  missing PID + failed title as mere warnings and still writes `status: busy`. The session then
+  shows dead only via later aliveness probes; nothing says "claude never launched." Spawn should
+  detect the both-signals-failed case and either retry the launch or write the marker as
+  launch-failed with a suggested `relay restart`.
+- **#21 — resume trusts a pinned conversation id that points at nothing, and reports success on a
+  dead tab.** `relay resume` ran `claude --resume <uuid>` on the never-created id; claude exited
+  instantly (iTerm: "A session ended very soon after starting"), yet resume printed
+  "resumed … pid N" — the pid was already gone. Every retry fails identically forever; the id can
+  never become valid. Fix: before relaunching, verify the pinned conversation exists (or at
+  minimum, verify the relaunched pid survives a short grace window); on the never-started case,
+  say so and point at `relay restart` (which mints a fresh UUID — it recovered this incident on
+  the first try).
+
+Also more field evidence for **#2** (identity-aware tab tracking): the label was the only handle,
+and it was the thing that failed.
