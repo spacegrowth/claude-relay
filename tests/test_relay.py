@@ -286,6 +286,92 @@ class TestPacketSummary:
         assert msg.startswith("Read and follow") and "Task —" not in msg
 
 
+class TestPreconditionsNag:
+    """#13/§7-h1: `relay send`/`relay spawn` warn (never block) when an outgoing packet has no
+    `## Preconditions` heading — pure grep, same warning-stamp philosophy as ver?/stale-hooks/d4's
+    dropped-discipline-marker check. The section itself isn't the point; authoring it forces the
+    world-state walk. Covers both send targets since h1 says "a packet" and both cmd_spawn and
+    cmd_send write one out — see packet_missing_preconditions's own call sites."""
+
+    def test_missing_section_flagged(self, relay):
+        assert relay.packet_missing_preconditions("do the thing\n\n## Deliverable\nfix it") is True
+
+    def test_h2_heading_present(self, relay):
+        assert relay.packet_missing_preconditions("intro\n\n## Preconditions\n- clean worktree\n") is False
+
+    def test_h3_heading_present(self, relay):
+        assert relay.packet_missing_preconditions("intro\n\n### Preconditions\n- clean worktree\n") is False
+
+    def test_case_insensitive(self, relay):
+        assert relay.packet_missing_preconditions("intro\n\n## preconditions\n- x\n") is False
+
+    def test_trailing_text_on_heading_line_tolerated(self, relay):
+        # "don't demand byte-exactness for a nag" — annotations after the word still count.
+        assert relay.packet_missing_preconditions("intro\n\n## Preconditions (world-state)\n- x\n") is False
+
+    def test_mention_in_prose_does_not_count(self, relay):
+        # Only a HEADING satisfies the nag — talking about preconditions in body text doesn't.
+        assert relay.packet_missing_preconditions("we should discuss preconditions here\n") is True
+
+    def test_spawn_warns_when_section_absent(self, relay, tmp_path, capsys):
+        packet = tmp_path / "p.md"
+        packet.write_text("do the thing\n\n## Deliverable\nfix it")
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: None), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(packet=str(packet), topic="foo", name="no-precond",
+                                             worktree=str(worktree), model=None, model_override=None,
+                                             skip_perms=None, pane=None, lead=None, scope=None))
+        out = capsys.readouterr().out
+        assert "Preconditions" in out and "spawning anyway" in out
+
+    def test_spawn_silent_when_section_present(self, relay, tmp_path, capsys):
+        packet = tmp_path / "p.md"
+        packet.write_text("do the thing\n\n## Preconditions\n- clean worktree\n\n## Deliverable\nfix it")
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: None), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(packet=str(packet), topic="foo", name="has-precond",
+                                             worktree=str(worktree), model=None, model_override=None,
+                                             skip_perms=None, pane=None, lead=None, scope=None))
+        out = capsys.readouterr().out
+        assert "Preconditions" not in out
+
+    def _mk_send_target(self, relay, sid="e1"):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": "/w", "topic": "t", "scope": "t",
+            "tab_label": "relay-" + sid, "model": None, "pid": os.getpid(),
+            "iterm_session": "w0t0p0:OLD", "claude_session": "cs-x", "status": "busy",
+            "current_packet": 1, "busy_since": relay.now(), "created": relay.now(),
+            "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("first packet")
+        (relay.packets_dir(sid) / "001-report.md").write_text("done")
+
+    def test_send_warns_when_section_absent(self, relay, tmp_path, capsys):
+        self._mk_send_target(relay, "e1")
+        packet = tmp_path / "next.md"
+        packet.write_text("# Follow-up\n\nDo the next thing.")
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=str(packet)))
+        out = capsys.readouterr().out
+        assert "Preconditions" in out and "sending anyway" in out
+
+    def test_send_silent_when_section_present(self, relay, tmp_path, capsys):
+        self._mk_send_target(relay, "e2")
+        packet = tmp_path / "next.md"
+        packet.write_text("# Follow-up\n\n## Preconditions\n- clean worktree\n\nDo the next thing.")
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e2", packet=str(packet)))
+        out = capsys.readouterr().out
+        assert "Preconditions" not in out
+
+
 class TestReportCommand:
     def _make(self, relay, sid="s1", packet=1, body="the report body"):
         relay.session_dir(sid).mkdir(parents=True)

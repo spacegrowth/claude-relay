@@ -347,6 +347,20 @@ def build_packet(body, report_path, diff_cmd, diff_url):
     return body.rstrip() + TEMPLATE_FOOTER.format(report_path=report_path, diff_cmd=diff_cmd, diff_url=diff_url)
 
 
+# #13/§7-h1: tolerant of heading depth (## or ###) and case, and of trailing text on the same line
+# ("## Preconditions (world-state)") — this is a nag, not a format validator, so it should never
+# false-positive on a section that's obviously there just because the heading isn't byte-exact.
+PRECONDITIONS_HEADING_RE = re.compile(r"^#{1,6}[ \t]*preconditions\b", re.IGNORECASE | re.MULTILINE)
+
+
+def packet_missing_preconditions(body):
+    """True when an outgoing packet body has no `## Preconditions` heading. Pure grep, same
+    warning-stamp philosophy as `ver?`/stale-hooks/d4's dropped-discipline-marker check: never
+    blocks the send, just nags — the point isn't the section existing, it's the world-state walk
+    that AUTHORING it forces on the lead (§7-h1)."""
+    return PRECONDITIONS_HEADING_RE.search(body) is None
+
+
 def packet_summary(body, limit=160):
     """A ONE-LINE gist of a packet — its first meaningful line, markdown heading markers stripped
     and whitespace collapsed — so the executor's first message shows WHAT the task is, not just a
@@ -647,6 +661,9 @@ def _kill_and_wait(s, timeout=3.0):
 
 def cmd_spawn(args):
     body = Path(args.packet).read_text()
+    if packet_missing_preconditions(body):
+        print(c("  ⚠ no ## Preconditions section: authoring one forces the world-state walk "
+                "before send (checkout pulled? code live? DDL applied?) — spawning anyway.", "red"))
     session_id = args.name or f"{slugify(args.topic)}-{time.strftime('%H%M%S')}"
     if read_session(session_id):
         sys.exit(f"session '{session_id}' already exists — pick a different --name or use `relay send`")
@@ -1126,6 +1143,9 @@ def cmd_send(args):
 
     n = next_packet_number(args.session_id)
     body = Path(args.packet).read_text()
+    if packet_missing_preconditions(body):
+        print(c("  ⚠ no ## Preconditions section: authoring one forces the world-state walk "
+                "before send (checkout pulled? code live? DDL applied?) — sending anyway.", "red"))
     report_path = str(packets_dir(args.session_id) / f"{n:03d}-report.md")
     diff_cmd = f"{RELAY_BIN} diff {args.session_id}"
     diff_path = packets_dir(args.session_id) / f"{n:03d}-diff.html"
