@@ -567,6 +567,277 @@ class TestSpawnTabIdentity:
         assert "relay diff e1" in packet_content
 
 
+class TestSpawnLaunchHonesty:
+    """§12 #20 (LIVE INCIDENT, 2026-07-21): a spawn whose launch never happened — no PID captured
+    AND the tab label never took — used to write a plain `status: busy` marker, so `relay list`
+    showed a live executor working on a packet nothing had ever been delivered to. Both signals
+    failing now retries the launch once and, if that fails too, records LAUNCH_FAILED and points at
+    `relay restart`. Either signal alone is a degraded-but-live tab and must be UNAFFECTED."""
+
+    def _spawn(self, relay, tmp_path, pids, labels, expect_exit=False):
+        """Drive cmd_spawn with per-ATTEMPT launch signals: `pids`/`labels` are the values read_pid
+        and _ensure_tab_label return on attempt 1, attempt 2, … Returns (spawn_call_count, session).
+        `expect_exit` asserts the non-zero exit a launch-failed spawn owes a scripted caller."""
+        pkt = tmp_path / "p.md"
+        pkt.write_text("do the thing")
+        calls = []
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: calls.append(kw)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", side_effect=list(pids)), \
+             mock.patch.object(relay, "read_iterm_id", return_value=None), \
+             mock.patch.object(relay, "_ensure_tab_label", side_effect=list(labels)), \
+             mock.patch.object(relay, "pid_start_time", return_value=None):
+            run = lambda: relay.cmd_spawn(SimpleNamespace(  # noqa: E731
+                worktree=str(tmp_path), topic="t", packet=str(pkt), model=None, name="e1",
+                scope=None, skip_perms=None, pane=None, lead=None, model_override=None))
+            if expect_exit:
+                with pytest.raises(SystemExit) as ei:
+                    run()
+                assert ei.value.code == 1
+            else:
+                run()
+        return len(calls), relay.read_session("e1")
+
+    def _ledger_events(self, relay):
+        return [json.loads(l) for l in relay.LEDGER.read_text().splitlines()] if relay.LEDGER.exists() else []
+
+    def test_both_signals_fail_retries_once_then_marks_launch_failed(self, relay, tmp_path, capsys):
+        n, s = self._spawn(relay, tmp_path, pids=[None, None], labels=[False, False], expect_exit=True)
+        assert n == 2                                    # retried the launch exactly once
+        assert s["status"] == relay.LAUNCH_FAILED        # NOT busy — nothing is working
+        assert s["pid"] is None
+        err = capsys.readouterr().err
+        assert "did NOT launch" in err and f"relay restart e1" in err
+        assert any(e["event"] == "launch_failed" and e["session_id"] == "e1"
+                   for e in self._ledger_events(relay))
+
+    def test_retry_that_succeeds_is_a_normal_busy_spawn(self, relay, tmp_path, capsys):
+        n, s = self._spawn(relay, tmp_path, pids=[None, 4242], labels=[False, True])
+        assert n == 2                                    # first attempt failed, retry launched
+        assert s["status"] == "busy" and s["pid"] == 4242
+        out = capsys.readouterr().out
+        assert "spawned session 'e1'" in out
+        assert not any(e["event"] == "launch_failed" for e in self._ledger_events(relay))
+
+    def test_pid_only_failure_still_busy_and_not_retried(self, relay, tmp_path):
+        # The label took → the tab is real, just missing its pidfile. Pre-existing degraded-but-live
+        # behavior (a warning), NOT a failed launch — the over-correction this must not become.
+        n, s = self._spawn(relay, tmp_path, pids=[None], labels=[True])
+        assert n == 1 and s["status"] == "busy" and s["pid"] is None
+
+    def test_label_only_failure_still_busy_and_not_retried(self, relay, tmp_path):
+        n, s = self._spawn(relay, tmp_path, pids=[999], labels=[False])
+        assert n == 1 and s["status"] == "busy" and s["pid"] == 999
+
+    def test_healthy_spawn_unaffected(self, relay, tmp_path, capsys):
+        n, s = self._spawn(relay, tmp_path, pids=[123], labels=[True])
+        assert n == 1 and s["status"] == "busy" and s["pid"] == 123
+        assert "spawned session 'e1'" in capsys.readouterr().out
+
+    def test_launch_failed_is_sticky_through_check(self, relay, tmp_path):
+        # _check_one must not relabel it `dead` — that reads as "it ran and then died" and loses the
+        # one fact that matters (the pinned conversation id was never registered).
+        self._spawn(relay, tmp_path, pids=[None, None], labels=[False, False], expect_exit=True)
+        assert relay._check_one("e1")["status"] == relay.LAUNCH_FAILED
+
+    def test_status_renders_untruncated_in_list(self, relay, tmp_path, capsys, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        self._spawn(relay, tmp_path, pids=[None, None], labels=[False, False], expect_exit=True)
+        capsys.readouterr()
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        assert relay.LAUNCH_FAILED in out                  # not clipped to "launch-fai"
+        # …and it isn't listed as a wake-orphan: nothing is running to lose a wake, and the orphan
+        # line's "just relay send/resume" advice is exactly what this session can't do.
+        assert "owned by retired leads" not in out
+
+    def test_send_refuses_launch_failed_session(self, relay, tmp_path):
+        # Neither delivery path can work: no tab to type into, no conversation to resume.
+        self._spawn(relay, tmp_path, pids=[None, None], labels=[False, False], expect_exit=True)
+        nxt = tmp_path / "next.md"
+        nxt.write_text("more work")
+        with pytest.raises(SystemExit) as ei:
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=str(nxt)))
+        assert relay.LAUNCH_FAILED in str(ei.value) and "relay restart e1" in str(ei.value)
+
+
+class TestResumeLaunchHonesty:
+    """§12 #21 (same incident): `claude --resume <uuid>` against an id Claude Code never registered
+    exits instantly, yet resume printed "resumed … pid N" for a pid that was already gone — and did
+    so identically forever, since that id can never become valid. Resume now refuses up front on a
+    known-failed launch, and verifies the relaunched process survives a grace window before
+    claiming success."""
+
+    def _mk(self, relay, sid="e1", status="dead", claude_session="uuid-x"):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": "/w", "topic": "t", "scope": "t",
+            "tab_label": "[Exec] e1", "model": None, "pid": 999, "iterm_session": "w0t0p0:OLD",
+            "claude_session": claude_session, "status": status, "current_packet": 1,
+            "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("do the work")
+
+    def _resume(self, relay, sid="e1", new_pid=123, new_pid_alive=True, force=False):
+        calls = []
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: calls.append(kw)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=new_pid), \
+             mock.patch.object(relay, "read_iterm_id", return_value="w0t0p0:NEW"), \
+             mock.patch.object(relay, "_ensure_tab_label", return_value=True), \
+             mock.patch.object(relay, "pid_start_time", return_value=None), \
+             mock.patch.object(relay, "LAUNCH_GRACE_SECONDS", 0), \
+             mock.patch.object(relay, "conversation_transcript_exists", return_value=None), \
+             mock.patch.object(relay, "pid_alive", side_effect=lambda p: new_pid_alive if p == new_pid else False):
+            relay.cmd_resume(SimpleNamespace(session_id=sid, force=force))
+        return calls
+
+    def test_refuses_resume_of_a_launch_that_never_happened(self, relay):
+        self._mk(relay, status=relay.LAUNCH_FAILED)
+        with pytest.raises(SystemExit) as ei:
+            self._resume(relay)
+        msg = str(ei.value)
+        assert "never" in msg and "relay restart e1" in msg
+        assert relay.read_session("e1")["status"] == relay.LAUNCH_FAILED  # untouched
+
+    def test_launch_failed_refusal_does_not_launch_anything(self, relay):
+        self._mk(relay, status=relay.LAUNCH_FAILED)
+        calls = []
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: calls.append(kw)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "pid_alive", return_value=False):
+            with pytest.raises(SystemExit):
+                relay.cmd_resume(SimpleNamespace(session_id="e1", force=False))
+        assert not calls
+
+    def test_force_overrides_the_launch_failed_refusal(self, relay):
+        self._mk(relay, status=relay.LAUNCH_FAILED, claude_session="uuid-keep")
+        calls = self._resume(relay, force=True)
+        assert calls and calls[0]["resume_id"] == "uuid-keep"
+        assert relay.read_session("e1")["status"] == "busy"
+
+    def test_dead_pid_after_relaunch_is_reported_as_failure_not_success(self, relay, capsys):
+        self._mk(relay)
+        with pytest.raises(SystemExit) as ei:
+            self._resume(relay, new_pid=4242, new_pid_alive=False)
+        msg = str(ei.value)
+        assert "FAILED" in msg and "4242 is already gone" in msg and "relay restart e1" in msg
+        assert "resumed 'e1'" not in capsys.readouterr().out      # never claimed success
+        assert relay.read_session("e1")["status"] == relay.LAUNCH_FAILED
+
+    def test_missing_pid_after_relaunch_is_a_failed_launch(self, relay):
+        self._mk(relay)
+        with pytest.raises(SystemExit) as ei:
+            self._resume(relay, new_pid=None)
+        assert "no PID was ever written" in str(ei.value)
+        assert relay.read_session("e1")["status"] == relay.LAUNCH_FAILED
+
+    def test_healthy_resume_unaffected(self, relay, capsys):
+        self._mk(relay, claude_session="uuid-keep")
+        calls = self._resume(relay)
+        assert calls[0]["resume_id"] == "uuid-keep"
+        assert "resumed 'e1'" in capsys.readouterr().out
+        s = relay.read_session("e1")
+        assert s["status"] == "busy" and s["pid"] == 123
+
+    def test_second_resume_after_a_failed_one_is_refused_not_looped(self, relay):
+        # The loop-forever half of #21: the first resume's failure marks the session, so the next
+        # one stops instead of relaunching into the identical wall.
+        self._mk(relay)
+        with pytest.raises(SystemExit):
+            self._resume(relay, new_pid=4242, new_pid_alive=False)
+        with pytest.raises(SystemExit) as ei:
+            self._resume(relay)
+        assert "relay restart e1" in str(ei.value)
+
+    def test_missing_transcript_warns_but_does_not_block(self, relay, capsys):
+        self._mk(relay)
+        with mock.patch.object(relay, "conversation_transcript_exists", return_value=False):
+            calls = self._resume2(relay)
+        assert calls                                              # still resumed
+        assert "no Claude Code transcript exists" in capsys.readouterr().err
+
+    def test_present_transcript_is_silent(self, relay, capsys):
+        self._mk(relay)
+        with mock.patch.object(relay, "conversation_transcript_exists", return_value=True):
+            self._resume2(relay)
+        assert "no Claude Code transcript" not in capsys.readouterr().err
+
+    def _resume2(self, relay, sid="e1"):
+        """_resume without its own conversation_transcript_exists patch, so a caller can set one."""
+        calls = []
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: calls.append(kw)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123), \
+             mock.patch.object(relay, "read_iterm_id", return_value="w0t0p0:NEW"), \
+             mock.patch.object(relay, "_ensure_tab_label", return_value=True), \
+             mock.patch.object(relay, "pid_start_time", return_value=None), \
+             mock.patch.object(relay, "LAUNCH_GRACE_SECONDS", 0), \
+             mock.patch.object(relay, "pid_alive", side_effect=lambda p: p == 123):
+            relay.cmd_resume(SimpleNamespace(session_id=sid, force=False))
+        return calls
+
+
+class TestLaunchSurvived:
+    """_launch_survived: the shell writes the pidfile BEFORE exec'ing claude, so a just-read pid
+    proves only that the shell ran. The probe must return the moment the pid is gone (the failure a
+    human is waiting on) and only wait out the full window for a genuinely healthy launch."""
+
+    def test_none_pid_is_a_failed_launch(self, relay):
+        assert relay._launch_survived(None, grace=0) is False
+
+    def test_dead_pid_returns_immediately_without_sleeping(self, relay):
+        slept = []
+        with mock.patch.object(relay, "pid_alive", return_value=False):
+            ok = relay._launch_survived(4242, grace=30, sleep_fn=slept.append, clock_fn=lambda: 0.0)
+        assert ok is False and slept == []          # no waiting out the window on a dead pid
+
+    def test_pid_that_dies_mid_window_fails(self, relay):
+        alive = iter([True, True, False])
+        ticks = iter([0.0, 0.5, 1.0, 1.5, 2.0])
+        with mock.patch.object(relay, "pid_alive", side_effect=lambda p: next(alive)):
+            ok = relay._launch_survived(1, grace=3, sleep_fn=lambda _: None,
+                                        clock_fn=lambda: next(ticks))
+        assert ok is False
+
+    def test_pid_alive_through_the_window_survives(self, relay):
+        ticks = iter([0.0, 0.5, 1.0, 5.0])
+        with mock.patch.object(relay, "pid_alive", return_value=True):
+            ok = relay._launch_survived(1, grace=3, sleep_fn=lambda _: None,
+                                        clock_fn=lambda: next(ticks))
+        assert ok is True
+
+
+class TestConversationTranscriptExists:
+    """The pre-flight 'was this conversation ever created' probe: Claude Code writes
+    <config-dir>/projects/<cwd-slug>/<uuid>.jsonl. Unknowable cases must return None, not False —
+    a false 'never created' would refuse a perfectly good resume."""
+
+    def _root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        root = tmp_path / "cfg" / "projects"
+        root.mkdir(parents=True)
+        return root
+
+    def test_finds_transcript_in_any_project_dir(self, relay, tmp_path, monkeypatch):
+        root = self._root(tmp_path, monkeypatch)
+        (root / "-some-other-path").mkdir()
+        (root / "-w").mkdir()
+        (root / "-w" / "uuid-x.jsonl").write_text("{}")
+        assert relay.conversation_transcript_exists("uuid-x") is True
+
+    def test_absent_transcript_is_false(self, relay, tmp_path, monkeypatch):
+        root = self._root(tmp_path, monkeypatch)
+        (root / "-w").mkdir()
+        assert relay.conversation_transcript_exists("uuid-x") is False
+
+    def test_no_projects_root_is_unknown(self, relay, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "nope"))
+        assert relay.conversation_transcript_exists("uuid-x") is None
+
+    def test_empty_projects_root_is_unknown(self, relay, tmp_path, monkeypatch):
+        self._root(tmp_path, monkeypatch)
+        assert relay.conversation_transcript_exists("uuid-x") is None
+
+
 class TestRelativeAge:
     """_relative_age renders a compact age and degrades to '-' for missing/old-format input."""
     def test_seconds(self, relay):
@@ -1228,13 +1499,19 @@ class TestRestartResume:
             (relay.packets_dir(sid) / "001-packet.md").write_text("do the work")
 
     def _run(self, relay, fn, sid="e1", alive=False, force=False):
+        # pid_alive is per-pid, not a constant: `alive` answers for the session's OLD pid (999, the
+        # already-dead-or-not process the restart/resume guard asks about), while the NEW pid the
+        # relaunch reads back (123) is alive — a healthy relaunch. A blanket False would also mean
+        # "the process we just launched is already gone", i.e. the §12 #21 failure, which is a
+        # different scenario and has its own tests (TestResumeLaunchHonesty).
         captured = {}
         with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: captured.update(kw)), \
              mock.patch.object(relay, "auto_trust"), \
              mock.patch.object(relay, "read_pid", return_value=123), \
              mock.patch.object(relay, "read_iterm_id", return_value="w0t0p0:NEW"), \
              mock.patch.object(relay, "_ensure_tab_label", return_value=True), \
-             mock.patch.object(relay, "pid_alive", return_value=alive):
+             mock.patch.object(relay, "LAUNCH_GRACE_SECONDS", 0), \
+             mock.patch.object(relay, "pid_alive", side_effect=lambda p: True if p == 123 else alive):
             fn(SimpleNamespace(session_id=sid, force=force))
         return captured
 
@@ -1441,7 +1718,8 @@ class TestResumeLead:
              mock.patch.object(relay, "read_pid", return_value=123), \
              mock.patch.object(relay, "read_iterm_id", return_value="w0t0p0:NEW"), \
              mock.patch.object(relay, "_ensure_tab_label", return_value=True), \
-             mock.patch.object(relay, "pid_alive", return_value=False):
+             mock.patch.object(relay, "LAUNCH_GRACE_SECONDS", 0), \
+             mock.patch.object(relay, "pid_alive", side_effect=lambda p: p == 123):
             relay.cmd_resume(SimpleNamespace(session_id="e1", force=False))
         assert captured["resume_id"] == "cs-exec"     # executor uses its captured claude_session
 
@@ -1939,13 +2217,15 @@ class TestAdoption:
         (relay.packets_dir(sid) / "001-packet.md").write_text("do the work")
 
     def _run_relaunch(self, relay, fn, sid="e1", alive=False, force=False):
+        # Per-pid pid_alive for the same reason as TestRestartResume._run — see that comment.
         captured = {}
         with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: captured.update(kw)), \
              mock.patch.object(relay, "auto_trust"), \
              mock.patch.object(relay, "read_pid", return_value=123), \
              mock.patch.object(relay, "read_iterm_id", return_value="w0t0p0:NEW"), \
              mock.patch.object(relay, "_ensure_tab_label", return_value=True), \
-             mock.patch.object(relay, "pid_alive", return_value=alive):
+             mock.patch.object(relay, "LAUNCH_GRACE_SECONDS", 0), \
+             mock.patch.object(relay, "pid_alive", side_effect=lambda p: True if p == 123 else alive):
             fn(SimpleNamespace(session_id=sid, force=force))
         return captured
 
