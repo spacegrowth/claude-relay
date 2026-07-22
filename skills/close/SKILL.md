@@ -18,6 +18,11 @@ If just closing an executor session: run `${CLAUDE_PLUGIN_ROOT}/bin/relay close 
 If superseding (e.g. a session's model wasn't strong enough and you spawned a replacement): run
 `${CLAUDE_PLUGIN_ROOT}/bin/relay close $session_id --supersede $superseded_by`
 
+If you're closing a session whose *territory* someone will pick up again — it got heavy, or it
+finished a phase and more work is coming to the same area — use `/relay:retire` instead. Same
+teardown, but it also leaves a `successor-seed.md` behind so the next session inherits what this one
+learned for the cost of one packet-read.
+
 A session's model is fixed at launch — there's no way to change it mid-session. "Upgrading the
 model" always means spawning a fresh session (via `/relay:spawn`) with a stronger `--model`, then
 closing the old one with `--supersede` so `/relay:list` shows it was replaced rather than looking

@@ -34,6 +34,7 @@ import time
 import urllib.parse
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "scripts"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
@@ -181,6 +182,33 @@ You were pre-armed by relay handoff under pinned session id {successor_sid}.
    it; on their go run: relay close-predecessor . Never close it unasked.
 3. Your first send/resume of an inherited executor adopts it automatically.
 """
+
+# The successor seed (backlog §6e-e3). Written by `relay retire` into the retired session's own dir,
+# and inlined into a fresh spawn's packet by `relay spawn --seed`. Same body+appended-section
+# relationship as build_packet/TEMPLATE_FOOTER — the seed is CONTEXT, never the task.
+SEED_FILENAME = "successor-seed.md"
+
+SEED_INHERITED_SECTION = """
+
+---
+(relay — INHERITED CONTEXT, written by `relay retire`; not part of your task)
+You are picking up territory a retired session worked before you. What follows is that session's
+successor seed: an INDEX of its packets and their reported outcomes, not a transcript and not
+instructions. Your task is the packet body above — this section only tells you what happened here
+already and where the detail lives. Per TREAT THIS PACKET COLD, verify anything you rely on: every
+claim below is a summary the retired session wrote about its own work.
+Seed source: {seed_path}
+
+{seed_text}
+"""
+
+
+def build_seeded_body(body, seed_text, seed_path):
+    """A packet body with a retired session's successor seed appended as inherited context. Runs
+    BEFORE build_packet, so the GATES/REPORT FORMAT footer still lands last (the seed must never
+    come between the executor and its gates)."""
+    return body.rstrip() + SEED_INHERITED_SECTION.format(
+        seed_path=seed_path, seed_text=seed_text.strip())
 
 
 def build_handoff_copy(body, successor_sid):
@@ -611,8 +639,25 @@ def _kill_and_wait(s, timeout=3.0):
         pass
 
 
+def resolve_seed(value):
+    """Resolve `--seed` to (seed_text, seed_path). Accepts either a path to a seed file or, for the
+    ergonomic case the retire message actually prints, a RETIRED SESSION'S id — whose seed lives at
+    a known place. A path is tried first so an on-disk file always wins over a name collision."""
+    p = Path(value).expanduser()
+    if not p.is_file():
+        p = session_dir(resolve_sid(value)) / SEED_FILENAME
+    if not p.is_file():
+        sys.exit(f"spawn: --seed '{value}' is neither a readable file nor a retired session with a "
+                 f"{SEED_FILENAME} (looked in {p}). Retire a session first: relay retire <session_id>")
+    return p.read_text(), str(p.resolve())
+
+
 def cmd_spawn(args):
     body = Path(args.packet).read_text()
+    # A successor seed is inherited CONTEXT appended to the packet body, before the GATES footer.
+    if getattr(args, "seed", None):
+        seed_text, seed_path = resolve_seed(args.seed)
+        body = build_seeded_body(body, seed_text, seed_path)
     session_id = args.name or f"{slugify(args.topic)}-{time.strftime('%H%M%S')}"
     if read_session(session_id):
         sys.exit(f"session '{session_id}' already exists — pick a different --name or use `relay send`")
@@ -1863,6 +1908,134 @@ def cmd_close(args):
           + (f" (superseded by {args.supersede})" if args.supersede else "") + tab_note)
 
 
+# ── retire → successor seed (backlog §6e-e3, the "make the escape cheap" layer) ────────────────
+# Retirement today is expensive, so leads reuse a heavy executor instead of rotating it. The seed
+# file changes that arithmetic: respawning fresh over the same territory costs ONE packet-read
+# instead of archaeology. Deliberately derived from what is already on disk (packets + reports) —
+# asking the retiring executor to write its own seed would re-spend the very context we're retiring,
+# and would fail outright on the dead/stalled sessions most in need of retiring.
+SEED_RETIRED_BY_SEED = "successor-seed"  # the `superseded_by` sentinel a retire writes
+
+
+def _report_tldr(text):
+    """The lead-facing fields of one report: its first-line outcome sentence plus the three TL;DR
+    lines the REPORT FORMAT mandates (Status / Risk flags / UNVERIFIED). Those are exactly the
+    "state of the work / decisions / gotchas" a successor needs; everything else in a report is
+    detail it can go read. Missing fields come back None — a malformed report degrades to a thinner
+    seed entry, never an error."""
+    fields = {"outcome": packet_summary(text, limit=200) or None,
+              "status": None, "risk": None, "unverified": None}
+    keys = (("Status:", "status"), ("Risk flags:", "risk"), ("UNVERIFIED:", "unverified"))
+    for raw in text.splitlines()[:40]:  # the TL;DR block sits at the top; don't scan a whole report
+        line = raw.strip().lstrip("-*# ").strip()
+        for prefix, key in keys:
+            if fields[key] is None and line.startswith(prefix):
+                fields[key] = " ".join(line[len(prefix):].split()) or None
+    return fields
+
+
+def seed_entries(session_id):
+    """One entry per packet the session was ever sent, oldest first: its gist (the packet's own
+    first line) and, when the packet was reported, that report's TL;DR fields. An unreported packet
+    is kept in the list ON PURPOSE and flagged — "this territory was touched but never reported" is
+    the single most useful thing a successor can know."""
+    d = packets_dir(session_id)
+    entries = []
+    for pf in sorted(d.glob("*-packet.md")) if d.exists() else []:
+        n = pf.stem.split("-")[0]
+        rf = d / f"{n}-report.md"
+        e = {"n": n, "gist": packet_summary(pf.read_text()) or "(empty packet)",
+             "packet_path": str(pf), "report_path": str(rf) if rf.exists() else None,
+             "tldr": _report_tldr(rf.read_text()) if rf.exists() else None}
+        entries.append(e)
+    return entries
+
+
+def build_successor_seed(session_id, s, entries, generated):
+    """The successor-seed.md text. Contract: a header saying what this file is and is not, the
+    inherited TERRITORY (where the work lives), a PACKET INDEX with one summarised entry per packet,
+    and a closing INHERIT WITH CARE caveat. Pure — takes the timestamp rather than calling now(),
+    so it is testable byte-for-byte."""
+    reported = sum(1 for e in entries if e["report_path"])
+    unreported = len(entries) - reported
+    L = [f"# Successor seed — {session_id}", "",
+         f"Written by `relay retire` at {generated}. This is an INDEX, not a transcript: it exists so a",
+         "fresh session can pick up this territory for the cost of one packet-read instead of",
+         "archaeology. Each entry below is the retired session's own summary of its own work — read the",
+         "linked report for anything you actually need to depend on.", "",
+         "## Territory", ""]
+    for label, val in (("Worktree", s.get("worktree")), ("Topic", s.get("topic")),
+                       ("Scope", s.get("scope")), ("Model", s.get("model")),
+                       ("Retired session", session_id)):
+        L.append(f"- {label}: {val or '(unrecorded)'}")
+    L += [f"- Packets worked: {len(entries)} ({reported} reported, {unreported} unreported)",
+          f"- Packet/report files: {packets_dir(session_id)}", "",
+          "## Packet index", ""]
+    if not entries:
+        L += ["(none — this session was retired before it was ever sent a packet, so there is no",
+              "prior work to inherit.)", ""]
+    for e in entries:
+        L.append(f"### {e['n']} — {e['gist']}")
+        t = e["tldr"]
+        if t:
+            L.append(f"- Outcome: {t['outcome'] or '(report is empty)'}")
+            for label, key in (("Status", "status"), ("Risk flags", "risk"), ("UNVERIFIED", "unverified")):
+                L.append(f"- {label}: {t[key] or '(not stated in the report)'}")
+            L.append(f"- Report: {e['report_path']}")
+        else:
+            L += ["- Outcome: NO REPORT — this packet was sent but never reported (unfinished,",
+                  "  interrupted, or blocked). Treat everything it touched as unverified.",
+                  f"- Packet: {e['packet_path']}"]
+        L.append("")
+    L += ["## Inherit with care", "",
+          "- Nothing here was independently verified; it is self-reported. Re-read the code you touch.",
+          "- Work may still be sitting STAGED-but-uncommitted in the worktree from the retired",
+          f"  session — check `git -C {s.get('worktree') or '<worktree>'} diff --staged` before you start.",
+          "- Anything listed as UNVERIFIED above is still unverified. It did not become true by being",
+          "  written down.", ""]
+    return "\n".join(L)
+
+
+def cmd_retire(args):
+    """Retire an executor: write its successor seed, then close it as superseded-by-seed. A CLOSE
+    VARIANT, not a new lifecycle — the actual teardown (report dedup, SIGTERM, tab close, status
+    write) is delegated to cmd_close so retire can never drift from it."""
+    s = read_session(args.session_id)
+    if not s:
+        sys.exit(f"no such session: {args.session_id}")
+
+    seed_path = session_dir(args.session_id) / SEED_FILENAME
+    if s.get("superseded_by") == SEED_RETIRED_BY_SEED:
+        sys.exit(f"session '{args.session_id}' is already retired — its seed is at {seed_path}\n"
+                 f"  Spawn its successor with: relay spawn <worktree> <topic> <packet.md> "
+                 f"--seed {args.session_id}")
+
+    # Retiring mid-flight silently discards whatever the executor is working on right now: it dies
+    # unreported, so nothing about that packet reaches the seed. Refuse by default and say what is
+    # about to be lost — this is the one moment a lead can still choose to wait for the report.
+    n = s.get("current_packet")
+    unreported = n is not None and not (packets_dir(args.session_id) / f"{n:03d}-report.md").exists()
+    if s.get("status") == "busy" and unreported and not args.force:
+        sys.exit(f"retire: '{args.session_id}' is still busy on packet {n:03d} and has not reported "
+                 f"— retiring now kills that work unreported, and the seed cannot summarise a report "
+                 f"that was never written.\n"
+                 f"  Wait for it (relay check {args.session_id}), or retire anyway with --force "
+                 f"(the packet is then seeded as NO REPORT).")
+
+    entries = seed_entries(args.session_id)
+    seed_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_path.write_text(build_successor_seed(args.session_id, s, entries, now()))
+
+    cmd_close(SimpleNamespace(session_id=args.session_id, supersede=SEED_RETIRED_BY_SEED,
+                              self_session=None, keep_tab=args.keep_tab))
+    append_ledger("retired", session_id=args.session_id, seed=str(seed_path),
+                  packets=len(entries), forced=bool(args.force))
+    print(f"retired '{args.session_id}' — successor seed ({len(entries)} packet(s)) at:\n"
+          f"  {seed_path}\n"
+          f"  Respawn over the same territory with: relay spawn "
+          f"{s.get('worktree') or '<worktree>'} <topic> <packet.md> --seed {args.session_id}")
+
+
 def cmd_stop(args):
     """Step down from lead mode for THIS session (unarm). A discoverable alias for `relay close --self`
     — same effect, shorter name."""
@@ -2629,6 +2802,9 @@ def main():
                     "recorded in the ledger (model_ceiling_override)")
     sp.add_argument("--name")
     sp.add_argument("--scope")
+    sp.add_argument("--seed", metavar="PATH_OR_SID",
+                    help="inherit a retired session's successor-seed.md as context in this packet: "
+                         "a path to the seed file, or the retired session's id (see `relay retire`)")
     sp.add_argument("--lead", help="session id of the lead spawning this executor (stamps ownership); "
                     "defaults to $CLAUDE_CODE_SESSION_ID, else unowned")
     # Tri-state: neither flag → None → use config's executor_skip_permissions. --skip-perms forces
@@ -2679,6 +2855,16 @@ def main():
     cl.add_argument("--self", dest="self_session", help="step down from lead mode for this session id")
     cl.add_argument("--keep-tab", action="store_true", help="mark closed but leave the iTerm tab open")
     cl.set_defaults(func=cmd_close)
+
+    rtr = sub.add_parser("retire", help="close an executor AND write a successor-seed.md indexing "
+                                        "its packets/reports, so respawning fresh over the same "
+                                        "territory is cheap (`relay spawn --seed <sid>`)")
+    rtr.add_argument("session_id")
+    rtr.add_argument("--force", action="store_true",
+                     help="retire even while it's busy on an unreported packet (that packet is "
+                          "seeded as NO REPORT)")
+    rtr.add_argument("--keep-tab", action="store_true", help="retire but leave the tab open")
+    rtr.set_defaults(func=cmd_retire)
 
     st = sub.add_parser("stop")
     st.add_argument("session_id")
@@ -2778,6 +2964,7 @@ def main():
     RESOLVE_FIELDS = {
         "send": ["session_id"], "check": ["session_id"], "status": ["session_id"],
         "close": ["session_id", "supersede", "self_session"], "stop": ["session_id"],
+        "retire": ["session_id"],
         "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
         "auto": ["session"],
         "diff": ["session_id"], "focus": ["session_id"], "restart": ["session_id"],
