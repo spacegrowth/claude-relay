@@ -58,6 +58,15 @@ LEAD_DEFAULTS = {
                                   # executor doesn't flip to `stalled` at the exact instant the
                                   # idle-lead poller's window also expires — see
                                   # docs/wake-watch-design.md §2.2's "two numeric coincidences".
+    "autonomous_mode": False,     # the POSTURE a newly-armed lead holds (§6f, task #16 phase 1).
+                                  # False = wait-for-human on every routine approval beat (the safe
+                                  # default, and it must stay the default). True = new leads arm
+                                  # already in auto, for someone who ALWAYS works this way. Either
+                                  # way `relay auto on|off` flips it mid-session; the posture lives
+                                  # in the lead's own marker, so it is per-session and resets to
+                                  # this config value on every fresh arm rather than persisting
+                                  # silently. Auto NEVER covers committing executor work — see
+                                  # cmd_auto in bin/relay and skills/mode/SKILL.md's stop-list.
     "executor_escalation": True,  # arm every spawned executor with the escalation Stop hook
                                   # (wake-watch design §9): once its report lands and it goes idle,
                                   # push a nudge into the owning lead's tab, once. A net UNDER the
@@ -318,7 +327,8 @@ def is_lead(state_root, session_id):
 
 def write_marker(state_root, session_id, model=None, iterm_session=None, project=None, cwd=None,
                  tab_label=None, color=None, plugin_version=None, stop_hook_timeout=None,
-                 predecessor=None, started=None, backend=None):
+                 predecessor=None, started=None, backend=None, autonomous=False,
+                 autonomous_source="config"):
     d = lead_dir(state_root, session_id)
     d.mkdir(parents=True, exist_ok=True)
     marker_path(state_root, session_id).write_text(json.dumps({
@@ -348,6 +358,15 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
         # this is the only record of how to close that now-unarmed zombie tab. `relay
         # close-predecessor` reads and clears it. None for any lead that didn't arrive via handoff.
         "predecessor": predecessor,
+        # Autonomous posture (§6f / task #16 phase 1) — whether THIS lead proceeds by default on the
+        # routine in-plan approval beats instead of waiting for the human. Deliberately written on
+        # EVERY arm (never preserved like predecessor/started): the posture is opt-in-each-time, so a
+        # fresh `lead-start` resets it to whatever `autonomous_mode` config says (default False).
+        # `autonomous_source` records WHERE the current posture came from — "config" when an arm set
+        # it, "command" once `relay auto on|off` overrode it mid-session — so `relay auto status` can
+        # tell the human which it is rather than just the boolean.
+        "autonomous": bool(autonomous),
+        "autonomous_source": autonomous_source,
     }, indent=2))
 
 
@@ -357,6 +376,35 @@ def read_marker(state_root, session_id):
         return json.loads(p.read_text()) if p.exists() else {}
     except Exception:
         return {}
+
+
+def autonomous_state(marker):
+    """This lead's autonomous posture as `(on, source)` — `(bool, "config" | "command")`.
+
+    Read from the marker alone, never from config: config only decides the posture an arm STARTS
+    with (cmd_lead_start stamps it), after which the marker is the single source of truth. That is
+    what makes the posture per-session and resettable — a lead armed before this feature existed
+    (no key at all) reads as `(False, "config")`, i.e. the safe wait-for-human default."""
+    if not isinstance(marker, dict):
+        return (False, "config")
+    src = marker.get("autonomous_source")
+    return (bool(marker.get("autonomous")),
+            src if src in ("config", "command") else "config")
+
+
+def set_autonomous(state_root, session_id, on):
+    """Flip a lead's autonomous posture (read-modify-write, preserving every other marker field) and
+    stamp its source as "command". Returns True when the marker was updated, False when there is no
+    marker to update — the caller decides whether that is an error (`relay auto` treats it as one:
+    a posture with no lead to hold it would be silently meaningless)."""
+    m = read_marker(state_root, session_id)
+    if not isinstance(m, dict) or not m:
+        return False
+    m["autonomous"] = bool(on)
+    m["autonomous_source"] = "command"
+    m["last_active"] = now()
+    marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
+    return True
 
 
 def wake_hook_state(marker, poll_seconds):

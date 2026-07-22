@@ -112,13 +112,33 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg):
             iterm_session=marker.get("iterm_session"))
     # Emoji-forward banner: the model echoes this into its announcement, so 🚦 is a visible,
     # consistent "you have a relay update" marker in the lead's on-screen text.
+    #
+    # The instruction half is POSTURE-AWARE (§6f, task #16 phase 1). This text is injected at the
+    # exact beat autonomous mode redefines — "announce and WAIT" vs "announce, act, and record" — so
+    # a hardcoded "WAIT / do NOT act" would silently override the posture the user just granted, and
+    # the toggle would appear not to work. Manual stays the default and its wording is unchanged.
+    if lg.autonomous_state(marker)[0]:
+        instruction = (
+            "\n\nYou are in AUTONOMOUS MODE: announce, ACT, and record — do not wait for the user on "
+            "the routine, in-plan steps. Open your reply with '🚦 [relay] — review needed:', surface "
+            "these, then proceed on whatever is clearly the next step within the ALREADY-APPROVED "
+            "plan, announcing each autonomous action together with what you would have asked "
+            "(\"proceeded: sent packet 003 — under manual mode this would have waited for your go\"). "
+            "STOP and ask anyway if any of these applies: a risk flag / failing tests / UNVERIFIED "
+            "claim bearing on correctness; core logic, ledgers, parity tests, migrations or deploys; "
+            "an irreversible or outward-facing action; work not in the approved plan; genuine "
+            "ambiguity. AND COMMITTING an executor's work ALWAYS stops for the user — announce what "
+            "you would commit and ask. Say which stop-list item stopped you when one does.\n")
+    else:
+        instruction = (
+            "\n\nOpen your reply with the marker '🚦 [relay] — review needed:', surface these to the "
+            "user, and WAIT for their direction. Do NOT auto-review, auto-commit, or otherwise act "
+            "on them yourself until the user asks. If a report needs reviewing, tell the user it's "
+            "ready and ask whether to review it.\n")
     sys.stderr.write(
         "🚦 [relay] — review needed: new activity while you were idle:\n"
         + "\n".join(lines)
-        + "\n\nOpen your reply with the marker '🚦 [relay] — review needed:', surface these to the "
-          "user, and WAIT for their direction. Do NOT auto-review, auto-commit, or otherwise act "
-          "on them yourself until the user asks. If a report needs reviewing, tell the user it's "
-          "ready and ask whether to review it.\n"
+        + instruction
     )
     sys.exit(2)  # wake the idle lead
 
