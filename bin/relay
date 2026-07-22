@@ -523,12 +523,35 @@ def _launch_background_label_assert(bk, handle, label):
         pass
 
 
+def _label_holds_for_tab(handle, label):
+    """Does THIS tab currently carry `label`? The identity-aware title check (backlog §2).
+
+    With a handle, ask that one session what its title is (iterm.title_by_id) and bounded-match it.
+    The question the old code asked — `title_is_live(label, live_session_names())`, i.e. "does ANY
+    live tab carry this label" — is only equivalent while labels are unique, and relay's aren't: a
+    handoff gives predecessor and successor the SAME `[Lead] <project>` title and writes the
+    successor's marker before stepping the predecessor down, so during that window the successor
+    reads the predecessor's correctly-titled tab as proof of its own and never titles itself.
+    Reproduced at the seam (see the packet's repro), which upgrades §2 from hypothesis to bug.
+
+    A None from title_by_id means the tab couldn't be read at all (closed, or the probe failed) and
+    is deliberately NOT treated as "the label holds" — an unreadable tab is not a titled tab. It
+    returns False, so the caller re-asserts; a rename against a gone session is a harmless no-op,
+    whereas believing a vanished tab is correctly titled is the §2 bug again.
+
+    Without a handle (legacy/pre-capture sessions) there is no identity to ask about, so it falls
+    back to the old any-tab scan — imprecise, but strictly better than refusing to check at all."""
+    if handle:
+        title = iterm_backend.title_by_id(handle)
+        return bool(title) and iterm_backend.title_is_live(label, {title})
+    return iterm_backend.title_is_live(label, iterm_backend.live_session_names())
+
+
 def _background_label_loop(handle, label, window=27.0, interval=3.0, hold_checks=2,
                             sleep_fn=time.sleep, clock_fn=time.time):
     """The durable half of the [Exec]-label fix: runs INSIDE the detached subprocess launched by
-    _launch_background_label_assert. Polls the actual live tab title (iterm.live_session_names +
-    iterm.title_is_live, via the real scripts/iterm.py module — see the `iterm_backend` import at
-    the top of this file — a real title read, not is_alive's id short-circuit, which would report
+    _launch_background_label_assert. Polls THIS tab's actual title (_label_holds_for_tab, keyed by
+    the captured handle — a real title read, not is_alive's id short-circuit, which would report
     the tab "alive" without checking what its title currently says) and re-renames via
     rename_by_id whenever it isn't (still) `label`, over a bounded window (~25-30s by default — a
     few seconds past Claude Code's observed ~6-8s one-time titling).
@@ -542,7 +565,7 @@ def _background_label_loop(handle, label, window=27.0, interval=3.0, hold_checks
     consecutive = 0
     deadline = clock_fn() + window
     while clock_fn() < deadline:
-        if iterm_backend.title_is_live(label, iterm_backend.live_session_names()):
+        if _label_holds_for_tab(handle, label):
             consecutive += 1
             if consecutive >= hold_checks:
                 return True
@@ -902,7 +925,12 @@ def cmd_resume_lead(sid, force=False):
     except Exception:
         alive = False
     if not alive and marker.get("tab_label"):
-        alive = iterm.is_alive(marker["tab_label"])
+        # Ask about THIS lead's tab, not "is some tab called that" — the marker's own backend and
+        # handle, via _lead_tab_target. Label-only (what this used to be) reads a handoff sibling's
+        # identically-titled tab as proof this lead is alive and refuses a restore it should have
+        # allowed (backlog §2, same shape as the label-loop bug).
+        lead_bk, lead_label, lead_handle = _lead_tab_target(marker)
+        alive = lead_bk.is_alive(lead_label, lead_handle)
     if alive and not force:
         sys.exit(f"lead '{sid}' still looks alive — close its tab first or pass --force "
                  f"(two live copies of one conversation stomp on each other)")
@@ -2307,8 +2335,11 @@ def cmd_focus(args):
             f"or `relay restart {sid}` (re-runs its packet fresh).")
     marker = lead_guard.read_marker(STATE_ROOT, sid)  # a lead session?
     if marker:
-        label = marker.get("tab_label")
-        if label and iterm.focus(label):
+        # Identity first, exactly like the executor branch above: the marker's recorded backend and
+        # handle, not the label alone. Two leads can share a tab title (a handoff pair does, byte
+        # for byte — backlog §2), so a label-only focus could jump to the OTHER lead's tab.
+        bk, label, handle = _lead_tab_target(marker)
+        if label and bk.focus(label, handle):
             print(f"focused lead '{marker.get('project')}' (tab '{label}')")
             return
         sys.exit(
@@ -2334,6 +2365,33 @@ def _probe_backend_for_tab(label, handle):
         except Exception:
             continue
     return found[0] if len(found) == 1 else None
+
+
+def _lead_tab_target(marker):
+    """How to address a LEAD's own tab: `(backend, label, handle)`.
+
+    Two identities, both from the marker rather than from the caller's ambient state:
+      - the BACKEND that hosts the tab (recorded at arm time; probed, not guessed, for markers
+        armed before backend stamping existed — see _probe_backend_for_tab);
+      - the HANDLE ($TERM_SESSION_ID) that identifies the tab WITHIN that backend, which every
+        tab op takes as its id-first argument and which callers used to simply not pass.
+    Leaving the handle out makes an operation label-aware, and lead labels are NOT unique — a
+    handoff pair shares `[Lead] <project>` byte-for-byte (backlog §2), so a label-only lookup can
+    answer about, focus, or act on the WRONG lead's tab. The handle is already on the marker; this
+    exists so no lead-tab call site has to remember to pass it.
+
+    NOTE: cmd_nudge_lead below resolves the backend with this same logic inline. It is deliberately
+    NOT refactored onto this helper here — the packet that added this helper was explicitly bounded
+    off the wake path, and nudge-lead IS that path. Fold it in as a follow-up (behavior-identical),
+    rather than letting the two drift."""
+    label = marker.get("tab_label")
+    handle = marker.get("iterm_session")
+    recorded = marker.get("backend")
+    if recorded:
+        bk = backend.by_name(recorded) or iterm
+    else:
+        bk = _probe_backend_for_tab(label, handle) or iterm  # last resort: ambient guess, as before
+    return bk, label, handle
 
 
 def cmd_nudge_lead(args):
