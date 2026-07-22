@@ -2828,6 +2828,156 @@ class TestLeadListTermColumn:
         assert relay._lead_term_cell({}) == "?"
 
 
+class TestLeadLiveness:
+    """§3: `relay list`'s LIVE cell — live / unreachable / ghost — from a tab-alive probe plus
+    the same fresh-stamp window unique_lead_project uses (LEAD_LIVE_WINDOW_SECONDS)."""
+
+    NOW = time.mktime(time.strptime("2026-01-01T12:00:00", "%Y-%m-%dT%H:%M:%S"))
+
+    @classmethod
+    def _stamp(cls, offset_seconds):
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(cls.NOW - offset_seconds))
+
+    def _marker(self, last_active_offset=60, tab_label="[Lead] p", iterm_session="w0t0p0:X"):
+        return {"session_id": "lead-1", "project": "p", "tab_label": tab_label,
+                "iterm_session": iterm_session, "last_active": self._stamp(last_active_offset)}
+
+    def test_alive_tab_is_live_regardless_of_stamp_age(self, relay):
+        # an idle lead waiting on the human can legitimately go quiet past the window without
+        # being dead — the tab being alive is what matters here, not staleness.
+        m = self._marker(last_active_offset=relay.LEAD_LIVE_WINDOW_SECONDS + 999)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            assert relay._lead_liveness(m, now_ts=self.NOW) == "live"
+
+    def test_dead_tab_fresh_stamp_is_unreachable(self, relay):
+        # the alpha_service failure §3 calls out as "the valuable one".
+        m = self._marker(last_active_offset=60)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            assert relay._lead_liveness(m, now_ts=self.NOW) == "unreachable"
+
+    def test_dead_tab_stale_stamp_is_ghost(self, relay):
+        # the beta_view case: dead for days, never stepped down.
+        m = self._marker(last_active_offset=relay.LEAD_LIVE_WINDOW_SECONDS + 1)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            assert relay._lead_liveness(m, now_ts=self.NOW) == "ghost"
+
+    def test_missing_last_active_with_dead_tab_is_ghost(self, relay):
+        m = self._marker()
+        m["last_active"] = None
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            assert relay._lead_liveness(m, now_ts=self.NOW) == "ghost"
+
+    def test_is_alive_exception_degrades_to_not_alive(self, relay):
+        # fail-open: a probe crash must surface a degraded state, never take down the render.
+        m = self._marker(last_active_offset=relay.LEAD_LIVE_WINDOW_SECONDS + 1)
+        with mock.patch.object(relay.iterm, "is_alive", side_effect=RuntimeError("boom")):
+            assert relay._lead_liveness(m, now_ts=self.NOW) == "ghost"
+
+    def test_legacy_marker_with_no_tab_label_never_crashes(self, relay):
+        # pre-stamping legacy marker: tab_label/iterm_session never recorded at all.
+        m = {"session_id": "lead-1", "project": "p", "last_active": self._stamp(60)}
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            assert relay._lead_liveness(m, now_ts=self.NOW) == "unreachable"
+
+    def test_liveness_cell_shapes(self, relay):
+        # _lead_liveness_cell has no now_ts override (mirrors _lead_auto_cell/_lead_term_cell,
+        # which always resolve against real wall-clock time) — so stamps here must be relative to
+        # relay.now(), not the fixed self.NOW used by the now_ts-injectable tests above.
+        fresh = relay.now()
+        stale = time.strftime("%Y-%m-%dT%H:%M:%S",
+                               time.localtime(time.time() - relay.LEAD_LIVE_WINDOW_SECONDS - 1))
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            assert relay._lead_liveness_cell(self._marker())[0] == "live"
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            assert relay._lead_liveness_cell(
+                {"session_id": "lead-1", "tab_label": "x", "iterm_session": "y",
+                 "last_active": fresh})[0] == "unreachable"
+            assert relay._lead_liveness_cell(
+                {"session_id": "lead-1", "tab_label": "x", "iterm_session": "y",
+                 "last_active": stale})[0] == "ghost"
+
+    def _render(self, relay, capsys, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        capsys.readouterr()
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        return capsys.readouterr().out
+
+    def test_live_lead_renders_in_table(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="alpha",
+                                      tab_label="[Lead] alpha", iterm_session="w0t0p0:X")
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            out = self._render(relay, capsys, monkeypatch)
+        assert "LIVE" in out
+        row = [l for l in out.splitlines() if l.startswith("alpha")][0]
+        assert "live" in row.split()
+
+    def test_ghost_lead_renders_and_footnote(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="beta_view")
+        mp = relay.lead_guard.marker_path(relay.STATE_ROOT, "lead-1")
+        m = json.loads(mp.read_text())
+        m["last_active"] = "2000-01-01T00:00:00"
+        mp.write_text(json.dumps(m))
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            out = self._render(relay, capsys, monkeypatch)
+        row = [l for l in out.splitlines() if l.startswith("beta_view")][0]
+        assert "ghost" in row.split()
+        assert "LIVE=ghost" in out
+        assert "beta_view" in [l for l in out.splitlines() if "LIVE=ghost" in l][0]
+
+    def test_unreachable_lead_renders_and_footnote(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="alpha_service")
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            out = self._render(relay, capsys, monkeypatch)
+        row = [l for l in out.splitlines() if l.startswith("alpha_service")][0]
+        assert "unreachable" in row.split()
+        assert "LIVE=unreachable" in out
+
+    def test_legacy_marker_renders_without_crashing(self, relay, capsys, monkeypatch):
+        # no tab_label/iterm_session at all (write_marker's own defaults) — must render, not raise.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="legacy")
+        out = self._render(relay, capsys, monkeypatch)
+        row = [l for l in out.splitlines() if l.startswith("legacy")][0]
+        assert row.split()[-1]  # rendered a full row, no crash
+
+
+class TestLeadTranscriptMB:
+    """§9: `relay list`'s MB cell — a lead's OWN transcript size, read straight from disk (list
+    has no --statusline payload to reuse, unlike the status-line's weight segment)."""
+
+    def test_reads_real_transcript(self, relay, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        proj_dir = tmp_path / "cfg" / "projects" / "-some-project"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / "lead-1.jsonl").write_bytes(b"x" * (2 * 1024 * 1024))
+        assert relay._lead_mb_cell({"session_id": "lead-1"}) == "2.0"
+
+    def test_dash_when_unlocatable(self, relay, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        (tmp_path / "cfg" / "projects").mkdir(parents=True)
+        assert relay._lead_mb_cell({"session_id": "lead-1"}) == "-"
+
+    def test_dash_when_no_projects_root(self, relay, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "nope"))
+        assert relay._lead_mb_cell({"session_id": "lead-1"}) == "-"
+
+    def test_dash_for_missing_session_id(self, relay):
+        assert relay._lead_mb_cell({}) == "-"
+
+    def test_mb_column_renders_in_list(self, relay, capsys, monkeypatch, tmp_path):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        proj_dir = tmp_path / "cfg" / "projects" / "-p"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / "lead-1.jsonl").write_bytes(b"x" * (3 * 1024 * 1024))
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="heavy")
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        assert "MB" in out
+        row = [l for l in out.splitlines() if l.startswith("heavy")][0]
+        assert "3.0" in row.split()
+
+
 class TestClosePredecessor:
     """`relay close-predecessor`: the successor-only aftercare step that closes the outgoing lead's
     now-unarmed zombie tab, recorded in the successor's own marker at handoff time."""
