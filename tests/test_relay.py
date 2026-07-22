@@ -3115,6 +3115,209 @@ class TestLeadTranscriptMB:
         assert "3.0" in row.split()
 
 
+class TestHeavinessHelpers:
+    """§6e: the shared MB/threshold helpers behind both the EXECUTORS MB column (e1) and
+    cmd_send's heaviness gate (e2) — one number, read the same way everywhere."""
+
+    def _set_threshold(self, relay, mb):
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        relay.lead_guard.config_path(relay.STATE_ROOT).write_text(json.dumps({"handoff_nudge_mb": mb}))
+
+    def test_threshold_default_matches_handoff_nudge_default(self, relay):
+        # §6e design note: "reuse the existing handoff-nudge thresholds rather than inventing new
+        # ones" — same key, same default, not a second number to keep in sync.
+        assert relay._heaviness_threshold_mb() == relay.lead_guard.LEAD_DEFAULTS["handoff_nudge_mb"]
+
+    def test_threshold_reads_config_override(self, relay):
+        self._set_threshold(relay, 2)
+        assert relay._heaviness_threshold_mb() == 2.0
+
+    def test_is_heavy_at_or_above_threshold(self, relay):
+        assert relay._is_heavy(5.0, 5.0) is True
+        assert relay._is_heavy(5.1, 5.0) is True
+        assert relay._is_heavy(4.9, 5.0) is False
+
+    def test_is_heavy_none_is_never_heavy(self, relay):
+        # an unlocatable transcript must never gate/warn — nothing to warn about, and guessing
+        # would be worse than staying quiet.
+        assert relay._is_heavy(None, 0.0) is False
+
+    def test_transcript_mb_for_missing_session_is_none(self, relay):
+        assert relay._transcript_mb_for(None) is None
+        assert relay._transcript_mb_for("") is None
+
+    def test_transcript_mb_for_real_file(self, relay, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        d = tmp_path / "cfg" / "projects" / "-p"
+        d.mkdir(parents=True)
+        (d / "cs-x.jsonl").write_bytes(b"x" * (1024 * 1024))
+        assert relay._transcript_mb_for("cs-x") == pytest.approx(1.0, abs=0.01)
+
+    def test_transcript_mb_for_unlocatable_is_none(self, relay, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        (tmp_path / "cfg" / "projects").mkdir(parents=True)
+        assert relay._transcript_mb_for("cs-x") is None
+
+    def test_mb_cell_text(self, relay):
+        assert relay._mb_cell_text(3.14159) == "3.1"
+        assert relay._mb_cell_text(None) == "-"
+
+
+class TestExecutorMBColumn:
+    """§6e e1: `relay list`'s EXECUTORS table gains the same MB visibility leads got in #3, plus
+    a ver?/stale-hooks-style "heavy" footnote naming executors past the threshold."""
+
+    def _exec(self, relay, sid, claude_session, status="reported", packet=3):
+        relay.write_session(sid, {"session_id": sid, "current_packet": packet, "status": status,
+            "topic": "t", "worktree": "/w", "scope": "", "model": "sonnet",
+            "claude_session": claude_session, "busy_since": relay.now(), "updated": relay.now(),
+            "owner_lead": None, "owner_project": None})
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        (relay.packets_dir(sid) / f"{packet:03d}-report.md").write_text("done")
+
+    def _transcript(self, tmp_path, monkeypatch, name, mb):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        d = tmp_path / "cfg" / "projects" / "-p"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}.jsonl").write_bytes(b"x" * int(mb * 1024 * 1024))
+
+    def test_light_and_heavy_rows_both_show_mb(self, relay, capsys, tmp_path, monkeypatch):
+        self._transcript(tmp_path, monkeypatch, "cs-light", 0.5)
+        d = tmp_path / "cfg" / "projects" / "-p"
+        (d / "cs-heavy.jsonl").write_bytes(b"x" * int(6 * 1024 * 1024))
+        self._exec(relay, "light-1", "cs-light")
+        self._exec(relay, "heavy-1", "cs-heavy")
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        assert "MB" in out
+        light_row = [l for l in out.splitlines() if l.startswith("light-1")][0]
+        heavy_row = [l for l in out.splitlines() if l.startswith("heavy-1")][0]
+        assert "0.5" in light_row.split()
+        assert "6.0" in heavy_row.split()
+
+    def test_heavy_footnote_names_the_session_pkts_and_mb(self, relay, capsys, tmp_path, monkeypatch):
+        self._transcript(tmp_path, monkeypatch, "cs-heavy", 6)
+        self._exec(relay, "heavy-1", "cs-heavy", packet=9)
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        assert "⚠ heavy:" in out
+        footnote = [l for l in out.splitlines() if "⚠ heavy:" in l][0]
+        assert "heavy-1" in footnote and "9 pkts" in footnote and "6.0MB" in footnote
+
+    def test_no_footnote_when_nothing_heavy(self, relay, capsys, tmp_path, monkeypatch):
+        self._transcript(tmp_path, monkeypatch, "cs-light", 0.2)
+        self._exec(relay, "light-1", "cs-light")
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        assert "⚠ heavy:" not in out
+
+    def test_unlocatable_transcript_is_dash_not_heavy(self, relay, capsys, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        (tmp_path / "cfg" / "projects").mkdir(parents=True)
+        self._exec(relay, "nope-1", "cs-missing")
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        row = [l for l in out.splitlines() if l.startswith("nope-1")][0]
+        assert "-" in row.split()
+        assert "⚠ heavy:" not in out
+
+
+class TestSendHeavinessGate:
+    """§6e e2: `relay send` into a heavy session refuses unless --heavy-override "<reason>" is
+    given (mirrors executor_model_ceiling exactly), and the override reason lands in the ledger.
+    §9 binding constraint: wording must NUDGE (state the fact + the alternative), never scold."""
+
+    def _mk(self, relay, sid="e1", claude_session="cs-x", status="reported"):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": "/w", "topic": "t", "scope": "t",
+            "tab_label": "relay-e1", "model": None, "pid": os.getpid(), "iterm_session": "w0t0p0:OLD",
+            "claude_session": claude_session, "status": status, "current_packet": 1,
+            "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("first packet")
+        (relay.packets_dir(sid) / "001-report.md").write_text("done")
+
+    def _packet(self, tmp_path):
+        p = tmp_path / "next-packet.md"
+        p.write_text("# Follow-up\n\nDo the next thing.")
+        return str(p)
+
+    def _transcript(self, tmp_path, monkeypatch, name, mb):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        d = tmp_path / "cfg" / "projects" / "-p"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}.jsonl").write_bytes(b"x" * int(mb * 1024 * 1024))
+
+    def _ledger_events(self, relay):
+        if not relay.LEDGER.exists():
+            return []
+        return [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
+
+    def test_heavy_session_refuses_without_override(self, relay, tmp_path, monkeypatch):
+        self._transcript(tmp_path, monkeypatch, "cs-x", 6)
+        self._mk(relay)
+        with mock.patch.object(relay.iterm, "send") as send:
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path),
+                                               heavy_override=None))
+        msg = str(ei.value)
+        assert "heavy" in msg and "6.0MB" in msg and "--heavy-override" in msg
+        send.assert_not_called()  # refused before any delivery attempt
+
+    def test_nudge_wording_states_fact_and_alternative_not_a_scold(self, relay, tmp_path, monkeypatch):
+        # §9: "heaviness is not degradation... the override will be used often and legitimately."
+        self._transcript(tmp_path, monkeypatch, "cs-x", 6)
+        self._mk(relay)
+        with mock.patch.object(relay.iterm, "send"):
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path),
+                                               heavy_override=None))
+        msg = str(ei.value).lower()
+        assert "not a verdict on its work" in msg or "not degrad" in msg or "disciplined executor" in msg
+        assert "relay retire" in msg  # the cheap-escape alternative is named, not just a refusal
+
+    def test_heavy_session_proceeds_with_override_and_ledgers_reason(self, relay, tmp_path, monkeypatch):
+        self._transcript(tmp_path, monkeypatch, "cs-x", 6)
+        self._mk(relay)
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path),
+                                           heavy_override="need to finish this thread"))
+        send.assert_called_once()
+        events = self._ledger_events(relay)
+        override_events = [e for e in events if e["event"] == "heavy_override"]
+        assert len(override_events) == 1
+        assert override_events[0]["session_id"] == "e1"
+        assert override_events[0]["reason"] == "need to finish this thread"
+        assert override_events[0]["mb"] == 6.0
+
+    def test_light_session_sends_silently_no_gate(self, relay, tmp_path, monkeypatch):
+        self._transcript(tmp_path, monkeypatch, "cs-x", 0.5)
+        self._mk(relay)
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path),
+                                           heavy_override=None))
+        send.assert_called_once()
+        events = self._ledger_events(relay)
+        assert not [e for e in events if e["event"] == "heavy_override"]
+
+    def test_unlocatable_transcript_never_gates(self, relay, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        (tmp_path / "cfg" / "projects").mkdir(parents=True)
+        self._mk(relay, claude_session="cs-nowhere")
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path),
+                                           heavy_override=None))
+        send.assert_called_once()
+
+    def test_missing_heavy_override_attr_treated_as_none(self, relay, tmp_path, monkeypatch):
+        # callers that predate this flag (or construct args without it) must not crash — getattr
+        # default, same defensive style as args.all/args.closed elsewhere in cmd_list.
+        self._transcript(tmp_path, monkeypatch, "cs-x", 0.5)
+        self._mk(relay)
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send:
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path)))
+        send.assert_called_once()
+
+
 class TestClosePredecessor:
     """`relay close-predecessor`: the successor-only aftercare step that closes the outgoing lead's
     now-unarmed zombie tab, recorded in the successor's own marker at handoff time."""
