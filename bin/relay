@@ -1120,6 +1120,25 @@ def cmd_send(args):
         sys.exit(f"session '{args.session_id}' is {prev_status} with no captured Claude session to "
                  f"resume — use `relay spawn` for a fresh one")
 
+    # (§6e e2) Heaviness gate: mirrors executor_model_ceiling above (refuse unless an override with
+    # a ledgered reason) — but the WORDING must NUDGE, not scold (§9): heaviness is not degradation,
+    # a disciplined executor does its best work deep into a session, and this override will be used
+    # often and legitimately. Same threshold (handoff_nudge_mb) and same MB reading the EXECUTORS
+    # table's MB column/heavy footnote use, so `relay list` and `relay send` never disagree about
+    # what "heavy" means. mb is None (unlocatable transcript) never gates — nothing to warn about.
+    mb = _transcript_mb_for(s.get("claude_session"))
+    threshold = _heaviness_threshold_mb()
+    if _is_heavy(mb, threshold):
+        if not getattr(args, "heavy_override", None):
+            sys.exit(f"session '{args.session_id}' is heavy — its transcript is {mb:.1f}MB, past the "
+                     f"{threshold:g}MB threshold. That's not a verdict on its work — a disciplined "
+                     f"executor does its best work deep into a session — it's just a point worth a "
+                     f"conscious choice: `relay retire {args.session_id}` and a fresh spawn keeps "
+                     f"the next packet's context cheap, or pass --heavy-override \"<reason>\" to "
+                     f"send into this one anyway.")
+        append_ledger("heavy_override", session_id=args.session_id, mb=round(mb, 1),
+                      reason=args.heavy_override)
+
     # Claim ownership BEFORE delivery, so the poller arms for the CALLING lead the moment the
     # packet lands — whether it's delivered via the live-tab path or the resume-fallback below.
     s = _maybe_adopt(args.session_id, s)
@@ -1589,17 +1608,45 @@ def _find_transcript_path(claude_session):
     return None
 
 
+def _transcript_mb_for(claude_session):
+    """Raw MB (float) for `claude_session`'s transcript, via _find_transcript_path, or None when
+    unlocatable (no session id, unreadable projects root, no matching file). Shared by the LEADS
+    and EXECUTORS MB cells (format to '-' on None) and cmd_send's heaviness gate (§6e e2, which
+    skips the gate on None rather than guessing at a session's weight)."""
+    if not claude_session:
+        return None
+    path = _find_transcript_path(claude_session)
+    return lead_guard.transcript_mb(str(path)) if path else None
+
+
+def _mb_cell_text(mb):
+    """'-' for an unlocatable transcript (mb is None), else one decimal place — the shared cell
+    formatter behind both the LEADS and EXECUTORS MB columns."""
+    return f"{mb:.1f}" if mb is not None else "-"
+
+
 def _lead_mb_cell(m):
     """`relay list`'s MB cell (§9's "cheap sibling" to §3): this lead's OWN transcript size, read
     straight from disk rather than the --statusline payload (list has no payload to read — this
     runs from any shell, not necessarily the lead's own). '-' when the transcript can't be
     located — never guesses, never crashes — which also covers the legacy-marker case (no
     session_id at all)."""
-    sid = m.get("session_id")
-    path = _find_transcript_path(sid) if sid else None
-    if not path:
-        return "-"
-    return f"{lead_guard.transcript_mb(str(path)):.1f}"
+    return _mb_cell_text(_transcript_mb_for(m.get("session_id")))
+
+
+def _heaviness_threshold_mb():
+    """§6e's heaviness threshold (MB) — reuses the EXISTING handoff-nudge threshold
+    (`handoff_nudge_mb`, default 5) rather than inventing a new config key, per the backlog's own
+    design note: "Reuse the existing handoff-nudge thresholds rather than inventing new ones." One
+    number now means one thing everywhere it's read (a lead's own weight via --statusline, an
+    executor's weight here) instead of two thresholds silently drifting apart."""
+    return float(lead_guard.load_config(STATE_ROOT).get("handoff_nudge_mb", 5))
+
+
+def _is_heavy(mb, threshold):
+    """Whether an MB reading counts as 'heavy' for §6e e1/e2 — None (unlocatable transcript) is
+    never heavy; there's nothing to warn about, and guessing would be worse than staying quiet."""
+    return mb is not None and mb >= threshold
 
 
 def cmd_list(args):
@@ -1815,6 +1862,13 @@ def cmd_list(args):
             elapsed = _busy_elapsed(s)
             st = f"busy {int(elapsed / 60)}m" if elapsed is not None else "busy ?"
         rendered_statuses.append(st)
+    # §6e e1: one transcript-MB reading per executor, computed up front (same memoize-once
+    # rationale the LEADS liveness column uses above) — the table needs it in both the MB cell and
+    # the heavy footnote, and a heavy session's transcript is the single biggest file this command
+    # touches, so re-reading it twice per row is worth avoiding.
+    mb_by_sid = {s["session_id"]: _transcript_mb_for(s.get("claude_session")) for s in rows}
+    heavy_threshold = _heaviness_threshold_mb()
+
     # Calculate dynamic widths for EXECUTORS table with per-column caps.
     exec_cols = [
         ("SESSION", 36, [s["session_id"] for s in rows]),
@@ -1825,6 +1879,10 @@ def cmd_list(args):
         ("PROJECT", 14, [str(s.get("owner_project") or "-") for s in rows]),
         ("MODEL", 8, [str(s.get("model") or "-") for s in rows]),
         ("PKT", 4, [str(s["current_packet"]).zfill(4) for s in rows]),
+        # MB: §6e e1 — the same context-weight visibility leads got in #3, so "how heavy is this
+        # exec" is a glance instead of archaeology. A proxy for transcript size, not context-window
+        # occupancy (same caveat lead_guard.transcript_mb's own docstring carries).
+        ("MB", 6, [_mb_cell_text(mb_by_sid[s["session_id"]]) for s in rows]),
         ("REPORTED", 8, ["yes" if s["reported"] else "no" for s in rows]),
     ]
     exec_widths = {name: min(cap, max(len(name), max((len(str(v)) for v in vals), default=0)))
@@ -1849,9 +1907,21 @@ def cmd_list(args):
             cell(str(s.get("owner_project") or "-"), exec_widths["PROJECT"]),
             cell(str(s.get("model") or "-"), exec_widths["MODEL"]),
             cell(str(s["current_packet"]).zfill(4), exec_widths["PKT"]),
+            cell(_mb_cell_text(mb_by_sid[s["session_id"]]), exec_widths["MB"]),
             rep_cell,
         ]
         print(" ".join(row_parts))
+
+    # heavy footnote (§6e e1's "warning-stamp" shape, ver?/stale-hooks style — say it in words, not
+    # just a skimmable column) — NUDGE wording per §9: state the fact and the alternative, never
+    # imply the executor's work is degraded. Same threshold cmd_send's gate (§6e e2) refuses on, so
+    # the column, the footnote, and the send-time gate never disagree about what "heavy" means.
+    heavy = [(s, mb_by_sid[s["session_id"]]) for s in rows if _is_heavy(mb_by_sid[s["session_id"]], heavy_threshold)]
+    if heavy:
+        parts = ", ".join(f"{s['session_id']} ({s['current_packet']} pkts / {mb:.1f}MB)" for s, mb in heavy)
+        print(c(f"  ⚠ heavy: {parts} — no verdict on the work, just a heads up: `relay retire "
+                f"<sid>` and a fresh spawn keeps the next packet's context cheap; `relay send "
+                f"--heavy-override \"<reason>\"` keeps going in this one.", "yellow"))
 
     if orphans:
         sids = ", ".join(s["session_id"] for s in orphans)
@@ -2797,6 +2867,10 @@ def main():
     sd = sub.add_parser("send")
     sd.add_argument("session_id")
     sd.add_argument("packet")
+    sd.add_argument("--heavy-override", metavar="REASON",
+                    help="required to send into a session whose transcript is past the heaviness "
+                         "threshold (§6e e2) — the reason is ledgered (model_ceiling_override's "
+                         "sibling)")
     sd.set_defaults(func=cmd_send)
 
     ck = sub.add_parser("check")
