@@ -51,12 +51,12 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 1 | BUG | Stamp `backend` at the 3 `write_marker` sites that miss it ✅ LANDED v0.3.30 | §1 |
 | 2 | BUG | Make tab-label assertion identity-aware, not label-aware (repro first) ✅ LANDED v0.3.30 | §2 |
 | 3 | BUG | Lead status in `relay list` (live/unreachable/ghost) + own transcript-MB column ✅ LANDED v0.3.31 | §3, §9 |
-| 4 | CAP | Retitle predecessor tab `[ex-Lead]` on step-down — dissolves the suffix question | §4 |
+| 4 | CAP | Retitle predecessor tab `[ex-Lead]` on step-down — dissolves the suffix question — ✅ LANDED v0.3.32 ([ex-Lead]/[closed] retitles) | §4 |
 | 5 | — | *Superseded by #17* — the "woken twice" investigation; §5b confirmed the bug | §5 |
 | 6 | CAP | Required TL;DR block in report format (UNVERIFIED list mandatory) ✅ LANDED v0.3.29 | §6a, §9 |
-| 7 | CAP | Plugin-side verifier — with the "counts-match ≠ true" caveat | §6b, §9 |
+| 7 | CAP | Plugin-side verifier — with the "counts-match ≠ true" caveat ✅ LANDED v0.3.32 (`relay verify`, INCONCLUSIVE 4th verdict) | §6b, §9 |
 | 8 | DEC | Approved-plan autopilot `relay plan approve` (subset of #16) — *superseded by #16 phase 1* | §6c |
-| 9 | CAP | `relay land` deploy pipeline — *likely out of scope* | §6d |
+| 9 | CAP | `relay land` deploy pipeline — ❌ DROPPED by the user 2026-07-22 (out of scope; commit-push-merge + restart-app skills already cover it) | §6d |
 | 10 | CAP | Executor context/heaviness awareness (price/gate/escape e1–e2) ✅ LANDED v0.3.31 | §6e |
 | 11 | CAP | `relay retire` + `successor-seed.md` (the sleeper) ✅ LANDED v0.3.31 | §6e-e3 |
 | 12 | DOC | "Treat this packet cold" GATES line ✅ LANDED v0.3.30 | §6e-e4 |
@@ -65,12 +65,12 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 15 | DOC | Packet self-sufficiency doctrine ✅ LANDED v0.3.30 | §8 |
 | 16 | DEC | Autonomous/"confident" mode (hard-deps on #7 + #6) — ✅ PHASE 1 LANDED v0.3.29 (auto-commit awaits #7) | §6f, §9 |
 | 17 | BUG | **Asymmetric surfaced_reports dedup** → re-wake after review (high priority) ✅ LANDED v0.3.30 | §5b |
-| 18 | CAP | `relay send --when-idle` queue (replaces unsafe until-loop) | §9 |
+| 18 | CAP | `relay send --when-idle` queue (replaces unsafe until-loop) ✅ LANDED v0.3.32 | §9 |
 | 19 | BUG | Handoff double SUCCESSOR AFTERCARE section ✅ LANDED v0.3.31 | §9 |
 | 20 | BUG | Spawn writes a live marker when the launch never happened (no PID + no title) ✅ LANDED v0.3.30 | §12 |
 | 21 | BUG | Resume loops on a never-created conversation id; claims success on a dead tab ✅ LANDED v0.3.30 | §12 |
-| 22 | BUG | Wake dedup stamps surfaced on announce ATTEMPT, not delivery — busy-lead wake lost forever | §13 |
-| d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) | §10 |
+| 22 | BUG | Wake dedup stamps surfaced on announce ATTEMPT, not delivery — busy-lead wake lost forever ✅ LANDED v0.3.32 (two-phase stamp; §13 diagnosis code-confirmed) | §13 |
+| d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) ✅ PHASE 1 (logging-only) LANDED v0.3.32 — blocking mode waits on tuned logs | §10 |
 | d2 | DOC | Mutation-budget tripwire line in `/relay:mode` ✅ LANDED v0.3.30 | §10 |
 | d3 | DOC | Standing ops-hands pattern (spawn an ops executor up front) ✅ LANDED v0.3.30 | §10 |
 | d4 | BUG | Discipline markers must survive handoff + handoff-linter ✅ LANDED v0.3.31 | §10 |
