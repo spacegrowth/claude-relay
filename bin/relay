@@ -448,23 +448,31 @@ def session_pid_alive(s):
     return True
 
 
+def _transcript_project_dirs():
+    """Every <config-dir>/projects/<cwd-slug> dir, or None if the projects root itself doesn't
+    exist / is unreadable — the "can't tell" case conversation_transcript_exists's callers must
+    not mistake for "no transcript". Shared scan behind both that function and _find_transcript_path
+    (a session's transcript lives under a cwd-derived slug, so callers scan every dir rather than
+    reconstructing the one slug — a session can legitimately have been opened from a path that no
+    longer resolves the same way)."""
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")) / "projects"
+    try:
+        return [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        return None
+
+
 def conversation_transcript_exists(claude_session):
     """Whether Claude Code has a transcript on disk for `claude_session` — i.e. whether that
     conversation was ever actually created. Transcripts live at
-    <config-dir>/projects/<cwd-slug>/<session-uuid>.jsonl; the cwd slug is derived from the
-    launching directory, so this scans every project dir rather than reconstructing it (a session
-    can legitimately have been opened from a path that no longer resolves the same way).
+    <config-dir>/projects/<cwd-slug>/<session-uuid>.jsonl.
 
     Returns True, False, or None for "can't tell" — no projects root, or an unreadable one. Callers
     must treat None and False differently: a pinned id with no transcript is the §12 #21 signature
     (the launch died before Claude Code ever registered the id), but transcripts are also pruned on
     a retention schedule, so this is evidence for a WARNING, never grounds to refuse a resume on its
     own. The authority on "did this launch actually work" is _launch_survived."""
-    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")) / "projects"
-    try:
-        project_dirs = [d for d in root.iterdir() if d.is_dir()]
-    except OSError:
-        return None
+    project_dirs = _transcript_project_dirs()
     if not project_dirs:
         return None
     return any((d / f"{claude_session}.jsonl").exists() for d in project_dirs)
@@ -1521,6 +1529,79 @@ def _lead_term_cell(m):
     return m.get("backend") or "?"
 
 
+def _lead_stamp_fresh(m, now_ts=None):
+    """Whether marker `m`'s last_active is parseable and within LEAD_LIVE_WINDOW_SECONDS — the
+    same "fresh" test unique_lead_project uses to decide whether a name is still reserved (§3).
+    An unparseable/missing stamp degrades to False (not fresh), mirroring that convention."""
+    now_ts = time.time() if now_ts is None else now_ts
+    try:
+        last_active = time.mktime(time.strptime(m.get("last_active") or "", "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return False
+    return (now_ts - last_active) <= LEAD_LIVE_WINDOW_SECONDS
+
+
+def _lead_liveness(m, now_ts=None):
+    """§3's liveness verdict for one lead marker — 'live' / 'unreachable' / 'ghost':
+
+      'live'        — the tab is still alive (term_backend(m).is_alive, the same tab-title/handle
+                       probe executors use via _check_one — see docstring there). A live tab is
+                       'live' regardless of stamp freshness: an idle lead waiting on the human can
+                       legitimately go quiet past LEAD_LIVE_WINDOW_SECONDS without being dead.
+      'unreachable' — tab NOT alive, but last_active is still fresh. This is the valuable case §3
+                       calls out: a lead that crashed moments ago and hasn't aged into obvious
+                       staleness yet (the alpha_service failure — invisible until someone looked).
+      'ghost'       — tab not alive AND the stamp is beyond the window (or unparseable/missing) —
+                       the beta_view case: dead for days, never stepped down, never tombstoned.
+
+    Pure and fail-open: any is_alive probe exception is treated as "not alive" (surface the
+    degraded state rather than hiding it behind a crash)."""
+    try:
+        alive = term_backend(m).is_alive(m.get("tab_label"), m.get("iterm_session"), None)
+    except Exception:
+        alive = False
+    if alive:
+        return "live"
+    return "unreachable" if _lead_stamp_fresh(m, now_ts) else "ghost"
+
+
+_LIVENESS_CELL = {"live": ("live", ("green",)), "unreachable": ("unreachable", ("red", "bold")),
+                  "ghost": ("ghost", ("dim", "red"))}
+
+
+def _lead_liveness_cell(m):
+    """`relay list`'s LIVE cell for one lead marker: `(text, styles)`, same shape as _WAKE_CELL's
+    entries. 'unreachable' is styled as loud as a stale WAKE warning — it is the state a dead lead
+    used to hide behind ("indistinguishable from an idle one", §3) — while 'ghost' is dim (already
+    long gone, nothing urgent to act on beyond eventual `relay prune`)."""
+    return _LIVENESS_CELL[_lead_liveness(m)]
+
+
+def _find_transcript_path(claude_session):
+    """First matching transcript JSONL for `claude_session`, scanning the same project dirs as
+    conversation_transcript_exists (see _transcript_project_dirs). Returns a Path, or None when
+    the projects root is unreadable/empty or nothing matches — callers render '-' for either case,
+    so there is no need to distinguish "unknowable" from "not found" here."""
+    for d in (_transcript_project_dirs() or []):
+        p = d / f"{claude_session}.jsonl"
+        if p.exists():
+            return p
+    return None
+
+
+def _lead_mb_cell(m):
+    """`relay list`'s MB cell (§9's "cheap sibling" to §3): this lead's OWN transcript size, read
+    straight from disk rather than the --statusline payload (list has no payload to read — this
+    runs from any shell, not necessarily the lead's own). '-' when the transcript can't be
+    located — never guesses, never crashes — which also covers the legacy-marker case (no
+    session_id at all)."""
+    sid = m.get("session_id")
+    path = _find_transcript_path(sid) if sid else None
+    if not path:
+        return "-"
+    return f"{lead_guard.transcript_mb(str(path)):.1f}"
+
+
 def cmd_list(args):
     # LEADS are ALWAYS shown in full — you always want to see/restore any project, regardless of
     # which lead is asking. Executor scoping is separate (below).
@@ -1599,6 +1680,8 @@ def cmd_list(args):
             wake_states[sid] = state
         _WAKE_CELL = {"ok": ("ok", ("green",)), "stale": ("STALE", ("red", "bold")),
                       "unknown": ("ver?", ("dim",)), "stuck": ("stuck", ("red", "bold"))}
+        # One liveness verdict per lead, computed up front — see the LIVE column comment below.
+        liveness_by_sid = {m.get("session_id"): _lead_liveness(m) for m in leads}
         # Calculate dynamic widths for LEADS table with per-column caps.
         lead_cols = [
             ("PROJECT", 22, [m.get("project") or "-" for m in leads]),
@@ -1614,6 +1697,15 @@ def cmd_list(args):
             # nudges to it are probe-or-guess rather than addressed (§1) — the same "you can only
             # find this by reading JSON" blind spot the VER/WAKE cells already exist to remove.
             ("TERM", 8, [_lead_term_cell(m) for m in leads]),
+            # LIVE: §3's honest liveness verdict (live/unreachable/ghost) — before this, a dead
+            # lead with no clean step-down was indistinguishable from an idle one. Computed ONCE
+            # per lead here (liveness_by_sid): each verdict runs a real is_alive osascript probe,
+            # and this table needs it in four places (sizing, row, two footnotes) — re-probing
+            # would add 4×N subprocess round-trips to every `relay list`.
+            ("LIVE", 11, [_LIVENESS_CELL[liveness_by_sid[m.get("session_id")]][0] for m in leads]),
+            # MB: §9's cheap sibling to §3 — this lead's own transcript size, so a heavy session is
+            # a visible climbing number all day rather than a surprise at the handoff nudge.
+            ("MB", 6, [_lead_mb_cell(m) for m in leads]),
             ("LAST ACTIVE", 12, [_lead_age_cell(m) for m in leads]),
         ]
         lead_widths = {name: min(cap, max(len(name), max((len(str(v)) for v in vals), default=0)))
@@ -1626,6 +1718,7 @@ def cmd_list(args):
             wake_text, wake_styles = _WAKE_CELL[wake_states[m.get("session_id")]]
             auto_text, auto_styles = _lead_auto_cell(m)
             term_text = _lead_term_cell(m)
+            live_text, live_styles = _LIVENESS_CELL[liveness_by_sid[m.get("session_id")]]
             row_parts = [
                 cell(m.get("project") or "-", lead_widths["PROJECT"]),
                 cell(m.get("session_id") or "-", lead_widths["SESSION"]),
@@ -1637,6 +1730,8 @@ def cmd_list(args):
                 # only the "?" gets styling (dim — informational, not an error).
                 cell(term_text, lead_widths["TERM"]) if term_text != "?"
                 else c(cell(term_text, lead_widths["TERM"]), "dim"),
+                c(cell(live_text, lead_widths["LIVE"]), *live_styles),
+                cell(_lead_mb_cell(m), lead_widths["MB"]),
                 cell(_lead_age_cell(m), lead_widths["LAST ACTIVE"]),
             ]
             print(" ".join(row_parts))
@@ -1655,6 +1750,20 @@ def cmd_list(args):
             print(c(f"  ⚡ AUTO: {names} — proceeding without asking on routine in-plan steps. "
                     f"Committing executor work still stops for you. `relay auto off --session <id>` "
                     f"reverts.", "yellow"))
+        # LIVE=unreachable/ghost footnotes (§3) — the same "say it in words, not just a cell" rule
+        # the AUTO/WAKE warnings already follow, since a skimmed column is easy to slide past.
+        unreachable_leads = [m for m in leads if liveness_by_sid[m.get("session_id")] == "unreachable"]
+        if unreachable_leads:
+            names = ", ".join((m.get("project") or (m.get("session_id") or "?")[:8]) for m in unreachable_leads)
+            print(c(f"  ⚠ LIVE=unreachable: {names} — recently active but its tab can no longer be "
+                    f"reached (crashed or closed without stepping down). Check on it directly.",
+                    "red"))
+        ghost_leads = [m for m in leads if liveness_by_sid[m.get("session_id")] == "ghost"]
+        if ghost_leads:
+            names = ", ".join((m.get("project") or (m.get("session_id") or "?")[:8]) for m in ghost_leads)
+            print(c(f"  ⚠ LIVE=ghost: {names} — tab gone, stamp stale — this lead is dead and never "
+                    f"stepped down. `relay close --self <session-id>` clears it (or `relay prune`).",
+                    "dim"))
         if any(st == "stuck" for st in wake_states.values()):
             print(c("  ⚠ WAKE=stuck: a dead watcher's lock is blocking wakes for this lead — it "
                     "will self-heal on the lead's next turn (the lock is now auto-broken), and any "
