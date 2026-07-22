@@ -74,6 +74,16 @@ class TestTemplateFooterConsistency:
         assert "sess-x" in p
         assert "diff: file://" in p
 
+    def test_footer_forbids_opening_real_tabs_in_demos(self, relay):
+        """An executor verifying its work must not drive the human's real terminal. The bullet
+        names the EXACT seam a live packet-002 incident found: term_backend(s) re-resolves the
+        backend from session.json, so patching relay.iterm alone silently misses close/send/rename."""
+        p = relay.build_packet("do the thing", "/tmp/x/001-report.md",
+                               "/path/to/relay diff sess-x", "file:///tmp/x/001-diff.html")
+        assert "NEVER OPEN REAL TABS TO VERIFY" in p
+        assert "term_backend" in p and "iterm_backend" in p
+        assert "Sandbox HOME alone is NOT enough" in p
+
     def test_footer_contains_required_tldr_block(self, relay):
         """§6a (task #6): the auto-appended REPORT FORMAT must require a TL;DR block with
         Status/Risk flags/UNVERIFIED/Changed fields, and the UNVERIFIED line must be called out
@@ -1545,11 +1555,11 @@ class TestWhoami:
 class TestCloseTab:
     """cmd_close now kills the executor's process and closes its iTerm tab (report's on disk). Mocks
     iterm.close / pid_alive / os.kill / time.sleep — no real iTerm or signals."""
-    def _mk(self, relay, sid="e1", pid=12345):
+    def _mk(self, relay, sid="e1", pid=12345, handle=None):
         relay.session_dir(sid).mkdir(parents=True)
         relay.write_session(sid, {"session_id": sid, "status": "busy",
             "tab_label": "relay-e1", "pid": pid, "current_packet": 1, "topic": "t",
-            "worktree": "/w", "busy_since": relay.now()})
+            "worktree": "/w", "busy_since": relay.now(), "iterm_session": handle})
 
     def _args(self, **over):
         base = dict(session_id="e1", supersede=None, self_session=None, keep_tab=False)
@@ -1581,6 +1591,66 @@ class TestCloseTab:
             relay.cmd_close(self._args())
         out = capsys.readouterr().out
         assert "closed itself" in out and "Cmd-W" not in out
+
+    def test_lingering_tab_is_retitled_closed(self, relay):
+        """#4 generalization: a tab that outlives its session says so. Only the branch that leaves
+        one standing retitles — a tab that actually closed has nothing to rename."""
+        self._mk(relay, handle="w0t0p0:E1")
+        with mock.patch.object(relay.iterm, "close", return_value=False), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay.iterm, "rename_by_id", return_value=True) as rn, \
+             mock.patch.object(relay, "pid_alive", side_effect=[True, False]), \
+             mock.patch.object(relay.os, "kill"), \
+             mock.patch.object(relay.time, "sleep"):
+            relay.cmd_close(self._args())
+        rn.assert_called_once_with("w0t0p0:E1", "[closed] e1")   # by HANDLE, never by label
+        assert relay.read_session("e1")["tab_label"] == "[closed] e1"   # persisted after the retitle
+
+    def test_a_closed_tab_is_not_retitled(self, relay):
+        self._mk(relay, handle="w0t0p0:E1")
+        with mock.patch.object(relay.iterm, "close", return_value=True), \
+             mock.patch.object(relay.iterm, "rename_by_id") as rn, \
+             mock.patch.object(relay, "pid_alive", side_effect=[True, False]), \
+             mock.patch.object(relay.os, "kill"), \
+             mock.patch.object(relay.time, "sleep"):
+            relay.cmd_close(self._args())
+        rn.assert_not_called()
+        assert relay.read_session("e1")["tab_label"] == "relay-e1"      # untouched
+
+    def test_retitle_failure_never_fails_the_close(self, relay):
+        self._mk(relay, handle="w0t0p0:E1")
+        with mock.patch.object(relay.iterm, "close", return_value=False), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay.iterm, "rename_by_id", side_effect=OSError("boom")), \
+             mock.patch.object(relay, "pid_alive", side_effect=[True, False]), \
+             mock.patch.object(relay.os, "kill"), \
+             mock.patch.object(relay.time, "sleep"):
+            relay.cmd_close(self._args())                               # must not raise
+        assert relay.read_session("e1")["status"] == "closed"
+        assert relay.read_session("e1")["tab_label"] == "relay-e1"
+
+    def test_keep_tab_retitles_the_still_live_tab(self, relay):
+        self._mk(relay, handle="w0t0p0:E1")
+        with mock.patch.object(relay.iterm, "rename_by_id", return_value=True) as rn, \
+             mock.patch.object(relay, "pid_alive", return_value=True):
+            relay.cmd_close(self._args(keep_tab=True))
+        rn.assert_called_once_with("w0t0p0:E1", "[closed] e1")
+        assert relay.read_session("e1")["tab_label"] == "[closed] e1"
+
+    def test_a_handle_less_session_is_never_retitled_by_label(self, relay):
+        """No recorded handle → no rename at all. Falling back to a label match is exactly the #2
+        defect (a label can name two live tabs), so a legacy record degrades to a silent no-op."""
+        self._mk(relay, handle=None)   # legacy record, spawned before handle capture
+        with mock.patch.object(relay.iterm, "close", return_value=False), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay.iterm, "rename_by_id") as rn, \
+             mock.patch.object(relay, "pid_alive", side_effect=[True, False]), \
+             mock.patch.object(relay.os, "kill"), \
+             mock.patch.object(relay.time, "sleep"):
+            relay.cmd_close(self._args())          # must not raise
+        rn.assert_not_called()
+        assert relay.read_session("e1")["status"] == "closed"
+        assert relay.read_session("e1")["tab_label"] == "relay-e1"
 
     def test_keep_tab_leaves_tab_and_process(self, relay):
         self._mk(relay)
@@ -3279,6 +3349,43 @@ class TestHandoff:
         # /relay:mode after settling instead of being told never to run it — see
         # test_handoff_copy_has_aftercare_section for the full replacement spec.
         assert "do NOT run /relay:mode" not in cap["prompt"]
+
+    def test_handoff_retitles_the_predecessor_tab(self, relay, tmp_path, monkeypatch):
+        """#4/§4: after a handoff the tab bar briefly holds TWO tabs titled `[Lead] webapp`. The
+        husk is retitled so exactly one tab ever claims to be the live lead."""
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp",
+                                      cwd=str(tmp_path), iterm_session="w0t0p0:OLD")
+        self._env(monkeypatch, "lead-1")
+        with mock.patch.object(relay.iterm, "rename_by_id", return_value=True) as rn:
+            self._run(relay, self._md(tmp_path))
+        # by HANDLE, never by label — the label is precisely what's ambiguous right now (#2)
+        rn.assert_called_once_with("w0t0p0:OLD", "[ex-Lead] webapp")
+        succ = [m for sid, m in self._leads(relay).items() if sid != "lead-1"][0]
+        assert succ["tab_label"] == "[Lead] webapp"                    # successor untouched
+        assert succ["predecessor"]["tab_label"] == "[ex-Lead] webapp"  # husk record kept in sync,
+        # so close-predecessor's label FALLBACK can still find it
+        assert any(e["event"] == "predecessor_retitled" for e in self._ledger_events(relay))
+
+    def test_handoff_without_a_recorded_handle_is_a_silent_noop(self, relay, tmp_path, monkeypatch):
+        # a legacy marker (pre-iterm_session) must degrade to no rename, not an error
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))
+        self._env(monkeypatch, "lead-1")
+        with mock.patch.object(relay.iterm, "rename_by_id") as rn:
+            self._run(relay, self._md(tmp_path))
+        rn.assert_not_called()
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1") == {}   # handoff still done
+        assert any(e["event"] == "lead_handoff" for e in self._ledger_events(relay))
+
+    def test_a_failing_retitle_never_fails_the_handoff(self, relay, tmp_path, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp",
+                                      cwd=str(tmp_path), iterm_session="w0t0p0:OLD",
+                                      tab_label="[Lead] webapp")
+        self._env(monkeypatch, "lead-1")
+        with mock.patch.object(relay.iterm, "rename_by_id", side_effect=OSError("boom")):
+            self._run(relay, self._md(tmp_path))                       # must not raise
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1") == {}   # stepped down anyway
+        succ = [m for sid, m in self._leads(relay).items() if sid != "lead-1"][0]
+        assert succ["predecessor"]["tab_label"] == "[Lead] webapp"      # unchanged: rename didn't take
 
     def test_handoff_steps_caller_down(self, relay, tmp_path, monkeypatch):
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", cwd=str(tmp_path))

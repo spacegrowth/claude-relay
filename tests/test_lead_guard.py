@@ -660,6 +660,107 @@ class TestExecutorEscalationHookSendPath:
                    for e in events)
 
 
+class TestEscalationRearmOnUnconfirmedPush:
+    """#22/§13 second half: the one-shot push must NOT burn its slot on a nudge it can't confirm.
+    §13's incident had the nudge fire into a busy lead's tab, get swallowed, and the slot spent —
+    both wake layers dying on the same busy window with nothing left to retry."""
+
+    @pytest.fixture
+    def hook_mod(self):
+        import importlib.util
+        path = str(REPO_ROOT / "hooks" / "executor_escalation.py")
+        spec = importlib.util.spec_from_file_location("executor_escalation_rearm_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _executor(self, root, sid="exec-r"):
+        d = root / sid
+        (d / "packets").mkdir(parents=True)
+        (d / "session.json").write_text(json.dumps({
+            "session_id": sid, "current_packet": 1, "status": "busy", "owner_lead": "lead-1"}))
+        (d / "packets" / "001-report.md").write_text("done")
+        lg.write_marker(root, "lead-1", tab_label="[Lead] alpha")
+
+    def _run(self, hook_mod, root, monkeypatch, sid="exec-r"):
+        import io
+        real_run = hook_mod.subprocess.run
+        calls = []
+        monkeypatch.setattr(hook_mod, "STATE_ROOT", str(root))
+        monkeypatch.setattr("sys.argv", ["executor_escalation.py", sid])
+        monkeypatch.setenv("HOME", str(root.parent))
+        monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
+
+        def fake_run(cmd, **kwargs):
+            if len(cmd) > 1 and cmd[1] in ("nudge-lead", "_deliver-queued"):
+                calls.append(cmd[1])
+                return SimpleNamespace(returncode=0)
+            return real_run(cmd, **kwargs)          # whoami runs for real
+
+        monkeypatch.setattr(hook_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "claude-uuid"})))
+        with pytest.raises(SystemExit) as ei:
+            hook_mod.main()
+        return ei.value.code, calls
+
+    def test_a_sent_push_is_recorded_unconfirmed(self, tmp_path, hook_mod, monkeypatch):
+        root = tmp_path / ".relay-tasks"
+        self._executor(root)
+        rc, calls = self._run(hook_mod, root, monkeypatch)
+        assert rc == 0 and "nudge-lead" in calls
+        entry = lg.load_escalation(root, "exec-r")["1"]
+        assert entry["status"] == "sent" and entry["confirmed"] is False
+
+    def test_unconfirmed_push_re_arms_while_the_report_stays_unsurfaced(self, tmp_path, hook_mod,
+                                                                       monkeypatch):
+        # THE FIX: the lead never handled it, so a later executor Stop pushes again instead of
+        # gating out on a shot that demonstrably achieved nothing.
+        root = tmp_path / ".relay-tasks"
+        self._executor(root)
+        self._run(hook_mod, root, monkeypatch)
+        rc, calls = self._run(hook_mod, root, monkeypatch)
+        assert rc == 0 and "nudge-lead" in calls          # pushed a SECOND time
+
+    def test_it_stops_re_arming_once_the_lead_handles_the_report(self, tmp_path, hook_mod,
+                                                                 monkeypatch):
+        # the negative half: proof via an #17 channel closes it out — no infinite re-nudging
+        root = tmp_path / ".relay-tasks"
+        self._executor(root)
+        self._run(hook_mod, root, monkeypatch)
+        lg.mark_surfaced(root, "lead-1", ["exec-r:1"])    # lead ran check/diff/close
+        rc, calls = self._run(hook_mod, root, monkeypatch)
+        assert rc == 0 and "nudge-lead" not in calls
+        assert lg.load_escalation(root, "exec-r")["1"]["confirmed"] is True
+
+    def test_a_pending_only_announce_does_not_count_as_handled(self, tmp_path, hook_mod,
+                                                               monkeypatch):
+        # a lead-side announce that was never proven delivered must NOT silence the executor's
+        # push — that combination is exactly how §13's report reached nobody
+        root = tmp_path / ".relay-tasks"
+        self._executor(root)
+        self._run(hook_mod, root, monkeypatch)
+        lg.mark_pending(root, "lead-1", ["exec-r:1"])
+        rc, calls = self._run(hook_mod, root, monkeypatch)
+        assert rc == 0 and "nudge-lead" in calls
+
+    def test_a_legacy_entry_is_never_resurrected(self, tmp_path, hook_mod, monkeypatch):
+        # entries written before this fix carry no `confirmed` field → treated as confirmed
+        root = tmp_path / ".relay-tasks"
+        self._executor(root)
+        lg.save_escalation(root, "exec-r", {"1": {"status": "sent"}})
+        rc, calls = self._run(hook_mod, root, monkeypatch)
+        assert rc == 0 and "nudge-lead" not in calls
+        assert lg.load_escalation(root, "exec-r") == {"1": {"status": "sent"}}
+
+    def test_a_failed_push_still_does_not_retry(self, tmp_path, hook_mod, monkeypatch):
+        # unchanged design: `failed` is terminal (D4) — only an unconfirmed `sent` re-arms
+        root = tmp_path / ".relay-tasks"
+        self._executor(root)
+        lg.save_escalation(root, "exec-r", {"1": {"status": "failed"}})
+        rc, calls = self._run(hook_mod, root, monkeypatch)
+        assert rc == 0 and "nudge-lead" not in calls
+
+
 class TestExecutorEscalationHookQueueDelivery:
     """The PRIMARY --when-idle delivery trigger (task #18): this Stop hook IS the idle transition a
     queued packet is waiting for, so it hands off to `relay _deliver-queued`. Same in-process load
@@ -1330,6 +1431,77 @@ class TestEscalationDecision:
         assert lg.escalation_decision(root, "exec-1", 2, owner_lead="lead-1") == "send"
 
 
+class TestPendingWakes:
+    """#22/§13: the two-phase wake stamp. An announce is PENDING (retryable); only proven delivery
+    promotes it to surfaced. The mirror of #17 — that stamped too little and caused duplicate
+    wakes; this stamped too early and swallowed reports for good, which is strictly worse."""
+
+    @pytest.fixture
+    def root(self, tmp_path):
+        return tmp_path / ".relay-tasks"
+
+    def test_pending_does_not_suppress_a_later_announce(self, root):
+        # the heart of the fix: an announced-but-unproven report is still "new" next time
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        assert lg.load_surfaced(root, "lead-1") == set()
+        assert lg.load_pending(root, "lead-1")["exec-1:1"]["announces"] == 1
+
+    def test_promote_makes_it_surfaced(self, root):
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        assert lg.promote_pending(root, "lead-1") == ["exec-1:1"]
+        assert lg.load_surfaced(root, "lead-1") == {"exec-1:1"}
+        assert lg.load_pending(root, "lead-1") == {}          # and stops being retryable
+
+    def test_promote_with_nothing_pending_is_a_noop(self, root):
+        assert lg.promote_pending(root, "lead-1") == []
+        assert lg.load_surfaced(root, "lead-1") == set()
+
+    def test_an_17_channel_stamp_clears_pending(self, root):
+        # check/diff/close/retire are proof the lead HANDLED the report — stop retrying it
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        lg.mark_surfaced(root, "lead-1", ["exec-1:1"])
+        assert lg.load_pending(root, "lead-1") == {}
+        assert lg.load_surfaced(root, "lead-1") == {"exec-1:1"}
+
+    def test_retry_is_capped_so_it_can_never_spam(self, root):
+        # a harness that never sets stop_hook_active must not be re-announced at forever
+        capped = []
+        for _ in range(lg.WAKE_RETRY_CAP):
+            capped = lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        assert capped == ["exec-1:1"]
+        assert lg.load_surfaced(root, "lead-1") == {"exec-1:1"}   # given up: stamped for real
+        assert lg.load_pending(root, "lead-1") == {}
+
+    def test_below_the_cap_nothing_is_stamped(self, root):
+        for _ in range(lg.WAKE_RETRY_CAP - 1):
+            assert lg.mark_pending(root, "lead-1", ["exec-1:1"]) == []
+        assert lg.load_surfaced(root, "lead-1") == set()
+
+    def test_pending_is_per_lead(self, root):
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        assert lg.load_pending(root, "lead-2") == {}
+        lg.promote_pending(root, "lead-2")
+        assert lg.load_surfaced(root, "lead-1") == set()          # untouched by the other lead
+
+    def test_corrupt_pending_file_reads_as_empty(self, root):
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        lg._pending_path(root, "lead-1").write_text("{not json")
+        assert lg.load_pending(root, "lead-1") == {}              # never raises
+
+    def test_new_reports_for_still_returns_a_pending_report(self, root):
+        # the property the whole fix rests on: pending is NOT dedup
+        lg.write_marker(root, "lead-1")
+        ed = root / "exec-1"; (ed / "packets").mkdir(parents=True)
+        (ed / "session.json").write_text(json.dumps(
+            {"session_id": "exec-1", "current_packet": 1, "status": "reported",
+             "owner_lead": "lead-1"}))
+        (ed / "packets" / "001-report.md").write_text("done")
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        assert [f[0] for f in lg.new_reports_for(root, "lead-1")] == ["exec-1:1"]
+        lg.promote_pending(root, "lead-1")
+        assert lg.new_reports_for(root, "lead-1") == []            # proven → deduped
+
+
 class TestEscalationLedger:
     """The executor's OWN escalation-state ledger — separate from the lead's surfaced_reports.json
     (design §4.4), so the executor's 'I notified/nudged' bookkeeping never suppresses the lead's own
@@ -1757,8 +1929,33 @@ class TestStopHookLivePayload:
             {"session_id": "exec-1", "current_packet": 1, "status": "reported", "owner_lead": "lead-1"}))
         (ed / "packets" / "001-report.md").write_text("done")
         assert self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path)})[0] == 2
-        # second stop: same report already surfaced → silent
+        # #22 CONTRACT CHANGE: an announce alone is no longer proof of delivery. When the wake IS
+        # delivered, the harness continues the session and re-runs Stop with stop_hook_active — that
+        # re-run is the proof, and it promotes the pending key to surfaced. Modelling the real
+        # delivered sequence (this test used to fire two bare Stops back-to-back, which is actually
+        # the DROPPED case — see test_undelivered_wake_retries for that half).
+        assert self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                    "stop_hook_active": True})[0] == 0
+        # third stop: proven-surfaced → silent, exactly as before (no #17 regression)
         assert self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path)})[0] == 0
+
+    def test_undelivered_wake_retries(self, tmp_path):
+        """#22/§13, the lost-wake repro: a wake that fires but is never delivered (no
+        stop_hook_active re-run — the lead was mid-turn and the harness dropped this hook's exit-2)
+        must be announced AGAIN on a later Stop. Pre-fix this returned 0: the announce had already
+        stamped surfaced_reports.json, so the report was swallowed for good."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        ed = root / "exec-1"; (ed / "packets").mkdir(parents=True)
+        (ed / "session.json").write_text(json.dumps(
+            {"session_id": "exec-1", "current_packet": 1, "status": "reported", "owner_lead": "lead-1"}))
+        (ed / "packets" / "001-report.md").write_text("done")
+        rc1, err1 = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path)})
+        assert rc1 == 2 and "exec-1" in err1
+        assert lg.load_surfaced(root, "lead-1") == set()        # NOT stamped on a mere attempt
+        assert "exec-1:1" in lg.load_pending(root, "lead-1")    # pending instead
+        rc2, err2 = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path)})
+        assert rc2 == 2 and "exec-1" in err2                    # re-announced, not swallowed
 
     def test_stop_hook_active_is_silent(self, tmp_path):
         root = tmp_path / ".relay-tasks"

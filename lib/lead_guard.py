@@ -480,6 +480,22 @@ def touch_lead(state_root, session_id, plugin_root=None):
         pass
 
 
+def update_marker(state_root, session_id, **fields):
+    """Read-modify-write a FEW marker fields, preserving everything else — the safe counterpart to
+    write_marker, which rewrites the whole marker and silently drops anything the caller forgot to
+    re-pass (§1). Same defensive contract as touch_lead: a missing/unreadable marker is a silent
+    no-op and nothing here ever raises. Returns True only if the write happened."""
+    try:
+        m = read_marker(state_root, session_id)
+        if not isinstance(m, dict) or not m:
+            return False
+        m.update(fields)
+        marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
+        return True
+    except Exception:
+        return False
+
+
 def list_leads(state_root):
     """Every lead marker under <state_root>/lead/*/marker.json, oldest-first by `started`. Each
     item is the marker dict exactly as stored. Fully defensive: config.json and any non-marker
@@ -655,8 +671,10 @@ def load_surfaced(state_root, lead_sid):
 
 
 def mark_surfaced(state_root, lead_sid, keys):
-    """Record report keys (\"execsid:packet\") already announced to this lead, so each report wakes
-    the lead exactly once."""
+    """Record report keys (\"execsid:packet\") PROVEN to have reached this lead, so each report wakes
+    it exactly once. Callers are the delivery-proven ones only: the #17 channels (check/diff/close/
+    retire — the lead demonstrably handled the report) and promote_pending below. An announce that
+    merely FIRED is not proof — see mark_pending (#22)."""
     try:
         cur = load_surfaced(state_root, lead_sid)
         cur.update(keys)
@@ -665,6 +683,104 @@ def mark_surfaced(state_root, lead_sid, keys):
         _surfaced_path(state_root, lead_sid).write_text(json.dumps(sorted(cur)))
     except Exception:
         pass
+    drop_pending(state_root, lead_sid, keys)  # proven by another channel → stop retrying it
+
+
+# ---- #22: announced-but-unproven wakes (§13's lost-wake bug) -----------------------------------
+# The bug: the Stop hook stamped `surfaced` the moment it ANNOUNCED, then relied on its exit-2
+# reaching the lead. A firing that can't be delivered (the lead is mid-turn, so the harness drops a
+# stale hook's exit-2) still kept the stamp, and the report was never announced again — silently
+# swallowed. Mirror image of #17: that stamped too little (duplicate wakes), this stamps too early
+# (lost wakes), which is strictly worse.
+#
+# The fix is a two-phase stamp. An announce records the keys as PENDING, which does NOT suppress a
+# later announce — so an undelivered wake naturally retries on the lead's next Stop. Delivery is
+# PROVEN by the harness itself: when our exit-2 actually continues the session, Claude Code re-runs
+# the Stop hook with `stop_hook_active: true`, and that re-run promotes pending → surfaced. If the
+# wake was dropped instead, no such re-run happens, the key stays pending, and the next Stop
+# re-announces it.
+WAKE_RETRY_CAP = 3  # give up (and stamp) after this many unproven announces — a lead whose harness
+                    # never sets stop_hook_active must not be re-announced at forever.
+
+
+def _pending_path(state_root, lead_sid):
+    return lead_dir(state_root, lead_sid) / "pending_wakes.json"
+
+
+def load_pending(state_root, lead_sid):
+    """{key: {"announces": n}} for wakes announced but not yet proven delivered."""
+    try:
+        p = _pending_path(state_root, lead_sid)
+        return json.loads(p.read_text()) if p.exists() else {}
+    except Exception:
+        return {}
+
+
+def _save_pending(state_root, lead_sid, pending):
+    try:
+        d = lead_dir(state_root, lead_sid)
+        d.mkdir(parents=True, exist_ok=True)
+        p = _pending_path(state_root, lead_sid)
+        if pending:
+            p.write_text(json.dumps(pending, indent=2, sort_keys=True))
+        elif p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def mark_pending(state_root, lead_sid, keys):
+    """Record an UNPROVEN announce. Returns the keys that hit WAKE_RETRY_CAP and were therefore
+    stamped surfaced outright (announced enough times that continuing to retry is spam, not
+    recovery) — the caller may want to say so in the ledger."""
+    pending = load_pending(state_root, lead_sid)
+    capped = []
+    for k in keys:
+        n = pending.get(k, {}).get("announces", 0) + 1
+        if n >= WAKE_RETRY_CAP:
+            capped.append(k)
+            pending.pop(k, None)
+        else:
+            pending[k] = {"announces": n}
+    _save_pending(state_root, lead_sid, pending)
+    if capped:
+        try:                                  # NOT via mark_surfaced: that would recurse into
+            cur = load_surfaced(state_root, lead_sid)   # drop_pending, which we just did by hand
+            cur.update(capped)
+            _surfaced_path(state_root, lead_sid).write_text(json.dumps(sorted(cur)))
+        except Exception:
+            pass
+    return capped
+
+
+def drop_pending(state_root, lead_sid, keys):
+    """Forget pending entries for `keys` (they were proven some other way)."""
+    pending = load_pending(state_root, lead_sid)
+    if not pending:
+        return
+    for k in keys:
+        pending.pop(k, None)
+    _save_pending(state_root, lead_sid, pending)
+
+
+def promote_pending(state_root, lead_sid):
+    """Delivery is PROVEN — promote every pending key to surfaced and return them. Called when the
+    harness re-runs the Stop hook with stop_hook_active set, which only happens because our own
+    exit-2 continued the session: the wake reached the lead."""
+    pending = load_pending(state_root, lead_sid)
+    if not pending:
+        return []
+    keys = sorted(pending)
+    try:
+        cur = load_surfaced(state_root, lead_sid)
+        cur.update(keys)
+        d = lead_dir(state_root, lead_sid)
+        d.mkdir(parents=True, exist_ok=True)
+        _surfaced_path(state_root, lead_sid).write_text(json.dumps(sorted(cur)))
+    except Exception:
+        return []
+    _save_pending(state_root, lead_sid, {})
+    return keys
 
 
 # ---- Stop-hook: handoff nudge (transcript-size proxy) ------------------------------------------

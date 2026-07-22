@@ -102,8 +102,15 @@ def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_sess
 
 
 def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg):
+    # #22 (§13): record the announce as PENDING, never as surfaced. Firing is not delivering — this
+    # exit-2 only wakes the lead if the harness is still listening to THIS hook process, and a
+    # stale poller announcing while the lead is mid-turn is exactly the case that got dropped and
+    # then silently deduped forever. The stamp becomes real when delivery is proven (the
+    # stop_hook_active re-run in main, or an #17 channel), so an undelivered wake retries instead.
     if surfaced_keys:
-        lg.mark_surfaced(STATE_ROOT, sid, surfaced_keys)
+        capped = lg.mark_pending(STATE_ROOT, sid, surfaced_keys)
+        if capped:
+            lg.append_ledger(STATE_ROOT, "wake_retry_capped", session_id=sid, keys=capped)
     # Identify the source so the notification says WHICH project/executor and can click to the lead.
     marker = lg.read_marker(STATE_ROOT, sid)
     project = marker.get("project")
@@ -204,6 +211,18 @@ def main():
         # to arm the background watcher below even when stop_hook_active, so a report that lands while
         # the lead sits idle awaiting your answer is still caught (this used to early-exit and miss
         # it — a #2-reported-then-#3-reported-while-you-decide bug). mark_surfaced dedups either way.
+        # #22: THIS re-run is the delivery proof. Claude Code only sets stop_hook_active when the
+        # session was continued by a Stop hook — i.e. our own exit-2 landed and the lead actually
+        # woke. Promote everything we announced-but-couldn't-prove; a wake that was DROPPED never
+        # produces this re-run, so its keys stay pending and the announce below retries them.
+        if payload.get("stop_hook_active"):
+            try:
+                promoted = lg.promote_pending(STATE_ROOT, sid)
+                if promoted:
+                    lg.append_ledger(STATE_ROOT, "wake_delivered", session_id=sid, keys=promoted)
+            except Exception:
+                pass
+
         if not payload.get("stop_hook_active"):
             lines, surfaced_keys = [], []
             cwd = payload.get("cwd") or os.getcwd()

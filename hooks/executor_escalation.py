@@ -102,15 +102,40 @@ def _deliver_queued(sid):
         pass
 
 
-def _mark(lg, sid, packet, status):
-    """Record this packet's terminal state so a later Stop (repeated executor idles) gates out
-    before re-checking anything — the whole of what `escalation.json` needs to be now that there is
-    nothing to retry or back off from. `status` is "resolved" | "notified" | "sent" | "failed" —
-    "failed" still occupies the once-per-packet slot (no retry, per design), it just tells the
-    truth instead of claiming delivery that didn't happen (D4)."""
+def _mark(lg, sid, packet, status, confirmed=True):
+    """Record this packet's state so a later Stop (repeated executor idles) gates out before
+    re-checking anything. `status` is "resolved" | "notified" | "sent" | "failed" — "failed" still
+    occupies the slot (no retry, per design), it just tells the truth instead of claiming delivery
+    that didn't happen (D4).
+
+    #22/§13: a push is marked `confirmed: False` until something proves the lead actually acted on
+    the report. Burning the one shot on a nudge that landed in a busy lead's tab and was never
+    consumed is exactly what left §13's report unannounced for 95 minutes — an unconfirmed entry is
+    re-pushable (see _already_handled). Entries with NO `confirmed` field are legacy and treated as
+    confirmed, so this can never resurrect an old packet."""
     ledger = lg.load_escalation(STATE_ROOT, sid)
-    ledger[str(packet)] = {"status": status}
+    # `confirmed` is written explicitly (never encoded as absence) so the on-disk state says what
+    # it means; only entries predating this fix omit it, and those read as confirmed.
+    ledger[str(packet)] = {"status": status, "confirmed": bool(confirmed)}
     lg.save_escalation(STATE_ROOT, sid, ledger)
+
+
+def _already_handled(lg, sid, packet, owner_lead):
+    """The once-per-packet gate, now delivery-aware (#22). True → this Stop has nothing to do.
+
+    An entry that never claimed delivery (resolved/notified/failed), or one from before this fix,
+    gates out exactly as it always did. The ONE case that re-arms is a push we sent but could not
+    confirm: if the report is STILL not in the owning lead's surfaced set, the nudge demonstrably
+    did not result in the lead handling it, so a later executor Stop is allowed to push again."""
+    entry = lg.load_escalation(STATE_ROOT, sid).get(str(packet))
+    if entry is None:
+        return False
+    if entry.get("confirmed", True) or entry.get("status") != "sent":
+        return True
+    if owner_lead and f"{sid}:{packet}" in lg.load_surfaced(STATE_ROOT, owner_lead):
+        _mark(lg, sid, packet, "sent", confirmed=True)   # the lead handled it — stop re-arming
+        return True
+    return False   # sent, unconfirmed, still unsurfaced → re-arm rather than burn the one shot
 
 
 def main():
@@ -153,10 +178,10 @@ def main():
         if not who.get("report_exists"):
             sys.exit(0)  # idle mid-work, nothing written yet → nothing to push
 
-        if str(n) in lg.load_escalation(STATE_ROOT, sid):
-            sys.exit(0)  # already handled this packet — once-per-packet gate
-
         owner_lead = who.get("owner_lead")
+        if _already_handled(lg, sid, n, owner_lead):
+            sys.exit(0)  # already handled this packet — once-per-packet gate (delivery-aware, #22)
+
         decision = lg.escalation_decision(STATE_ROOT, sid, n, owner_lead)
 
         if decision == "resolved":
@@ -175,7 +200,11 @@ def main():
 
         # decision == "send"
         ok = _push_to_lead(owner_lead, sid, n)
-        _mark(lg, sid, n, "sent" if ok else "failed")
+        # A successful `nudge-lead` proves the TEXT was typed, not that the lead consumed it (a busy
+        # lead's tab swallows it — §13). Mark unconfirmed so a later Stop can re-arm while the
+        # report is still unsurfaced, instead of burning the one shot exactly when it's needed most.
+        # (`failed` is terminal either way — _already_handled only re-arms an unconfirmed `sent`.)
+        _mark(lg, sid, n, "sent", confirmed=False) if ok else _mark(lg, sid, n, "failed")
         if not ok:
             lg.append_ledger(STATE_ROOT, "escalation_push_failed", session_id=sid, packet=n,
                               owner_lead=owner_lead)

@@ -59,6 +59,27 @@ def term_backend(s):
     Pre-backend session records (no field) use this invocation's selected backend."""
     return backend.by_name((s or {}).get("backend")) or iterm
 
+
+# ── tab husks self-identify (§4 synthesis, task #4) ─────────────────────────────────────────────
+# After a handoff there are briefly TWO tabs titled `[Lead] <project>` — the stepped-down
+# predecessor and the live successor — and no internal addressing fix helps a HUMAN glancing at the
+# tab bar. Labels have two consumers; §2 only fixed the machine one. So the husk is retitled to say
+# what it is: exactly one tab ever reads `[Lead] X`, and the leftovers announce themselves as
+# `[ex-Lead] X` / `[closed] X` until someone closes them.
+#
+# ALWAYS by recorded HANDLE (rename_by_id), never by label match — a label is precisely what is
+# ambiguous at this moment (#2). No handle → no-op, never a guess at which tab to rename.
+def retitle_tab(bk, handle, new_title):
+    """Best-effort tab retitle. Returns True only if the backend confirms it. NEVER raises and
+    never fails its caller: a handoff or a close must not break because a tab title didn't take."""
+    if not handle:
+        return False
+    try:
+        return bool(bk.rename_by_id(handle, new_title))
+    except Exception:
+        return False
+
+
 STATE_ROOT = Path.home() / ".relay-tasks"
 LEDGER = STATE_ROOT / "sessions.jsonl"
 
@@ -128,6 +149,11 @@ GATES
   conversations — earlier state may have been landed, reverted, or superseded since this packet
   was written. If the packet text alone wasn't enough to complete the work, say so explicitly in
   your report.
+- NEVER OPEN REAL TABS TO VERIFY. Any live demo or verification you run must STUB the terminal
+  backend — pin `term_backend` AND `relay.iterm`/`iterm_backend`, since `term_backend(s)` re-resolves
+  the backend by the name recorded in session.json and will otherwise reach the REAL one straight
+  past a patched `relay.iterm`. Spawning, closing or renaming a real tab from a demo touches the
+  human's actual workspace and can launch stray processes. Sandbox HOME alone is NOT enough.
 - STOP AND REPORT, NEVER ASK IN THE TAB. If a step cannot be executed against currently
   deployed/committed/applied state (needs a restart, un-applied DDL, an unpulled checkout, an
   unlanded commit) OR needs any judgement call this packet can't resolve, STOP at that point.
@@ -2353,7 +2379,14 @@ def cmd_close(args):
     # Kill the process FIRST so iTerm doesn't prompt "confirm close running process", give it a beat
     # to die, then close. Best-effort — a failure here still leaves the session marked closed.
     tab_note = ""
-    if not getattr(args, "keep_tab", False):
+    # §4 generalization: a tab that OUTLIVES its session must say so. Both branches below that
+    # leave one standing retitle it to `[closed] <name>`, by handle only (see retitle_tab).
+    closed_title = f"[closed] {args.session_id}"
+    if getattr(args, "keep_tab", False):
+        # deliberately kept open (the session is still live in it) → it can retitle itself
+        if retitle_tab(term_backend(s), s.get("iterm_session"), closed_title):
+            s["tab_label"] = closed_title
+    else:
         bk = term_backend(s)
         _kill_and_wait(s)  # start-time-checked inside: never SIGTERM an unrelated recycled pid
         closed_tab = bk.close(s.get("tab_label", ""), s.get("iterm_session"), s.get("pid"))
@@ -2366,7 +2399,14 @@ def cmd_close(args):
         else:
             # Terminal.app ignores scripted window-close on some macOS versions (verified no-op,
             # no error) — the process is dead either way; the lingering window is a Cmd-W away.
+            # Retitle it so it at least identifies itself while it lingers. (iTerm's rename writes
+            # `/rename` INTO the session, which a killed process can't act on — so this actually
+            # lands on the Terminal.app backend, which sets the title directly. Harmless either way.)
+            if retitle_tab(bk, s.get("iterm_session"), closed_title):
+                s["tab_label"] = closed_title
             tab_note = " (tab not auto-closed — Cmd-W it if it lingers)"
+    if s.get("tab_label") == closed_title:
+        write_session(args.session_id, s)  # the status write above predates the retitle
     print(f"closed session '{args.session_id}'"
           + (f" (superseded by {args.supersede})" if args.supersede else "") + tab_note)
 
@@ -2857,6 +2897,20 @@ def cmd_handoff(args):
     lead_guard.clear_lead(STATE_ROOT, caller)
     append_ledger("lead_handoff", from_lead=caller, to_lead=successor_sid, project=project,
                   handoff_md=str(handoff_path))
+
+    # …and one more final act (§4): retitle the husk so the tab bar stops showing two `[Lead] X`.
+    # Addressed by the handle captured above, so it can only ever hit the predecessor's own tab —
+    # the successor's identically-titled tab is untouchable by construction. When it takes, the
+    # recorded predecessor label is updated to match, or `relay close-predecessor`'s label FALLBACK
+    # (used when the handle lookup misses) would later search for a title that no longer exists.
+    ex_title = f"[ex-Lead] {project}"
+    pred_bk = backend.by_name(caller_marker.get("backend")) or iterm
+    if retitle_tab(pred_bk, predecessor.get("iterm_session"), ex_title):
+        predecessor["tab_label"] = ex_title
+        lead_guard.update_marker(STATE_ROOT, successor_sid, predecessor=predecessor)
+        append_ledger("predecessor_retitled", from_lead=caller, to_lead=successor_sid,
+                      tab_label=ex_title)
+
     print(f"handoff complete — successor lead '{project}' (session {successor_sid}) opened, "
           f"pre-armed; this session has stepped down (gate + auto-wake off here).")
 
