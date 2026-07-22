@@ -987,6 +987,24 @@ def _busy_elapsed(s):
         return None
 
 
+def _mark_report_surfaced(s):
+    """Stamp the owning lead's surfaced_reports.json for a session's current-packet report, if one
+    exists — the fix for the asymmetric dedup (backlog §5b / task #17). Before this, ONLY the lead's
+    own at-Stop wake path called lg.mark_surfaced; a report reviewed through any other channel
+    (`relay check`, `relay diff`, `relay close`) left the dedup unstamped, so the next at-Stop check
+    still saw it as new and re-announced an already-handled report. These are all channels where the
+    lead has DEMONSTRABLY handled the report (not merely been notified of it — see the explicit
+    "do not mark on the mere nudge" warning in the backlog), so it's safe to stamp here. Best-effort;
+    a missing owner_lead or report is simply a no-op, never an error."""
+    owner_lead = s.get("owner_lead")
+    n = s.get("current_packet")
+    if not owner_lead or n is None:
+        return
+    if not (packets_dir(s["session_id"]) / f"{n:03d}-report.md").exists():
+        return
+    lead_guard.mark_surfaced(STATE_ROOT, owner_lead, [f"{s['session_id']}:{n}"])
+
+
 def _check_one(session_id):
     s = read_session(session_id)
     if not s:
@@ -1054,6 +1072,9 @@ def c(text, *styles):
 def cmd_check(args):
     ids = all_session_ids() if args.all else [args.session_id]
     results = [_check_one(sid) for sid in ids if sid]
+    for s in results:
+        if "error" not in s:
+            _mark_report_surfaced(s)  # the lead just looked at this report — dedup it (§5b)
     if args.json:
         print(json.dumps(results, indent=2))
         return
@@ -1549,6 +1570,7 @@ def cmd_diff(args):
         sys.exit(f"session '{args.session_id}' has no recorded worktree")
     n = s.get("current_packet", 1)
     report_path = packets_dir(args.session_id) / f"{n:03d}-report.md"
+    _mark_report_surfaced(s)  # the lead is reviewing this report's diff — dedup it (§5b)
 
     staged = subprocess.run(["git", "-C", worktree, "diff", "--staged", "--name-only"],
                             capture_output=True, text=True)
@@ -1596,6 +1618,7 @@ def cmd_close(args):
     s = read_session(args.session_id)
     if not s:
         sys.exit(f"no such session: {args.session_id}")
+    _mark_report_surfaced(s)  # the lead is done with this executor's report — dedup it (§5b)
     if args.supersede:
         s["status"] = "superseded"
         s["superseded_by"] = args.supersede

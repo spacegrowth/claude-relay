@@ -1868,6 +1868,87 @@ class TestDiff:
         assert unquoted == str(expected_path)
 
 
+class TestSurfacedDedupOnReview:
+    """§5b / task #17: the at-Stop wake path (lg.new_reports_for + lg.mark_surfaced) is the ONLY
+    writer of a lead's surfaced_reports.json before this fix. Reviewing a report through any other
+    channel — `relay check`, `relay diff`, `relay close` — left the dedup unstamped, so a report
+    already reviewed in a user-prompted turn (e.g. after the push escalation nudged the lead) was
+    still "new" at the lead's next at-Stop check and re-announced. These tests drive the real
+    lg.new_reports_for/lg.load_surfaced dedup the Stop hook itself reads, not a reimplementation."""
+
+    def _mk_owned_session(self, relay, sid, lead_sid, packet=1, reported=True, extra=None):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        data = {
+            "session_id": sid, "worktree": "/tmp/wt", "topic": "t", "scope": "t",
+            "tab_label": f"relay-{sid}", "status": "reported" if reported else "busy",
+            "current_packet": packet, "busy_since": relay.now(), "owner_lead": lead_sid,
+        }
+        if extra:
+            data.update(extra)
+        relay.write_session(sid, data)
+        if reported:
+            (relay.packets_dir(sid) / f"{packet:03d}-report.md").write_text("Fixed it. Staged.")
+
+    def test_check_dedups_report_the_at_stop_path_would_otherwise_reannounce(self, relay):
+        self._mk_owned_session(relay, "e1", "lead-1")
+        # Before any review: the at-Stop path's own check sees it as fresh.
+        assert [k for k, *_ in relay.lead_guard.new_reports_for(relay.STATE_ROOT, "lead-1")] == ["e1:1"]
+        relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=True))
+        # After `relay check` reviewed it: the at-Stop path must no longer see it as new.
+        assert relay.lead_guard.new_reports_for(relay.STATE_ROOT, "lead-1") == []
+
+    def test_diff_dedups_report(self, relay, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        import subprocess
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        self._mk_owned_session(relay, "e2", "lead-1", extra={"worktree": str(repo)})
+        assert [k for k, *_ in relay.lead_guard.new_reports_for(relay.STATE_ROOT, "lead-1")] == ["e2:1"]
+        relay.cmd_diff(SimpleNamespace(session_id="e2", open=False, all=False))
+        assert relay.lead_guard.new_reports_for(relay.STATE_ROOT, "lead-1") == []
+
+    def test_close_dedups_report(self, relay):
+        self._mk_owned_session(relay, "e3", "lead-1")
+        assert [k for k, *_ in relay.lead_guard.new_reports_for(relay.STATE_ROOT, "lead-1")] == ["e3:1"]
+        relay.cmd_close(SimpleNamespace(session_id="e3", self_session=None, supersede=None,
+                                        keep_tab=True))
+        assert relay.lead_guard.new_reports_for(relay.STATE_ROOT, "lead-1") == []
+
+    def test_new_report_after_review_still_surfaces(self, relay):
+        """Anti-over-suppression: reviewing packet 1 must not silently swallow packet 2's report
+        once the executor is re-sent and reports again — a genuinely NEW report must still wake."""
+        self._mk_owned_session(relay, "e4", "lead-1", packet=1)
+        relay.cmd_check(SimpleNamespace(session_id="e4", all=False, json=True))
+        assert relay.lead_guard.new_reports_for(relay.STATE_ROOT, "lead-1") == []
+        # Executor moves to packet 2 and reports again.
+        s = relay.read_session("e4")
+        s["current_packet"] = 2
+        s["status"] = "reported"
+        relay.write_session("e4", s)
+        (relay.packets_dir("e4") / "002-report.md").write_text("Second fix. Staged.")
+        fresh = relay.lead_guard.new_reports_for(relay.STATE_ROOT, "lead-1")
+        assert [k for k, *_ in fresh] == ["e4:2"]
+
+    def test_check_without_report_does_not_mark_surfaced(self, relay):
+        # No report yet (busy) → nothing to dedup; must not pre-emptively suppress the eventual
+        # report (the backlog's explicit "do not mark on the mere nudge" warning, mirrored here for
+        # "do not mark before there's even anything to review").
+        self._mk_owned_session(relay, "e5", "lead-1", reported=False)
+        relay.cmd_check(SimpleNamespace(session_id="e5", all=False, json=True))
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, "lead-1") == set()
+
+    def test_check_unowned_session_is_a_noop(self, relay):
+        # No owner_lead recorded → nothing to stamp anywhere; must not raise.
+        relay.packets_dir("e6").mkdir(parents=True, exist_ok=True)
+        relay.write_session("e6", {
+            "session_id": "e6", "worktree": "/tmp/wt", "topic": "t", "scope": "t",
+            "tab_label": "relay-e6", "status": "reported", "current_packet": 1,
+            "busy_since": relay.now(),
+        })
+        (relay.packets_dir("e6") / "001-report.md").write_text("done")
+        relay.cmd_check(SimpleNamespace(session_id="e6", all=False, json=True))  # must not raise
+
+
 class TestReportPointsToDiff:
     """`relay report` appends a discoverability line pointing at `relay diff --open` only when a
     staged diff actually exists — never generates the HTML itself."""
