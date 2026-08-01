@@ -71,7 +71,7 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 21 | BUG | Resume loops on a never-created conversation id; claims success on a dead tab ✅ LANDED v0.3.30 | §12 |
 | 22 | BUG | Wake dedup stamps surfaced on announce ATTEMPT, not delivery — busy-lead wake lost forever ✅ LANDED v0.3.32 (two-phase stamp; §13 diagnosis code-confirmed) | §13 |
 | 23 | BUG | #22's delivery proof read the GLOBAL stop_hook_active flag — a foreign blocking Stop hook (rules-check) silenced wakes for hours ✅ LANDED v0.3.34 (relay-owned claim + transcript evidence) | §14 |
-| 24 | BUG | Spawn typed its whole bootstrap into an unrelated live tab — target re-read from focus after tab creation ✅ LANDED (target-or-abort + misfire localization + fresh-tab payload guard) | §15 |
+| 24 | BUG | Spawn typed its whole bootstrap into an unrelated live tab — target re-read from focus after tab creation ✅ LANDED v0.3.35 (target-or-abort + misfire localization + fresh-tab payload guard) | §15 |
 | d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) ✅ PHASE 1 (logging-only) LANDED v0.3.32 — blocking mode waits on tuned logs | §10 |
 | d2 | DOC | Mutation-budget tripwire line in `/relay:mode` ✅ LANDED v0.3.30 | §10 |
 | d3 | DOC | Standing ops-hands pattern (spawn an ops executor up front) ✅ LANDED v0.3.30 | §10 |
