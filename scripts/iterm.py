@@ -267,9 +267,21 @@ def pid_on_tty(tty_path, binary_suffix=CLAUDE_BIN):
 
 
 def _create_target_block(lead_handle=None, layout="tab"):
-    """AppleScript fragment binding `targetSession` to a freshly created tab or pane. With no
-    `lead_handle`, same as always: new tab in the current window (or a new window if none exist) —
-    `layout` is ignored in this branch since there's no lead session to split.
+    """AppleScript fragment binding `targetSession` to a freshly created tab or pane, and setting
+    `targetFound` true on every path that binds it. With no `lead_handle`, same as always: new tab
+    in the current window (or a new window if none exist) — `layout` is ignored in this branch since
+    there's no lead session to split.
+
+    TARGET-OR-ABORT (2026-08-01 spawn-misfire incident, ~/.relay-tasks/
+    incident-spawn-misfire-2026-08-01.md): every binding here must be to the object CREATE RETURNED,
+    never to a focus-dependent expression re-read after creation. The pre-fix code did
+    `tell <window> to create tab …` and then, as a SEPARATE statement,
+    `set targetSession to current session of <window>` — "current session" is whatever tab is
+    SELECTED at the moment that statement runs, so a human cycling tabs between the two statements
+    silently redirected `targetSession` at an existing tab, and the whole bootstrap payload
+    (`… && exec claude --session-id …`) was typed into it. That is exactly what happened to the
+    d2cengine_refactor lead's spawn of `alerts-badge`. `create tab with default profile` RETURNS the
+    new tab, so binding through that return value is immune to focus moving.
 
     With `lead_handle` (the spawning lead's own iTerm session id), first try to find the window
     AND session matching it — same session-id walk as `_for_session_by_id` — then:
@@ -293,23 +305,35 @@ def _create_target_block(lead_handle=None, layout="tab"):
     entirely — a split pane has no "position in the tab bar" to fight over, it's just next to the
     lead's own pane by construction.
     """
+    fresh_window = (
+        "    set newWindow to (create window with default profile)\n"
+        "    set targetSession to current session of newWindow\n"
+        "    set targetFound to true\n"
+    )
+    fresh_tab_here = (
+        "    tell current window to set newTab to (create tab with default profile)\n"
+        "    set targetSession to current session of newTab\n"
+        "    set targetFound to true\n"
+    )
     if not lead_handle:
         return (
             "  if (count of windows) is 0 then\n"
-            "    set newWindow to (create window with default profile)\n"
-            "    set targetSession to current session of newWindow\n"
+            f"{fresh_window}"
             "  else\n"
-            "    tell current window to create tab with default profile\n"
-            "    set targetSession to current session of current window\n"
+            f"{fresh_tab_here}"
             "  end if\n"
         )
     uuid = osa(lead_handle.split(":")[-1])
     if layout == "pane":
-        create_in_lead = "    tell leadSession to set targetSession to (split vertically with default profile)\n"
+        create_in_lead = (
+            "    tell leadSession to set targetSession to (split vertically with default profile)\n"
+            "    set targetFound to true\n"
+        )
     else:
         create_in_lead = (
-            "    tell leadWindow to create tab with default profile\n"
-            "    set targetSession to current session of leadWindow\n"
+            "    tell leadWindow to set newTab to (create tab with default profile)\n"
+            "    set targetSession to current session of newTab\n"
+            "    set targetFound to true\n"
         )
     return (
         "  set foundLeadWindow to false\n"
@@ -327,11 +351,9 @@ def _create_target_block(lead_handle=None, layout="tab"):
         "  if foundLeadWindow then\n"
         f"{create_in_lead}"
         "  else if (count of windows) is 0 then\n"
-        "    set newWindow to (create window with default profile)\n"
-        "    set targetSession to current session of newWindow\n"
+        f"{fresh_window}"
         "  else\n"
-        "    tell current window to create tab with default profile\n"
-        "    set targetSession to current session of current window\n"
+        f"{fresh_tab_here}"
         "  end if\n"
     )
 
@@ -341,18 +363,55 @@ def _target_by_session_id_block(uuid):
     — used when `iterm_pyapi.try_create_adjacent_tab` has ALREADY created the tab at the right
     index via the Python API; this fragment just hands the resulting session over to the existing
     write-text/rename AppleScript machinery (confirmed live: Python API session ids and
-    AppleScript's `id of session` are the same UUID space, so this lookup always matches)."""
+    AppleScript's `id of session` are the same UUID space, so this lookup always matches).
+
+    Sets `targetFound` only when the walk actually matches. Pre-fix this fragment left
+    `targetSession` UNBOUND on a miss (pyapi tab already closed, id-space surprise, …) while the
+    caller typed the payload regardless; the caller now aborts on an unbound target — see spawn()."""
     return (
         "  repeat with w in windows\n"
         "    repeat with t in tabs of w\n"
         "      repeat with s in sessions of t\n"
         f'        if (id of s) is "{osa(uuid)}" then\n'
         "          set targetSession to s\n"
+        "          set targetFound to true\n"
         "        end if\n"
         "      end repeat\n"
         "    end repeat\n"
         "  end repeat\n"
     )
+
+
+# --- Ask 3 of the 2026-08-01 spawn-misfire incident: make a mis-delivered payload inert ----------
+# The bootstrap is no longer typed as a bare command. It is wrapped in a shell conditional on the
+# RECEIVING tab's own iTerm session id matching the session relay just created — a fresh-tab marker
+# only the intended tab can satisfy, since iTerm sets $ITERM_SESSION_ID per session and relay learns
+# the target's id from tab creation itself. A copy delivered anywhere else takes the else-branch:
+# one self-localizing line printed, nothing run. That makes the incident's worst case — the payload
+# landing in a tab that is a plain SHELL, where `exec claude --session-id <uuid>` would REPLACE that
+# shell with a duplicate executor on the same session id the retry then also used — structurally
+# impossible instead of luck-dependent (the victim tab happening to run a Claude REPL).
+_GUARD_HEAD = '_relay_sid="${ITERM_SESSION_ID:-$TERM_SESSION_ID}"; if [ "${_relay_sid##*:}" = "'
+_GUARD_THEN = '" ]; then '
+_GUARD_ELSE = '; else echo "[relay] bootstrap for iTerm session '
+_GUARD_TAIL = (' was mis-delivered to this tab (${_relay_sid:-no session id}); ignored, '
+               'nothing was run."; fi')
+
+
+def bootstrap_guard_parts(cmd):
+    """The guarded bootstrap, split for AppleScript assembly: (head, mid, tail) such that
+    `head + <session id> + mid + <session id> + tail` is the exact line to type. spawn() concatenates
+    these around AppleScript's runtime `id of targetSession` — the id is only knowable INSIDE the
+    script, after tab creation — so the guard's id and the typed-into session are the same value by
+    construction; there is no window in which Python could staple the wrong id onto the payload."""
+    return (_GUARD_HEAD, _GUARD_THEN + cmd + _GUARD_ELSE, _GUARD_TAIL)
+
+
+def guarded_bootstrap(cmd, session_id):
+    """The assembled guarded line — the same string spawn() has iTerm build at runtime. Exists so the
+    inertness test can execute the real payload in a plain shell, with no terminal app involved."""
+    head, mid, tail = bootstrap_guard_parts(cmd)
+    return head + session_id + mid + session_id + tail
 
 
 def _match_session_block(label, action):
@@ -384,6 +443,23 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     one AppleScript call holding a single `targetSession` reference throughout, so there's no race
     with "current session" shifting if another spawn happens in between (two separate osascript
     calls relying on "current session of current window" staying correct would have that race).
+
+    TARGET-OR-ABORT + INERT PAYLOAD (2026-08-01 spawn-misfire incident, write-up at
+    ~/.relay-tasks/incident-spawn-misfire-2026-08-01.md — a lead's bootstrap, `exec claude
+    --session-id …` and all, was typed into an unrelated live tab while the human cycled tabs):
+    holding ONE osascript call was never enough, because inside it the target was re-read from the
+    focus-dependent `current session of <window>` AFTER creating the tab. Three changes:
+      1. every target binding is to the object creation RETURNED (`_create_target_block`), the
+         script re-checks the bound session still exists, and any failure to resolve returns a
+         verdict WITHOUT typing anything — the frontmost fall-through is gone;
+      2. the frontmost tab's title at send time is captured and returned, so a caller reporting a
+         failed launch can tell the human which tab to inspect;
+      3. the payload itself is wrapped by `bootstrap_guard_parts` in a conditional on the receiving
+         tab's own $ITERM_SESSION_ID, so a stray copy is a no-op even in a plain shell.
+
+    Returns a dict — `{"ok": bool, "reason": str, "session_id": str|None, "front_title": str|None}`
+    — see `_read_spawn_outcome`. Never raises; `ok=False` means the launch did not happen, and
+    `reason` distinguishes "nothing was typed" from "osascript failed, state indeterminate".
 
     Writes the launched process's PID to `pidfile` via `$$` + `exec` (the shell's PID becomes
     claude's PID after exec replaces the process image, so no race with backgrounding/job
@@ -433,7 +509,8 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     color_part = f"printf '{tab_color_printf(tab_color)}' && " if tab_color else ""
     cmd = (f"cd {shlex.quote(cwd)} && {color_part}{env_prefix}echo $$ > {shlex.quote(pidfile)}{capture} "
            f"&& exec {base}")
-    cmd_e = osa(cmd)
+    guard_head, guard_mid, guard_tail = bootstrap_guard_parts(cmd)
+    head_e, mid_e, tail_e = osa(guard_head), osa(guard_mid), osa(guard_tail)
     rename_e = osa("/rename " + label)
     # Only worth attempting adjacency for a separate TAB — a "pane" layout is inherently adjacent
     # (it's split off the lead's own session), no placement problem to solve.
@@ -444,18 +521,65 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
         _target_by_session_id_block(pyapi_session_id) if pyapi_session_id
         else _create_target_block(lead_handle, layout)
     )
+    # TARGET-OR-ABORT. Ordering is the whole safety property: bind the target, capture the frontmost
+    # tab's title (for localization if anything did go wrong), RE-CHECK that the bound session still
+    # exists, and only then type. Every failure path returns BEFORE the first `write text`, so an
+    # unresolvable target types nothing anywhere instead of falling through to the frontmost tab.
+    # The re-check walk is by `id of targetSession`, i.e. the same identity the guard will be built
+    # from — a target that vanished between creation and send (tab closed, window closed) aborts.
     script = (
+        'set frontTitle to ""\n'
+        "set targetFound to false\n"
         f'tell application "{ITERM_APP_NAME}"\n'
         "  activate\n"
         f"{target_block}"
+        "  try\n"
+        "    set frontTitle to name of current session of current window\n"
+        "  end try\n"
+        '  if not targetFound then return "NOTARGET" & linefeed & "" & linefeed & frontTitle\n'
+        "  set sid to id of targetSession\n"
+        "  set stillThere to false\n"
+        "  repeat with w in windows\n"
+        "    repeat with t in tabs of w\n"
+        "      repeat with s in sessions of t\n"
+        "        if (id of s) is sid then set stillThere to true\n"
+        "      end repeat\n"
+        "    end repeat\n"
+        "  end repeat\n"
+        '  if not stillThere then return "GONE" & linefeed & sid & linefeed & frontTitle\n'
         "  tell targetSession\n"
-        f'    write text "{cmd_e}"\n'
+        f'    write text ("{head_e}" & sid & "{mid_e}" & sid & "{tail_e}")\n'
         f"    delay {rename_delay}\n"
         f'    write text "{rename_e}"\n'
         "  end tell\n"
+        '  return "OK" & linefeed & sid & linefeed & frontTitle\n'
         "end tell"
     )
-    run_osascript(script, timeout=rename_delay + 5)
+    r = run_osascript(script, timeout=rename_delay + 5)
+    return _read_spawn_outcome(r)
+
+
+def _read_spawn_outcome(r):
+    """Parse spawn()'s three-line AppleScript verdict into the dict spawn() returns:
+    `{"ok", "reason", "session_id", "front_title"}`.
+
+    `ok` is True only for a payload typed into a re-checked target session. Reasons:
+    - "ok"            — typed into `session_id`; `front_title` is what was frontmost at send time.
+    - "no-target"     — tab creation/lookup never bound a session. NOTHING was typed.
+    - "target-gone"   — the bound session vanished before the send. NOTHING was typed.
+    - "script-failed" — osascript itself errored/timed out; since every abort path returns before the
+                        first `write text`, a failure here still means nothing was typed UNLESS it
+                        happened mid-send, which callers must report as indeterminate.
+    Callers use `front_title` for the incident's Ask 2 (tell the human which tab to inspect)."""
+    if r.returncode != 0:
+        return {"ok": False, "reason": "script-failed", "session_id": None, "front_title": None}
+    lines = (r.stdout or "").splitlines()
+    verdict = lines[0].strip() if lines else ""
+    sid = lines[1].strip() if len(lines) > 1 else ""
+    front = lines[2].strip() if len(lines) > 2 else ""
+    reason = {"OK": "ok", "NOTARGET": "no-target", "GONE": "target-gone"}.get(verdict, "script-failed")
+    return {"ok": reason == "ok", "reason": reason,
+            "session_id": sid or None, "front_title": front or None}
 
 
 def send(label, prompt, handle=None, pid=None):

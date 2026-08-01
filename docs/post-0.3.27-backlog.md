@@ -71,6 +71,7 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 21 | BUG | Resume loops on a never-created conversation id; claims success on a dead tab ✅ LANDED v0.3.30 | §12 |
 | 22 | BUG | Wake dedup stamps surfaced on announce ATTEMPT, not delivery — busy-lead wake lost forever ✅ LANDED v0.3.32 (two-phase stamp; §13 diagnosis code-confirmed) | §13 |
 | 23 | BUG | #22's delivery proof read the GLOBAL stop_hook_active flag — a foreign blocking Stop hook (rules-check) silenced wakes for hours ✅ LANDED v0.3.34 (relay-owned claim + transcript evidence) | §14 |
+| 24 | BUG | Spawn typed its whole bootstrap into an unrelated live tab — target re-read from focus after tab creation ✅ LANDED (target-or-abort + misfire localization + fresh-tab payload guard) | §15 |
 | d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) ✅ PHASE 1 (logging-only) LANDED v0.3.32 — blocking mode waits on tuned logs | §10 |
 | d2 | DOC | Mutation-budget tripwire line in `/relay:mode` ✅ LANDED v0.3.30 | §10 |
 | d3 | DOC | Standing ops-hands pattern (spawn an ops executor up front) ✅ LANDED v0.3.30 | §10 |
@@ -680,3 +681,64 @@ Loose end from the same cycle: `relay verify`'s claim-plausibility filter false-
 basenames and dotted identifiers in report prose (observed on rl-wake's own report — MISMATCH on
 `lead_guard.py`, `lg.relay`, `e.g`). Tuning item, not urgent: the failure direction is a false
 STOP, which costs a question, never trust.
+
+## 15. Spawn typed its bootstrap into an unrelated live tab (#24, field incident 2026-08-01)
+
+Full incident write-up (evidence, damage assessment, three asks):
+~/.relay-tasks/incident-spawn-misfire-2026-08-01.md — reported by Vamsi, observed live by the
+d2cengine_refactor lead. Summary: `relay spawn --name alerts-badge` (relay 0.3.34) typed its whole
+bootstrap — `cd … && printf '<tab-color>' && echo $$ > …/pid && exec claude
+--dangerously-skip-permissions --session-id 290f5187-… '<packet>'`, plus the follow-up
+`/rename [Exec] alerts-badge` — into an EXISTING lead's tab. #20's no-PID/no-title check caught it
+and the retry landed clean, so detection worked; but the payload had already gone somewhere, and
+nothing said where.
+
+**Root cause** (verified against the code, and it is *not* quite what the write-up's "read on the
+bug" guessed). The send was already inside a single osascript call holding one `targetSession` —
+the defense §12 added. The hole was one level down: `_create_target_block` created the tab and then,
+as a SEPARATE statement, re-read the target from a focus-dependent expression —
+`set targetSession to current session of <window>`. "Current session" is whatever tab is SELECTED
+when that statement runs, so Vamsi cycling tabs between the two statements silently repointed
+`targetSession` at a live tab. Two spawns ~2s apart in one Bash call, the first clean and the second
+misfired, is exactly this shape. The pyapi placement path had the sibling hole: its lookup left
+`targetSession` unbound on a miss and the caller typed anyway.
+
+**Damage was luck, not design.** The victim tab ran a Claude REPL, so the payload was inert text.
+In a plain SHELL, `exec claude --session-id 290f5187` would have REPLACED that shell with a
+duplicate executor on the same session id the retry then also used.
+
+**Fixed** (all three asks, `scripts/iterm.py` + `bin/relay`):
+1. *Target-or-abort.* Every binding is to the object creation RETURNED (`set newTab to (create tab
+   …)`, `split vertically`, the id walk), each sets `targetFound`, the script re-checks the bound
+   session still exists, and every failure path returns BEFORE the first `write text`. The
+   frontmost fall-through is gone; an unresolvable target types nothing anywhere.
+2. *Localize on misfire.* `spawn()` returns `{ok, reason, session_id, front_title}` and every
+   launch-failure report renders it — distinguishing "ABORTED, nothing typed anywhere" from "typed
+   into session X, frontmost tab was '<title>'".
+3. *Inert payload.* The bootstrap is wrapped in a conditional on the receiving tab's own
+   `$ITERM_SESSION_ID` matching the created session — a fresh-tab marker only the intended tab can
+   satisfy. A stray copy prints one self-localizing line and runs nothing.
+
+Terminal.app is IMMUNE and stays unchanged: `do script "<cmd>"` creates the window and runs the
+command atomically, so there is no separate type-into-target step to misdirect.
+
+### Evidence (§0-style)
+
+| Claim | How observed | Result |
+|---|---|---|
+| Pre-fix binding is redirectable by focus | `TestSpawnMisfireRepro::test_repro_prefix_binding_sends_payload_to_the_focused_tab` — pre-fix block, focus moved between create and read | Resolves to the VICTIM session (misfire reproduced) |
+| …and looked healthy when focus stayed put | same test, second half | Resolves to the created session — why it shipped |
+| Post-fix bindings ignore focus | `test_fixed_binding_is_immune_to_focus_moving`, all 3 paths (no-lead / lead tab / pane) | Always the created session |
+| No focus-dependent binding survives | `test_no_focus_dependent_binding_survives_anywhere` over all 4 fragments | Absent everywhere |
+| Unresolvable target types nothing | `test_every_abort_path_returns_before_the_first_write` (both abort returns precede any `write text`) | Structural, in the emitted script |
+| Mis-delivered payload is inert in a real shell | `TestBootstrapInertWhenMisdelivered`, real `bash` AND `zsh`, wrong id / empty id / no id | No exec, no pidfile, rc 0, prints "mis-delivered" |
+| …and the healthy tab still runs it | `test_positive_control_the_real_tab_still_runs_it`, same runs | pidfile written, stub claude exec'd with its argv |
+| Misfire reports name the tab | `TestSpawnMisfireLocalization` (5 cases incl. backend returning None) | Abort / typed / indeterminate worded distinctly |
+| #20's launch honesty unaffected | `TestSpawnLaunchHonesty` (8 tests) unchanged | Pass |
+
+**UNVERIFIED, and only a real iTerm can close it:** that `create tab with default profile` returns
+the new tab in live AppleScript (consistent with `create window` and the live-confirmed `split
+vertically` in the same file, and fail-safe — an error there binds nothing, so spawn aborts rather
+than misfires), and the true focus race itself. The repro models AppleScript's focus semantics; the
+expressions it judges come from the real code, and the model raises on any expression it doesn't
+know, so it cannot silently drift.

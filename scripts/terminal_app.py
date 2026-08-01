@@ -45,7 +45,15 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     /rename dance needed — the custom title is Terminal chrome, not Claude's OSC title).
     `lead_handle` ignored (Terminal.app addresses by window, not adjacent tabs — n/a here).
     `layout` ignored (Terminal.app has no split-pane scripting surface — always a new window).
-    `settings_file` passed straight through to build_claude_cmd (same meaning as iTerm's backend)."""
+    `settings_file` passed straight through to build_claude_cmd (same meaning as iTerm's backend).
+
+    IMMUNE to the 2026-08-01 iTerm spawn-misfire (target-or-abort; see iterm.spawn): there is no
+    separate "type into the target" step to misdirect here. `do script "<cmd>"` with no `in <tab>`
+    clause CREATES a window and runs the command in it atomically — the command can only execute in
+    the window that call made, and nothing is ever typed into a pre-existing session. The window id
+    is likewise derived from the returned tab's `tty`, never from `front window` (see below). So
+    neither the abort path nor the fresh-tab payload guard has anything to protect here; the return
+    value mirrors iterm.spawn's only for caller parity."""
     base = build_claude_cmd(prompt, model=model, skip_perms=skip_perms,
                             session_uuid=session_uuid, resume_id=resume_id,
                             settings_file=settings_file)
@@ -70,7 +78,7 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     r = run_osascript(script, timeout=10)
     wid = (r.stdout or "").strip()
     if r.returncode != 0 or not wid.isdigit():
-        return
+        return {"ok": False, "reason": "script-failed", "session_id": None, "front_title": None}
     if iterm_id_file:
         try:
             with open(iterm_id_file, "w") as f:
@@ -78,6 +86,7 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
         except OSError:
             pass
     rename_by_id(f"twid:{wid}", label)
+    return {"ok": True, "reason": "ok", "session_id": f"twid:{wid}", "front_title": None}
 
 
 def is_alive(label, handle=None, pid=None):

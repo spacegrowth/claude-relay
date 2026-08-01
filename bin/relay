@@ -803,6 +803,34 @@ def resolve_seed(value):
     return p.read_text(), str(p.resolve())
 
 
+def _misfire_locator(outcome):
+    """Ask 2 of the 2026-08-01 spawn-misfire incident: when a launch looks like it didn't happen,
+    say WHERE the bootstrap payload may have gone so the human knows which tab to inspect.
+
+    `outcome` is whatever the backend's spawn() returned (see iterm._read_spawn_outcome). Returns a
+    printable suffix ("" when there is nothing useful to add — including for backends or test doubles
+    whose spawn returns None, so this can never turn a launch report into a crash). The wording is
+    deliberately different per reason: an ABORT is good news (nothing was typed anywhere) and must
+    not read like a stray payload is loose."""
+    if not isinstance(outcome, dict):
+        return ""
+    front = (outcome.get("front_title") or "").strip()
+    where = f" The frontmost tab at that moment was '{front}'." if front else ""
+    reason = outcome.get("reason")
+    if reason in ("no-target", "target-gone"):
+        return (f"\n  The send was ABORTED before typing anything: the target session could not be "
+                f"resolved ({reason}), so no payload was typed into any tab.{where}")
+    if reason == "script-failed":
+        return ("\n  The terminal script itself failed, so where the payload got to is INDETERMINATE "
+                "— check the tab that was frontmost during the spawn for a stray `cd … && exec claude` "
+                "line (it is guarded and inert, but it may sit in a tab's input).")
+    if outcome.get("ok"):
+        sid = outcome.get("session_id") or "unknown"
+        return (f"\n  The payload WAS typed into terminal session {sid}.{where} If that tab isn't the "
+                f"executor's, the payload may have landed there — it is guarded, so it ran nothing.")
+    return ""
+
+
 def cmd_spawn(args):
     body = Path(args.packet).read_text()
     warn_missing_preconditions(body, "spawning")
@@ -893,7 +921,7 @@ def cmd_spawn(args):
                 f.unlink()
             except FileNotFoundError:
                 pass
-        iterm.spawn(
+        outcome = iterm.spawn(
             cwd=worktree,
             prompt=build_pointer_message(str(packet_path), packet_summary(body)),
             label=label,
@@ -909,16 +937,16 @@ def cmd_spawn(args):
         )
         pid = read_pid(session_id)
         handle = read_iterm_id(session_id)  # backend handle (iTerm session id / Terminal "twid:N")
-        return pid, handle, _ensure_tab_label(iterm, handle, label)
+        return pid, handle, _ensure_tab_label(iterm, handle, label), outcome
 
-    pid, iterm_session, label_ok = launch_attempt()
+    pid, iterm_session, label_ok, outcome = launch_attempt()
     # BOTH signals missing means nothing came back from the launch at all — the observed signature
     # of the §12 launch race (a human typing into iTerm during the AppleScript tab setup). Either
     # signal alone is just a degraded-but-live tab, so only the both-failed case retries here.
     if pid is None and not label_ok:
         print(f"spawn: no PID and the tab title '{label}' didn't take — the launch may not have "
-              f"happened at all; retrying it once…", file=sys.stderr)
-        pid, iterm_session, label_ok = launch_attempt()
+              f"happened at all; retrying it once…{_misfire_locator(outcome)}", file=sys.stderr)
+        pid, iterm_session, label_ok, outcome = launch_attempt()
     launch_failed = pid is None and not label_ok
 
     write_session(session_id, {
@@ -953,7 +981,8 @@ def cmd_spawn(args):
         print(f"spawn: claude did NOT launch for '{session_id}' — no PID and the tab title "
               f"'{label}' never took, on the first attempt AND the retry. The session is recorded "
               f"{LAUNCH_FAILED} (not busy): nothing is working on packet {n:03d}, and its pinned "
-              f"conversation id was never registered, so `relay resume` cannot help.\n"
+              f"conversation id was never registered, so `relay resume` cannot help."
+              f"{_misfire_locator(outcome)}\n"
               f"  Recover with: relay restart {session_id}   "
               f"(fresh tab, fresh conversation id, same packet)", file=sys.stderr)
         sys.exit(1)  # message already printed; a spawn that launched nothing must not exit 0

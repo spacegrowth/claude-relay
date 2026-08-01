@@ -6,6 +6,7 @@ iterm.py's shared command builder + tab-color escapes, terminal_app.py's window-
 Run: pytest tests/test_backends.py -v
 """
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -83,9 +84,9 @@ class TestSpawnLeadWindow:
         assert "set leadWindow to w" in script
         assert "set foundLeadWindow to true" in script
         assert "if foundLeadWindow then" in script
-        assert "tell leadWindow to create tab with default profile" in script
+        assert "tell leadWindow to set newTab to (create tab with default profile)" in script
         # fallback branches for when the lead's session isn't found must still be present
-        assert "tell current window to create tab with default profile" in script
+        assert "tell current window to set newTab to (create tab with default profile)" in script
 
     def test_without_lead_handle_matches_todays_shape(self):
         with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run:
@@ -94,7 +95,7 @@ class TestSpawnLeadWindow:
         assert "foundLeadWindow" not in script
         assert "leadWindow" not in script
         assert "  if (count of windows) is 0 then\n" in script
-        assert "    tell current window to create tab with default profile\n" in script
+        assert "    tell current window to set newTab to (create tab with default profile)\n" in script
 
 
 class TestSpawnPaneLayout:
@@ -108,9 +109,9 @@ class TestSpawnPaneLayout:
         assert "set foundLeadWindow to true" in script
         assert "tell leadSession to set targetSession to (split vertically with default profile)" in script
         # tab-creation verb must NOT appear — pane layout never creates a tab when the lead is found
-        assert "tell leadWindow to create tab with default profile" not in script
+        assert "create tab with default profile" not in script.split("else if (count of windows)")[0]
         # fallback branches for when the lead's session isn't found must still be present
-        assert "tell current window to create tab with default profile" in script
+        assert "tell current window to set newTab to (create tab with default profile)" in script
 
     def test_pane_without_lead_handle_degrades_to_tab_shape(self):
         # no lead_handle at all → no session to split against, same as today's tab-only shape
@@ -120,7 +121,7 @@ class TestSpawnPaneLayout:
         script = osa_run.call_args[0][0]
         assert "split vertically" not in script
         assert "  if (count of windows) is 0 then\n" in script
-        assert "    tell current window to create tab with default profile\n" in script
+        assert "    tell current window to set newTab to (create tab with default profile)\n" in script
 
     def test_default_layout_is_byte_identical_to_tab(self):
         # layout="tab" (the default) must produce the exact same script as omitting layout entirely
@@ -355,7 +356,7 @@ class TestPyApiHybrid:
                         lead_handle="w1t2p0:LEAD-UUID", layout="tab")
         script = osa_run.call_args[0][0]
         assert "set leadWindow to w" in script
-        assert "tell leadWindow to create tab with default profile" in script
+        assert "tell leadWindow to set newTab to (create tab with default profile)" in script
 
     def test_pyapi_not_attempted_for_pane_layout(self):
         # Panes are inherently adjacent — no placement problem to solve, so the (possibly slow)
@@ -384,11 +385,12 @@ class TestPyApiHybrid:
                         lead_handle="w1t2p0:LEAD-UUID", layout="tab")
         script = osa_run.call_args[0][0]
         assert "set leadWindow to w" in script
-        assert "tell leadWindow to create tab with default profile" in script
+        assert "tell leadWindow to set newTab to (create tab with default profile)" in script
         # the pyapi-success-only assignment ("set targetSession to s", from
         # _target_by_session_id_block) must be absent — only the fallback shape's
-        # "set targetSession to current session of leadWindow" should appear.
+        # "set targetSession to current session of newTab" should appear.
         assert "set targetSession to s\n" not in script
+        assert "set targetSession to current session of newTab" in script
 
 
 class TestLeadColor:
@@ -502,3 +504,213 @@ class TestBackendSelection:
         assert backend.by_name("terminal") is terminal_app
         assert backend.by_name(None) is None
         assert backend.by_name("kitty") is None
+
+
+# ================================================================================================
+# 2026-08-01 SPAWN-MISFIRE INCIDENT (~/.relay-tasks/incident-spawn-misfire-2026-08-01.md)
+#
+# A lead's `relay spawn --name alerts-badge` typed its ENTIRE bootstrap — `cd … && printf … &&
+# echo $$ > …/pid && exec claude --dangerously-skip-permissions --session-id 290f5187-… '<packet>'`
+# plus a follow-up `/rename [Exec] alerts-badge` — into an unrelated live lead's tab. relay's own
+# #20 no-PID/no-title check DETECTED it and retried cleanly, but only AFTER the payload had already
+# landed somewhere, and it never said where. The trigger (confirmed by Vamsi): he was cycling iTerm
+# tabs while the spawn ran. Damage was luck-dependent — the victim tab happened to be running a
+# Claude REPL, so the payload was inert text; in a plain SHELL the `exec claude --session-id <uuid>`
+# would have replaced that shell with a duplicate executor on the same session id as the retry.
+#
+# The three classes below cover the incident's three asks in order.
+# ================================================================================================
+
+
+# The binding statements the PRE-FIX _create_target_block emitted, verbatim from scripts/iterm.py at
+# commit 8620672. Kept here as the repro's input: this is the shape that misfired, and no fragment
+# of the current code may resolve its target this way again.
+PRE_FIX_TARGET_BLOCK = (
+    "  if (count of windows) is 0 then\n"
+    "    set newWindow to (create window with default profile)\n"
+    "    set targetSession to current session of newWindow\n"
+    "  else\n"
+    "    tell current window to create tab with default profile\n"
+    "    set targetSession to current session of current window\n"
+    "  end if\n"
+)
+
+
+def _target_bindings(script):
+    """Every `set targetSession to <expr>` right-hand side in an AppleScript fragment."""
+    key = "set targetSession to "
+    return [ln.strip()[len(key):] for ln in script.splitlines() if ln.strip().startswith(key)]
+
+
+def _resolve_binding(expr, created, focused_at_read_time):
+    """MODEL of how iTerm evaluates the target-binding expressions these blocks emit.
+
+    Deliberately tiny and total: an expression it doesn't know raises, so this model cannot silently
+    drift from the code it is asserting about. The one fact it encodes is the incident's root cause —
+    `current session of <window>` is evaluated WHEN THAT STATEMENT RUNS and yields whatever tab is
+    selected in that window at that instant, whereas a binding through the object `create …`
+    RETURNED yields the created session no matter where focus went.
+
+    (A model, not real AppleScript: exercising the true evaluation needs a live iTerm, which the
+    packet forbids. It is the focus semantics that are modelled; the expressions come from the real
+    code.)"""
+    if expr in ("current session of newTab", "current session of newWindow",
+                "(split vertically with default profile)", "s"):
+        return created
+    if expr in ("current session of current window", "current session of leadWindow"):
+        return focused_at_read_time
+    raise AssertionError(f"unmodelled target-binding expression: {expr!r} — extend the model")
+
+
+class TestSpawnMisfireRepro:
+    """Ask 1, repro half: the focus race, at the mock seam, against the pre-fix binding shape."""
+
+    def test_repro_prefix_binding_sends_payload_to_the_focused_tab(self):
+        # THE BUG. Tab creation made session NEW-EXEC, then the human selected another tab before
+        # the next statement ran, so `current session of current window` resolved to the victim.
+        created, victim = "NEW-EXEC-SESSION", "LEAD-DATA-PROVIDER-SESSION"
+        bindings = _target_bindings(PRE_FIX_TARGET_BLOCK)
+        resolved = [_resolve_binding(b, created, focused_at_read_time=victim) for b in bindings]
+        assert victim in resolved, "expected the pre-fix shape to be redirectable by focus"
+        # …and with focus left alone it looked perfectly healthy — which is why this shipped.
+        assert all(r == created for r in
+                   [_resolve_binding(b, created, focused_at_read_time=created) for b in bindings])
+
+    def test_fixed_binding_is_immune_to_focus_moving(self):
+        # Same race, current code: every binding the real spawn() emits resolves to the created
+        # session even when focus moves to the victim between create and send.
+        created, victim = "NEW-EXEC-SESSION", "LEAD-DATA-PROVIDER-SESSION"
+        for kwargs in ({}, {"lead_handle": "w1t2p0:LEAD-UUID"},
+                       {"lead_handle": "w1t2p0:LEAD-UUID", "layout": "pane"}):
+            with mock.patch.object(iterm, "run_osascript", return_value=_ok("OK\nX\nY")) as osa_run, \
+                 mock.patch.object(iterm.iterm_pyapi, "try_create_adjacent_tab", return_value=None):
+                iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0,
+                            **kwargs)
+            bindings = _target_bindings(osa_run.call_args[0][0])
+            assert bindings, f"no target binding found for {kwargs}"
+            for b in bindings:
+                assert _resolve_binding(b, created, focused_at_read_time=victim) == created, \
+                    f"focus-dependent binding {b!r} survived in the {kwargs} path"
+
+    def test_no_focus_dependent_binding_survives_anywhere(self):
+        # Belt and braces on the fragments directly, including the pyapi-placement path.
+        fragments = [iterm._create_target_block(),
+                     iterm._create_target_block("w1t2p0:LEAD-UUID", "tab"),
+                     iterm._create_target_block("w1t2p0:LEAD-UUID", "pane"),
+                     iterm._target_by_session_id_block("NEW-TAB-SESSION-ID")]
+        for frag in fragments:
+            assert "set targetSession to current session of current window" not in frag
+            assert "set targetSession to current session of leadWindow" not in frag
+
+
+class TestSpawnTargetOrAbort:
+    """Ask 1, fix half: the payload goes to the re-checked session id or nowhere at all."""
+
+    def _spawn(self, stdout, returncode=0):
+        r = (_ok(stdout) if returncode == 0
+             else subprocess.CompletedProcess(["osascript"], returncode, stdout, "boom"))
+        with mock.patch.object(iterm, "run_osascript", return_value=r) as osa_run:
+            out = iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0)
+        return out, osa_run.call_args[0][0]
+
+    def test_unresolvable_target_aborts_and_localizes(self):
+        out, _ = self._spawn("NOTARGET\n\n[Lead] data_provider")
+        assert out["ok"] is False and out["reason"] == "no-target"
+        assert out["session_id"] is None
+        assert out["front_title"] == "[Lead] data_provider"   # Ask 2's "which tab do I inspect"
+
+    def test_target_that_vanished_before_the_send_aborts(self):
+        out, _ = self._spawn("GONE\nDEAD-SESSION\n[Lead] data_provider")
+        assert out["ok"] is False and out["reason"] == "target-gone"
+        assert out["session_id"] == "DEAD-SESSION"
+
+    def test_successful_send_reports_the_session_it_typed_into(self):
+        out, _ = self._spawn("OK\nNEW-EXEC-SESSION\n[Exec] alerts-badge")
+        assert out["ok"] is True and out["reason"] == "ok"
+        assert out["session_id"] == "NEW-EXEC-SESSION"
+
+    def test_osascript_failure_is_reported_as_indeterminate(self):
+        out, _ = self._spawn("", returncode=1)
+        assert out["ok"] is False and out["reason"] == "script-failed"
+
+    def test_every_abort_path_returns_before_the_first_write(self):
+        # The structural guarantee behind "types nothing anywhere": both abort returns are ahead of
+        # any `write text` in the emitted script, so an unresolvable target cannot reach a send.
+        _, script = self._spawn("OK\nS\nT")
+        first_write = script.index("write text")
+        assert script.index("if not targetFound then return") < first_write
+        assert script.index("if not stillThere then return") < first_write
+
+    def test_target_is_rechecked_against_the_bound_session_id(self):
+        _, script = self._spawn("OK\nS\nT")
+        assert "set sid to id of targetSession" in script
+        assert "if (id of s) is sid then set stillThere to true" in script
+
+    def test_frontmost_title_is_captured_before_the_send(self):
+        _, script = self._spawn("OK\nS\nT")
+        assert script.index("set frontTitle to name of current session of current window") \
+            < script.index("write text")
+
+
+class TestBootstrapInertWhenMisdelivered:
+    """Ask 3: a mis-delivered payload must be a no-op — including in a plain SHELL, the incident's
+    real corruption mode. These tests execute the REAL payload with a real shell; no terminal app is
+    involved anywhere."""
+
+    TARGET = "TARGET-SESSION-UUID"
+
+    def _payload(self, tmp_path):
+        """A bootstrap shaped exactly like spawn()'s: pidfile via $$, then `exec <claude>`. The
+        'claude' here is a stub script that records that it ran, so an exec is observable."""
+        marker, pidfile = tmp_path / "claude-ran", tmp_path / "pid"
+        stub = tmp_path / "fake-claude"
+        stub.write_text(f"#!/bin/sh\necho \"$@\" > {shlex.quote(str(marker))}\n")
+        stub.chmod(0o755)
+        cmd = (f"cd {shlex.quote(str(tmp_path))} && echo $$ > {shlex.quote(str(pidfile))} "
+               f"&& exec {shlex.quote(str(stub))} --session-id 290f5187 'do the packet'")
+        return iterm.guarded_bootstrap(cmd, self.TARGET), marker, pidfile
+
+    def _run(self, payload, session_env, shell="bash"):
+        env = dict(os.environ)
+        env.pop("ITERM_SESSION_ID", None)
+        env.pop("TERM_SESSION_ID", None)
+        if session_env is not None:
+            env["ITERM_SESSION_ID"] = session_env
+        return subprocess.run([shell, "-c", payload], capture_output=True, text=True, env=env,
+                              timeout=30)
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    @pytest.mark.parametrize("wrong_session", [
+        "w1t3p0:LEAD-DATA-PROVIDER-SESSION",   # the incident: a different live tab
+        "",                                    # variable present but empty
+        None,                                  # no session id at all (not a terminal we know)
+    ])
+    def test_misdelivered_payload_runs_nothing(self, tmp_path, shell, wrong_session):
+        payload, marker, pidfile = self._payload(tmp_path)
+        r = self._run(payload, wrong_session, shell=shell)
+        assert not marker.exists(), "the mis-delivered payload EXECED — the corruption mode is live"
+        assert not pidfile.exists(), "the mis-delivered payload ran the pre-exec chain"
+        assert r.returncode == 0, "a mis-delivered payload must be harmless, not an error"
+        assert "mis-delivered" in r.stdout
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    def test_positive_control_the_real_tab_still_runs_it(self, tmp_path, shell):
+        # The other half of the same run: the guard must not break healthy spawns. Same payload,
+        # delivered to the tab whose $ITERM_SESSION_ID carries the target id.
+        payload, marker, pidfile = self._payload(tmp_path)
+        r = self._run(payload, f"w9t9p0:{self.TARGET}", shell=shell)
+        assert r.returncode == 0, r.stderr
+        assert pidfile.exists(), "healthy bootstrap did not write its pidfile"
+        assert marker.exists(), "healthy bootstrap did not exec claude"
+        assert "--session-id 290f5187" in marker.read_text()
+
+    def test_guard_is_built_around_applescripts_runtime_session_id(self):
+        # spawn() never staples a Python-side id onto the payload: the script concatenates the guard
+        # around `sid`, which is `id of targetSession` — the session it is about to type into.
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("OK\nS\nT")) as osa_run:
+            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0)
+        script = osa_run.call_args[0][0]
+        head, mid, tail = iterm.bootstrap_guard_parts("cd /tmp && exec claude")
+        assert f'write text ("{iterm.osa(head)}" & sid & "' in script
+        assert '" & sid & "' in script and iterm.osa(tail) in script
+        assert "exec claude" in mid  # the real bootstrap is inside the conditional, not beside it

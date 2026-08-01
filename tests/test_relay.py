@@ -775,6 +775,75 @@ class TestSpawnLaunchHonesty:
         assert relay.LAUNCH_FAILED in str(ei.value) and "relay restart e1" in str(ei.value)
 
 
+class TestSpawnMisfireLocalization:
+    """Ask 2 of the 2026-08-01 spawn-misfire incident (~/.relay-tasks/
+    incident-spawn-misfire-2026-08-01.md): relay's #20 check DETECTED the misfire but never said
+    WHERE the bootstrap went, so the human had no idea which tab to clean. Every launch-failure
+    report now carries the backend's verdict — and says something materially different for "we
+    aborted, nothing was typed anywhere" than for "it was typed, possibly into the wrong tab"."""
+
+    def _spawn(self, relay, tmp_path, outcomes, expect_exit=True):
+        """Drive cmd_spawn with a per-attempt backend verdict (what iterm.spawn returns) and both
+        launch signals failing, so the misfire reports are the ones under test."""
+        pkt = tmp_path / "p.md"
+        pkt.write_text("do the thing")
+        with mock.patch.object(relay.iterm, "spawn", side_effect=list(outcomes)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=None), \
+             mock.patch.object(relay, "read_iterm_id", return_value=None), \
+             mock.patch.object(relay, "_ensure_tab_label", return_value=False), \
+             mock.patch.object(relay, "pid_start_time", return_value=None):
+            run = lambda: relay.cmd_spawn(SimpleNamespace(  # noqa: E731
+                worktree=str(tmp_path), topic="t", packet=str(pkt), model=None, name="e1",
+                scope=None, skip_perms=None, pane=None, lead=None, model_override=None))
+            if expect_exit:
+                with pytest.raises(SystemExit):
+                    run()
+            else:
+                run()
+
+    ABORTED = {"ok": False, "reason": "no-target", "session_id": None,
+               "front_title": "[Lead] data_provider"}
+    TYPED = {"ok": True, "reason": "ok", "session_id": "NEW-EXEC-SESSION",
+             "front_title": "[Lead] data_provider"}
+
+    def test_abort_says_nothing_was_typed_and_names_the_frontmost_tab(self, relay, tmp_path, capsys):
+        self._spawn(relay, tmp_path, [self.ABORTED, self.ABORTED])
+        err = capsys.readouterr().err
+        assert "ABORTED before typing anything" in err
+        assert "no payload was typed into any tab" in err
+        assert "[Lead] data_provider" in err      # which tab the human was looking at
+
+    def test_typed_payload_names_the_session_and_the_frontmost_tab(self, relay, tmp_path, capsys):
+        self._spawn(relay, tmp_path, [self.TYPED, self.TYPED])
+        err = capsys.readouterr().err
+        assert "typed into terminal session NEW-EXEC-SESSION" in err
+        assert "[Lead] data_provider" in err
+        assert "may have landed there" in err
+        assert "ABORTED" not in err               # must NOT claim nothing was typed
+
+    def test_indeterminate_script_failure_says_so(self, relay, tmp_path, capsys):
+        failed = {"ok": False, "reason": "script-failed", "session_id": None, "front_title": None}
+        self._spawn(relay, tmp_path, [failed, failed])
+        assert "INDETERMINATE" in capsys.readouterr().err
+
+    def test_retry_notice_localizes_too(self, relay, tmp_path, capsys):
+        # The first report the human sees is the retry notice — it carries attempt 1's verdict.
+        self._spawn(relay, tmp_path, [self.TYPED, self.ABORTED])
+        err = capsys.readouterr().err
+        retry_notice = err.split("retrying it once")[1].split("spawn: claude did NOT launch")[0]
+        assert "NEW-EXEC-SESSION" in retry_notice        # attempt 1 typed somewhere…
+        assert "ABORTED before typing anything" in err   # …attempt 2 aborted clean
+
+    def test_backend_returning_none_adds_nothing_and_never_crashes(self, relay, tmp_path, capsys):
+        # Terminal.app pre-dating the return value, or any test double: the report degrades to the
+        # pre-incident wording rather than blowing up a launch report.
+        self._spawn(relay, tmp_path, [None, None])
+        err = capsys.readouterr().err
+        assert "did NOT launch" in err and "relay restart e1" in err
+        assert "ABORTED" not in err and "INDETERMINATE" not in err
+
+
 class TestResumeLaunchHonesty:
     """§12 #21 (same incident): `claude --resume <uuid>` against an id Claude Code never registered
     exits instantly, yet resume printed "resumed … pid N" for a pid that was already gone — and did
