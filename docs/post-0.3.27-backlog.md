@@ -831,3 +831,4 @@ offset of the typed line is wedge-free and runs nothing; a clipped $1 no-ops wit
 positive control execs with a >4KB prompt intact. Inline guard constants removed (historical
 shape kept as a literal in the repro test). Terminal.app unchanged (atomic `do script`, no typing).
 UNVERIFIED as ever: live-iTerm behavior — settled by the first real spawns on 0.3.37.
+CONFIRMED LIVE 2026-08-02: first real spawn on 0.3.37 launched clean — file protocol held.
