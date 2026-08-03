@@ -633,18 +633,48 @@ class TestSpawnTargetOrAbort:
         out, _ = self._spawn("", returncode=1)
         assert out["ok"] is False and out["reason"] == "script-failed"
 
-    def test_every_abort_path_returns_before_the_first_write(self):
-        # The structural guarantee behind "types nothing anywhere": both abort returns are ahead of
-        # any `write text` in the emitted script, so an unresolvable target cannot reach a send.
+    def test_unresolved_target_aborts_before_any_write(self):
+        # An unbound target still returns ahead of every `write text` in the script.
         _, script = self._spawn("OK\nS\nT")
-        first_write = script.index("write text")
-        assert script.index("if not targetFound then return") < first_write
-        assert script.index("if not stillThere then return") < first_write
+        assert script.index("if not targetFound then return") < script.index("write text")
 
-    def test_target_is_rechecked_against_the_bound_session_id(self):
+    def test_every_write_is_inside_an_id_match(self):
+        # #25's structural invariant, and the reason the GONE verdict needs no separate re-check:
+        # NO `write text` is reachable except from inside the loop iteration whose session id
+        # matched `sid`. A write addressed any other way — notably through a held `targetSession`
+        # reference — is what let the cutoff-jump payload land in the frontmost tab.
         _, script = self._spawn("OK\nS\nT")
-        assert "set sid to id of targetSession" in script
-        assert "if (id of s) is sid then set stillThere to true" in script
+        lines = script.splitlines()
+        writes = [i for i, ln in enumerate(lines) if "write text" in ln]
+        assert writes, "no write at all — the send would be a no-op"
+        for i in writes:
+            guard = [ln.strip() for ln in lines[max(0, i - 2):i]]
+            assert "if (id of s) is sid then" in guard, (
+                f"write not guarded by an id match: {lines[i].strip()!r} after {guard!r}")
+
+    def test_no_write_addresses_a_held_reference(self):
+        _, script = self._spawn("OK\nS\nT")
+        assert "set sid to id of targetSession" in script      # resolved ONCE, immediately
+        assert "tell targetSession" not in script              # …and never written through again
+
+    def test_missed_walk_reports_gone_without_writing(self):
+        # didWrite is set only inside the id match, so "the walk found nothing" and "nothing was
+        # typed" are the same fact — that is what makes the GONE verdict trustworthy.
+        _, script = self._spawn("OK\nS\nT")
+        assert "set didWrite to false\n" in script
+        assert "          set didWrite to true\n" in script
+        assert 'if not didWrite then return "GONE"' in script
+
+    def test_send_path_has_no_focus_dependent_addressing(self):
+        # Packet #25 asks this explicitly: grep the emitted script for the focus-dependent forms.
+        # The ONE permitted use is the frontmost-title capture for localization, which never
+        # addresses a write — so it is excluded by line, not by weakening the check.
+        _, script = self._spawn("OK\nS\nT")
+        for ln in script.splitlines():
+            if "set frontTitle to name of current session of current window" in ln:
+                continue
+            assert "current session of current window" not in ln, ln
+            assert "front window" not in ln, ln
 
     def test_frontmost_title_is_captured_before_the_send(self):
         _, script = self._spawn("OK\nS\nT")
@@ -706,11 +736,152 @@ class TestBootstrapInertWhenMisdelivered:
 
     def test_guard_is_built_around_applescripts_runtime_session_id(self):
         # spawn() never staples a Python-side id onto the payload: the script concatenates the guard
-        # around `sid`, which is `id of targetSession` — the session it is about to type into.
+        # segments around `sid`, which is `id of targetSession` — the session it types into.
         with mock.patch.object(iterm, "run_osascript", return_value=_ok("OK\nS\nT")) as osa_run:
             iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0)
         script = osa_run.call_args[0][0]
-        head, mid, tail = iterm.bootstrap_guard_parts("cd /tmp && exec claude")
-        assert f'write text ("{iterm.osa(head)}" & sid & "' in script
-        assert '" & sid & "' in script and iterm.osa(tail) in script
-        assert "exec claude" in mid  # the real bootstrap is inside the conditional, not beside it
+        # The first three segments are independent of the bootstrap command, so they can be pinned
+        # exactly; the last one carries spawn()'s own real `cmd`, checked by its landmarks.
+        segs = iterm.bootstrap_guard_parts("<cmd>")
+        prefix = " & sid & ".join(f'"{iterm.osa(s)}"' for s in segs[:3])
+        assert f"write text ({prefix} & sid & " in script
+        assert segs[-1].endswith("<cmd>" + iterm._GUARD_END)   # bootstrap rides in the last segment
+        assert "exec claude" in script and iterm.osa(iterm._GUARD_END) in script
+        # Exactly 3 id insertions in the PAYLOAD line itself, every one the same runtime `sid`,
+        # so no Python-side id is ever spliced in. (Scoped to that line: the GONE/OK verdicts
+        # legitimately concatenate `sid` too.)
+        payload_line = next(ln for ln in script.splitlines() if "_relay_sid=" in ln)
+        assert payload_line.count(" & sid & ") == 3
+
+
+# ================================================================================================
+# #25 — THE RESIDUAL SEAM (incident updates 2026-08-01-later and 2026-08-02)
+#
+# #24 shipped target-or-abort and the payload guard, and BOTH worked: a `badge-flow` spawn misfired
+# twice into two different wrong tabs and the guard ran nothing in either. But targeting still
+# missed, and the 2026-08-02 `cutoff-jump` misfire pinned down why it wasn't a creation bug: the
+# typed payload's guard carried the CORRECT intended session id, so creation and resolution were
+# both right — yet the write landed in the frontmost tab. The send step's addressing was the hole.
+# Second, smaller failure from the same evidence: the guard's else-echo arrived truncated, so the
+# victim shell sat at a `dquote>` continuation prompt and swallowed the follow-up /rename line.
+# ================================================================================================
+
+
+class TestByIdWalkMatchOrAbort:
+    """Incident audit item 1: the by-session-id walk must bind via an actual match or abort — and
+    must not be defeated by the two id FORMATS in play (`w#t#p#:UUID` handles vs bare `id of
+    session`)."""
+
+    def test_repro_handle_form_id_would_miss_every_session(self):
+        # THE BUG SHAPE. Feed the walk a handle-form id without normalizing: it compares
+        # "w1t9p0:UUID" against `id of session` (bare "UUID"), so no session can ever match. Before
+        # #24 that miss fell through to the frontmost tab; the point here is that the COMPARISON
+        # itself is unsatisfiable, which is what made the fall-through reachable at all.
+        handle, bare = "w1t9p0:81C69A6A-DEAD-BEEF", "81C69A6A-DEAD-BEEF"
+        unnormalized = f'if (id of s) is "{handle}" then'
+        assert unnormalized not in iterm._target_by_session_id_block(handle), \
+            "walk still compares against the handle form — it would miss every session"
+        # …post-fix both forms normalize to the same, satisfiable comparison.
+        assert f'if (id of s) is "{bare}" then' in iterm._target_by_session_id_block(handle)
+        assert iterm._target_by_session_id_block(handle) == iterm._target_by_session_id_block(bare)
+
+    def test_walk_miss_sets_no_target_and_types_nothing(self):
+        # The walk only ever sets targetFound INSIDE the match, so a miss reaches spawn()'s
+        # NOTARGET abort — verdict returned, nothing typed anywhere.
+        block = iterm._target_by_session_id_block("SOME-UUID")
+        for line in block.splitlines():
+            if "set targetFound to true" in line:
+                assert line.startswith("          "), "targetFound set outside the match branch"
+        assert block.count("set targetFound to true") == 1
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("NOTARGET\n\n[Lead] fdata")), \
+             mock.patch.object(iterm.iterm_pyapi, "try_create_adjacent_tab", return_value="GONE-ID"):
+            out = iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid",
+                              rename_delay=0, lead_handle="w1t2p0:LEAD", layout="tab")
+        assert out["ok"] is False and out["reason"] == "no-target"
+        assert out["front_title"] == "[Lead] fdata"
+
+    def test_pyapi_handoff_id_is_normalized_on_the_way_in(self):
+        # The pyapi path hands its session id straight to the walk; whichever form it returns, the
+        # emitted comparison is the bare one the walk can actually match.
+        for returned in ("81C69A6A-DEAD-BEEF", "w3t1p0:81C69A6A-DEAD-BEEF"):
+            with mock.patch.object(iterm, "run_osascript", return_value=_ok("OK\nS\nT")) as osa_run, \
+                 mock.patch.object(iterm.iterm_pyapi, "try_create_adjacent_tab", return_value=returned):
+                iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0,
+                            lead_handle="w1t2p0:LEAD", layout="tab")
+            script = osa_run.call_args[0][0]
+            assert 'if (id of s) is "81C69A6A-DEAD-BEEF" then' in script
+            assert "w3t1p0" not in script
+
+
+class TestGuardDoesNotWedgeVictimShell:
+    """Incident update 2026-08-01-later: the guard's else-echo arrived truncated in the victim tab,
+    leaving the shell at a `dquote>` continuation prompt that swallowed the follow-up /rename line.
+    These run REAL shells; no terminal app is involved."""
+
+    # The pre-#25 guard, verbatim from scripts/iterm.py at v0.3.35 — the repro's input.
+    OLD_SHAPE = ('_relay_sid="${ITERM_SESSION_ID:-$TERM_SESSION_ID}"; if [ "${_relay_sid##*:}" = "%s" ]; '
+                 'then %s; else echo "[relay] bootstrap for iTerm session %s was mis-delivered to '
+                 'this tab (${_relay_sid:-no session id}); ignored, nothing was run."; fi')
+    RENAME = "/rename [Exec] cutoff-jump"
+
+    def _feed(self, line1, shell):
+        """Both payload lines into a real shell, exactly as iTerm delivers them. A shell left with
+        an unterminated quote reports an EOF/unmatched-quote error and never runs line 2 — the
+        non-interactive face of the `dquote>` prompt the human saw."""
+        return subprocess.run([shell], input=line1 + "\n" + self.RENAME + "\n",
+                              capture_output=True, text=True, timeout=30,
+                              env={k: v for k, v in os.environ.items()
+                                   if k not in ("ITERM_SESSION_ID", "TERM_SESSION_ID")})
+
+    def _truncated(self, payload, marker):
+        assert marker in payload
+        return payload[:payload.index(marker) + len(marker)]
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    def test_repro_old_shape_swallows_the_rename_line(self, shell):
+        old = self.OLD_SHAPE % ("TARGET-UUID", "cd /tmp && exec claude --session-id 290f5187", "TARGET-UUID")
+        r = self._feed(self._truncated(old, "was"), shell)
+        blob = r.stdout + r.stderr
+        assert ("unexpected EOF" in blob or "unmatched" in blob), \
+            f"expected an unterminated-quote wedge, got: {blob!r}"
+        assert "/rename" not in blob, "the rename line should have been swallowed by the open quote"
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    def test_fixed_shape_leaves_a_clean_prompt_and_runs_the_rename_line(self, shell):
+        # Same truncation point, current payload: notice printed once, and the /rename line is
+        # parsed as its OWN line (it fails as a command — harmless — rather than vanishing).
+        new = iterm.guarded_bootstrap("cd /tmp && exec claude --session-id 290f5187", "TARGET-UUID")
+        r = self._feed(self._truncated(new, "was" if "was" in new else "session TARGET-UUID"), shell)
+        blob = r.stdout + r.stderr
+        assert "unexpected EOF" not in blob and "unmatched" not in blob, blob
+        assert blob.count("ignored a mis-delivered bootstrap") == 1
+        # Line 2 reached the parser as a line of its OWN — each shell says so differently (bash
+        # can't find the command `/rename`, zsh fails globbing the `[Exec]` word first), and either
+        # way it was executed rather than swallowed into an open string.
+        assert ("/rename" in blob or "[Exec]" in blob), blob
+
+    def test_guard_prologue_has_no_quote_or_block_terminator(self):
+        # The structural reason the above holds for ANY truncation point in the prologue: nothing
+        # before the bootstrap can leave a quote or a block open.
+        payload = iterm.guarded_bootstrap("cd /tmp && exec claude", "TARGET-UUID")
+        prologue = payload[:payload.index("cd /tmp")]
+        assert '"' not in prologue and "'" not in prologue
+        # Block keywords/grouping checked as WORDS: a bare `{` substring is fine here because it
+        # only ever comes from `${…}` parameter expansion, which opens nothing the shell waits on.
+        words = prologue.split()
+        for kw in ("if", "then", "fi", "case", "esac", "{", "}", "do", "done"):
+            assert kw not in words, f"{kw!r} in prologue — a truncation could wedge on it"
+        assert "$(" not in prologue and "`" not in prologue  # no unclosed command substitution
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    def test_misdelivered_payload_line_exits_zero(self, shell):
+        # The PAYLOAD line alone (not the bogus /rename that follows it, whose failure is the
+        # shell's own verdict on an unknown command): a victim shell must not be left with a
+        # non-zero $? for a no-op it never asked for. Without the trailing `|| :` the line's status
+        # is the failed guard test, i.e. 1.
+        payload = iterm.guarded_bootstrap("cd /tmp && exec claude", "TARGET-UUID")
+        r = subprocess.run([shell], input=payload + "\n", capture_output=True, text=True,
+                           timeout=30, env={k: v for k, v in os.environ.items()
+                                            if k not in ("ITERM_SESSION_ID", "TERM_SESSION_ID")})
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert "ignored a mis-delivered bootstrap" in r.stdout

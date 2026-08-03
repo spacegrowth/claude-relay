@@ -72,6 +72,7 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 22 | BUG | Wake dedup stamps surfaced on announce ATTEMPT, not delivery — busy-lead wake lost forever ✅ LANDED v0.3.32 (two-phase stamp; §13 diagnosis code-confirmed) | §13 |
 | 23 | BUG | #22's delivery proof read the GLOBAL stop_hook_active flag — a foreign blocking Stop hook (rules-check) silenced wakes for hours ✅ LANDED v0.3.34 (relay-owned claim + transcript evidence) | §14 |
 | 24 | BUG | Spawn typed its whole bootstrap into an unrelated live tab — target re-read from focus after tab creation ✅ LANDED v0.3.35 (target-or-abort + misfire localization + fresh-tab payload guard) | §15 |
+| 25 | BUG | #24's own residual seam — writes went through a POSITIONAL `targetSession` reference, so a reorder still landed the payload in the frontmost tab; plus the guard's else-echo wedging victim shells at `dquote>` ✅ LANDED (write-inside-the-id-match, id normalization, wedge-proof guard) | §15b |
 | d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) ✅ PHASE 1 (logging-only) LANDED v0.3.32 — blocking mode waits on tuned logs | §10 |
 | d2 | DOC | Mutation-budget tripwire line in `/relay:mode` ✅ LANDED v0.3.30 | §10 |
 | d3 | DOC | Standing ops-hands pattern (spawn an ops executor up front) ✅ LANDED v0.3.30 | §10 |
@@ -742,3 +743,69 @@ vertically` in the same file, and fail-safe — an error there binds nothing, so
 than misfires), and the true focus race itself. The repro models AppleScript's focus semantics; the
 expressions it judges come from the real code, and the model raises on any expression it doesn't
 know, so it cannot silently drift.
+
+## 15b. #24's residual seam — binding is not addressing (#25, field incidents 2026-08-01/02)
+
+Same incident file as §15, two sections added after v0.3.35 shipped: "Update — 2026-08-01 later,
+badge-flow" and "Update — 2026-08-02, cutoff-jump".
+
+**What #24 got right, and what it missed.** #24 removed the focus-dependent *binding*
+(`set targetSession to current session of <window>`) and added the payload guard. Both worked in the
+field: `badge-flow` misfired twice into two different wrong tabs and the guard ran nothing in either,
+and relay named the victim session. But targeting still missed — and `cutoff-jump` explained why.
+Its typed payload's guard carried the **correct intended session id**, so creation *and* resolution
+had both succeeded, yet the write still landed in the frontmost tab.
+
+**Root cause.** Binding is not addressing. #24 bound `targetSession` to what creation returned, then
+wrote through that held reference. An AppleScript object specifier is POSITIONAL — `session N of tab
+M of window K` — and iTerm orders `windows` front-to-back. Anything that reorders windows/tabs
+between binding and writing (the human switching tabs — the incident's own trigger) leaves the
+reference denoting a *different* session, while `id of targetSession`, read earlier, still reports
+the right one. That is exactly the observed signature. `send()`/`close()`/`focus()` never had this
+bug because they write INSIDE the id match (`_for_session_by_id`).
+
+**Fixes.**
+1. *Write inside the id match.* `sid` is read once, immediately after binding (the one unavoidable
+   deref), and `targetSession` is never touched again. Every write re-resolves by id and happens in
+   the same loop iteration that matched it, so the walk IS the existence re-check: no match → no
+   write → `GONE` verdict. `/rename` re-resolves the same way after the delay. No focus-dependent
+   expression reaches the send path; the sole remaining `current session of current window` is the
+   frontmost-title capture for localization, which addresses no write.
+2. *Id-format normalization.* `_target_by_session_id_block` now normalizes to the bare UUID. `id of
+   session` is bare, while every id sourced from a shell (`$ITERM_SESSION_ID`, hence every stored
+   `iterm_session` handle) is `w#t#p#:UUID`; feeding the handle form would make the walk miss every
+   session. `try_create_adjacent_tab` returns the bare form today, so this is belt-and-braces — but
+   it is one line and the failure it prevents is the whole incident.
+3. *Wedge-proof guard.* The old else-echo arrived truncated in victim shells, leaving them at a
+   `dquote>` continuation prompt that swallowed the follow-up `/rename` line. The guard is now two
+   `;`-separated statements with `||`/`&&` — no `if`/`fi` to wait on, no quote characters anywhere
+   before the bootstrap (an `x` prefix on both test operands makes it empty-safe without quoting),
+   the notice first so it completes early, and a trailing `|| :` so a mis-delivered payload exits 0.
+
+### Evidence (§0-style)
+
+| Claim | How observed | Result |
+|---|---|---|
+| Old guard wedges a victim shell, swallowing the next line | `TestGuardDoesNotWedgeVictimShell::test_repro_old_shape_swallows_the_rename_line`, real bash + zsh | `unexpected EOF while looking for matching '"'` / `unmatched "`; `/rename` never runs |
+| …and interactively it is the reported `dquote>` | pty run, PS2=`CONT>`, both shells | `CONT> /rename [Exec] cutoff-jump` — swallowed |
+| New guard leaves a clean prompt | same test, fixed shape, same truncation point | notice once, `/rename` executes as its own line, no quote error |
+| …interactively too | same pty harness | back to `PROMPT$`, not `CONT>` |
+| Mis-delivered payload exits 0 | `test_misdelivered_payload_line_exits_zero`, bash + zsh | rc 0 (was rc 1 before the trailing `\|\| :`) |
+| No prefix of the guard can wedge | `test_guard_prologue_has_no_quote_or_block_terminator` | no quotes, no block words, no command substitution |
+| Handle-form id would miss every session | `TestByIdWalkMatchOrAbort::test_repro_handle_form_id_would_miss_every_session` | pre-fix comparison unsatisfiable; post-fix both forms normalize identically |
+| A missed walk aborts without typing | `test_walk_miss_sets_no_target_and_types_nothing` | `no-target` verdict, front title captured |
+| Every write is inside an id match | `test_every_write_is_inside_an_id_match` | all writes guarded; `tell targetSession` absent |
+| Send path free of focus-dependent addressing | `test_send_path_has_no_focus_dependent_addressing` | only the localization line uses it, and it writes nothing |
+| #24's own classes still pass | `TestSpawnMisfireRepro`, `TestSpawnTargetOrAbort`, `TestBootstrapInertWhenMisdelivered`, `TestSpawnLaunchHonesty`, `TestSpawnMisfireLocalization` | 45 passed together with the new classes |
+
+**UNVERIFIED, live-iTerm only:** that AppleScript specifiers are positional and `windows` is
+front-to-back ordered — the mechanism above. It is the only explanation consistent with all the
+field evidence (correct id in the guard, write to frontmost), and the fix is strictly safer whether
+or not it is the mechanism, since addressing by id at write time removes the held reference
+entirely. Also unverified: what truncates the typed line in the victim tab (the wedge is fixed
+defensively, by making no prefix able to wedge, rather than by removing the truncation).
+
+**Known residual, deliberately not fixed here (would exceed this packet's one deliverable):** a
+truncation landing inside the BOOTSTRAP's own quoted prompt can still wedge the tab it was correctly
+delivered to. The durable fix is to stop typing the packet prompt inline — pass it via a file — which
+is a spawn-protocol change, not a guard change.

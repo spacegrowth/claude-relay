@@ -365,9 +365,19 @@ def _target_by_session_id_block(uuid):
     write-text/rename AppleScript machinery (confirmed live: Python API session ids and
     AppleScript's `id of session` are the same UUID space, so this lookup always matches).
 
-    Sets `targetFound` only when the walk actually matches. Pre-fix this fragment left
+    Sets `targetFound` only when the walk actually matches. Pre-#24 this fragment left
     `targetSession` UNBOUND on a miss (pyapi tab already closed, id-space surprise, …) while the
-    caller typed the payload regardless; the caller now aborts on an unbound target — see spawn()."""
+    caller typed the payload regardless; the caller now aborts on an unbound target — see spawn().
+
+    ID-FORMAT NORMALIZATION (#25, incident audit item 1a): the walk compares against `id of session`,
+    which is the BARE UUID. Every id that reaches relay from a shell — `$ITERM_SESSION_ID`, hence
+    every stored `iterm_session` handle — is the `w#t#p#:UUID` form instead. Feeding a handle-form id
+    to this walk would compare `"w1t9p0:UUID"` against `"UUID"`, miss on every session, and (pre-#24)
+    fall through to the frontmost tab. `try_create_adjacent_tab` happens to return the bare form
+    today, so this normalization is belt-and-braces rather than a live bug — but it is one line, and
+    the failure it prevents is the whole incident. Case is not normalized here on purpose:
+    AppleScript's `is` comparison on strings is case-insensitive by default."""
+    uuid = str(uuid or "").split(":")[-1]
     return (
         "  repeat with w in windows\n"
         "    repeat with t in tabs of w\n"
@@ -391,27 +401,50 @@ def _target_by_session_id_block(uuid):
 # landing in a tab that is a plain SHELL, where `exec claude --session-id <uuid>` would REPLACE that
 # shell with a duplicate executor on the same session id the retry then also used — structurally
 # impossible instead of luck-dependent (the victim tab happening to run a Claude REPL).
-_GUARD_HEAD = '_relay_sid="${ITERM_SESSION_ID:-$TERM_SESSION_ID}"; if [ "${_relay_sid##*:}" = "'
-_GUARD_THEN = '" ]; then '
-_GUARD_ELSE = '; else echo "[relay] bootstrap for iTerm session '
-_GUARD_TAIL = (' was mis-delivered to this tab (${_relay_sid:-no session id}); ignored, '
-               'nothing was run."; fi')
+#
+# WEDGE-PROOF SHAPE (#25, incident update 2026-08-01-later). The first guard shipped the notice as
+# `… ; else echo "[relay] bootstrap for iTerm session <id> was mis-delivered …"; fi`. Delivered to a
+# victim SHELL it arrived TRUNCATED mid-string, so the shell sat at a `dquote>` continuation prompt
+# and swallowed the follow-up `/rename …` line as more string content — the human's tab left wedged.
+# Whatever truncates the line (unconfirmed — see the report's UNVERIFIED), the structural answer is
+# that NO PREFIX of the guard prologue may leave a quote or a block open:
+#   - no quote characters at all before the bootstrap — the `x` prefix on both operands makes the
+#     test empty-safe without needing `"` (a bare `[ ${v##*:} = X ]` errors on an empty v);
+#   - no `if`/`then`/`fi` (or `{`/`}`/`case`/`esac`) — two independent `;`-separated statements
+#     guarded by `||` and `&&`, so there is no terminator the shell can be left waiting for;
+#   - the notice comes FIRST, so it is complete long before the long bootstrap tail.
+# Truncated anywhere in the prologue the victim shell therefore lands on a CLEAN prompt, and the
+# `/rename` line that follows is parsed as its own (harmless, command-not-found) line.
+_GUARD_HEAD = "_relay_sid=${ITERM_SESSION_ID:-$TERM_SESSION_ID}; [ x${_relay_sid##*:} = x"
+_GUARD_NOTICE = " ] || echo relay: ignored a mis-delivered bootstrap meant for session "
+_GUARD_THEN = "; [ x${_relay_sid##*:} = x"
+_GUARD_TAIL = " ] && "
+# Trailing `|| :` so a mis-delivered payload exits 0. Without it the line's status is the FAILED
+# guard test, i.e. rc 1 — a victim shell left with a non-zero `$?` for a no-op it never asked for
+# (and, in a shell with `set -e` or a status-showing prompt, actively alarming). On the healthy path
+# `exec` never returns, so this can only ever fire for a no-op or a bootstrap that already failed —
+# and a failed bootstrap is detected by the missing pidfile (#20), never by this exit status.
+_GUARD_END = " || :"
 
 
 def bootstrap_guard_parts(cmd):
-    """The guarded bootstrap, split for AppleScript assembly: (head, mid, tail) such that
-    `head + <session id> + mid + <session id> + tail` is the exact line to type. spawn() concatenates
-    these around AppleScript's runtime `id of targetSession` — the id is only knowable INSIDE the
-    script, after tab creation — so the guard's id and the typed-into session are the same value by
-    construction; there is no window in which Python could staple the wrong id onto the payload."""
-    return (_GUARD_HEAD, _GUARD_THEN + cmd + _GUARD_ELSE, _GUARD_TAIL)
+    """The guarded bootstrap as LITERAL SEGMENTS to be joined by the target session id: the payload
+    is exactly `<session id>.join(bootstrap_guard_parts(cmd))`. spawn() emits that join as AppleScript
+    concatenation around the runtime `id of targetSession` — the id is only knowable INSIDE the
+    script, after tab creation — so the guard's id and the session being typed into are the same
+    value by construction; there is no window in which Python could staple a wrong id onto it.
+
+    Shape: `_relay_sid=…; [ x<mine> = x<target> ] || echo <notice> <target>; [ x<mine> = x<target> ]
+    && <cmd>` — three id insertions, and the test is evaluated twice on purpose so that neither
+    statement needs a block. See the WEDGE-PROOF SHAPE note above for why every character before
+    `<cmd>` is free of quotes and block terminators."""
+    return (_GUARD_HEAD, _GUARD_NOTICE, _GUARD_THEN, _GUARD_TAIL + cmd + _GUARD_END)
 
 
 def guarded_bootstrap(cmd, session_id):
     """The assembled guarded line — the same string spawn() has iTerm build at runtime. Exists so the
     inertness test can execute the real payload in a plain shell, with no terminal app involved."""
-    head, mid, tail = bootstrap_guard_parts(cmd)
-    return head + session_id + mid + session_id + tail
+    return session_id.join(bootstrap_guard_parts(cmd))
 
 
 def _match_session_block(label, action):
@@ -439,23 +472,27 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
           iterm_id_file=None, session_uuid=None, resume_id=None, tab_color=None, lead_handle=None,
           layout="tab", settings_file=None):
     """Open a new iTerm tab (or pane), cd into `cwd`, launch `claude [--model X] <prompt>`, then
-    (after a delay for claude to finish starting) send `/rename <label>` into the SAME session —
-    one AppleScript call holding a single `targetSession` reference throughout, so there's no race
-    with "current session" shifting if another spawn happens in between (two separate osascript
-    calls relying on "current session of current window" staying correct would have that race).
+    (after a delay for claude to finish starting) send `/rename <label>` into the SAME session — one
+    AppleScript call that resolves the target ONCE to a session id and then addresses every write by
+    that id, so nothing that happens to focus or window order in between can redirect the payload.
 
-    TARGET-OR-ABORT + INERT PAYLOAD (2026-08-01 spawn-misfire incident, write-up at
+    TARGET-OR-ABORT + INERT PAYLOAD (2026-08-01/02 spawn-misfire incident, write-up at
     ~/.relay-tasks/incident-spawn-misfire-2026-08-01.md — a lead's bootstrap, `exec claude
-    --session-id …` and all, was typed into an unrelated live tab while the human cycled tabs):
-    holding ONE osascript call was never enough, because inside it the target was re-read from the
-    focus-dependent `current session of <window>` AFTER creating the tab. Three changes:
-      1. every target binding is to the object creation RETURNED (`_create_target_block`), the
-         script re-checks the bound session still exists, and any failure to resolve returns a
-         verdict WITHOUT typing anything — the frontmost fall-through is gone;
-      2. the frontmost tab's title at send time is captured and returned, so a caller reporting a
+    --session-id …` and all, was typed into an unrelated live tab while the human cycled tabs).
+    This took two rounds, and the first round's reasoning was incomplete:
+      1. (#24) every target binding is to the object creation RETURNED (`_create_target_block`) —
+         never re-read from the focus-dependent `current session of <window>`;
+      2. (#25) but binding is not addressing. A specifier like `session N of tab M of window K` is
+         POSITIONAL, so holding it across a reorder still wrote to the wrong session — proven by the
+         `cutoff-jump` misfire, where the payload's guard carried the CORRECT id. Every write now
+         re-resolves BY ID inside the matching loop iteration, the walk doubles as the existence
+         re-check, and a miss returns a verdict WITHOUT typing. No focus-dependent expression
+         reaches the send path at all;
+      3. the frontmost tab's title at send time is captured and returned, so a caller reporting a
          failed launch can tell the human which tab to inspect;
-      3. the payload itself is wrapped by `bootstrap_guard_parts` in a conditional on the receiving
-         tab's own $ITERM_SESSION_ID, so a stray copy is a no-op even in a plain shell.
+      4. the payload itself is wrapped by `bootstrap_guard_parts` in a conditional on the receiving
+         tab's own $ITERM_SESSION_ID — a stray copy is a no-op even in a plain shell, and (#25) is
+         shaped so no prefix of it can leave that shell wedged at a continuation prompt.
 
     Returns a dict — `{"ok": bool, "reason": str, "session_id": str|None, "front_title": str|None}`
     — see `_read_spawn_outcome`. Never raises; `ok=False` means the launch did not happen, and
@@ -509,8 +546,8 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     color_part = f"printf '{tab_color_printf(tab_color)}' && " if tab_color else ""
     cmd = (f"cd {shlex.quote(cwd)} && {color_part}{env_prefix}echo $$ > {shlex.quote(pidfile)}{capture} "
            f"&& exec {base}")
-    guard_head, guard_mid, guard_tail = bootstrap_guard_parts(cmd)
-    head_e, mid_e, tail_e = osa(guard_head), osa(guard_mid), osa(guard_tail)
+    # The payload as AppleScript concatenation: literal segments joined by the runtime `sid`.
+    payload_expr = ' & sid & '.join(f'"{osa(seg)}"' for seg in bootstrap_guard_parts(cmd))
     rename_e = osa("/rename " + label)
     # Only worth attempting adjacency for a separate TAB — a "pane" layout is inherently adjacent
     # (it's split off the lead's own session), no placement problem to solve.
@@ -521,37 +558,63 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
         _target_by_session_id_block(pyapi_session_id) if pyapi_session_id
         else _create_target_block(lead_handle, layout)
     )
-    # TARGET-OR-ABORT. Ordering is the whole safety property: bind the target, capture the frontmost
-    # tab's title (for localization if anything did go wrong), RE-CHECK that the bound session still
-    # exists, and only then type. Every failure path returns BEFORE the first `write text`, so an
-    # unresolvable target types nothing anywhere instead of falling through to the frontmost tab.
-    # The re-check walk is by `id of targetSession`, i.e. the same identity the guard will be built
-    # from — a target that vanished between creation and send (tab closed, window closed) aborts.
-    script = (
-        'set frontTitle to ""\n'
-        "set targetFound to false\n"
-        f'tell application "{ITERM_APP_NAME}"\n'
-        "  activate\n"
-        f"{target_block}"
-        "  try\n"
-        "    set frontTitle to name of current session of current window\n"
-        "  end try\n"
-        '  if not targetFound then return "NOTARGET" & linefeed & "" & linefeed & frontTitle\n'
-        "  set sid to id of targetSession\n"
-        "  set stillThere to false\n"
+    # TARGET-OR-ABORT, addressed BY ID AT WRITE TIME (#24 established the first half; #25 the second).
+    #
+    # #24 bound `targetSession` to what creation returned, re-checked it, then wrote through that
+    # held reference. The 2026-08-02 `cutoff-jump` misfire proved that is still not enough: the
+    # typed payload carried the CORRECT session id in its guard (so creation and resolution were
+    # both right) yet the write landed in the frontmost tab. The reason is that an AppleScript
+    # object specifier from `create tab`/`repeat with s in …` is POSITIONAL — `session N of tab M of
+    # window K` — and iTerm orders `windows` front-to-back. Anything that reorders windows/tabs
+    # between binding and writing (the human switching tabs, i.e. the incident's own trigger) leaves
+    # the reference denoting a DIFFERENT session, while `id of targetSession`, read earlier, still
+    # reports the right one. `send()`/`close()`/`focus()` never had this bug because they write
+    # INSIDE the id match (`_for_session_by_id`); this is the same discipline applied to spawn.
+    #
+    # So: read `sid` immediately after binding (the one unavoidable deref, adjacent to creation),
+    # then never touch `targetSession` again — every write re-resolves by id and happens in the same
+    # loop iteration that matched it. The walk IS the re-check: no match, no write, verdict returned.
+    # `/rename` re-resolves the same way after the delay, and is best-effort (the bootstrap is
+    # already delivered by then; `_ensure_tab_label` owns label retries).
+    write_payload = (
         "  repeat with w in windows\n"
         "    repeat with t in tabs of w\n"
         "      repeat with s in sessions of t\n"
-        "        if (id of s) is sid then set stillThere to true\n"
+        "        if (id of s) is sid then\n"
+        f"          tell s to write text ({payload_expr})\n"
+        "          set didWrite to true\n"
+        "        end if\n"
         "      end repeat\n"
         "    end repeat\n"
         "  end repeat\n"
-        '  if not stillThere then return "GONE" & linefeed & sid & linefeed & frontTitle\n'
-        "  tell targetSession\n"
-        f'    write text ("{head_e}" & sid & "{mid_e}" & sid & "{tail_e}")\n'
-        f"    delay {rename_delay}\n"
-        f'    write text "{rename_e}"\n'
-        "  end tell\n"
+    )
+    write_rename = (
+        "  repeat with w in windows\n"
+        "    repeat with t in tabs of w\n"
+        "      repeat with s in sessions of t\n"
+        "        if (id of s) is sid then\n"
+        f'          tell s to write text "{rename_e}"\n'
+        "        end if\n"
+        "      end repeat\n"
+        "    end repeat\n"
+        "  end repeat\n"
+    )
+    script = (
+        'set frontTitle to ""\n'
+        "set targetFound to false\n"
+        "set didWrite to false\n"
+        f'tell application "{ITERM_APP_NAME}"\n'
+        "  activate\n"
+        f"{target_block}"
+        '  if not targetFound then return "NOTARGET" & linefeed & "" & linefeed & frontTitle\n'
+        "  set sid to id of targetSession\n"
+        "  try\n"
+        "    set frontTitle to name of current session of current window\n"
+        "  end try\n"
+        f"{write_payload}"
+        '  if not didWrite then return "GONE" & linefeed & sid & linefeed & frontTitle\n'
+        f"  delay {rename_delay}\n"
+        f"{write_rename}"
         '  return "OK" & linefeed & sid & linefeed & frontTitle\n'
         "end tell"
     )
