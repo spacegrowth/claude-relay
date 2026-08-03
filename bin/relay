@@ -1569,6 +1569,38 @@ def _busy_elapsed(s):
         return None
 
 
+def _surfacing_caller(s):
+    """WHO is invoking a #17 stamping channel (`relay check`/`diff`/`close`) against session `s`?
+    Returns "lead" (the OWNING lead — the only invoker that proves the lead handled the report),
+    "self" (the executor `s` itself), "other" (some other known relay session or lead), or
+    "unknown" (no ambient session identity at all: a human at a plain terminal, a script, the test
+    suite). See _mark_report_surfaced for what each answer buys.
+
+    Identity comes from $CLAUDE_CODE_SESSION_ID, which Claude Code sets in every session's shell —
+    a lead's to its own session id, an executor's to its `claude_session` uuid (`relay whoami`
+    already relies on exactly this, see _resolve_whoami). That env var is chosen over the obvious
+    alternative — a flag the auto-appended GATES text tells the executor to pass — because it is
+    the LESS SPOOFABLE of the two: the harness sets it, no packet text can drop it, and every
+    packet already in flight (written before this fix) carries it for free, whereas a GATES flag is
+    text a model may reword, omit, or copy onto the wrong invocation, and only helps packets
+    written after the change."""
+    caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not caller:
+        return "unknown"
+    # Cheap, index-free self-check FIRST: it must hold even if the session scan below can't resolve
+    # the token (a session.json without claude_session, a pruned state dir).
+    if caller in (s.get("claude_session"), s.get("session_id")):
+        return "self"
+    if caller == s.get("owner_lead"):
+        return "lead"
+    role, name, _ = _resolve_whoami(caller)
+    if role is None:
+        return "unknown"
+    if role == "executor" and name == s.get("session_id"):
+        return "self"
+    return "other"
+
+
 def _mark_report_surfaced(s):
     """Stamp the owning lead's surfaced_reports.json for a session's current-packet report, if one
     exists — the fix for the asymmetric dedup (backlog §5b / task #17). Before this, ONLY the lead's
@@ -1577,12 +1609,33 @@ def _mark_report_surfaced(s):
     still saw it as new and re-announced an already-handled report. These are all channels where the
     lead has DEMONSTRABLY handled the report (not merely been notified of it — see the explicit
     "do not mark on the mere nudge" warning in the backlog), so it's safe to stamp here. Best-effort;
-    a missing owner_lead or report is simply a no-op, never an error."""
+    a missing owner_lead or report is simply a no-op, never an error.
+
+    #27/§16: "reviewed through another channel" was never checked against WHO ran the channel, and
+    the auto-appended GATES tell every executor to run `relay diff <its own sid>` the moment its
+    report is written. That self-diff stamped the OWNING LEAD's surfaced set seconds after the
+    report appeared — before any lead could possibly have seen it — and killed both wake paths at
+    once: the lead's at-Stop/poller announce (new_reports_for excludes surfaced keys) and the
+    executor's own escalation push (escalation_decision reads the same set and returns "resolved").
+    Worse, mark_surfaced calls drop_pending, so a #22/#23 announce that had fired but not yet proven
+    delivery was CANCELLED rather than retried. Hence the invoker gate: only the owning lead — or an
+    invoker with no session identity at all, which is #17's original human-at-a-terminal case —
+    may stamp. A self-diff is recorded in the ledger instead of stamping, so the suppression that
+    used to be invisible now leaves a trace."""
     owner_lead = s.get("owner_lead")
     n = s.get("current_packet")
     if not owner_lead or n is None:
         return
     if not (packets_dir(s["session_id"]) / f"{n:03d}-report.md").exists():
+        return
+    who = _surfacing_caller(s)
+    if who not in ("lead", "unknown"):
+        # "self" is #27 proper and worth a ledger line (once per packet — the GATES self-diff runs
+        # once); "other" is a foreign lead/executor and merely correct scoping, not an anomaly, so
+        # it stays silent rather than spamming a multi-lead `relay check --all`.
+        if who == "self":
+            append_ledger("surfaced_stamp_declined", session_id=s["session_id"], packet=n,
+                          owner_lead=owner_lead, caller="self")
         return
     lead_guard.mark_surfaced(STATE_ROOT, owner_lead, [f"{s['session_id']}:{n}"])
 

@@ -73,6 +73,7 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 23 | BUG | #22's delivery proof read the GLOBAL stop_hook_active flag — a foreign blocking Stop hook (rules-check) silenced wakes for hours ✅ LANDED v0.3.34 (relay-owned claim + transcript evidence) | §14 |
 | 24 | BUG | Spawn typed its whole bootstrap into an unrelated live tab — target re-read from focus after tab creation ✅ LANDED v0.3.35 (target-or-abort + misfire localization + fresh-tab payload guard) | §15 |
 | 25 | BUG | #24's own residual seam — writes went through a POSITIONAL `targetSession` reference, so a reorder still landed the payload in the frontmost tab; plus the guard's else-echo wedging victim shells at `dquote>` ✅ LANDED v0.3.36 (write-inside-the-id-match, id normalization, wedge-proof guard) | §15b |
+| 27 | BUG | **#17's stamp had no invoker check** — the GATES self-diff made every executor stamp its OWN report surfaced-to-the-lead at birth, killing the announce, the escalation push and #23's retry at once 🟡 STAGED (invoker gate on `_mark_report_surfaced`) | §16 |
 | 26a | BUG | Typed bootstrap corrupts at the fresh-tab seam (truncation + head-eating) — bootstrap-via-file, typed line < 100 quote-free chars ✅ LANDED v0.3.37 (lead-inline under retain; §15c) | §15c |
 | d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) ✅ PHASE 1 (logging-only) LANDED v0.3.32 — blocking mode waits on tuned logs | §10 |
 | d2 | DOC | Mutation-budget tripwire line in `/relay:mode` ✅ LANDED v0.3.30 | §10 |
@@ -832,3 +833,94 @@ positive control execs with a >4KB prompt intact. Inline guard constants removed
 shape kept as a literal in the repro test). Terminal.app unchanged (atomic `do script`, no typing).
 UNVERIFIED as ever: live-iTerm behavior — settled by the first real spawns on 0.3.37.
 CONFIRMED LIVE 2026-08-02: first real spawn on 0.3.37 launched clean — file protocol held.
+
+## 16. The stamp with no invoker check — executors surfaced their own reports (#27, field incident 2026-08-02)
+
+**Symptom.** Reports kept going silent on 0.3.37, after #22 (§13) and #23 (§14) had both been
+fixed. The d2cengine lead (`81969319…`) never woke for `alert-monitors` packets 1/3/5/7 or
+`shadow-dir` packet 1 — and left none of the traces those fixes were supposed to leave: no
+`wake_delivered`, no `wake_retry_capped`, no `pending_wakes.json`, no `announce_claim.json`.
+
+**Cause.** `bin/relay:_mark_report_surfaced` (#17, §5b) stamps the OWNING LEAD's
+`surfaced_reports.json` whenever a report is reviewed through `relay check` / `diff` / `close`,
+on the reasoning that those are channels where the lead has demonstrably handled the report. It
+never checked WHO ran the channel. Meanwhile `TEMPLATE_FOOTER`'s GATES end with *"AFTER writing
+your report, run: `relay diff <your own sid>`"* (self-diff step, landed v0.3.0, three months before
+#17). So every executor stamped its own report as surfaced-to-the-lead seconds after writing it —
+before any lead could possibly have seen it. That one write closes all three doors:
+
+1. the lead's at-Stop / background-poller announce — `lg.new_reports_for` excludes surfaced keys;
+2. the executor's own escalation push — `lg.escalation_decision` reads the same set and returns
+   `resolved`, which is why the ledger is full of `escalation_resolved` for reports the lead never
+   saw (the dedup "working" is indistinguishable in that log line from the dedup lying);
+3. **#23's retry** — `mark_surfaced` calls `drop_pending`, so an announce that had fired but not
+   yet proven delivery was cancelled rather than retried, and `_save_pending` unlinks the emptied
+   file. That is precisely why the field evidence had no `pending_wakes.json` to find: the
+   suppression deleted the record of itself.
+
+**Why most wakes still worked (the required puzzle piece).** The stamp and the lead's announce are
+in a RACE for the same key, opened when the report file appears and closed by the executor's
+`relay diff` a few seconds later. A live poller ticks every `poll_interval` (default 5 s), so it
+usually gets there first; when it does, the wake fires, delivery is proven, and the self-diff's
+stamp lands on an already-surfaced key and is harmless. The ledger shows both sides:
+
+| Report | wake_delivered | escalation_resolved (= the self-diff stamp) | Gap |
+|---|---|---|---|
+| `eodhd-client:11` | 08:36:11 | 08:36:28 | +17 s — poller won |
+| `eodhd-client:13` | 09:01:49 | 09:01:57 | +8 s — poller won |
+| `eodhd-client:16` | 09:26:42 | 09:26:52 | +10 s — poller won |
+| `eodhd-stream-095733:1` | 19:28:01 | 19:28:45 | +44 s — poller won |
+| `fund-filter:1` | 00:33:39 | 00:33:47 | +8 s — poller won |
+| `alert-monitors:1` | *(never)* | 14:47:29 | stamp won → `reported` first seen 16:48:26, 2 h later |
+| `alert-monitors:3/5/7`, `shadow-dir:1` | *(never)* | 21:02:24 / 08:45:40 / 09:01:08 / 18:38:27 | stamp won |
+
+The self-diff wins whenever no poller is live in that window: its 30-min `poll_seconds` expired,
+the poll lock is held by another poller, or the lead never Stopped with that executor in flight.
+So the bug is total per-report but intermittent per-session, which is exactly how it hid behind two
+earlier wake fixes.
+
+**Fix.** `_surfacing_caller(s)` classifies the invoker as `lead` / `self` / `other` / `unknown`
+from `$CLAUDE_CODE_SESSION_ID` (a lead's shell carries its session id, an executor's its
+`claude_session` uuid — the same identity `relay whoami`/`_resolve_whoami` already rely on).
+Only `lead` and `unknown` may stamp. `unknown` is deliberate: with no ambient session identity
+there is nothing to disprove "the lead is doing this", and refusing to stamp there would resurrect
+#17's duplicate wakes for a human reviewing from a plain terminal. A declined `self` stamp appends
+a `surfaced_stamp_declined` ledger event, so the suppression that used to be invisible now leaves
+a trace and the diagnosis above is checkable in the field.
+
+*Why the env var and not a flag in the GATES text:* the env var is the less spoofable of the two.
+The harness sets it, no packet wording can drop it, and every packet already in flight carries it
+for free — whereas a GATES flag is text a model may reword, omit, or paste onto the wrong
+invocation, and would only protect packets written after the change.
+
+**Sibling sweep.** `mark_surfaced` has exactly one caller in `bin/relay` (`_mark_report_surfaced`,
+reached from `cmd_check`/`cmd_diff`/`cmd_close`; `relay retire` delegates to `cmd_close`), so the
+one gate covers every #17 channel. `mark_pending`/`promote_pending` are called only by
+`hooks/stop_lead_watch.py`, which exits unless the payload's session IS the lead — unreachable by a
+non-lead invoker. `drop_pending` is reachable only through `mark_surfaced`.
+`hooks/executor_escalation.py` only READS the surfaced set; its own `_mark` writes the executor's
+separate `escalation.json`. All clean.
+
+### Evidence (§0-style)
+
+| Claim | How observed | Result |
+|---|---|---|
+| The self-diff suppresses the lead's wake | `TestSelfDiffMustNotStampSurfaced` against **pre-fix** `bin/relay` | 9 failed / 5 passed — incl. `..._does_not_suppress_the_leads_wake`: `new_reports_for` → `[]` |
+| …and disarms the escalation push too | `test_self_diff_leaves_the_escalation_push_armed`, pre-fix | `escalation_decision` → `resolved` (want `send`) |
+| …and cancels #23's pending retry | `test_self_diff_does_not_cancel_a_pending_wake`, pre-fix | `pending_wakes` emptied by `drop_pending` |
+| The worked/swallowed split is a race, not a config | `TestWakeSplitWorkedVsSwallowed` pre-fix | A (poller first) **passes**, B (stamp first) + C (announce undelivered, then stamp) **fail** |
+| …and the field ledger shows both sides | read-only `~/.relay-tasks/sessions.jsonl` | 5 delivered wakes each trailed by the stamp at +8…44 s; every swallowed report has the stamp and no wake |
+| Post-fix all three orderings deliver | same classes against fixed `bin/relay` | 17 passed |
+| #17's contract preserved | `test_owning_lead_{diff,check,close}_still_stamps`, `test_no_ambient_session_identity_still_stamps`, `test_unresolvable_caller_still_stamps` | stamped as before |
+| No re-wake regression in #17's/#23's own classes | `TestSurfacedDedupOnReview`, `TestPendingWakes`, `TestAnnounceClaim`, `TestStopHookLivePayload`, `TestEscalationDecision`, `TestReportSurfacing`, `TestEscalationRearmOnUnconfirmedPush`, `TestStopHookBackgroundPoll` | 55 passed |
+| Siblings closed | `test_executor_running_check_on_itself_does_not_stamp`, `test_executor_closing_itself_does_not_stamp`, `test_a_foreign_lead_does_not_stamp_the_owners_set`, `test_another_executor_does_not_stamp` | all decline the stamp |
+| Suite green | `python3 -m pytest tests/ --ignore=…e2e…` (Xcode python3 3.9, pytest 8.4.2) | baseline 999 → 1016 passed |
+
+**UNVERIFIED:** not observed on a live lead/executor pair — no real tab was opened (packet
+Boundaries), so the end-to-end claim "the lead now actually wakes for a report whose executor
+self-diffed" rests on the real `new_reports_for`/`escalation_decision`/`load_pending` primitives
+the hooks read, not on a live wake. The field ledger above was read read-only and interprets
+`escalation_resolved`-without-`wake_delivered` as "the stamp got there first"; a wake that fired
+and landed but was never promoted (no `stop_hook_active` re-run) would log nothing either, so that
+inference is strong but not airtight for any individual row. Also unverified: that the 5 s poller
+tick vs. self-diff gap is the *only* thing that decides the race — no live timing was measured.

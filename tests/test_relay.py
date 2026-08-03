@@ -3383,6 +3383,273 @@ class TestSurfacedDedupOnReview:
         relay.cmd_check(SimpleNamespace(session_id="e6", all=False, json=True))  # must not raise
 
 
+class _SurfacedStampSeam:
+    """Shared fixture helpers for the two #27 classes below. A plain mixin, not a base Test class —
+    pytest would otherwise collect and re-run every inherited test under each subclass."""
+
+    LEAD = "lead-1"
+    EXEC_UUID = "c1a0de00-0000-4000-8000-000000000001"   # the executor's claude_session
+
+    def _repo(self, tmp_path, name="repo"):
+        import subprocess
+        repo = tmp_path / name
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        return repo
+
+    def _mk(self, relay, tmp_path, sid="ex1", lead=None, packet=1, reported=True):
+        """An owned, reported executor whose lead has a real marker (so escalation_decision can
+        return "send" rather than "owner-missing")."""
+        lead = lead or self.LEAD
+        relay.lead_guard.write_marker(relay.STATE_ROOT, lead, project="p")
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {
+            "session_id": sid, "worktree": str(self._repo(tmp_path, f"repo-{sid}")), "topic": "t",
+            "scope": "t", "tab_label": f"relay-{sid}", "status": "reported" if reported else "busy",
+            "current_packet": packet, "busy_since": relay.now(), "owner_lead": lead,
+            "claude_session": self.EXEC_UUID,
+        })
+        if reported:
+            (relay.packets_dir(sid) / f"{packet:03d}-report.md").write_text("Fixed it. Staged.")
+
+    def _as(self, session_id):
+        """Run the next call as if from inside that Claude session's shell."""
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_SESSION_ID"}
+        if session_id is not None:
+            env["CLAUDE_CODE_SESSION_ID"] = session_id
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def _diff(self, relay, sid="ex1"):
+        relay.cmd_diff(SimpleNamespace(session_id=sid, open=False, all=False))
+
+    def _new_keys(self, relay, lead=None):
+        return [k for k, *_ in relay.lead_guard.new_reports_for(relay.STATE_ROOT, lead or self.LEAD)]
+
+
+class TestSelfDiffMustNotStampSurfaced(_SurfacedStampSeam):
+    """§16 / task #27 — the wake-suppression hole that survived #22 and #23.
+
+    The auto-appended GATES (TEMPLATE_FOOTER) end with "AFTER writing your report, run: relay diff
+    <your own sid>". #17 then made `relay diff` stamp the OWNING LEAD's surfaced_reports.json,
+    without ever asking who ran it. So the executor's own self-diff — fired seconds after its
+    report file appears, long before any lead could have seen it — stamped the report as
+    "surfaced to the lead", and that ONE write kills every wake path at once:
+
+      * the lead's at-Stop / background-poller announce  (lg.new_reports_for excludes surfaced keys)
+      * the executor's own escalation push               (lg.escalation_decision → "resolved")
+      * a #22/#23 announce already in flight             (mark_surfaced → drop_pending cancels the
+                                                          retry of a wake that was never delivered)
+
+    These tests drive the REAL lg.new_reports_for / lg.escalation_decision / lg.load_pending the
+    hooks read, at the real seam (relay.cmd_diff with the executor's own $CLAUDE_CODE_SESSION_ID),
+    not a reimplementation."""
+
+    # ---- the repro ------------------------------------------------------------------------------
+
+    def test_executor_self_diff_does_not_suppress_the_leads_wake(self, relay, tmp_path):
+        """THE repro. Before the fix this assertion failed: the self-diff emptied new_reports_for
+        and the lead was never told its executor had reported."""
+        self._mk(relay, tmp_path)
+        assert self._new_keys(relay) == ["ex1:1"]
+        with self._as(self.EXEC_UUID):        # the executor running its own GATES self-diff step
+            self._diff(relay)
+        assert self._new_keys(relay) == ["ex1:1"]        # still new → the wake still fires
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, self.LEAD) == set()
+
+    def test_self_diff_by_relay_name_also_does_not_stamp(self, relay, tmp_path):
+        """Defence in depth: the self-check must hold even when the caller's token is the relay
+        NAME rather than the claude_session uuid (a session.json written without claude_session,
+        or a hand-run `CLAUDE_CODE_SESSION_ID=<name> relay diff <name>`)."""
+        self._mk(relay, tmp_path)
+        with self._as("ex1"):
+            self._diff(relay)
+        assert self._new_keys(relay) == ["ex1:1"]
+
+    def test_self_diff_leaves_the_escalation_push_armed(self, relay, tmp_path):
+        """The second half of the swallow: hooks/executor_escalation.py reads the SAME surfaced set,
+        so the stamp also convinced the executor's own push that the lead had handled the report
+        ("resolved" — exactly the escalation_resolved ledger events seen in the field), removing the
+        net under the missed wake."""
+        self._mk(relay, tmp_path)
+        with self._as(self.EXEC_UUID):
+            self._diff(relay)
+        assert relay.lead_guard.escalation_decision(relay.STATE_ROOT, "ex1", 1, self.LEAD) == "send"
+
+    def test_self_diff_does_not_cancel_a_pending_wake(self, relay, tmp_path):
+        """The #23 hole proper. An announce that fired but is not yet proven delivered lives in
+        pending_wakes.json so the next Stop retries it. mark_surfaced calls drop_pending, so the
+        executor's self-diff used to cancel that retry — a wake nobody ever saw, recorded as done."""
+        self._mk(relay, tmp_path)
+        relay.lead_guard.mark_pending(relay.STATE_ROOT, self.LEAD, ["ex1:1"])   # lead announced
+        with self._as(self.EXEC_UUID):
+            self._diff(relay)
+        assert "ex1:1" in relay.lead_guard.load_pending(relay.STATE_ROOT, self.LEAD)
+        assert self._new_keys(relay) == ["ex1:1"]        # pending never suppresses — it retries
+
+    def test_declined_stamp_is_recorded_in_the_ledger(self, relay, tmp_path):
+        """The suppression used to be invisible; the decline must leave a trace so the field can
+        tell "the gate worked" from "nothing ran"."""
+        self._mk(relay, tmp_path)
+        with self._as(self.EXEC_UUID):
+            self._diff(relay)
+        events = [json.loads(l) for l in relay.LEDGER.read_text().splitlines() if l.strip()]
+        declined = [e for e in events if e.get("event") == "surfaced_stamp_declined"]
+        assert [(e["session_id"], e["packet"], e["caller"]) for e in declined] == [("ex1", 1, "self")]
+
+    # ---- #17's contract is preserved ------------------------------------------------------------
+
+    def test_owning_lead_diff_still_stamps(self, relay, tmp_path):
+        self._mk(relay, tmp_path)
+        with self._as(self.LEAD):
+            self._diff(relay)
+        assert self._new_keys(relay) == []
+
+    def test_owning_lead_check_still_stamps(self, relay, tmp_path):
+        self._mk(relay, tmp_path)
+        with self._as(self.LEAD):
+            relay.cmd_check(SimpleNamespace(session_id="ex1", all=False, json=True))
+        assert self._new_keys(relay) == []
+
+    def test_owning_lead_close_still_stamps(self, relay, tmp_path):
+        self._mk(relay, tmp_path)
+        with self._as(self.LEAD), mock.patch.object(relay, "term_backend", return_value=_StubBackend()):
+            relay.cmd_close(SimpleNamespace(session_id="ex1", self_session=None, supersede=None,
+                                            keep_tab=True))
+        # A closed session drops out of new_reports_for outright, so the stamp is the only visible
+        # evidence here — assert it directly.
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, self.LEAD) == {"ex1:1"}
+
+    def test_no_ambient_session_identity_still_stamps(self, relay, tmp_path):
+        """#17's original case — a human reviewing from a plain terminal, and every existing test.
+        With no $CLAUDE_CODE_SESSION_ID there is nothing to disprove "the lead is doing this", and
+        refusing to stamp there would resurrect #17's duplicate wakes."""
+        self._mk(relay, tmp_path)
+        with self._as(None):
+            self._diff(relay)
+        assert self._new_keys(relay) == []
+
+    def test_unresolvable_caller_still_stamps(self, relay, tmp_path):
+        """A session id relay has never heard of (e.g. the lead's own id before its marker is
+        readable) is 'unknown', not 'not the lead' — same back-compat direction as above."""
+        self._mk(relay, tmp_path)
+        with self._as("00000000-dead-4000-8000-000000000000"):
+            self._diff(relay)
+        assert self._new_keys(relay) == []
+
+    # ---- siblings: every other invoker of a #17 stamping channel --------------------------------
+
+    def test_executor_running_check_on_itself_does_not_stamp(self, relay, tmp_path):
+        self._mk(relay, tmp_path)
+        with self._as(self.EXEC_UUID):
+            relay.cmd_check(SimpleNamespace(session_id="ex1", all=False, json=True))
+        assert self._new_keys(relay) == ["ex1:1"]
+
+    def test_executor_closing_itself_does_not_stamp(self, relay, tmp_path):
+        self._mk(relay, tmp_path)
+        with self._as(self.EXEC_UUID), mock.patch.object(relay, "term_backend",
+                                                         return_value=_StubBackend()):
+            relay.cmd_close(SimpleNamespace(session_id="ex1", self_session=None, supersede=None,
+                                            keep_tab=True))
+        # Same as the lead-close test: closing hides it from new_reports_for either way, so the
+        # surfaced set is what distinguishes "declined" from "stamped".
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, self.LEAD) == set()
+
+    def test_a_foreign_lead_does_not_stamp_the_owners_set(self, relay, tmp_path):
+        """`relay check --all` from a second lead walks executors it does not own. Stamping their
+        owner's set there is the same bug wearing a different hat: it suppresses a wake for a lead
+        that has demonstrably not seen anything."""
+        self._mk(relay, tmp_path)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-2", project="other")
+        with self._as("lead-2"):
+            relay.cmd_check(SimpleNamespace(session_id="ex1", all=False, json=True))
+        assert self._new_keys(relay) == ["ex1:1"]
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, "lead-2") == set()
+
+    def test_another_executor_does_not_stamp(self, relay, tmp_path):
+        self._mk(relay, tmp_path)
+        self._mk(relay, tmp_path, sid="ex2", reported=False)
+        s2 = relay.read_session("ex2")
+        s2["claude_session"] = "c1a0de00-0000-4000-8000-000000000002"
+        relay.write_session("ex2", s2)
+        with self._as("c1a0de00-0000-4000-8000-000000000002"):
+            self._diff(relay, sid="ex1")
+        assert self._new_keys(relay) == ["ex1:1"]
+
+
+class TestWakeSplitWorkedVsSwallowed(_SurfacedStampSeam):
+    """§16/#27's REQUIRED puzzle piece: if the GATES self-diff always stamped, why did most wakes
+    still fire? Because the stamp and the lead's announce are in a RACE for the same key, opened by
+    the report file appearing and closed by the executor's `relay diff` a few seconds later. The
+    field ledger (~/.relay-tasks/sessions.jsonl) shows both sides of it:
+
+        08:36:11 wake_delivered ['eodhd-client:11']   08:36:28 escalation_resolved eodhd-client 11
+        09:01:49 wake_delivered ['eodhd-client:13']   09:01:57 escalation_resolved eodhd-client 13
+        19:28:01 wake_delivered ['eodhd-stream:1']    19:28:45 escalation_resolved eodhd-stream 1
+
+    Every delivered wake is followed 8–44 s later by the self-diff's stamp — the poller (default
+    poll_interval 5 s) got there first and the stamp landed on an already-surfaced key, harmless.
+    Every SWALLOWED report shows the mirror image: an `escalation_resolved` with no preceding
+    `wake_delivered` (d2cengine lead 81969319: alert-monitors 1/3/5/7, shadow-dir 1), i.e. the key
+    was already surfaced when the executor went idle, minutes before the lead's first look.
+
+    Three orderings, inherited fixtures, real primitives. Pre-fix, A delivers and B/C swallow;
+    post-fix all three deliver — which is what makes the explanation testable rather than a story."""
+
+    def test_A_lead_announce_wins_the_race_wake_is_delivered(self, relay, tmp_path):
+        """Poller ticks inside the gap: announce → proven delivery → surfaced. The self-diff that
+        follows lands on an already-surfaced key and changes nothing. This is the majority case,
+        and it is why the bug looked intermittent instead of total."""
+        self._mk(relay, tmp_path)
+        relay.lead_guard.mark_pending(relay.STATE_ROOT, self.LEAD, self._new_keys(relay))  # announced
+        assert relay.lead_guard.promote_pending(relay.STATE_ROOT, self.LEAD) == ["ex1:1"]  # delivered
+        with self._as(self.EXEC_UUID):
+            self._diff(relay)
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, self.LEAD) == {"ex1:1"}
+        assert self._new_keys(relay) == []   # correctly quiet: the lead HAS been told
+
+    def test_B_self_diff_wins_the_race_and_the_report_must_still_wake(self, relay, tmp_path):
+        """No live poller in the gap (its 30-min poll_seconds expired, the lock is held, or the
+        lead never Stopped with this executor in flight) → the self-diff is first. Pre-fix this
+        surfaced the key at birth and BOTH channels went quiet forever."""
+        self._mk(relay, tmp_path)
+        with self._as(self.EXEC_UUID):
+            self._diff(relay)
+        assert self._new_keys(relay) == ["ex1:1"]                       # lead's announce survives
+        assert relay.lead_guard.escalation_decision(                    # push survives too
+            relay.STATE_ROOT, "ex1", 1, self.LEAD) == "send"
+
+    def test_C_announced_but_undelivered_then_self_diff_must_still_retry(self, relay, tmp_path):
+        """The hole that specifically survived #23. The announce fired but the exit-2 was dropped
+        (lead mid-turn), so the key sits in pending_wakes.json awaiting a retry. The self-diff's
+        mark_surfaced → drop_pending then DELETED that retry — and, since _save_pending unlinks an
+        emptied file, deleted the evidence too. That is exactly the field signature: no
+        wake_delivered, no wake_retry_capped, and no pending_wakes.json left behind."""
+        self._mk(relay, tmp_path)
+        relay.lead_guard.mark_pending(relay.STATE_ROOT, self.LEAD, ["ex1:1"])   # announced, unproven
+        with self._as(self.EXEC_UUID):
+            self._diff(relay)
+        assert relay.lead_guard.load_pending(relay.STATE_ROOT, self.LEAD) != {}  # retry preserved
+        assert self._new_keys(relay) == ["ex1:1"]                                # and re-announces
+
+
+class _StubBackend:
+    """Terminal backend that touches nothing real — cmd_close retitles/closes a tab, and a test
+    must never reach the human's actual iTerm (packet Boundaries)."""
+    NAME = "stub"
+
+    def is_alive(self, *a, **k):
+        return False
+
+    def retitle(self, *a, **k):
+        return False
+
+    def close(self, *a, **k):
+        return False
+
+    def kill_process(self, *a, **k):
+        return False
+
+
 class TestReportPointsToDiff:
     """`relay report` appends a discoverability line pointing at `relay diff --open` only when a
     staged diff actually exists — never generates the HTML itself."""
