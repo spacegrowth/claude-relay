@@ -10,6 +10,7 @@ bounded title match only for legacy/unowned sessions with no captured handle —
 docstring. The caller (relay) additionally treats the recorded PID as the source of truth for
 aliveness, the title/id match as a secondary confirmation.
 """
+import os
 import shlex
 import subprocess
 
@@ -392,59 +393,62 @@ def _target_by_session_id_block(uuid):
     )
 
 
-# --- Ask 3 of the 2026-08-01 spawn-misfire incident: make a mis-delivered payload inert ----------
-# The bootstrap is no longer typed as a bare command. It is wrapped in a shell conditional on the
-# RECEIVING tab's own iTerm session id matching the session relay just created — a fresh-tab marker
-# only the intended tab can satisfy, since iTerm sets $ITERM_SESSION_ID per session and relay learns
-# the target's id from tab creation itself. A copy delivered anywhere else takes the else-branch:
-# one self-localizing line printed, nothing run. That makes the incident's worst case — the payload
-# landing in a tab that is a plain SHELL, where `exec claude --session-id <uuid>` would REPLACE that
-# shell with a duplicate executor on the same session id the retry then also used — structurally
-# impossible instead of luck-dependent (the victim tab happening to run a Claude REPL).
-#
-# WEDGE-PROOF SHAPE (#25, incident update 2026-08-01-later). The first guard shipped the notice as
-# `… ; else echo "[relay] bootstrap for iTerm session <id> was mis-delivered …"; fi`. Delivered to a
-# victim SHELL it arrived TRUNCATED mid-string, so the shell sat at a `dquote>` continuation prompt
-# and swallowed the follow-up `/rename …` line as more string content — the human's tab left wedged.
-# Whatever truncates the line (unconfirmed — see the report's UNVERIFIED), the structural answer is
-# that NO PREFIX of the guard prologue may leave a quote or a block open:
-#   - no quote characters at all before the bootstrap — the `x` prefix on both operands makes the
-#     test empty-safe without needing `"` (a bare `[ ${v##*:} = X ]` errors on an empty v);
-#   - no `if`/`then`/`fi` (or `{`/`}`/`case`/`esac`) — two independent `;`-separated statements
-#     guarded by `||` and `&&`, so there is no terminator the shell can be left waiting for;
-#   - the notice comes FIRST, so it is complete long before the long bootstrap tail.
-# Truncated anywhere in the prologue the victim shell therefore lands on a CLEAN prompt, and the
-# `/rename` line that follows is parsed as its own (harmless, command-not-found) line.
-_GUARD_HEAD = "_relay_sid=${ITERM_SESSION_ID:-$TERM_SESSION_ID}; [ x${_relay_sid##*:} = x"
-_GUARD_NOTICE = " ] || echo relay: ignored a mis-delivered bootstrap meant for session "
-_GUARD_THEN = "; [ x${_relay_sid##*:} = x"
-_GUARD_TAIL = " ] && "
-# Trailing `|| :` so a mis-delivered payload exits 0. Without it the line's status is the FAILED
-# guard test, i.e. rc 1 — a victim shell left with a non-zero `$?` for a no-op it never asked for
-# (and, in a shell with `set -e` or a status-showing prompt, actively alarming). On the healthy path
-# `exec` never returns, so this can only ever fire for a no-op or a bootstrap that already failed —
-# and a failed bootstrap is detected by the missing pidfile (#20), never by this exit status.
-_GUARD_END = " || :"
+# (History — the inline guarded-bootstrap era, #24 Ask 3 then #25's wedge-proof reshape: the full
+# bootstrap used to be TYPED, wrapped in a quote-free session-id conditional built from _GUARD_*
+# segments joined around the runtime sid. It ended with §15b below: typing ~1KB of fragile text
+# into a fresh tab proved unreliable regardless of shape — observed truncation mid-payload AND
+# head-of-line corruption. The guard's properties survive in the file protocol: same runtime-sid
+# comparison, same inert-on-mismatch, same exit-0, and the typed line is now too short and
+# quote-free for any truncation to wedge. tests/test_backends.py keeps the old inline shape as a
+# literal in its historical repro.)
+
+# --- §15b (2026-08-02, field-blocking): the bootstrap is no longer TYPED at all -------------------
+# Two live corruption modes killed the inline protocol, both on the CORRECT freshly-created tab:
+#   - mid-payload truncation at a consistent ~1KB offset (inside the single-quoted Task prompt),
+#     leaving an unterminated quote and a `quote>`-wedged tab (`cutoff-jump`, twice);
+#   - head-of-payload corruption (`_relay_sid=` arrived as `sp_relay_sid=`), which made the guard
+#     read an empty variable and no-op the launch in its own intended tab (rl-spawn resume).
+# Both are symptoms of typing long fragile text into a shell that hasn't settled. The structural
+# fix: write the COMPLETE bootstrap (guard, cd, colors, pidfile, exec claude with the full prompt,
+# any length) to a per-session file, and type only one short, quote-free launch line:
+#     sh <session dir>/bootstrap.sh <runtime session id>
+# The receiving-tab guard moves INSIDE the file, comparing $ITERM_SESSION_ID against $1 — and $1 is
+# spliced by AppleScript from `id of targetSession` at send time, so the guard's id and the typed-
+# into session remain the same value by construction (#24's property, preserved). Truncate the
+# typed line anywhere and the worst case is command-not-found or "sh: can't open" — nothing
+# quote-open, nothing destructive; a truncated trailing $1 makes the guard mismatch and the file
+# no-op with the notice. A sacrificial empty write precedes the launch line so head-eating consumes
+# a blank line instead of the command. The file is also the exact durable record of what a launch
+# ran — inspectable after any incident, unlike keystrokes.
+BOOTSTRAP_FILENAME = "bootstrap.sh"
 
 
-def bootstrap_guard_parts(cmd):
-    """The guarded bootstrap as LITERAL SEGMENTS to be joined by the target session id: the payload
-    is exactly `<session id>.join(bootstrap_guard_parts(cmd))`. spawn() emits that join as AppleScript
-    concatenation around the runtime `id of targetSession` — the id is only knowable INSIDE the
-    script, after tab creation — so the guard's id and the session being typed into are the same
-    value by construction; there is no window in which Python could staple a wrong id onto it.
+def bootstrap_file_content(cmd):
+    """The full contents of the per-launch bootstrap file. Quotes and blocks are fine here — this
+    text is never typed into a terminal, so the wedge-proof constraints of the inline era don't
+    apply; only the SHORT launch line is typed, and that stays quote-free."""
+    return (
+        "#!/bin/sh\n"
+        "# relay bootstrap — written per launch by relay (see scripts/iterm.py, §15b).\n"
+        "# Invoked as: sh <this file> <intended iTerm session id>. A copy run anywhere else\n"
+        "# (or with a truncated/missing id) prints one line and exits 0 — inert by construction.\n"
+        '_relay_sid="${ITERM_SESSION_ID:-$TERM_SESSION_ID}"\n'
+        'if [ "x${_relay_sid##*:}" != "x$1" ] || [ "x$1" = "x" ]; then\n'
+        '  echo "relay: ignored a mis-delivered bootstrap meant for session ${1:-<missing>}"\n'
+        "  exit 0\n"
+        "fi\n"
+        f"{cmd}\n"
+    )
 
-    Shape: `_relay_sid=…; [ x<mine> = x<target> ] || echo <notice> <target>; [ x<mine> = x<target> ]
-    && <cmd>` — three id insertions, and the test is evaluated twice on purpose so that neither
-    statement needs a block. See the WEDGE-PROOF SHAPE note above for why every character before
-    `<cmd>` is free of quotes and block terminators."""
-    return (_GUARD_HEAD, _GUARD_NOTICE, _GUARD_THEN, _GUARD_TAIL + cmd + _GUARD_END)
 
-
-def guarded_bootstrap(cmd, session_id):
-    """The assembled guarded line — the same string spawn() has iTerm build at runtime. Exists so the
-    inertness test can execute the real payload in a plain shell, with no terminal app involved."""
-    return session_id.join(bootstrap_guard_parts(cmd))
+def write_bootstrap_file(pidfile, cmd):
+    """Write the bootstrap next to the session's pidfile (the per-session dir relay already owns),
+    mode 0700, overwritten on every launch. Returns the file's absolute path."""
+    path = os.path.join(os.path.dirname(os.path.abspath(pidfile)), BOOTSTRAP_FILENAME)
+    with open(path, "w") as f:
+        f.write(bootstrap_file_content(cmd))
+    os.chmod(path, 0o700)
+    return path
 
 
 def _match_session_block(label, action):
@@ -490,9 +494,10 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
          reaches the send path at all;
       3. the frontmost tab's title at send time is captured and returned, so a caller reporting a
          failed launch can tell the human which tab to inspect;
-      4. the payload itself is wrapped by `bootstrap_guard_parts` in a conditional on the receiving
-         tab's own $ITERM_SESSION_ID — a stray copy is a no-op even in a plain shell, and (#25) is
-         shaped so no prefix of it can leave that shell wedged at a continuation prompt.
+      4. (§15b) the full bootstrap lives in a per-session FILE (write_bootstrap_file) and only a
+         short quote-free `sh <file> <sid>` line is typed — the file's guard compares the receiving
+         tab's own $ITERM_SESSION_ID against the runtime sid in $1, so a stray or truncated copy is
+         a no-op even in a plain shell, and NO truncation point of the typed line can wedge anything.
 
     Returns a dict — `{"ok": bool, "reason": str, "session_id": str|None, "front_title": str|None}`
     — see `_read_spawn_outcome`. Never raises; `ok=False` means the launch did not happen, and
@@ -546,8 +551,13 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     color_part = f"printf '{tab_color_printf(tab_color)}' && " if tab_color else ""
     cmd = (f"cd {shlex.quote(cwd)} && {color_part}{env_prefix}echo $$ > {shlex.quote(pidfile)}{capture} "
            f"&& exec {base}")
-    # The payload as AppleScript concatenation: literal segments joined by the runtime `sid`.
-    payload_expr = ' & sid & '.join(f'"{osa(seg)}"' for seg in bootstrap_guard_parts(cmd))
+    # §15b: the full bootstrap goes to a FILE; only a short quote-free launch line is typed (see
+    # bootstrap_file_content's block comment for the two field corruption modes this closes). The
+    # runtime `sid` is appended by AppleScript as $1 so the file's guard checks the same value the
+    # send targeted. relay-owned session dirs have no spaces, so the path needs no quoting — and it
+    # must not get any: a quote in the typed line is exactly the wedge risk the file protocol removes.
+    boot_path = write_bootstrap_file(pidfile, cmd)
+    payload_expr = f'"sh {osa(boot_path)} " & sid'
     rename_e = osa("/rename " + label)
     # Only worth attempting adjacency for a separate TAB — a "pane" layout is inherently adjacent
     # (it's split off the lead's own session), no placement problem to solve.
@@ -581,6 +591,11 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
         "    repeat with t in tabs of w\n"
         "      repeat with s in sessions of t\n"
         "        if (id of s) is sid then\n"
+        # Sacrificial empty write first (§15b): the observed head-of-payload corruption eats the
+        # first characters typed into a just-created tab, so let it eat a blank line — the real
+        # launch line is the SECOND write, after the shell has had a beat to settle.
+        '          tell s to write text ""\n'
+        "          delay 0.2\n"
         f"          tell s to write text ({payload_expr})\n"
         "          set didWrite to true\n"
         "        end if\n"

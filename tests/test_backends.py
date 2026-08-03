@@ -54,19 +54,23 @@ class TestTabColor:
         assert "\\033]6;1;bg;red;brightness;1\\a" in p
         assert "\033" not in p and "\a" not in p  # printf-safe: literal backslashes only
 
-    def test_spawn_embeds_printf_when_colored(self):
-        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run:
-            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid",
+    def test_spawn_embeds_printf_when_colored(self, tmp_path):
+        # §15b: the cmd (printf included) lives in the bootstrap FILE now, not the typed script —
+        # the typed line must stay short and quote-free. Same invariant, new surface.
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")):
+            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile=str(tmp_path / "pid"),
                         tab_color=(9, 8, 7), rename_delay=0)
-        script = osa_run.call_args[0][0]
-        # The cmd is embedded in an AppleScript string literal, so osa() doubles the backslashes:
-        # script carries \\033, AppleScript unescapes to \033, printf turns that into ESC.
-        assert "printf '\\\\033]6;1;bg;red;brightness;9" in script
+        boot = (tmp_path / iterm.BOOTSTRAP_FILENAME).read_text()
+        assert "printf '\\033]6;1;bg;red;brightness;9" in boot
 
-    def test_spawn_omits_printf_without_color(self):
+    def test_spawn_omits_printf_without_color(self, tmp_path):
         with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run:
-            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0)
-        assert "printf" not in osa_run.call_args[0][0]
+            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile=str(tmp_path / "pid"),
+                        rename_delay=0)
+        # "printf '" (the invocation, quote included) — pytest's tmp dir is named after this very
+        # test, so the bare word "printf" legitimately appears in the bootstrap PATH in the script.
+        assert "printf '" not in osa_run.call_args[0][0]
+        assert "printf '" not in (tmp_path / iterm.BOOTSTRAP_FILENAME).read_text()
 
 
 class TestSpawnLeadWindow:
@@ -647,10 +651,19 @@ class TestSpawnTargetOrAbort:
         lines = script.splitlines()
         writes = [i for i, ln in enumerate(lines) if "write text" in ln]
         assert writes, "no write at all — the send would be a no-op"
+        # Scan back to the nearest block boundary rather than a fixed window (§15b added a
+        # sacrificial empty write + delay between the `if` and the launch-line write): the guard
+        # holds iff an `if (id of s) is sid then` opens the enclosing block with no `end if`
+        # in between. Stricter than the old 2-line window, not looser.
         for i in writes:
-            guard = [ln.strip() for ln in lines[max(0, i - 2):i]]
-            assert "if (id of s) is sid then" in guard, (
-                f"write not guarded by an id match: {lines[i].strip()!r} after {guard!r}")
+            opened = False
+            for ln in reversed([l.strip() for l in lines[:i]]):
+                if ln == "end if":
+                    break
+                if ln == "if (id of s) is sid then":
+                    opened = True
+                    break
+            assert opened, f"write not inside an id match: {lines[i].strip()!r}"
 
     def test_no_write_addresses_a_held_reference(self):
         _, script = self._spawn("OK\nS\nT")
@@ -689,24 +702,27 @@ class TestBootstrapInertWhenMisdelivered:
 
     TARGET = "TARGET-SESSION-UUID"
 
-    def _payload(self, tmp_path):
-        """A bootstrap shaped exactly like spawn()'s: pidfile via $$, then `exec <claude>`. The
-        'claude' here is a stub script that records that it ran, so an exec is observable."""
+    def _bootstrap(self, tmp_path):
+        """A bootstrap FILE shaped exactly like spawn()'s (§15b): pidfile via $$, then
+        `exec <claude>`. The 'claude' here is a stub script that records that it ran, so an exec
+        is observable. Returns (typed_line, marker, pidfile) — typed_line is what iTerm now types:
+        `sh <file> <sid>`."""
         marker, pidfile = tmp_path / "claude-ran", tmp_path / "pid"
         stub = tmp_path / "fake-claude"
         stub.write_text(f"#!/bin/sh\necho \"$@\" > {shlex.quote(str(marker))}\n")
         stub.chmod(0o755)
         cmd = (f"cd {shlex.quote(str(tmp_path))} && echo $$ > {shlex.quote(str(pidfile))} "
                f"&& exec {shlex.quote(str(stub))} --session-id 290f5187 'do the packet'")
-        return iterm.guarded_bootstrap(cmd, self.TARGET), marker, pidfile
+        boot = iterm.write_bootstrap_file(str(pidfile), cmd)
+        return f"sh {boot} {self.TARGET}", marker, pidfile
 
-    def _run(self, payload, session_env, shell="bash"):
+    def _run(self, typed, session_env, shell="bash"):
         env = dict(os.environ)
         env.pop("ITERM_SESSION_ID", None)
         env.pop("TERM_SESSION_ID", None)
         if session_env is not None:
             env["ITERM_SESSION_ID"] = session_env
-        return subprocess.run([shell, "-c", payload], capture_output=True, text=True, env=env,
+        return subprocess.run([shell, "-c", typed], capture_output=True, text=True, env=env,
                               timeout=30)
 
     @pytest.mark.parametrize("shell", ["bash", "zsh"])
@@ -716,42 +732,56 @@ class TestBootstrapInertWhenMisdelivered:
         None,                                  # no session id at all (not a terminal we know)
     ])
     def test_misdelivered_payload_runs_nothing(self, tmp_path, shell, wrong_session):
-        payload, marker, pidfile = self._payload(tmp_path)
-        r = self._run(payload, wrong_session, shell=shell)
+        typed, marker, pidfile = self._bootstrap(tmp_path)
+        r = self._run(typed, wrong_session, shell=shell)
         assert not marker.exists(), "the mis-delivered payload EXECED — the corruption mode is live"
         assert not pidfile.exists(), "the mis-delivered payload ran the pre-exec chain"
         assert r.returncode == 0, "a mis-delivered payload must be harmless, not an error"
         assert "mis-delivered" in r.stdout
 
     @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    def test_truncated_sid_argument_is_also_inert(self, tmp_path, shell):
+        # §15b: truncation can now only shorten the TYPED line. A clipped trailing $1 must
+        # mismatch the guard and no-op — even when delivered to the CORRECT tab.
+        typed, marker, pidfile = self._bootstrap(tmp_path)
+        r = self._run(typed[:-8], f"w9t9p0:{self.TARGET}", shell=shell)
+        assert not marker.exists() and not pidfile.exists()
+        assert r.returncode == 0
+        assert "mis-delivered" in r.stdout
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh"])
     def test_positive_control_the_real_tab_still_runs_it(self, tmp_path, shell):
-        # The other half of the same run: the guard must not break healthy spawns. Same payload,
-        # delivered to the tab whose $ITERM_SESSION_ID carries the target id.
-        payload, marker, pidfile = self._payload(tmp_path)
-        r = self._run(payload, f"w9t9p0:{self.TARGET}", shell=shell)
+        # The other half of the same run: the guard must not break healthy spawns. Same typed
+        # line, delivered to the tab whose $ITERM_SESSION_ID carries the target id.
+        typed, marker, pidfile = self._bootstrap(tmp_path)
+        r = self._run(typed, f"w9t9p0:{self.TARGET}", shell=shell)
         assert r.returncode == 0, r.stderr
         assert pidfile.exists(), "healthy bootstrap did not write its pidfile"
         assert marker.exists(), "healthy bootstrap did not exec claude"
         assert "--session-id 290f5187" in marker.read_text()
 
-    def test_guard_is_built_around_applescripts_runtime_session_id(self):
-        # spawn() never staples a Python-side id onto the payload: the script concatenates the guard
-        # segments around `sid`, which is `id of targetSession` — the session it types into.
+    def test_typed_line_carries_the_runtime_session_id(self, tmp_path):
+        # §15b replacement for the inline-guard contract test: spawn() never staples a Python-side
+        # id onto the launch. The typed line is `sh <bootstrap file> ` & sid — the id is
+        # AppleScript's `id of targetSession`, appended as $1 at send time, and the file's guard
+        # compares $ITERM_SESSION_ID against that $1, so the guard's id and the typed-into session
+        # remain the same value by construction (#24's property, preserved across the protocol move).
         with mock.patch.object(iterm, "run_osascript", return_value=_ok("OK\nS\nT")) as osa_run:
-            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile="/tmp/pid", rename_delay=0)
+            iterm.spawn(cwd="/tmp", prompt="p" * 4096, label="l",
+                        pidfile=str(tmp_path / "pid"), rename_delay=0)
         script = osa_run.call_args[0][0]
-        # The first three segments are independent of the bootstrap command, so they can be pinned
-        # exactly; the last one carries spawn()'s own real `cmd`, checked by its landmarks.
-        segs = iterm.bootstrap_guard_parts("<cmd>")
-        prefix = " & sid & ".join(f'"{iterm.osa(s)}"' for s in segs[:3])
-        assert f"write text ({prefix} & sid & " in script
-        assert segs[-1].endswith("<cmd>" + iterm._GUARD_END)   # bootstrap rides in the last segment
-        assert "exec claude" in script and iterm.osa(iterm._GUARD_END) in script
-        # Exactly 3 id insertions in the PAYLOAD line itself, every one the same runtime `sid`,
-        # so no Python-side id is ever spliced in. (Scoped to that line: the GONE/OK verdicts
-        # legitimately concatenate `sid` too.)
-        payload_line = next(ln for ln in script.splitlines() if "_relay_sid=" in ln)
-        assert payload_line.count(" & sid & ") == 3
+        boot = tmp_path / iterm.BOOTSTRAP_FILENAME
+        assert f'write text ("sh {iterm.osa(str(boot))} " & sid)' in script
+        # The typed line stays short and quote-free NO MATTER how long the prompt is — the whole
+        # point of the file protocol. The >4KB prompt must be in the file, never in the script.
+        assert "p" * 100 not in script
+        content = boot.read_text()
+        assert 'x$1' in content and "exec " in content and ("p" * 4096) in content
+        # Truncation of the typed line can only ever produce: a partial `sh <path>` (command not
+        # found / can't open — harmless) or a clipped $1 (guard mismatch → inert). No quotes exist
+        # to leave open.
+        typed = f"sh {boot} "
+        assert '"' not in typed and "'" not in typed
 
 
 # ================================================================================================
@@ -847,41 +877,34 @@ class TestGuardDoesNotWedgeVictimShell:
         assert "/rename" not in blob, "the rename line should have been swallowed by the open quote"
 
     @pytest.mark.parametrize("shell", ["bash", "zsh"])
-    def test_fixed_shape_leaves_a_clean_prompt_and_runs_the_rename_line(self, shell):
-        # Same truncation point, current payload: notice printed once, and the /rename line is
-        # parsed as its OWN line (it fails as a command — harmless — rather than vanishing).
-        new = iterm.guarded_bootstrap("cd /tmp && exec claude --session-id 290f5187", "TARGET-UUID")
-        r = self._feed(self._truncated(new, "was" if "was" in new else "session TARGET-UUID"), shell)
-        blob = r.stdout + r.stderr
-        assert "unexpected EOF" not in blob and "unmatched" not in blob, blob
-        assert blob.count("ignored a mis-delivered bootstrap") == 1
-        # Line 2 reached the parser as a line of its OWN — each shell says so differently (bash
-        # can't find the command `/rename`, zsh fails globbing the `[Exec]` word first), and either
-        # way it was executed rather than swallowed into an open string.
-        assert ("/rename" in blob or "[Exec]" in blob), blob
-
-    def test_guard_prologue_has_no_quote_or_block_terminator(self):
-        # The structural reason the above holds for ANY truncation point in the prologue: nothing
-        # before the bootstrap can leave a quote or a block open.
-        payload = iterm.guarded_bootstrap("cd /tmp && exec claude", "TARGET-UUID")
-        prologue = payload[:payload.index("cd /tmp")]
-        assert '"' not in prologue and "'" not in prologue
-        # Block keywords/grouping checked as WORDS: a bare `{` substring is fine here because it
-        # only ever comes from `${…}` parameter expansion, which opens nothing the shell waits on.
-        words = prologue.split()
-        for kw in ("if", "then", "fi", "case", "esac", "{", "}", "do", "done"):
-            assert kw not in words, f"{kw!r} in prologue — a truncation could wedge on it"
-        assert "$(" not in prologue and "`" not in prologue  # no unclosed command substitution
+    def test_typed_line_cut_at_every_offset_never_wedges(self, shell, tmp_path):
+        # §15b: the only thing typed now is `sh <file> <sid>`. Cut it at EVERY offset, feed it
+        # plus the /rename line to a real shell: no truncation point may leave a quote or block
+        # open (no wedge), and none may execute the bootstrap (the file's guard needs the full
+        # matching $1, which only the untruncated line carries — and even that no-ops here, since
+        # the test shell has no matching $ITERM_SESSION_ID).
+        marker = tmp_path / "claude-ran"
+        boot = iterm.write_bootstrap_file(
+            str(tmp_path / "pid"), f"echo ran > {shlex.quote(str(marker))}")
+        typed = f"sh {boot} TARGET-UUID"
+        for cut in range(1, len(typed) + 1):
+            r = self._feed(typed[:cut], shell)
+            blob = r.stdout + r.stderr
+            assert "unexpected EOF" not in blob and "unmatched" not in blob and "dquote" not in blob, \
+                f"offset {cut}: wedge — {blob!r}"
+            assert ("/rename" in blob or "[Exec]" in blob), \
+                f"offset {cut}: the rename line was swallowed — {blob!r}"
+            assert not marker.exists(), f"offset {cut}: a truncated line RAN the bootstrap"
 
     @pytest.mark.parametrize("shell", ["bash", "zsh"])
-    def test_misdelivered_payload_line_exits_zero(self, shell):
-        # The PAYLOAD line alone (not the bogus /rename that follows it, whose failure is the
-        # shell's own verdict on an unknown command): a victim shell must not be left with a
-        # non-zero $? for a no-op it never asked for. Without the trailing `|| :` the line's status
-        # is the failed guard test, i.e. 1.
-        payload = iterm.guarded_bootstrap("cd /tmp && exec claude", "TARGET-UUID")
-        r = subprocess.run([shell], input=payload + "\n", capture_output=True, text=True,
-                           timeout=30, env={k: v for k, v in os.environ.items()
-                                            if k not in ("ITERM_SESSION_ID", "TERM_SESSION_ID")})
+    def test_misdelivered_typed_line_exits_zero(self, shell, tmp_path):
+        # The full typed line in a wrong shell (no matching $ITERM_SESSION_ID): notice once,
+        # rc 0 — a victim shell must not be left with a non-zero $? for a no-op it never asked for.
+        boot = iterm.write_bootstrap_file(str(tmp_path / "pid"), "echo should-not-run")
+        r = subprocess.run([shell], input=f"sh {boot} TARGET-UUID\n", capture_output=True,
+                           text=True, timeout=30,
+                           env={k: v for k, v in os.environ.items()
+                                if k not in ("ITERM_SESSION_ID", "TERM_SESSION_ID")})
         assert r.returncode == 0, (r.stdout, r.stderr)
-        assert "ignored a mis-delivered bootstrap" in r.stdout
+        assert r.stdout.count("mis-delivered") == 1
+        assert "should-not-run" not in r.stdout

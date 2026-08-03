@@ -73,6 +73,7 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 23 | BUG | #22's delivery proof read the GLOBAL stop_hook_active flag — a foreign blocking Stop hook (rules-check) silenced wakes for hours ✅ LANDED v0.3.34 (relay-owned claim + transcript evidence) | §14 |
 | 24 | BUG | Spawn typed its whole bootstrap into an unrelated live tab — target re-read from focus after tab creation ✅ LANDED v0.3.35 (target-or-abort + misfire localization + fresh-tab payload guard) | §15 |
 | 25 | BUG | #24's own residual seam — writes went through a POSITIONAL `targetSession` reference, so a reorder still landed the payload in the frontmost tab; plus the guard's else-echo wedging victim shells at `dquote>` ✅ LANDED v0.3.36 (write-inside-the-id-match, id normalization, wedge-proof guard) | §15b |
+| 26a | BUG | Typed bootstrap corrupts at the fresh-tab seam (truncation + head-eating) — bootstrap-via-file, typed line < 100 quote-free chars ✅ LANDED v0.3.37 (lead-inline under retain; §15c) | §15c |
 | d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) ✅ PHASE 1 (logging-only) LANDED v0.3.32 — blocking mode waits on tuned logs | §10 |
 | d2 | DOC | Mutation-budget tripwire line in `/relay:mode` ✅ LANDED v0.3.30 | §10 |
 | d3 | DOC | Standing ops-hands pattern (spawn an ops executor up front) ✅ LANDED v0.3.30 | §10 |
@@ -809,3 +810,24 @@ defensively, by making no prefix able to wedge, rather than by removing the trun
 truncation landing inside the BOOTSTRAP's own quoted prompt can still wedge the tab it was correctly
 delivered to. The durable fix is to stop typing the packet prompt inline — pass it via a file — which
 is a spawn-protocol change, not a guard change.
+
+## 15c. §15b executed under fire — bootstrap-via-file (#26a, lead-implemented inline, 2026-08-02)
+
+Two further live failures on v0.3.36 forced §15b from "scheduled" to "now", and broke the
+delegation channel itself (three consecutive executor launches died to the same seam, including
+the executor being sent to fix it — the lead implemented inline under /relay:route retain):
+- mid-payload truncation at a consistent ~1KB offset (cutoff-jump restart, twice more), wedging
+  the CORRECT tab at quote> — the §15b residual exactly as predicted;
+- head-of-payload corruption (`_relay_sid=` arrived as `sp_relay_sid=`) on a resume relaunch,
+  which made the guard no-op the launch in its own intended tab (fail-safe, but launch dead).
+
+Fix (v0.3.37): the complete bootstrap — guard, cd, colors, pidfile, exec claude with the full
+prompt at any length — is written to `<session dir>/bootstrap.sh` (0700, per-launch, doubles as
+the durable record of what a launch ran). The typed payload is one short quote-free line,
+`sh <file> <runtime sid>`, with the sid appended by AppleScript as $1 so the file's guard still
+compares the same value the send targeted (#24's property preserved). A sacrificial empty write
+precedes it so head-eating consumes a blank line. Proven in real bash/zsh: every truncation
+offset of the typed line is wedge-free and runs nothing; a clipped $1 no-ops with the notice; the
+positive control execs with a >4KB prompt intact. Inline guard constants removed (historical
+shape kept as a literal in the repro test). Terminal.app unchanged (atomic `do script`, no typing).
+UNVERIFIED as ever: live-iTerm behavior — settled by the first real spawns on 0.3.37.
