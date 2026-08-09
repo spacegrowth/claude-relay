@@ -39,12 +39,14 @@ One-line, grep-able, versioned prefix — same philosophy as the TL;DR block:
 Receivers treat the envelope as a POINTER (read the real file at the known path), never as the
 payload — same discipline as spawn's pointer message. No conversation history, no file contents.
 
-## Addressing
+## Addressing (CORRECTED by phase-1 evidence, 2026-08-02)
 
-Executors get `--name`-stable identities at spawn (relay already names sessions); the lead's
-address is recorded in the executor's session.json at spawn (`lead_msg_name`), and vice versa.
-ListAgents at send time resolves name→address; a resolution miss falls back to the old path
-(phase 2) or errors honestly (phase 3). Collision behavior must be tested with 3+ executors.
+PRIMARY: the `uds:` inbox socket, resolved AT SEND TIME from the messaging registry
+(~/.claude/sessions/<pid>.json) by the Claude session id relay already records (owner_lead /
+claude_session) — see lead_guard.peer_address (skips dead pids; newest live entry wins).
+FALLBACK: ListAgents name+ref. Phase 1 proved bare names HARD-FAIL on collision (a twice-resumed
+lead collides with itself; refs are only printed at list/error time, so they cannot be recorded
+at spawn). Never resolve at spawn time — a resumed session gets a new pid and socket.
 
 ## Phases
 
@@ -65,9 +67,32 @@ ListAgents at send time resolves name→address; a resolution miss falls back to
 
 ## Open questions phase 1 MUST answer (do not design around guesses)
 
-- Inbound-control default for a `--settings`-spawned executor messaging its lead — accept or hold?
-- Does SendMessage from a hook/script context (executor's Stop) work, or only from Claude's turn?
-  (Docs mention CLAUDE_CODE_MESSAGING_SOCKET available to hooks — verify.)
+> **ANSWERED — phase 1 complete (rl-msg packet 001, 2026-08-08, landed v0.3.39).** Full evidence:
+> `~/.relay-tasks/rl-msg/packets/001-report.md`. Verdict: GO for phase 2, with two corrections that
+> OVERRIDE this doc's assumptions wherever they conflict:
+> 1. **Address by socket, not by name.** Bare-name SendMessage hard-fails on collision (observed
+>    live: a twice-resumed lead collides with itself), and the disambiguating ref is not recordable
+>    at spawn. Primary address = `uds:` socket resolved AT SEND TIME from Claude Code's
+>    `~/.claude/sessions/<pid>.json` registry by the session id relay already stores
+>    (`lead_guard.peer_address`); ListAgents name+ref is the fallback. This doc's `lead_msg_name`
+>    primitive is dead.
+> 2. **Delivery is turn-driven, not hook-driven.** `CLAUDE_CODE_MESSAGING_SOCKET` works only for a
+>    session's OWN socket; a foreign process writing to another session's socket is dropped by
+>    sender-class verification (reparented-sender control probe, same socket/settings: dropped).
+>    The report send must be a GATES instruction, never a Stop-hook push.
+> Also load-bearing: default inbound delivery requires sender/receiver permission classes to
+> MATCH — phase 2 gates on `crossSessionInbound: "accept"` at the lead (user/project settings; relay
+> can inject it only into the executor `--settings` file), and the `[relay-v2] report <sid> <pkt>`
+> envelope prefix is now what defeats the identical-repeat dedup — keep it verbatim. Per-question
+> detail below stays for the record; the report's evidence table answers each row.
+
+- ANSWERED (phase 1): default delivery requires sender/receiver permission classes to MATCH
+  (bypass<->bypass or prompt<->prompt); mismatches are HELD invisibly. Phase 2 is GATED on
+  `crossSessionInbound: "accept"` in the lead's user settings, and adds the key to the executor
+  --settings file for the reverse direction.
+- ANSWERED (phase 1): scripts can write only to their OWN session's socket (sender process-class
+  verification; a reparented control probe was dropped). Delivery is TURN-DRIVEN: the report send
+  is a GATES instruction, never a Stop-hook push.
 - Name collisions across projects (two leads each with an `[Exec] fix` executor).
 - The 50-queued-messages cap under a 5-executor fan-out reporting into a busy lead.
 - Message arrival mid-turn: confirm "between tool calls" injection doesn't disrupt an executor

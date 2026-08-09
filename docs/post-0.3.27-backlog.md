@@ -73,8 +73,9 @@ something broken today; **CAP** = capability/enhancement; **DEC** = blocked on t
 | 23 | BUG | #22's delivery proof read the GLOBAL stop_hook_active flag — a foreign blocking Stop hook (rules-check) silenced wakes for hours ✅ LANDED v0.3.34 (relay-owned claim + transcript evidence) | §14 |
 | 24 | BUG | Spawn typed its whole bootstrap into an unrelated live tab — target re-read from focus after tab creation ✅ LANDED v0.3.35 (target-or-abort + misfire localization + fresh-tab payload guard) | §15 |
 | 25 | BUG | #24's own residual seam — writes went through a POSITIONAL `targetSession` reference, so a reorder still landed the payload in the frontmost tab; plus the guard's else-echo wedging victim shells at `dquote>` ✅ LANDED v0.3.36 (write-inside-the-id-match, id normalization, wedge-proof guard) | §15b |
-| 27 | BUG | **#17's stamp had no invoker check** — the GATES self-diff made every executor stamp its OWN report surfaced-to-the-lead at birth, killing the announce, the escalation push and #23's retry at once 🟡 STAGED (invoker gate on `_mark_report_surfaced`) | §16 |
+| 27 | BUG | **#17's stamp had no invoker check** — the GATES self-diff made every executor stamp its OWN report surfaced-to-the-lead at birth, killing the announce, the escalation push and #23's retry at once ✅ LANDED v0.3.38, **confirmed live 2026-08-08** (invoker gate on `_mark_report_surfaced`; §16 tail) | §16 |
 | 26a | BUG | Typed bootstrap corrupts at the fresh-tab seam (truncation + head-eating) — bootstrap-via-file, typed line < 100 quote-free chars ✅ LANDED v0.3.37 (lead-inline under retain; §15c) | §15c |
+| 28 | CAP | Transport v2 — native cross-session messaging replaces the Stop-hook wake stack (docs/transport-v2-design.md) — ✅ PHASE 1 LANDED v0.3.39 (flag-gated prototype; five findings; phase 2 gated on crossSessionInbound accept) | design doc |
 | d1 | CAP | Bash gate for leads on custody-vs-implementation lines (dry-run first) ✅ PHASE 1 (logging-only) LANDED v0.3.32 — blocking mode waits on tuned logs | §10 |
 | d2 | DOC | Mutation-budget tripwire line in `/relay:mode` ✅ LANDED v0.3.30 | §10 |
 | d3 | DOC | Standing ops-hands pattern (spawn an ops executor up front) ✅ LANDED v0.3.30 | §10 |
@@ -924,3 +925,17 @@ the hooks read, not on a live wake. The field ledger above was read read-only an
 and landed but was never promoted (no `stop_hook_active` re-run) would log nothing either, so that
 inference is strong but not airtight for any individual row. Also unverified: that the 5 s poller
 tick vs. self-diff gap is the *only* thing that decides the race — no live timing was measured.
+
+**CONFIRMED LIVE (2026-08-08, first real executor cycle on 0.3.38).** Executor `rl-msg`
+(transport-v2 phase 1, #28) wrote its packet-001 report and ran the GATES self-diff against the
+deployed 0.3.38 binary. Ledger, verbatim ordering:
+
+```
+21:23:23  surfaced_stamp_declined  session=rl-msg packet=1 caller=self   ← the gate, working
+21:26:04  reported                 session=rl-msg packet=1
+21:26:26  wake_delivered           lead=5ab092fb… keys=['rl-msg:1']      ← 3 min after the self-diff
+```
+
+On ≤0.3.37 the 21:23:23 stamp would have landed, and the wake at 21:26:26 could never have fired
+(`new_reports_for` would already exclude the key). The UNVERIFIED end-to-end claim above is now
+verified in the field; the closing caveat of §16 is discharged.
