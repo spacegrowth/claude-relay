@@ -75,6 +75,12 @@ LEAD_DEFAULTS = {
                                   # push a nudge into the owning lead's tab, once. A net UNDER the
                                   # lead's own fast-path check, not a replacement — kill-switch
                                   # matches the auto_wake/notify_on_wake pattern above.
+    "transport_v2": "off",       # transport-v2 phase 1 (#28). "off" (default) = nothing changes, the
+                                  # Stop-hook wake stack is the only channel. "prototype" = the
+                                  # auto-appended GATES gain ONE extra final step telling the executor
+                                  # to also SendMessage a `[relay-v2] report …` pointer to its owning
+                                  # lead after the self-diff. Prototype only: the old wake stack is
+                                  # still the real channel, and a failed send is ledgered, never fatal.
     "bash_gate_logging": True,   # task d1 (§10): logging-only Bash gate for armed leads — ledgers
                                   # `would_have_blocked` on an implementation-verb Bash command, NEVER
                                   # denies (dry-run-first, per §10's "Fable punchlist item 2": tune the
@@ -1122,6 +1128,59 @@ def _pid_alive(pid):
         return True
     except Exception:
         return False
+
+
+# ---- transport v2: peer addressing (#28 phase 1) ------------------------------------------------
+# Claude Code ≥2.1.224 registers every messaging-capable session as ~/.claude/sessions/<pid>.json
+# ({"pid", "sessionId", "name", "messagingSocketPath", "updatedAt", …}) and binds that socket. The
+# path is the ADDRESS: an incoming peer message carries `from="uds:/tmp/cc-socks/<pid>.sock"`, and
+# SendMessage accepts that exact string as `to` (verified live, executor→lead, 2026-08-08).
+#
+# Why address by socket and not by the `--name` the design doc assumed: names COLLIDE and a colliding
+# bare name is a HARD SEND FAILURE, not a best-effort pick — `SendMessage to="[Lead] claude-relay"`
+# returned "matches 2 agents. Re-send with the ref". The disambiguating `[ref]` is only ever printed
+# by ListAgents/the error itself, so it can't be recorded at spawn. The registry, by contrast, is on
+# disk and keyed by the very id relay already stores as `owner_lead`.
+#
+# The duplicate is not exotic: a lead resumed twice leaves two live pids under ONE sessionId (seen
+# live — pids 6583/6646 both `claude --resume 5ab092fb…`). Hence "newest live entry wins" below.
+
+def _sessions_registry_dir():
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")) / "sessions"
+
+
+def peer_registry_entries():
+    """Every readable Claude Code session-registry record, newest-updated first. Never throws."""
+    out = []
+    try:
+        for p in _sessions_registry_dir().glob("*.json"):
+            try:
+                d = json.loads(p.read_text())
+            except Exception:
+                continue
+            if isinstance(d, dict) and d.get("sessionId"):
+                out.append(d)
+    except Exception:
+        return []
+    out.sort(key=lambda d: d.get("updatedAt") or d.get("startedAt") or 0, reverse=True)
+    return out
+
+
+def peer_address(claude_session_id):
+    """The `uds:<socket>` address to SendMessage a session whose Claude conversation id is
+    `claude_session_id`, or None when it can't be resolved (pre-2.1.224 session with no socket, no
+    registry entry, dead pid). Never throws — an unresolvable address must degrade to the old wake
+    path, never break a packet build."""
+    if not claude_session_id:
+        return None
+    for d in peer_registry_entries():
+        if d.get("sessionId") != claude_session_id:
+            continue
+        sock = d.get("messagingSocketPath")
+        # A stale record outlives its process; the socket file outlives it too, so check the pid.
+        if sock and d.get("pid") and _pid_alive(d["pid"]):
+            return f"uds:{sock}"
+    return None
 
 
 def _pid_start_time(pid):

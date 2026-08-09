@@ -198,6 +198,23 @@ Then include the full detail:
 AFTER writing your report, run:
   {diff_cmd}
 (generates your staged-diff review page; do not open it, do not attach it anywhere — just run it once)
+{transport_v2_step}"""
+
+# transport-v2 phase 1 (#28), config `transport_v2: "prototype"` — appended to TEMPLATE_FOOTER as the
+# ONE extra final step, after the self-diff. Prototype semantics on purpose: this is a SECOND, additive
+# announcement, not a replacement. The Stop-hook wake stack still runs and is still the real channel,
+# so a send that never happens costs nothing but a ledger line. Pointer-not-payload, exactly like the
+# spawn pointer: the envelope carries the report's first line and the lead reads the file itself.
+TRANSPORT_V2_STEP = """
+FINALLY (relay transport v2 prototype — additive; the report file above is still the real channel):
+after the self-diff, send your report's FIRST LINE to your owning lead as a one-line message, using
+the SendMessage tool with `to` set EXACTLY to:
+  {lead_addr}
+and the message body EXACTLY this one line (no other text, no file contents, no report body):
+  [relay-v2] report {session_id} {packet_n} — <the first line of your report, verbatim>
+If the tool is unavailable, the address does not resolve, or the send fails, do NOT retry and do NOT
+mention it in the tab — just run this once and carry on:
+  {msg_failed_cmd}
 """
 
 AFTERCARE_FOOTER = """
@@ -465,8 +482,30 @@ def enqueue_packet(session_id, body, source, heavy_override=None):
     return item
 
 
-def build_packet(body, report_path, diff_cmd, diff_url):
-    return body.rstrip() + TEMPLATE_FOOTER.format(report_path=report_path, diff_cmd=diff_cmd, diff_url=diff_url)
+def build_packet(body, report_path, diff_cmd, diff_url, transport_v2_step=""):
+    return body.rstrip() + TEMPLATE_FOOTER.format(report_path=report_path, diff_cmd=diff_cmd,
+                                                  diff_url=diff_url,
+                                                  transport_v2_step=transport_v2_step)
+
+
+def transport_v2_step(session_id, packet_n, owner_lead, cfg=None):
+    """The extra GATES step for `transport_v2: "prototype"`, or "" — which is the whole story when the
+    flag is off (default), so the footer stays byte-identical to the pre-#28 one.
+
+    Also "" when the owning lead's peer address can't be resolved: a packet that names no address has
+    nothing to instruct, and phase 1 must never turn an addressing miss into a failed spawn/send. The
+    miss IS worth knowing about, so it's ledgered here rather than swallowed."""
+    cfg = cfg if cfg is not None else lead_guard.load_config(STATE_ROOT)
+    if cfg.get("transport_v2") != "prototype":
+        return ""
+    addr = lead_guard.peer_address(owner_lead)
+    if not addr:
+        append_ledger("msg_send_failed", session_id=session_id, packet=packet_n,
+                      owner_lead=owner_lead, stage="resolve", reason="no peer address for owning lead")
+        return ""
+    return TRANSPORT_V2_STEP.format(
+        lead_addr=addr, session_id=session_id, packet_n=packet_n,
+        msg_failed_cmd=f"{RELAY_BIN} msg-failed {session_id} --packet {packet_n} --reason \"<what happened>\"")
 
 
 # #13/§7-h1: tolerant of heading depth (## or ###) and case, and of trailing text on the same line
@@ -881,7 +920,14 @@ def cmd_spawn(args):
     diff_path = d / f"{n:03d}-diff.html"
     diff_url = path_to_file_url(diff_path)
     packet_path = d / f"{n:03d}-packet.md"
-    packet_path.write_text(build_packet(body, report_path, diff_cmd, diff_url))
+
+    # Stamp this executor with the lead that spawned it. --lead wins; else the calling lead's own
+    # session id from the env; else unowned (None). Resolved HERE, before the packet is built, because
+    # the transport-v2 step has to address that lead; the marker lookups it feeds stay below.
+    owner_lead = getattr(args, "lead", None) or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+
+    packet_path.write_text(build_packet(body, report_path, diff_cmd, diff_url,
+                                        transport_v2_step(session_id, n, owner_lead, cfg)))
 
     # Whether the executor runs with --dangerously-skip-permissions. Per-spawn flag wins; else the
     # config default (executor_skip_permissions, default False = safe/prompts). Skip-perms means the
@@ -899,11 +945,9 @@ def cmd_spawn(args):
     # later (via `claude --resume <uuid>`) without scraping transcripts.
     claude_session = str(uuid.uuid4())
 
-    # Stamp this executor with the lead that spawned it. --lead wins; else the calling lead's own
-    # session id from the env; else unowned (None). The human-readable project AND the lead's tab
-    # color come from the owning lead's marker — executors inherit the color so a lead's tabs group
-    # visually (iTerm only; Terminal ignores it).
-    owner_lead = getattr(args, "lead", None) or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    # The human-readable project AND the lead's tab color come from the owning lead's marker —
+    # executors inherit the color so a lead's tabs group visually (iTerm only; Terminal ignores it).
+    # owner_lead itself is resolved above, before the packet build.
     owner_marker = lead_guard.read_marker(STATE_ROOT, owner_lead) if owner_lead else {}
     owner_project = owner_marker.get("project")
     tab_color = owner_marker.get("color") if cfg.get("tab_colors", True) else None
@@ -1359,7 +1403,8 @@ def cmd_send(args):
     diff_path = packets_dir(args.session_id) / f"{n:03d}-diff.html"
     diff_url = path_to_file_url(diff_path)
     packet_path = packets_dir(args.session_id) / f"{n:03d}-packet.md"
-    packet_path.write_text(build_packet(body, report_path, diff_cmd, diff_url))
+    packet_path.write_text(build_packet(body, report_path, diff_cmd, diff_url,
+                                        transport_v2_step(args.session_id, n, s.get("owner_lead"))))
 
     pointer = build_pointer_message(str(packet_path), packet_summary(body))
     ok = False if tab_gone else term_backend(s).send(s["tab_label"], pointer,
@@ -2400,6 +2445,23 @@ def cmd_report(args):
     print(c(bar, "green", "bold"))
     if s.get("worktree") and _has_staged_diff(s["worktree"]):
         print(c(f"  📄 review the staged diff: relay diff {args.session_id} --open", "dim"))
+
+
+def cmd_msg_failed(args):
+    """Ledger a transport-v2 prototype send that didn't happen (#28 phase 1). Called BY THE EXECUTOR
+    from the GATES step when SendMessage is unavailable / unresolvable / errored.
+
+    Deliberately near-silent and always exit 0: in phase 1 the real report already reached the lead
+    by the file + wake path, so a failed announcement is telemetry — the thing we're here to measure —
+    and must never look to the executor like its packet failed. An unknown session is still ledgered
+    rather than rejected: the point is to count misses, and refusing to record one would hide it."""
+    n = args.packet
+    if n is None:
+        s = read_session(args.session_id)
+        n = (s or {}).get("current_packet", 1)
+    append_ledger("msg_send_failed", session_id=args.session_id, packet=n, stage="send",
+                  reason=args.reason or "unspecified")
+    print(f"recorded msg_send_failed for {args.session_id} packet {n}")
 
 
 def cmd_diff(args):
@@ -3680,6 +3742,13 @@ def main():
     rpt.add_argument("session_id")
     rpt.add_argument("--packet", type=int)
     rpt.set_defaults(func=cmd_report)
+
+    mf = sub.add_parser("msg-failed", help="record that a transport-v2 prototype report message "
+                        "could not be sent (#28 phase 1) — ledger only, always exits 0")
+    mf.add_argument("session_id")
+    mf.add_argument("--packet", type=int)
+    mf.add_argument("--reason", default="")
+    mf.set_defaults(func=cmd_msg_failed)
 
     df = sub.add_parser("diff")
     df.add_argument("session_id")

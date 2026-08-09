@@ -5384,3 +5384,90 @@ class TestTombstoneNameReservation:
         name, clash = relay.unique_lead_project("claude-relay", "paused-1", [], leads,
                                                 now_ts=self.NOW)
         assert (name, clash) == ("claude-relay", None)
+
+
+class TestTransportV2PrototypeStep:
+    """#28 phase 1: behind `transport_v2: "prototype"`, the auto-appended GATES gain ONE final step
+    telling the executor to also SendMessage a report pointer to its owning lead.
+
+    The flag-off case is the load-bearing one — this is a prototype bolted onto the packet every
+    executor reads, so OFF must leave the footer byte-for-byte what it was."""
+
+    def _registry(self, tmp_path, monkeypatch, session_id="lead-uuid", sock="/tmp/cc-socks/lead.sock"):
+        d = tmp_path / "cfg" / "sessions"
+        d.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        (d / f"{os.getpid()}.json").write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": session_id,
+            "messagingSocketPath": sock, "updatedAt": 1}))
+
+    def _cfg(self, relay, value):
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps({"transport_v2": value}))
+
+    def test_flag_off_footer_is_byte_identical(self, relay, tmp_path, monkeypatch):
+        self._registry(tmp_path, monkeypatch)
+        baseline = relay.build_packet("do the thing", "/tmp/x/001-report.md",
+                                      "/path/to/relay diff sess-x", "file:///tmp/x/001-diff.html")
+        # Default (no config file at all) and an explicit "off" must both produce the old footer.
+        for value in (None, "off"):
+            if value:
+                self._cfg(relay, value)
+            step = relay.transport_v2_step("sess-x", 1, "lead-uuid")
+            assert step == ""
+            assert relay.build_packet("do the thing", "/tmp/x/001-report.md",
+                                      "/path/to/relay diff sess-x",
+                                      "file:///tmp/x/001-diff.html", step) == baseline
+
+    def test_flag_on_appends_step_with_exact_envelope(self, relay, tmp_path, monkeypatch):
+        self._registry(tmp_path, monkeypatch)
+        self._cfg(relay, "prototype")
+        step = relay.transport_v2_step("rl-msg", 3, "lead-uuid")
+        assert "uds:/tmp/cc-socks/lead.sock" in step
+        # The envelope is the contract with the receiving lead — pointer, not payload.
+        assert "[relay-v2] report rl-msg 3 — <the first line of your report, verbatim>" in step
+        assert "relay msg-failed rl-msg --packet 3" in step
+
+    def test_flag_on_step_lands_at_the_very_end_of_the_packet(self, relay, tmp_path, monkeypatch):
+        """'after the self-diff' — the send instruction must follow the diff step, not precede it."""
+        self._registry(tmp_path, monkeypatch)
+        self._cfg(relay, "prototype")
+        step = relay.transport_v2_step("rl-msg", 1, "lead-uuid")
+        p = relay.build_packet("body", "/tmp/x/001-report.md", "/path/to/relay diff rl-msg",
+                               "file:///tmp/x/001-diff.html", step)
+        assert p.index("just run it once") < p.index("[relay-v2] report")
+        assert p.rstrip().endswith('--reason "<what happened>"')
+
+    def test_unresolvable_lead_degrades_to_no_step_and_ledgers(self, relay, tmp_path, monkeypatch):
+        """An addressing miss must never fail the spawn — it drops the step and leaves a trace."""
+        self._registry(tmp_path, monkeypatch, session_id="a-different-lead")
+        self._cfg(relay, "prototype")
+        assert relay.transport_v2_step("rl-msg", 1, "lead-uuid") == ""
+        events = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
+        miss = [e for e in events if e["event"] == "msg_send_failed"]
+        assert len(miss) == 1
+        assert miss[0]["stage"] == "resolve"
+        assert miss[0]["session_id"] == "rl-msg"
+
+    def test_no_ledger_noise_when_flag_is_off(self, relay, tmp_path, monkeypatch):
+        """Flag off must not ledger addressing misses — nothing was ever going to be sent."""
+        self._registry(tmp_path, monkeypatch, session_id="a-different-lead")
+        assert relay.transport_v2_step("rl-msg", 1, "lead-uuid") == ""
+        assert not relay.LEDGER.exists()
+
+    def test_msg_failed_command_ledgers_send_failure(self, relay):
+        relay.write_session("rl-msg", {"session_id": "rl-msg", "current_packet": 2})
+        relay.cmd_msg_failed(SimpleNamespace(session_id="rl-msg", packet=None,
+                                             reason="ListAgents could not resolve the lead"))
+        events = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
+        e = [x for x in events if x["event"] == "msg_send_failed"][0]
+        assert e["packet"] == 2          # defaulted from the session's current packet
+        assert e["stage"] == "send"
+        assert e["reason"] == "ListAgents could not resolve the lead"
+
+    def test_msg_failed_records_unknown_session_rather_than_refusing(self, relay):
+        """The point is counting misses; rejecting an unknown session would hide one."""
+        relay.cmd_msg_failed(SimpleNamespace(session_id="ghost", packet=7, reason=""))
+        e = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()][0]
+        assert e["event"] == "msg_send_failed" and e["packet"] == 7
+        assert e["reason"] == "unspecified"

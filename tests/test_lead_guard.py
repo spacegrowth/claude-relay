@@ -2810,3 +2810,79 @@ class TestRearmNotification:
             raise RuntimeError("notifier exploded")
         monkeypatch.setattr(slw, "_notify", boom)
         mod._notify_rearm(lg, "lead-1", {"project": "webapp"})  # must not raise
+
+
+# ---- transport v2: peer addressing (#28 phase 1) ------------------------------------------------
+
+class TestPeerAddress:
+    """Resolving a Claude session id to a `uds:` inbox address off the on-disk session registry.
+
+    The registry is Claude Code's, not relay's: ~/.claude/sessions/<pid>.json. These tests point
+    CLAUDE_CONFIG_DIR at a tmp dir so nothing reads the developer's real sessions."""
+
+    def _registry(self, tmp_path, monkeypatch):
+        d = tmp_path / "cfg" / "sessions"
+        d.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        return d
+
+    def _entry(self, d, pid, session_id, sock="/tmp/cc-socks/x.sock", updated=1000):
+        (d / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "sessionId": session_id, "messagingSocketPath": sock,
+            "name": "[Lead] proj", "updatedAt": updated}))
+
+    def test_resolves_live_session_to_uds_address(self, tmp_path, monkeypatch):
+        d = self._registry(tmp_path, monkeypatch)
+        self._entry(d, os.getpid(), "lead-uuid", sock="/tmp/cc-socks/live.sock")
+        assert lg.peer_address("lead-uuid") == "uds:/tmp/cc-socks/live.sock"
+
+    def test_unknown_session_is_none(self, tmp_path, monkeypatch):
+        d = self._registry(tmp_path, monkeypatch)
+        self._entry(d, os.getpid(), "someone-else")
+        assert lg.peer_address("lead-uuid") is None
+
+    def test_none_session_id_is_none(self, tmp_path, monkeypatch):
+        self._registry(tmp_path, monkeypatch)
+        assert lg.peer_address(None) is None
+
+    def test_dead_pid_is_not_addressable(self, tmp_path, monkeypatch):
+        """The socket FILE outlives the process that bound it, so a stale record must not yield an
+        address — otherwise relay would hand out a path nothing is listening on."""
+        d = self._registry(tmp_path, monkeypatch)
+        self._entry(d, 999999999, "lead-uuid")  # pid that cannot be alive
+        assert lg.peer_address("lead-uuid") is None
+
+    def test_entry_without_socket_is_skipped(self, tmp_path, monkeypatch):
+        """A pre-2.1.224 session registers itself but binds no inbox socket."""
+        d = self._registry(tmp_path, monkeypatch)
+        (d / "1.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": "lead-uuid"}))
+        assert lg.peer_address("lead-uuid") is None
+
+    def test_duplicate_session_ids_prefer_newest_live_entry(self, tmp_path, monkeypatch):
+        """One lead resumed twice leaves TWO live pids under ONE sessionId — observed live
+        (pids 6583/6646 both `claude --resume 5ab092fb…`). Newest updatedAt wins."""
+        d = self._registry(tmp_path, monkeypatch)
+        self._entry(d, os.getpid(), "lead-uuid", sock="/tmp/cc-socks/old.sock", updated=1000)
+        self._entry(d, os.getppid(), "lead-uuid", sock="/tmp/cc-socks/new.sock", updated=2000)
+        assert lg.peer_address("lead-uuid") == "uds:/tmp/cc-socks/new.sock"
+
+    def test_corrupt_registry_file_never_throws(self, tmp_path, monkeypatch):
+        d = self._registry(tmp_path, monkeypatch)
+        (d / "bad.json").write_text("{ not json")
+        self._entry(d, os.getpid(), "lead-uuid", sock="/tmp/cc-socks/ok.sock")
+        assert lg.peer_address("lead-uuid") == "uds:/tmp/cc-socks/ok.sock"
+
+    def test_missing_registry_dir_never_throws(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "nope"))
+        assert lg.peer_address("lead-uuid") is None
+        assert lg.peer_registry_entries() == []
+
+
+class TestTransportV2ConfigDefault:
+    def test_defaults_off(self, root):
+        assert lg.load_config(root)["transport_v2"] == "off"
+
+    def test_prototype_opt_in(self, root):
+        (root / "lead").mkdir(parents=True)
+        (root / "lead" / "config.json").write_text(json.dumps({"transport_v2": "prototype"}))
+        assert lg.load_config(root)["transport_v2"] == "prototype"
