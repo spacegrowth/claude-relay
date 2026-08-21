@@ -70,13 +70,6 @@ LEAD_DEFAULTS = {
                                   # that has its own five-condition gate (#16 phase 2) — see
                                   # report_verify.clearance, `relay verify --for-autocommit`, and
                                   # skills/mode/SKILL.md's stop-list.
-    "executor_mcp": "none",       # which MCP servers an executor launches with (see "executor MCP
-                                  # policy" below): "none" (default — strict mode, ZERO servers:
-                                  # no connector/plugin/user/project MCPs, their tool names and
-                                  # instruction blocks never enter the executor's context),
-                                  # "inherit" (plain launch: whatever the CLI would load), or a
-                                  # list of configured server names ["linear", ...] (strict
-                                  # allowlist). `relay spawn --mcp …` overrides per executor.
     "executor_escalation": True,  # arm every spawned executor with the escalation Stop hook
                                   # (wake-watch design §9): once its report lands and it goes idle,
                                   # push a nudge into the owning lead's tab, once. A net UNDER the
@@ -1436,7 +1429,9 @@ def escalation_decision(state_root, exec_sid, packet, owner_lead):
 # Gmail/Linear, plugin MCPs like claude-in-chrome, user/project servers) costs tokens on EVERY turn
 # (tool-name roster + per-server instruction blocks, plus schemas once loaded) and is a side-effect
 # surface nobody asked for. Relay therefore decides an executor's MCP set itself, like its model:
-# default "none", a lead opts in per packet with `relay spawn --mcp` / `--mcp a,b`.
+# default "none" (no config knob — on purpose: a global "inherit" would quietly undo the saving for
+# every packet); a packet opts in with its own `MCP: linear` / `MCP: inherit` line, or
+# `relay spawn --mcp …` overrides per spawn.
 #
 # Mechanism (verified live 2026-08-21): `claude --strict-mcp-config --mcp-config '{"mcpServers":{}}'`
 # yields a session with NO mcp__* tools at all — connectors and plugin MCPs included. An allowlist
@@ -1446,12 +1441,13 @@ def escalation_decision(state_root, exec_sid, packet, owner_lead):
 # back via "inherit".
 
 MCP_NONE_JSON = '{"mcpServers":{}}'
+MCP_DEFAULT = "none"   # what an executor gets when its packet declares nothing and no --mcp is passed
 
 
 def normalize_mcp_spec(raw):
     """Canonical form of an executor MCP spec: "none" | "inherit" | sorted list of server names.
-    Accepts the config value, the `--mcp` CLI value (bare flag → "inherit"; "a,b" → list), or a
-    stored session value. None/"" → "none" (the policy default, never silent inheritance)."""
+    Accepts the packet `MCP:` value, the `--mcp` CLI value (bare flag → "inherit"; "a,b" → list),
+    or a stored session value. None/"" → "none" (the policy default, never silent inheritance)."""
     if raw is None or raw is True:
         return "inherit" if raw is True else "none"
     if isinstance(raw, (list, tuple, set)):

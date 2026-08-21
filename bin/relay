@@ -913,18 +913,18 @@ def cmd_spawn(args):
                       reason=args.model_override)
 
     # Resolve the executor's MCP set the same way (see "executor MCP policy" in lead_guard.py):
-    # `--mcp` (bare → inherit; "none"; "a,b" allowlist) wins, else config executor_mcp (default
-    # "none" — strict mode, zero servers). Resolved BEFORE files are written so an unknown allowlist
-    # name refuses the spawn cleanly instead of launching an executor missing its tool.
+    # `--mcp` (bare → inherit; "none"; "a,b" allowlist) wins, else the packet's `MCP:` line, else
+    # MCP_DEFAULT ("none" — strict mode, zero servers). Resolved BEFORE files are written so an
+    # unknown allowlist name refuses the spawn cleanly instead of launching an executor missing its tool.
     # Precedence: --mcp flag > the packet's own `MCP:` line (lead_guard.packet_mcp_spec — the packet
-    # is the source of truth for what its executor needs) > config default.
+    # is the source of truth for what its executor needs) > MCP_DEFAULT.
     packet_mcp = lead_guard.packet_mcp_spec(authored_body)
     if getattr(args, "mcp", None) is not None:
         mcp_spec, mcp_src = lead_guard.normalize_mcp_spec(args.mcp), "--mcp"
     elif packet_mcp is not None:
         mcp_spec, mcp_src = packet_mcp, "packet MCP: line"
     else:
-        mcp_spec, mcp_src = lead_guard.normalize_mcp_spec(cfg.get("executor_mcp", "none")), "config"
+        mcp_spec, mcp_src = lead_guard.MCP_DEFAULT, "default"
     if packet_mcp is not None and getattr(args, "mcp", None) is not None and packet_mcp != mcp_spec:
         print(c(f"  ⚠ packet declares MCP: {lead_guard.mcp_spec_label(packet_mcp)} but --mcp "
                 f"{lead_guard.mcp_spec_label(mcp_spec)} overrides it", "red"))
@@ -1095,10 +1095,10 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     if session_uuid and not model:
         model = cfg.get("executor_default_model", "sonnet")
         s["model"] = model
-    # MCP set: what this executor was spawned with; a legacy record (no "mcp") gets the config
-    # default — MCP loading is per-process, so resume and restart both need the flags again.
+    # MCP set: what this executor was spawned with; a legacy record (no "mcp") gets MCP_DEFAULT —
+    # MCP loading is per-process, so resume and restart both need the flags again.
     mcp_spec = lead_guard.normalize_mcp_spec(s.get("mcp") if s.get("mcp") is not None
-                                             else cfg.get("executor_mcp", "none"))
+                                             else lead_guard.MCP_DEFAULT)
     try:
         mcp_flags = lead_guard.mcp_cli_flags(mcp_spec, state_root=STATE_ROOT, exec_name=session_id,
                                              cwd=s["worktree"])
@@ -1390,7 +1390,7 @@ def cmd_send(args):
             body = Path(args.packet).read_text()
             warn_missing_preconditions(body, "queueing")
             need_mcp = lead_guard.packet_mcp_spec(body)
-            have_mcp = s.get("mcp") if s.get("mcp") is not None else lead_guard.load_config(STATE_ROOT).get("executor_mcp", "none")
+            have_mcp = s.get("mcp") if s.get("mcp") is not None else lead_guard.MCP_DEFAULT
             if need_mcp is not None and not lead_guard.mcp_covers(have_mcp, need_mcp):
                 sys.exit(f"packet declares MCP: {lead_guard.mcp_spec_label(need_mcp)} but '{args.session_id}' "
                          f"runs with MCP {lead_guard.mcp_spec_label(have_mcp)} — queued delivery types into the "
@@ -1457,7 +1457,7 @@ def cmd_send(args):
     # the resume-fallback path below (kill tab → `--resume` with new flags → deliver packet),
     # which is exactly the already-proven "tab gone" route. Only idle/reported sessions reach here.
     need_mcp = lead_guard.packet_mcp_spec(body)
-    have_mcp = s.get("mcp") if s.get("mcp") is not None else lead_guard.load_config(STATE_ROOT).get("executor_mcp", "none")
+    have_mcp = s.get("mcp") if s.get("mcp") is not None else lead_guard.MCP_DEFAULT
     mcp_relaunch = False
     if need_mcp is not None and not lead_guard.mcp_covers(have_mcp, need_mcp):
         if not s.get("claude_session"):
@@ -3707,7 +3707,7 @@ def main():
                     help="required to spawn a model above executor_model_ceiling — the reason is "
                     "recorded in the ledger (model_ceiling_override)")
     sp.add_argument("--mcp", nargs="?", const="inherit", default=None, metavar="SPEC",
-                    help="MCP servers for this executor (overrides config executor_mcp, default "
+                    help="MCP servers for this executor (overrides the packet's MCP: line; default "
                          "none): bare --mcp = inherit everything the CLI would load; --mcp none = "
                          "strict zero servers; --mcp linear,chrome-devtools = strict allowlist of "
                          "servers configured in ~/.claude.json / <worktree>/.mcp.json")

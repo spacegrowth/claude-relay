@@ -2899,8 +2899,8 @@ class TestExecutorMcpPolicy:
         assert n(["b", "a", "a"]) == ["a", "b"] and n([]) == "none"
         assert lg.mcp_spec_label(["b", "a"]) == "a,b" and lg.mcp_spec_label(None) == "none"
 
-    def test_default_config_is_none(self):
-        assert lg.LEAD_DEFAULTS["executor_mcp"] == "none"
+    def test_default_is_none_and_not_a_config_knob(self):
+        assert lg.MCP_DEFAULT == "none" and "executor_mcp" not in lg.LEAD_DEFAULTS
 
     def test_none_and_inherit_flags(self):
         assert lg.mcp_cli_flags("inherit") == []

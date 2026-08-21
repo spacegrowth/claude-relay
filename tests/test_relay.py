@@ -5501,8 +5501,10 @@ class TestSpawnExecutorMcp:
         assert self._run(relay, tmp_path, mcp="inherit")["mcp_flags"] == []
         assert relay.read_session("s1")["mcp"] == "inherit"
 
-    def test_config_inherit_overridden_by_flag_none(self, relay, tmp_path):
-        assert self._run(relay, tmp_path, cfg={"executor_mcp": "inherit"})["mcp_flags"] == []
+    def test_no_config_knob_can_change_the_default(self, relay, tmp_path):
+        # executor_mcp was deliberately NOT made a config key: a global "inherit" would silently undo
+        # the per-turn saving for every packet. Only the packet line / --mcp change the set.
+        assert self._run(relay, tmp_path, cfg={"executor_mcp": "inherit"})["mcp_flags"] == self.NONE
         assert self._run(relay, tmp_path, cfg={"executor_mcp": "inherit"}, mcp="none", name="s2")["mcp_flags"] == self.NONE
 
     def test_allowlist_writes_mcp_json_and_records_list(self, relay, tmp_path):
