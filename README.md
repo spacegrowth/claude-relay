@@ -510,7 +510,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 
 Per-spawn override for `executor_skip_permissions`: pass `--skip-perms` or `--no-skip-perms` at `relay spawn` time.
 
-Per-spawn override for `executor_mcp`: `--mcp` (bare = inherit everything), `--mcp none`, or `--mcp linear,chrome-devtools` (strict allowlist) at `relay spawn` time. The resolved set is recorded on the session and re-applied on `resume`/`restart` (MCP loading is per-process); an allowlist naming a server no config file defines refuses the spawn rather than launching an executor missing its tool.
+Per-packet MCP: the packet itself declares what it needs — a line `MCP: linear` (comma-separate several; strict allowlist) or `MCP: inherit` — and `relay spawn` launches accordingly (precedence: `--mcp` flag > packet line > `executor_mcp` config). On `relay send`, a packet declaring a server the executor lacks makes relay relaunch the executor's **same conversation** (`--resume`) with the widened set before delivering — MCP servers load at process start and `--resume` doesn't restore `--mcp-config` (verified live: `tests/test_e2e_mcp.py`). `relay resume|restart --mcp SPEC` changes the set by hand. The resolved set is recorded on the session; an allowlist naming a server no config file defines refuses rather than launching an executor missing its tool.
 
 **Environment variable overrides:**
 - `RELAY_TERMINAL`: force "iterm" or "terminal" (beats `terminal_app` in config)

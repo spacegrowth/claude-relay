@@ -5541,3 +5541,148 @@ class TestSpawnExecutorMcp:
              mock.patch.object(relay, "_ensure_tab_label"):
             relay._relaunch("s1", relay.read_session("s1"), "go", resume_id="cs")
         assert captured["mcp_flags"] == self.NONE
+
+
+class TestPacketMcpDeclaration:
+    """Packet `MCP:` line drives the executor's MCP set: spawn honours it (flag > line > config);
+    send relaunches the conversation with a wider set when the executor lacks what the packet needs."""
+    NONE = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+
+    def _spawn(self, relay, tmp_path, body, mcp=None, cfg=None):
+        pkt = tmp_path / "packet.md"; pkt.write_text(body)
+        if cfg is not None:
+            (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+            (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps(cfg))
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123), \
+             mock.patch.object(relay.lead_guard, "known_mcp_servers",
+                               return_value={"linear": {"type": "http", "url": "u"}}):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt),
+                model=None, name="s1", scope=None, skip_perms=None, pane=None, mcp=mcp))
+        return cap
+
+    def test_packet_line_beats_config(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path, "# T\nMCP: linear\n\ndo it")
+        assert json.loads(Path(cap["mcp_flags"][2]).read_text())["mcpServers"].keys() == {"linear"}
+        assert relay.read_session("s1")["mcp"] == ["linear"]
+
+    def test_flag_beats_packet_line(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path, "# T\nMCP: linear\n\ndo it", mcp="none")
+        assert cap["mcp_flags"] == self.NONE
+
+    def test_packet_inherit(self, relay, tmp_path):
+        assert self._spawn(relay, tmp_path, "MCP: inherit\n\ndo it")["mcp_flags"] == []
+
+    def test_packet_unknown_server_refuses(self, relay, tmp_path):
+        with pytest.raises(SystemExit) as ei:
+            self._spawn(relay, tmp_path, "MCP: gmail\n\ndo it")
+        assert "gmail" in str(ei.value) and "packet MCP" in str(ei.value)
+
+    # ---- send ----
+    def _mk_exec(self, relay, mcp="none", claude_session="cs-x"):
+        sid = "e1"
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": "/w", "topic": "t", "scope": "t",
+            "tab_label": "relay-e1", "model": "sonnet", "mcp": mcp, "pid": 999999,
+            "iterm_session": "w0t0p0:OLD", "claude_session": claude_session, "status": "reported",
+            "current_packet": 1, "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("first")
+        (relay.packets_dir(sid) / "001-report.md").write_text("done")
+
+    def _send(self, relay, tmp_path, body, alive=True):
+        p = tmp_path / "next.md"; p.write_text(body)
+        cap, sent = {}, {}
+        with mock.patch.object(relay.iterm, "send", side_effect=lambda *a: sent.update(label=a[0]) or True), \
+             mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=alive), \
+             mock.patch.object(relay.iterm, "close", return_value=True), \
+             mock.patch.object(relay, "_kill_and_wait"), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123), \
+             mock.patch.object(relay, "read_iterm_id", return_value="w0t0p0:NEW"), \
+             mock.patch.object(relay, "_ensure_tab_label", return_value=True), \
+             mock.patch.object(relay.lead_guard, "known_mcp_servers",
+                               return_value={"linear": {"type": "http", "url": "u"}}):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=str(p)))
+        return cap, sent
+
+    def test_send_covered_types_into_live_tab(self, relay, tmp_path):
+        self._mk_exec(relay, mcp=["linear"])
+        cap, sent = self._send(relay, tmp_path, "# F\nMCP: linear\nnext")
+        assert sent.get("label") == "relay-e1" and not cap   # no relaunch
+        assert relay.read_session("e1")["mcp"] == ["linear"]
+
+    def test_send_no_mcp_line_never_relaunches(self, relay, tmp_path):
+        self._mk_exec(relay, mcp="none")
+        cap, sent = self._send(relay, tmp_path, "# F\nnext")
+        assert sent and not cap
+
+    def test_send_uncovered_relaunches_same_conversation_with_wider_set(self, relay, tmp_path):
+        self._mk_exec(relay, mcp="none", claude_session="cs-x")
+        cap, sent = self._send(relay, tmp_path, "# F\nMCP: linear\nnext")
+        assert not sent                                   # did NOT type into the old process
+        assert cap["resume_id"] == "cs-x"                 # same conversation, new process
+        assert json.loads(Path(cap["mcp_flags"][2]).read_text())["mcpServers"].keys() == {"linear"}
+        assert "002-packet.md" in cap["prompt"]
+        s = relay.read_session("e1")
+        assert s["mcp"] == ["linear"] and s["status"] == "busy" and s["current_packet"] == 2
+
+    def test_send_uncovered_without_claude_session_refuses(self, relay, tmp_path):
+        self._mk_exec(relay, mcp="none", claude_session=None)
+        with pytest.raises(SystemExit) as ei:
+            self._send(relay, tmp_path, "MCP: linear\nnext")
+        assert "process start" in str(ei.value)
+
+    def test_send_uncovered_unknown_server_refuses_before_killing(self, relay, tmp_path):
+        self._mk_exec(relay, mcp="none")
+        with mock.patch.object(relay, "_kill_and_wait") as kill:
+            with pytest.raises(SystemExit) as ei:
+                self._send(relay, tmp_path, "MCP: gmail\nnext")
+        assert "gmail" in str(ei.value)
+        kill.assert_not_called()
+        assert relay.read_session("e1")["mcp"] == "none"  # untouched
+
+    def test_when_idle_queue_refuses_uncovered(self, relay, tmp_path):
+        self._mk_exec(relay, mcp="none")
+        s = relay.read_session("e1"); s["status"] = "busy"; relay.write_session("e1", s)
+        (relay.packets_dir("e1") / "001-report.md").unlink()
+        p = tmp_path / "next.md"; p.write_text("MCP: linear\nnext")
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay, "session_pid_alive", return_value=True):
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_send(SimpleNamespace(session_id="e1", packet=str(p), when_idle=True))
+        assert "without --when-idle" in str(ei.value)
+
+    def test_resume_with_mcp_flag_updates_spec(self, relay, tmp_path):
+        self._mk_exec(relay, mcp="none")
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay, "session_pid_alive", return_value=False), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123), \
+             mock.patch.object(relay, "read_iterm_id", return_value=None), \
+             mock.patch.object(relay, "_ensure_tab_label", return_value=True), \
+             mock.patch.object(relay, "_launch_survived", return_value=True), \
+             mock.patch.object(relay, "conversation_transcript_exists", return_value=None):
+            relay.cmd_resume(SimpleNamespace(session_id="e1", force=False, mcp="inherit"))
+        assert cap["resume_id"] == "cs-x" and cap["mcp_flags"] == []
+        assert relay.read_session("e1")["mcp"] == "inherit"
+
+
+class TestPacketMcpLineIgnoresSeed:
+    def test_seed_territory_mcp_field_is_not_a_declaration(self, relay, tmp_path):
+        # A retired session's successor seed carries "- MCP set: …" in its Territory block; appended
+        # seed context must never be read as the NEW packet's MCP declaration.
+        seed = tmp_path / "successor-seed.md"
+        seed.write_text("# Successor seed — old-1\n\n## Territory\n\n- MCP set: linear\n- MCP: (unrecorded)\n")
+        pkt = tmp_path / "packet.md"; pkt.write_text("# New task\n\ndo it")
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt),
+                model=None, name="s1", scope=None, skip_perms=None, pane=None, seed=str(seed)))
+        assert cap["mcp_flags"] == ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+        assert relay.read_session("s1")["mcp"] == "none"

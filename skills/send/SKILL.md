@@ -23,6 +23,12 @@ shot (full context + staged work back) — so you do NOT need `/relay:resume` fi
 closed/dead session with NO captured conversation needs a fresh `/relay:spawn`. Run
 `/relay:check $session_id` first if unsure of status.
 
+**Packet needs an MCP server the executor wasn't launched with?** Just declare it in the packet
+(`MCP: linear` / `MCP: inherit`, same as spawn). MCP servers load at process start, so relay
+relaunches that executor's SAME conversation (`--resume`, context and staged work intact) with the
+wider set and delivers the packet in one shot — no manual resume. Not possible via `--when-idle`
+(queued delivery types into the live process) — send it plainly once idle.
+
 **Busy target? Queue it with `--when-idle`** instead of waiting or retrying:
 
 `${CLAUDE_PLUGIN_ROOT}/bin/relay send $session_id $packet --when-idle`

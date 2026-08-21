@@ -1465,6 +1465,48 @@ def normalize_mcp_spec(raw):
     return normalize_mcp_spec(s.split(","))
 
 
+PACKET_MCP_RE = re.compile(r"^\s*(?:[-*>]\s*)?\**\s*MCP\s*\**\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def packet_mcp_spec(body):
+    """The MCP set a PACKET declares, or None if it doesn't. A packet is the single source of truth
+    for what its executor needs: a line `MCP: linear` / `MCP: linear, chrome-devtools` /
+    `MCP: inherit` / `MCP: none` anywhere in the authored body (typically the header; a leading
+    `-`/`*`/bold is tolerated). First such line wins. The lead writes the packet, so it already
+    knows whether the task needs a server — no flag to remember, no config to edit, no classifier
+    call. Code fences are NOT skipped on purpose: a packet quoting `MCP: x` in an example is rare,
+    and a false positive only costs a relaunch/warning, never a missing tool."""
+    if not body:
+        return None
+    m = PACKET_MCP_RE.search(body)
+    return normalize_mcp_spec(m.group(1)) if m else None
+
+
+def mcp_covers(have, need):
+    """True if an executor launched with MCP set `have` satisfies a packet needing `need`.
+    need None/"none" → always; have "inherit" → always; have "none" → only if need is none;
+    lists → need ⊆ have; need "inherit" needs have "inherit"."""
+    need = normalize_mcp_spec(need)
+    have = normalize_mcp_spec(have)
+    if need == "none" or have == "inherit":
+        return True
+    if have == "none" or need == "inherit":
+        return False
+    return set(need) <= set(have)
+
+
+def mcp_union(have, need):
+    """Smallest spec covering both — what a relaunch should use when `have` doesn't cover `need`."""
+    have = normalize_mcp_spec(have); need = normalize_mcp_spec(need)
+    if "inherit" in (have, need):
+        return "inherit"
+    if have == "none":
+        return need
+    if need == "none":
+        return have
+    return normalize_mcp_spec(list(have) + list(need))
+
+
 def mcp_spec_label(spec):
     """Short human form for `relay list`/ledgers: none | inherit | linear,chrome."""
     spec = normalize_mcp_spec(spec)

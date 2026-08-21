@@ -872,6 +872,8 @@ def _misfire_locator(outcome):
 
 def cmd_spawn(args):
     body = Path(args.packet).read_text()
+    authored_body = body  # the lead's own text — the packet `MCP:` line is read from THIS, never
+                          # from appended context (a successor seed's territory block, say)
     warn_missing_preconditions(body, "spawning")
     # A successor seed is inherited CONTEXT appended to the packet body, before the GATES footer.
     # (After the Preconditions nag on purpose: the nag judges the AUTHORED packet, and a seed
@@ -914,13 +916,25 @@ def cmd_spawn(args):
     # `--mcp` (bare → inherit; "none"; "a,b" allowlist) wins, else config executor_mcp (default
     # "none" — strict mode, zero servers). Resolved BEFORE files are written so an unknown allowlist
     # name refuses the spawn cleanly instead of launching an executor missing its tool.
-    mcp_spec = lead_guard.normalize_mcp_spec(
-        getattr(args, "mcp", None) if getattr(args, "mcp", None) is not None else cfg.get("executor_mcp", "none"))
+    # Precedence: --mcp flag > the packet's own `MCP:` line (lead_guard.packet_mcp_spec — the packet
+    # is the source of truth for what its executor needs) > config default.
+    packet_mcp = lead_guard.packet_mcp_spec(authored_body)
+    if getattr(args, "mcp", None) is not None:
+        mcp_spec, mcp_src = lead_guard.normalize_mcp_spec(args.mcp), "--mcp"
+    elif packet_mcp is not None:
+        mcp_spec, mcp_src = packet_mcp, "packet MCP: line"
+    else:
+        mcp_spec, mcp_src = lead_guard.normalize_mcp_spec(cfg.get("executor_mcp", "none")), "config"
+    if packet_mcp is not None and getattr(args, "mcp", None) is not None and packet_mcp != mcp_spec:
+        print(c(f"  ⚠ packet declares MCP: {lead_guard.mcp_spec_label(packet_mcp)} but --mcp "
+                f"{lead_guard.mcp_spec_label(mcp_spec)} overrides it", "red"))
     try:
         mcp_flags = lead_guard.mcp_cli_flags(mcp_spec, state_root=STATE_ROOT, exec_name=session_id,
                                              cwd=worktree)
     except ValueError as e:
-        sys.exit(f"spawn: --mcp: {e}")
+        sys.exit(f"spawn: MCP ({mcp_src}): {e}")
+    if mcp_spec != "none":
+        print(f"  MCP: {lead_guard.mcp_spec_label(mcp_spec)} (from {mcp_src})")
 
     auto_trust(worktree)
     label = f"[Exec] {session_id}"  # role-prefixed: exec tabs and lead tabs are told apart at a glance
@@ -1193,6 +1207,8 @@ def cmd_restart(args):
         sys.exit(f"cannot restart '{sid}': packet {n:03d} not found at {packet_path}")
     pointer = build_pointer_message(str(packet_path), packet_summary(packet_path.read_text()))
     s = _maybe_adopt(sid, s)
+    if getattr(args, "mcp", None) is not None:
+        s["mcp"] = lead_guard.normalize_mcp_spec(args.mcp)   # _relaunch applies it
     pid, label = _relaunch(sid, s, pointer, session_uuid=str(uuid.uuid4()))
     append_ledger("restarted", session_id=sid, packet=n)
     print(f"restarted '{sid}' (tab '{label}', pid {pid}) — re-running packet {n:03d} as a fresh session")
@@ -1335,6 +1351,8 @@ def cmd_resume(args):
              "intact. Pick up your packet where you left off, finish it, then write your report to "
              "the same report path as before.")
     s = _maybe_adopt(sid, s)
+    if getattr(args, "mcp", None) is not None:
+        s["mcp"] = lead_guard.normalize_mcp_spec(args.mcp)   # _relaunch applies it (MCP is per-process)
     pid, label = _relaunch(sid, s, nudge, resume_id=cs)
     append_ledger("resumed", session_id=sid, claude_session=cs)
     # _relaunch has already written a `busy` marker off the freshly-read pid. Only report success
@@ -1371,6 +1389,14 @@ def cmd_send(args):
         if getattr(args, "when_idle", False):
             body = Path(args.packet).read_text()
             warn_missing_preconditions(body, "queueing")
+            need_mcp = lead_guard.packet_mcp_spec(body)
+            have_mcp = s.get("mcp") if s.get("mcp") is not None else lead_guard.load_config(STATE_ROOT).get("executor_mcp", "none")
+            if need_mcp is not None and not lead_guard.mcp_covers(have_mcp, need_mcp):
+                sys.exit(f"packet declares MCP: {lead_guard.mcp_spec_label(need_mcp)} but '{args.session_id}' "
+                         f"runs with MCP {lead_guard.mcp_spec_label(have_mcp)} — queued delivery types into the "
+                         f"live process and cannot widen its MCP set (servers load at process start). "
+                         f"Send it without --when-idle once the session is idle (relay will relaunch "
+                         f"its conversation with the wider set), or drop the MCP line.")
             item = enqueue_packet(args.session_id, body, args.packet,
                                   heavy_override=getattr(args, "heavy_override", None))
             pending = len(read_queue(args.session_id))
@@ -1424,6 +1450,32 @@ def cmd_send(args):
     n = next_packet_number(args.session_id)
     body = Path(args.packet).read_text()
     warn_missing_preconditions(body, "sending")
+    # MCP coverage (executor MCP policy): MCP servers load at PROCESS start and `--resume` does not
+    # restore them (verified live, tests/test_e2e_mcp.py), so a follow-up packet declaring `MCP: x`
+    # that this executor wasn't launched with can only be honoured by relaunching the SAME
+    # conversation with the wider set. Decide that here, before any typing: `mcp_relaunch` forces
+    # the resume-fallback path below (kill tab → `--resume` with new flags → deliver packet),
+    # which is exactly the already-proven "tab gone" route. Only idle/reported sessions reach here.
+    need_mcp = lead_guard.packet_mcp_spec(body)
+    have_mcp = s.get("mcp") if s.get("mcp") is not None else lead_guard.load_config(STATE_ROOT).get("executor_mcp", "none")
+    mcp_relaunch = False
+    if need_mcp is not None and not lead_guard.mcp_covers(have_mcp, need_mcp):
+        if not s.get("claude_session"):
+            sys.exit(f"packet declares MCP: {lead_guard.mcp_spec_label(need_mcp)} but session "
+                     f"'{args.session_id}' was launched with MCP {lead_guard.mcp_spec_label(have_mcp)} and has "
+                     f"no captured Claude session to relaunch — MCP servers only load at process start. "
+                     f"Drop the MCP line, or `relay spawn` a fresh executor for this packet.")
+        widened = lead_guard.mcp_union(have_mcp, need_mcp)
+        try:  # validate the allowlist NOW (unknown names refuse before anything is killed)
+            lead_guard.mcp_cli_flags(widened, state_root=STATE_ROOT, exec_name=args.session_id, cwd=s["worktree"])
+        except ValueError as e:
+            sys.exit(f"send: packet MCP line: {e}")
+        s["mcp"] = widened
+        write_session(args.session_id, s)
+        mcp_relaunch = True
+        print(f"  packet needs MCP {lead_guard.mcp_spec_label(need_mcp)}; executor has "
+              f"{lead_guard.mcp_spec_label(have_mcp)} — relaunching its conversation with "
+              f"{lead_guard.mcp_spec_label(widened)} (context intact)")
     report_path = str(packets_dir(args.session_id) / f"{n:03d}-report.md")
     diff_cmd = f"{RELAY_BIN} diff {args.session_id}"
     diff_path = packets_dir(args.session_id) / f"{n:03d}-diff.html"
@@ -1433,8 +1485,8 @@ def cmd_send(args):
                                         transport_v2_step(args.session_id, n, s.get("owner_lead"))))
 
     pointer = build_pointer_message(str(packet_path), packet_summary(body))
-    ok = False if tab_gone else term_backend(s).send(s["tab_label"], pointer,
-                                                     s.get("iterm_session"), s.get("pid"))
+    ok = False if (tab_gone or mcp_relaunch) else term_backend(s).send(s["tab_label"], pointer,
+                                                                       s.get("iterm_session"), s.get("pid"))
     if not ok:
         # (B) The tab is gone. If we pinned this session's Claude conversation at spawn, don't
         # force a cold spawn — RESUME the conversation and deliver the new packet in one shot via
@@ -1452,10 +1504,12 @@ def cmd_send(args):
             s["current_packet"] = n
             s["updated"] = now()
             write_session(args.session_id, s)
-            append_ledger("packet_sent", session_id=args.session_id, packet=n, via="resume")
+            append_ledger("packet_sent", session_id=args.session_id, packet=n,
+                          via="resume" + ("-mcp" if mcp_relaunch else ""))
             note = (f"session '{args.session_id}' was {prev_status}"
                     if prev_status in ("closed", "dead")
-                    else f"tab '{s['tab_label']}' was gone")
+                    else (f"MCP set widened to {lead_guard.mcp_spec_label(s.get('mcp'))}" if mcp_relaunch
+                          else f"tab '{s['tab_label']}' was gone"))
             print(f"{note} — resumed with full context and delivered packet {n:03d}")
             return
         # No captured Claude session (spawned before session-id capture) → today's behavior.
@@ -2783,7 +2837,7 @@ def build_successor_seed(session_id, s, entries, generated):
          "## Territory", ""]
     for label, val in (("Worktree", s.get("worktree")), ("Topic", s.get("topic")),
                        ("Scope", s.get("scope")), ("Model", s.get("model")),
-                       ("MCP", lead_guard.mcp_spec_label(s.get("mcp")) if s.get("mcp") is not None else None),
+                       ("MCP set", lead_guard.mcp_spec_label(s.get("mcp")) if s.get("mcp") is not None else None),
                        ("Retired session", session_id)):
         L.append(f"- {label}: {val or '(unrecorded)'}")
     L += [f"- Packets worked: {len(entries)} ({reported} reported, {unreported} unreported)",
@@ -3816,11 +3870,16 @@ def main():
     rs = sub.add_parser("restart")
     rs.add_argument("session_id")
     rs.add_argument("--force", action="store_true", help="restart even if the process still looks alive")
+    rs.add_argument("--mcp", nargs="?", const="inherit", default=None, metavar="SPEC",
+                    help="change the executor's MCP set for the fresh process (inherit | none | a,b)")
     rs.set_defaults(func=cmd_restart)
 
     rsm = sub.add_parser("resume")
     rsm.add_argument("session_id")
     rsm.add_argument("--force", action="store_true", help="resume even if the process still looks alive")
+    rsm.add_argument("--mcp", nargs="?", const="inherit", default=None, metavar="SPEC",
+                    help="change the executor's MCP set for the resumed process (inherit | none | a,b) — "
+                         "MCP servers load per process, so a resume is when the set can change")
     rsm.set_defaults(func=cmd_resume)
 
     pr = sub.add_parser("prune")

@@ -2946,3 +2946,26 @@ class TestExecutorMcpPolicy:
 
     def test_missing_claude_json_is_not_fatal(self, tmp_path):
         assert lg.known_mcp_servers(cwd=str(tmp_path), claude_json=tmp_path / "nope.json") == {}
+
+
+class TestPacketMcpLine:
+    """A packet's `MCP:` line is the source of truth for what its executor needs."""
+    def test_parse_variants(self):
+        f = lg.packet_mcp_spec
+        assert f("# Task\nMCP: linear\nbody") == ["linear"]
+        assert f("- **MCP**: linear, chrome-devtools") == ["chrome-devtools", "linear"]
+        assert f("mcp: inherit") == "inherit"
+        assert f("MCP: none") == "none"
+        assert f("no line here") is None and f("") is None and f(None) is None
+        assert f("MCP: a\nMCP: b") == ["a"]  # first wins
+
+    def test_covers(self):
+        c = lg.mcp_covers
+        assert c("none", None) and c("none", "none") and c("inherit", ["x"]) and c("inherit", "inherit")
+        assert not c("none", ["linear"]) and not c(["linear"], "inherit") and not c(["linear"], ["gmail"])
+        assert c(["linear", "gmail"], ["linear"])
+
+    def test_union(self):
+        u = lg.mcp_union
+        assert u("none", ["a"]) == ["a"] and u(["a"], "none") == ["a"]
+        assert u(["a"], ["b"]) == ["a", "b"] and u("none", "inherit") == "inherit" and u(["a"], "inherit") == "inherit"
