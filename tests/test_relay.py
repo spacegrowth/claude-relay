@@ -5688,3 +5688,147 @@ class TestPacketMcpLineIgnoresSeed:
                 model=None, name="s1", scope=None, skip_perms=None, pane=None, seed=str(seed)))
         assert cap["mcp_flags"] == ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
         assert relay.read_session("s1")["mcp"] == "none"
+
+
+class TestAutoCloseSweep:
+    """auto_close_sweep parks finished executors (landed / idle) via the real cmd_close/cmd_retire,
+    against a real tmp git worktree; terminal interactions mocked."""
+    def _repo(self, tmp_path):
+        wt = tmp_path / "wt"; wt.mkdir()
+        import subprocess as sp
+        sp.run(["git", "-C", str(wt), "init", "-q"], check=True)
+        sp.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "--allow-empty", "-m", "init"], check=True)
+        return wt
+
+    def _exec(self, relay, wt, sid="e1", age=600, surfaced=True, claimed=("src/a.py",), keep=False,
+              owner="lead-1", report_body=None):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": str(wt), "topic": "t", "scope": "t",
+            "tab_label": f"[Exec] {sid}", "model": "sonnet", "pid": None, "iterm_session": None,
+            "claude_session": "cs-1", "status": "reported", "current_packet": 1, "owner_lead": owner,
+            "keep": keep, "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("do it")
+        rp = relay.packets_dir(sid) / "001-report.md"
+        rp.write_text(report_body if report_body is not None else
+                      "## TL;DR\n- outcome: done\n\n## What changed\n" + "".join(f"- `{p}`\n" for p in claimed))
+        t = time.time() - age
+        os.utime(rp, (t, t))
+        relay.lead_guard.write_marker(relay.STATE_ROOT, owner, tab_label="[Lead] x")
+        if surfaced:
+            relay.lead_guard.mark_surfaced(relay.STATE_ROOT, owner, [f"{sid}:1"])
+
+    def _sweep(self, relay, **kw):
+        with mock.patch.object(relay, "_kill_and_wait"), \
+             mock.patch.object(relay.iterm, "close", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=False), \
+             mock.patch.object(relay, "_transcript_mb_for", return_value=kw.pop("mb", 0.1)):
+            return relay.auto_close_sweep("test", **kw)
+
+    def test_landed_closes(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        self._exec(relay, wt)                                   # claimed src/a.py, worktree clean → landed
+        acted = self._sweep(relay)
+        assert acted == [("e1", "close", "landed")]
+        s = relay.read_session("e1")
+        assert s["status"] == "closed" and s["auto_closed"] == "landed"
+        assert any(e.get("event") == "auto_closed" for e in map(json.loads, relay.LEDGER.read_text().splitlines()))
+
+    def test_staged_work_still_present_is_not_landed(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        (wt / "src").mkdir(); (wt / "src" / "a.py").write_text("x")   # untracked claimed file = still here
+        self._exec(relay, wt)
+        assert self._sweep(relay) == [] and relay.read_session("e1")["status"] == "reported"
+
+    def test_not_surfaced_never_parks(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        self._exec(relay, wt, surfaced=False, age=5 * 3600)
+        assert self._sweep(relay) == []
+
+    def test_idle_timer_closes_without_claims(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        self._exec(relay, wt, report_body="## TL;DR\n- outcome: researched, nothing to stage\n", age=61 * 60)
+        assert self._sweep(relay) == [("e1", "close", "idle 61m")]
+
+    def test_idle_under_threshold_waits(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        self._exec(relay, wt, report_body="## TL;DR\n- outcome: x\n", age=30 * 60)
+        assert self._sweep(relay) == []
+
+    def test_keep_and_queue_and_config_off(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        self._exec(relay, wt, keep=True)
+        assert self._sweep(relay) == []
+        self._exec(relay, wt, sid="e2")
+        (relay.STATE_ROOT / "e2" / "queue.json").write_text(json.dumps({"items": [{"id": 1, "body_path": "x"}]}))
+        assert self._sweep(relay, sids=["e2"]) == []
+        self._exec(relay, wt, sid="e3")
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps({"auto_close": False}))
+        assert self._sweep(relay, sids=["e3"]) == []
+
+    def test_lead_scope_only_parks_own_executors(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        self._exec(relay, wt, sid="mine", owner="lead-1")
+        self._exec(relay, wt, sid="theirs", owner="lead-2")
+        acted = self._sweep(relay, lead_sid="lead-1")
+        assert [a[0] for a in acted] == ["mine"]
+
+    def test_heavy_retires_with_seed(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        self._exec(relay, wt)
+        acted = self._sweep(relay, mb=99.0)
+        assert acted == [("e1", "retire", "landed")]
+        s = relay.read_session("e1")
+        assert s["status"] == "superseded" and (relay.STATE_ROOT / "e1" / relay.SEED_FILENAME).exists()
+
+    def test_list_renders_closed_auto_and_pin(self, relay, tmp_path, capsys):
+        wt = self._repo(tmp_path)
+        self._exec(relay, wt)
+        self._exec(relay, wt, sid="pinned", keep=True)
+        with mock.patch.object(relay, "_kill_and_wait"), \
+             mock.patch.object(relay.iterm, "close", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=False), \
+             mock.patch.object(relay, "_transcript_mb_for", return_value=0.1), \
+             mock.patch.object(relay, "session_pid_alive", return_value=False):
+            relay.cmd_list(SimpleNamespace(json=False, lead=None, all=True, closed=True))
+        out = capsys.readouterr().out
+        assert "auto-closed 'e1' (landed)" in out
+        assert "closed (auto)" in out
+        assert "pinned" in out and "reported" in out
+
+    def test_keep_command_toggles(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        self._exec(relay, wt)
+        relay.cmd_keep(SimpleNamespace(session_id="e1", off=False))
+        assert relay.read_session("e1")["keep"] is True
+        relay.cmd_keep(SimpleNamespace(session_id="e1", off=True))
+        assert relay.read_session("e1")["keep"] is False
+
+    def test_spawn_keep_flag_recorded(self, relay, tmp_path):
+        pkt = tmp_path / "p.md"; pkt.write_text("do")
+        with mock.patch.object(relay.iterm, "spawn"), mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt), model=None,
+                                            name="k1", scope=None, skip_perms=None, pane=None, keep=True))
+        assert relay.read_session("k1")["keep"] is True
+
+
+class TestLeadStopHookTriggersAutoClose:
+    def test_hook_invokes_sweep_for_its_own_lead(self, tmp_path, monkeypatch):
+        import importlib.machinery, importlib.util, io as _io
+        path = str(REPO_ROOT / "hooks" / "stop_lead_watch.py")
+        loader = importlib.machinery.SourceFileLoader("stop_hook_mod_ac", path)
+        spec = importlib.util.spec_from_file_location("stop_hook_mod_ac", path, loader=loader)
+        mod = importlib.util.module_from_spec(spec); loader.exec_module(mod)
+        root = tmp_path / ".relay-tasks"
+        import lead_guard as lg
+        lg.write_marker(root, "lead-1")
+        monkeypatch.setattr(mod, "STATE_ROOT", str(root))
+        monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
+        calls = []
+        monkeypatch.setattr(mod.subprocess, "run", lambda cmd, **k: calls.append(list(cmd)) or SimpleNamespace(returncode=0))
+        monkeypatch.setattr("sys.stdin", _io.StringIO(json.dumps({"session_id": "lead-1", "cwd": str(tmp_path)})))
+        with pytest.raises(SystemExit):
+            mod.main()
+        assert any(c[1:] == ["_auto-close-sweep", "--lead", "lead-1"] for c in calls)

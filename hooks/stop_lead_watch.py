@@ -225,6 +225,17 @@ def main():
             pass
         cfg = lg.load_config(STATE_ROOT)
 
+        # Auto-close (lead_guard "auto-close policy"): every lead turn-end is the "lead thinks"
+        # beat — park this lead's finished executors (landed / idle past threshold). Delegated to
+        # the CLI so there is ONE implementation (relay list/check run the same sweep). Best-effort,
+        # bounded, silent here: the ledger records it and `relay list` shows `closed (auto)`.
+        if cfg.get("auto_close", True):
+            try:
+                subprocess.run([RELAY_BIN, "_auto-close-sweep", "--lead", sid],
+                               capture_output=True, timeout=25)
+            except Exception:
+                pass
+
         transcript_path = payload.get("transcript_path")
 
         # #22: promote announced-but-unproven wakes once delivery is PROVEN.

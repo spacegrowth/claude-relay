@@ -10,6 +10,7 @@ Commands:
   relay check [<session_id> | --all] [--json]
   relay status [session_id] [--statusline]    # read-only, statusline-safe one-liner; never writes
   relay list [--lead <session_id> | --all] [--json]
+  relay keep <session_id> [--off]             # pin/unpin against auto-close (finished executors are parked automatically)
   relay report <session_id> [--packet N]      # print an executor's report, framed in green
   relay verify <session_id> [--packet N] [--rerun]   # machine-check a report against its staged
                                               # reality: MALFORMED/MISMATCH/INCONCLUSIVE/COUNTS-MATCH
@@ -25,6 +26,7 @@ Commands:
 """
 import argparse
 import contextlib
+import io
 import json
 import os
 import re
@@ -1033,6 +1035,7 @@ def cmd_spawn(args):
                                   # what let `relay list` render `-` for a live executor)
         "mcp": mcp_spec,          # resolved MCP set ("none" | "inherit" | [names]) — resume/restart
                                   # relaunch with the same set, never silently inheriting
+        "keep": bool(getattr(args, "keep", False)),  # pinned: auto-close never parks it (relay keep)
         "pid": pid,
         "pid_started": pid_start_time(pid) if pid else None,  # pid-reuse guard (see session_pid_alive)
         "iterm_session": iterm_session,
@@ -1833,6 +1836,128 @@ def c(text, *styles):
     return "".join(_ANSI[s] for s in styles) + text + _ANSI["reset"]
 
 
+def _git_dirty_paths(worktree):
+    """Paths with ANY working-tree/index change (staged, modified, untracked, renamed-to) — what
+    "this executor's work is still sitting here" looks like. Empty on any git failure (a non-repo
+    worktree must not read as 'landed' — it reads as 'claimed paths are dirty = unknown' instead,
+    so callers treat a failure as NOT landed; see auto_close_sweep)."""
+    try:
+        r = subprocess.run(["git", "-C", str(worktree), "status", "--porcelain", "--untracked-files=all"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        out = set()
+        for line in r.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            path = line[3:]
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            out.add(path.strip().strip('"'))
+        return out
+    except Exception:
+        return None
+
+
+def auto_close_sweep(trigger, sids=None, lead_sid=None):
+    """Park finished executors (lead_guard "auto-close policy"). Deterministic, best-effort, never
+    raises: evaluates lead_guard.auto_close_decision for each candidate and delegates the teardown
+    to cmd_close / cmd_retire so auto-close can never drift from a manual one. `sids` limits the
+    sweep; `lead_sid` limits it to that lead's own executors (the hook path — a lead only parks what
+    it owns). Callers are expected to have refreshed liveness (_check_one) first. Returns the list
+    of (sid, action, reason) it acted on."""
+    acted = []
+    try:
+        cfg = lead_guard.load_config(STATE_ROOT)
+        if not cfg.get("auto_close", True):
+            return acted
+        idle_minutes = cfg.get("auto_close_idle_minutes", 60)
+        threshold = _heaviness_threshold_mb()
+        for sid in (sids if sids is not None else all_session_ids()):
+            try:
+                s = read_session(sid)
+                if not s or s.get("status") != "reported" or s.get("keep"):
+                    continue
+                owner = s.get("owner_lead")
+                if not owner or (lead_sid and owner != lead_sid):
+                    continue  # unowned: no lead could have seen the report → never auto-park
+                n = s.get("current_packet")
+                report = packets_dir(sid) / f"{n:03d}-report.md"
+                if not report.exists():
+                    continue
+                report_age = time.time() - report.stat().st_mtime
+                surfaced = f"{sid}:{n}" in lead_guard.load_surfaced(STATE_ROOT, owner)
+                queued = len(read_queue(sid))
+                claimed, _scoped = report_verify.claimed_paths(report.read_text())
+                dirty = _git_dirty_paths(s.get("worktree") or "")
+                if dirty is None:
+                    claimed = []  # git unreadable → the landed path is unavailable, timer only
+                heavy = _is_heavy(_transcript_mb_for(s.get("claude_session")), threshold)
+                decision = lead_guard.auto_close_decision(
+                    s, report_age=report_age, surfaced=surfaced, queued=queued, claimed=claimed,
+                    dirty=dirty, heavy=heavy, idle_minutes=idle_minutes)
+                if not decision:
+                    continue
+                action, reason = decision
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    if action == "retire":
+                        cmd_retire(SimpleNamespace(session_id=sid, force=False, keep_tab=False))
+                    else:
+                        cmd_close(SimpleNamespace(session_id=sid, supersede=None, self_session=None,
+                                                  keep_tab=False))
+                s2 = read_session(sid) or s
+                s2["auto_closed"] = reason
+                s2["updated"] = now()
+                write_session(sid, s2)
+                append_ledger("auto_closed", session_id=sid, action=action, reason=reason,
+                              trigger=trigger)
+                acted.append((sid, action, reason))
+            except Exception as e:
+                append_ledger("auto_close_error", session_id=sid, error=str(e)[:200], trigger=trigger)
+    except Exception:
+        pass
+    return acted
+
+
+def _print_auto_closed(acted):
+    for sid, action, reason in acted:
+        verb = "retired" if action == "retire" else "closed"
+        print(c(f"  🛏 auto-{verb} '{sid}' ({reason}) — `relay send {sid} <packet>` resumes "
+                f"it with full context", "dim"))
+
+
+def cmd_keep(args):
+    """Pin / unpin an executor against auto-close (lead_guard "auto-close policy")."""
+    s = read_session(args.session_id)
+    if not s:
+        sys.exit(f"no such session: {args.session_id}")
+    s["keep"] = not args.off
+    s["updated"] = now()
+    write_session(args.session_id, s)
+    append_ledger("keep", session_id=args.session_id, keep=s["keep"])
+    print(f"{'pinned' if s['keep'] else 'unpinned'} '{args.session_id}' — auto-close will "
+          f"{'leave it alone' if s['keep'] else 'park it once finished'}")
+
+
+def cmd_auto_close_sweep(args):
+    """Internal: the lead Stop hook's trigger (hooks/stop_lead_watch.py). Refreshes liveness for the
+    lead's own executors, then sweeps. Fail-open; prints one line per action (the hook discards
+    stdout, the ledger keeps it)."""
+    try:
+        lead = getattr(args, "lead", None)
+        sids = []
+        for sid in all_session_ids():
+            s = read_session(sid)
+            if s and (not lead or s.get("owner_lead") == lead) and s.get("status") not in (
+                    "dead", "superseded", "closed", LAUNCH_FAILED):
+                _check_one(sid)
+                sids.append(sid)
+        _print_auto_closed(auto_close_sweep("lead-stop", sids=sids, lead_sid=lead))
+    except Exception:
+        pass
+
+
 def cmd_check(args):
     ids = all_session_ids() if args.all else [args.session_id]
     # The NET delivery trigger for the --when-idle queue. The PRIMARY one is the executor's own
@@ -1855,9 +1980,21 @@ def cmd_check(args):
         if "error" not in s:
             _mark_report_surfaced(s)  # the lead just looked at this report — dedup it (§5b)
             s["queued"] = len(read_queue(s["session_id"]))
+    # Auto-close (lead_guard "auto-close policy"): check is the lead's own "where are things"
+    # beat, so finished executors get parked here too. The sweep re-reads sessions from disk, so
+    # the freshly-stamped surfaced set above is already visible to it; the result rows keep the
+    # status they were checked at.
+    with sink:
+        acted = auto_close_sweep("check", sids=[sid for sid in ids if sid])
     if args.json:
+        for s in results:
+            hit = next((a for a in acted if a[0] == s.get("session_id")), None)
+            if hit:
+                s["auto_closed"] = hit[2]
+                s["status"] = "superseded" if hit[1] == "retire" else "closed"
         print(json.dumps(results, indent=2))
         return
+    _print_auto_closed(acted)
     for s in results:
         if "error" in s:
             print(f"{s['session_id']}: {c(s['error'], 'red')}")
@@ -2208,6 +2345,14 @@ def cmd_list(args):
         n = s["current_packet"]
         report = packets_dir(sid) / f"{n:03d}-report.md"
         rows.append({**s, "reported": report.exists()})
+    # Auto-close (lead_guard "auto-close policy") rides the liveness refresh: list is where idle
+    # finished executors are NOTICED, so it's where they get parked. Acted-on rows are re-read so
+    # the table shows them as closed (auto) instead of a stale `reported`.
+    acted = auto_close_sweep("list", sids=[r["session_id"] for r in rows])
+    if acted:
+        hit = {a[0] for a in acted}
+        rows = [({**read_session(r["session_id"]), "reported": r["reported"]} if r["session_id"] in hit else r)
+                for r in rows]
     if not show_all:
         rows = [s for s in rows if s.get("owner_lead") in (None, lead_sid)]
 
@@ -2390,6 +2535,7 @@ def cmd_list(args):
         print()
 
     print(c("EXECUTORS", "bold"))
+    _print_auto_closed(acted)
     if not rows:
         print("(no executor sessions)")
         return
@@ -2400,6 +2546,10 @@ def cmd_list(args):
         if st == "busy":
             elapsed = _busy_elapsed(s)
             st = f"busy {int(elapsed / 60)}m" if elapsed is not None else "busy ?"
+        elif st in ("closed", "superseded") and s.get("auto_closed"):
+            st = f"{st[:6]} (auto)"   # "closed (auto)" / "supers (auto)" — fits the STATUS cap
+        elif st == "reported" and s.get("keep"):
+            st = "reported \U0001f4cc"  # pinned: auto-close leaves it alone
         rendered_statuses.append(st)
     # §6e e1: one transcript-MB reading per executor, computed up front (same memoize-once
     # rationale the LEADS liveness column uses above) — the table needs it in both the MB cell and
@@ -3711,6 +3861,8 @@ def main():
                          "none): bare --mcp = inherit everything the CLI would load; --mcp none = "
                          "strict zero servers; --mcp linear,chrome-devtools = strict allowlist of "
                          "servers configured in ~/.claude.json / <worktree>/.mcp.json")
+    sp.add_argument("--keep", action="store_true",
+                    help="pin this executor: auto-close never parks it (see `relay keep`)")
     sp.add_argument("--name")
     sp.add_argument("--scope")
     sp.add_argument("--seed", metavar="PATH_OR_SID",
@@ -3755,6 +3907,15 @@ def main():
     dq = sub.add_parser("_deliver-queued", help=argparse.SUPPRESS)  # internal: see cmd_deliver_queued
     dq.add_argument("session_id")
     dq.set_defaults(func=cmd_deliver_queued)
+
+    kp = sub.add_parser("keep", help="pin an executor so auto-close never parks it (--off to unpin)")
+    kp.add_argument("session_id")
+    kp.add_argument("--off", action="store_true", help="unpin")
+    kp.set_defaults(func=cmd_keep)
+
+    acs = sub.add_parser("_auto-close-sweep", help=argparse.SUPPRESS)  # internal: lead Stop hook trigger
+    acs.add_argument("--lead", help="only this lead's executors")
+    acs.set_defaults(func=cmd_auto_close_sweep)
 
     ck = sub.add_parser("check")
     ck.add_argument("session_id", nargs="?")
@@ -3926,6 +4087,7 @@ def main():
         "send": ["session_id"], "check": ["session_id"], "status": ["session_id"],
         "close": ["session_id", "supersede", "self_session"], "stop": ["session_id"],
         "retire": ["session_id"], "queue": ["session_id"], "_deliver-queued": ["session_id"],
+        "keep": ["session_id"], "_auto-close-sweep": ["lead"],
         "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
         "auto": ["session"],
         "diff": ["session_id"], "verify": ["session_id"], "focus": ["session_id"],

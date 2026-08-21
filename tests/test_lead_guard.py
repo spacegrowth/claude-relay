@@ -2969,3 +2969,42 @@ class TestPacketMcpLine:
         u = lg.mcp_union
         assert u("none", ["a"]) == ["a"] and u(["a"], "none") == ["a"]
         assert u(["a"], ["b"]) == ["a", "b"] and u("none", "inherit") == "inherit" and u(["a"], "inherit") == "inherit"
+
+
+class TestAutoCloseDecision:
+    """lead_guard.auto_close_decision — pure policy: park a reported, surfaced, unqueued, unpinned
+    executor when its work landed (claimed files clean) or it idled past the threshold."""
+    S = {"status": "reported"}
+
+    def _d(self, **kw):
+        base = dict(s=self.S, report_age=3600, surfaced=True, queued=0, claimed=["a.py"],
+                    dirty=set(), heavy=False, idle_minutes=60)
+        base.update(kw)
+        return lg.auto_close_decision(**base)
+
+    def test_defaults_are_on(self):
+        assert lg.LEAD_DEFAULTS["auto_close"] is True and lg.LEAD_DEFAULTS["auto_close_idle_minutes"] == 60
+
+    def test_landed_closes_after_grace(self):
+        assert self._d(report_age=200) == ("close", "landed")
+        assert self._d(report_age=30) is None                    # inside the grace window
+
+    def test_landed_needs_claimed_paths_clean(self):
+        assert self._d(report_age=200, dirty={"a.py"}) is None   # still staged/modified → not landed
+        assert self._d(report_age=200, dirty={"other.py"}) == ("close", "landed")
+        assert self._d(report_age=200, claimed=[]) is None       # nothing claimed → landed path unavailable
+
+    def test_idle_timer(self):
+        assert self._d(claimed=[], report_age=61 * 60) == ("close", "idle 61m")
+        assert self._d(claimed=[], report_age=59 * 60) is None
+        assert self._d(claimed=[], report_age=10 * 3600, idle_minutes=0) is None   # timer off
+
+    def test_guards(self):
+        assert self._d(surfaced=False) is None                   # lead never saw the report
+        assert self._d(queued=1) is None                         # a follow-up is waiting
+        assert self._d(s={"status": "reported", "keep": True}) is None
+        assert self._d(s={"status": "busy"}) is None
+        assert self._d(report_age=None) is None
+
+    def test_heavy_retires(self):
+        assert self._d(heavy=True) == ("retire", "landed")

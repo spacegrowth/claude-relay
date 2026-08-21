@@ -70,6 +70,16 @@ LEAD_DEFAULTS = {
                                   # that has its own five-condition gate (#16 phase 2) — see
                                   # report_verify.clearance, `relay verify --for-autocommit`, and
                                   # skills/mode/SKILL.md's stop-list.
+    "auto_close": True,           # park finished executors automatically (see "auto-close policy"
+                                  # below): an idle, REPORTED executor whose report the owning lead
+                                  # has already seen is closed once its work has landed (its
+                                  # claimed files are clean in the worktree — the lead committed or
+                                  # discarded them) or once it has sat idle past
+                                  # auto_close_idle_minutes. Closing is parking, not loss: `relay
+                                  # send` to a closed session resumes the same conversation.
+                                  # Heavy sessions are retired (seed written) instead of closed.
+    "auto_close_idle_minutes": 60,  # idle-after-report threshold for the timer path; 0 = timer off
+                                    # (the landed path still applies while auto_close is true)
     "executor_escalation": True,  # arm every spawned executor with the escalation Stop hook
                                   # (wake-watch design §9): once its report lands and it goes idle,
                                   # push a nudge into the owning lead's tab, once. A net UNDER the
@@ -1422,6 +1432,47 @@ def escalation_decision(state_root, exec_sid, packet, owner_lead):
         return "send"
     except Exception:
         return "owner-missing"
+
+
+# ---- auto-close policy -------------------------------------------------------------------------
+# Field observation (2026-08-21): executors finish, report, and then sit idle for hours because
+# nobody says `relay close` — tabs pile up, `relay list` fills with noise, and the live processes
+# hang around. Closing costs nothing that matters: the report is on disk, staged work stays in the
+# worktree, and `relay send` to a closed session auto-resumes the SAME conversation. So relay parks
+# them itself, on two deterministic signals, with no model call:
+#   landed — the report's claimed files are clean in the worktree (nothing staged/modified/
+#            untracked for them): the lead has committed or discarded the work. Immediate (after a
+#            short grace so a report written seconds ago isn't judged mid-stage).
+#   idle   — reported for longer than auto_close_idle_minutes.
+# Both REQUIRE that the owning lead has already surfaced the report (the wake dedup set) — relay
+# never parks a report nobody has looked at — and never touch busy/stalled/queued/pinned sessions.
+
+AUTO_CLOSE_LANDED_GRACE_SECONDS = 120
+
+
+def auto_close_decision(s, *, report_age, surfaced, queued, claimed, dirty, heavy,
+                        idle_minutes, grace=AUTO_CLOSE_LANDED_GRACE_SECONDS):
+    """PURE: should session record `s` be parked, and why? Returns (action, reason) with action
+    "close" | "retire" (retire when `heavy`, so the successor seed is written), or None.
+      report_age   seconds since its current report was written (None = no report)
+      surfaced     the owning lead has already seen that report (lead_guard surfaced set)
+      queued       number of --when-idle packets waiting (any → keep it)
+      claimed      paths the report claims under "What changed" (empty → landed path unavailable)
+      dirty        paths currently staged/modified/untracked in the worktree
+      heavy        transcript past the heaviness threshold → retire instead of close
+      idle_minutes timer threshold; 0/None disables the timer path"""
+    if not s or s.get("keep") or s.get("status") != "reported":
+        return None
+    if report_age is None or not surfaced or queued:
+        return None
+    reason = None
+    if claimed and report_age >= grace and not (set(claimed) & set(dirty or ())):
+        reason = "landed"
+    elif idle_minutes and report_age >= float(idle_minutes) * 60:
+        reason = f"idle {int(report_age // 60)}m"
+    if not reason:
+        return None
+    return ("retire" if heavy else "close"), reason
 
 
 # ---- executor MCP policy -----------------------------------------------------------------------

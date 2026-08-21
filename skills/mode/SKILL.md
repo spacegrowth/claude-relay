@@ -231,10 +231,13 @@ A lead message with no `🚦 [relay]` marker should be the exception, not the ru
 3. **Review**: when `/relay:check`/`/relay:list` shows `reported`, read the staged diff + report
    yourself, verify with evidence, then either commit it yourself (executors never commit) or
    send a fix-list packet. Watch for weakened tests, silent scope creep, unverified claims.
-   **Then offer to close it** — once you've committed an executor's work and don't need it for a
-   follow-up, ASK the user "done with `<X>` — close it?" and on their go run `/relay:close <X>`
-   (which closes its iTerm tab too). Never close unilaterally or auto-close; the user decides when a
-   tab goes. At the end of a fan-in you can offer to close the whole batch at once.
+   **Closing is automatic.** Once you've committed (or discarded) an executor's work, relay parks
+   it on its own — the next `/relay:check`, `/relay:list`, or your own turn-end sweeps finished
+   executors whose report you've already seen and whose claimed files are clean in the worktree
+   ("landed"), or that have idled past `auto_close_idle_minutes`. Closing is parking, not loss:
+   `/relay:send` to a closed session resumes the same conversation with full context. You don't
+   need to ask "close it?" — only close by hand (`/relay:close <X>`) when you want it gone NOW, and
+   pin one with `relay keep <X>` (or `spawn --keep`) when you know a follow-up is coming soon.
 4. **Own sign-off gates**: anything touching core logic/ledgers/parity tests needs the user's
    explicit approval — bring a recommendation, don't decide unilaterally. **Autonomous mode does
    not relax this gate** — it is on the stop-list above, unchanged, in every posture.

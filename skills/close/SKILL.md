@@ -15,6 +15,11 @@ routing gate deactivates for it): run `${CLAUDE_PLUGIN_ROOT}/bin/relay close --s
 
 If just closing an executor session: run `${CLAUDE_PLUGIN_ROOT}/bin/relay close $session_id`
 
+(Usually unnecessary: finished executors are **auto-closed** — once their report has been seen by
+you and their claimed files are clean in the worktree, or after `auto_close_idle_minutes` idle —
+and `relay send` to a closed session resumes it with full context. Close by hand only when you
+want it gone now; `relay keep <sid>` pins one against auto-close.)
+
 If superseding (e.g. a session's model wasn't strong enough and you spawned a replacement): run
 `${CLAUDE_PLUGIN_ROOT}/bin/relay close $session_id --supersede $superseded_by`
 

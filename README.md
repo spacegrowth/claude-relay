@@ -453,6 +453,26 @@ session something you'll actually do rather than piling one more packet onto it.
 Retire refuses on a session that's still busy with an unreported packet — that work would die
 unsummarised — unless you pass `--force` (the packet is then seeded as `NO REPORT`).
 
+### Auto-close: finished executors park themselves
+
+Executors used to sit idle for hours after reporting because nobody said `relay close` — tabs piling
+up, `relay list` full of noise. Now relay parks them on two deterministic signals, no model call:
+
+- **landed** — the report's "What changed" files are clean in the worktree (nothing staged, modified
+  or untracked for them): you committed or discarded the work. Immediate, after a 2-minute grace.
+- **idle** — reported for longer than `auto_close_idle_minutes` (default 60; 0 turns the timer off).
+
+Both require that the owning lead has **already seen the report** (the auto-wake dedup set) — relay
+never parks a report nobody looked at — and never touch busy/stalled sessions, ones with a
+`--when-idle` queue, unowned ones, or pinned ones (`relay keep <sid>` / `spawn --keep`; `keep --off`
+unpins). A heavy session (past the handoff threshold) is **retired** (seed written) instead of closed.
+The sweep runs on `relay check`, `relay list`, and every lead turn-end (the Stop hook), scoped to
+the lead's own executors; the ledger records `auto_closed` and `relay list --closed` shows
+`closed (auto)`.
+
+Closing is parking, not loss: the report is on disk, staged work stays in the worktree, and
+`relay send <sid> <packet>` to a closed session resumes the **same conversation**.
+
 ## Telling tabs apart
 
 - **Role-prefixed titles**: lead tabs are `[Lead] <project>`, executor tabs `[Exec] <session>`.
@@ -501,6 +521,8 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
 | `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) for the handoff nudge — a proxy for session weight, not context-window occupancy; calibrated on real sessions (a full working day ≈ 3MB, the heaviest marathon session ever ≈ 6MB) |
+| `auto_close` | true | Park finished executors automatically — see [Auto-close](#auto-close-finished-executors-park-themselves) |
+| `auto_close_idle_minutes` | 60 | Idle-after-report threshold for the auto-close timer path; 0 = timer off (the landed path still applies) |
 | `executor_escalation` | true | Arm every spawned executor with the second-layer one-shot push (see [Auto-wake and notifications](#auto-wake-and-notifications)) |
 | `autonomous_mode` | false | Posture a newly-armed lead holds. false = wait for you on every approval beat (safe default). true = new leads start in autonomous mode. `/relay:auto on\|off` flips it mid-session either way (see [Autonomous mode](#autonomous-mode)) |
 | `stall_threshold_seconds` | 2700 | How long an executor can be `busy` with no report before `stalled` — kept independent of `poll_seconds` so the two don't flip at the same instant |
