@@ -37,7 +37,7 @@ def _wid(handle):
 
 def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_delay=1.5,
           env_prefix="", iterm_id_file=None, session_uuid=None, resume_id=None, tab_color=None,
-          lead_handle=None, layout="tab", settings_file=None, mcp_flags=None):
+          lead_handle=None, layout="tab", settings_file=None, mcp_flags=None, agent_flags=None):
     """New Terminal WINDOW running the standard launch chain (cd → pidfile via $$ → exec claude).
     Writes "twid:<window id>" to `iterm_id_file` — the handle every later operation uses — then
     best-effort sets the tab's custom title to `label` (cosmetic only; addressing never relies on
@@ -56,7 +56,8 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     value mirrors iterm.spawn's only for caller parity."""
     base = build_claude_cmd(prompt, model=model, skip_perms=skip_perms,
                             session_uuid=session_uuid, resume_id=resume_id,
-                            settings_file=settings_file, mcp_flags=mcp_flags)
+                            settings_file=settings_file, mcp_flags=mcp_flags,
+                            agent_flags=agent_flags)
     cmd = f"cd {shlex.quote(cwd)} && {env_prefix}echo $$ > {shlex.quote(pidfile)} && exec {base}"
     # The window id must be derived from the RETURNED tab itself — "front window" races with any
     # window that is mid-close (observed live: it returned the closing window's id). A tab has no

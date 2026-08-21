@@ -1434,6 +1434,76 @@ def escalation_decision(state_root, exec_sid, packet, owner_lead):
         return "owner-missing"
 
 
+# ---- executor agent ----------------------------------------------------------------------------
+# The executor ROLE (standing GATES + REPORT FORMAT) is a Claude Code agent definition,
+# agents/executor.md in this plugin, passed INLINE at launch (`--agents <json> --agent
+# relay-executor`) rather than by plugin name — executors are launched plain (no --plugin-dir), so
+# `relay:executor` would not resolve for a lead that loaded relay via --plugin-dir. Inline works in
+# every install mode; it is not restored by `claude --resume`, but relay re-passes every launch flag
+# on relaunch anyway (same as --settings / --mcp-config).
+#
+# Verified live (2026-08-21, tests/test_e2e_agent.py): the agent prompt is APPENDED to the harness
+# system prompt (not a replacement); CLI --model beats the agent's model; the agent's
+# `disallowedTools: Agent` removes the Agent tool from the top-level session; an agent-level
+# `Bash(git commit*)` deny does NOT hold under --dangerously-skip-permissions, while the CLI
+# `--disallowedTools` rule DOES — hence the git denies ride the CLI flag below, not the agent file.
+
+EXECUTOR_AGENT_NAME = "relay-executor"
+EXECUTOR_AGENT_FILE = "executor.md"
+EXECUTOR_DENIED_BASH = ("Bash(git commit*)", "Bash(git push*)")
+
+
+def parse_agent_file(text):
+    """Minimal front-matter parser for an agent .md: returns (fields, body). Fields are the
+    `key: value` lines between the leading `---` fences; `tools`/`disallowedTools` values are
+    split on commas into lists. Body is everything after the closing fence, stripped."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text.strip()
+    fields, i = {}, 1
+    while i < len(lines) and lines[i].strip() != "---":
+        line = lines[i]
+        if ":" in line and not line.startswith((" ", "\t")):
+            k, v = line.split(":", 1)
+            k, v = k.strip(), v.strip()
+            if k in ("tools", "disallowedTools"):
+                v = [t.strip() for t in v.split(",") if t.strip()]
+            fields[k] = v
+        i += 1
+    return fields, "\n".join(lines[i + 1:]).strip()
+
+
+def load_executor_agent(plugin_root):
+    """The inline `--agents` definition for the executor role, or None if the plugin has no
+    agents/executor.md (a spawn then falls back to the full GATES footer in the packet — see
+    bin/relay build_packet)."""
+    try:
+        p = Path(plugin_root) / "agents" / EXECUTOR_AGENT_FILE
+        fields, body = parse_agent_file(p.read_text())
+        if not body:
+            return None
+        agent = {"description": fields.get("description", "relay executor"), "prompt": body}
+        if fields.get("disallowedTools"):
+            agent["disallowedTools"] = fields["disallowedTools"]
+        if fields.get("tools"):
+            agent["tools"] = fields["tools"]
+        return {EXECUTOR_AGENT_NAME: agent}
+    except Exception:
+        return None
+
+
+def executor_agent_flags(plugin_root):
+    """The `claude` argv words that give an executor its role: `--agents <json> --agent
+    relay-executor --disallowedTools "Bash(git commit*),Bash(git push*)"` — or [] when the agent
+    file is missing. The denies are ONE comma-joined argument on purpose: `--disallowedTools` is
+    variadic and would otherwise swallow the prompt positional that follows it."""
+    agents = load_executor_agent(plugin_root)
+    if not agents:
+        return []
+    return ["--agents", json.dumps(agents, separators=(",", ":")), "--agent", EXECUTOR_AGENT_NAME,
+            "--disallowedTools", ",".join(EXECUTOR_DENIED_BASH)]
+
+
 # ---- auto-close policy -------------------------------------------------------------------------
 # Field observation (2026-08-21): executors finish, report, and then sit idle for hours because
 # nobody says `relay close` — tabs pile up, `relay list` fills with noise, and the live processes

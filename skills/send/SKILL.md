@@ -8,7 +8,8 @@ arguments: [session_id, packet]
 ---
 
 Write the follow-up packet content to a file (same rules as `/relay:spawn` — task-specific
-content only, GATES/REPORT FORMAT are auto-appended), then run:
+content only — the executor's agent carries GATES/REPORT FORMAT, relay appends the per-packet
+footer), then run:
 
 `${CLAUDE_PLUGIN_ROOT}/bin/relay send $session_id $packet`
 

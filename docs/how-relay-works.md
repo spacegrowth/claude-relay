@@ -84,6 +84,15 @@ stateDiagram-v2
   instead. It runs inside `relay check`, `relay list`, and the lead's Stop hook (`relay
   _auto-close-sweep --lead <sid>`). Teardown is delegated to `cmd_close`/`cmd_retire`. Writes
   `auto_closed` (action, reason, trigger); `relay list --closed` shows `closed (auto)`.
+- **The role is an agent.** `relay spawn` launches `claude --agents <inline json> --agent
+  relay-executor --disallowedTools "Bash(git commit*),Bash(git push*)"`, the json built from the
+  plugin's `agents/executor.md` (`lead_guard.executor_agent_flags`). GATES + REPORT FORMAT are
+  therefore system prompt (appended to the harness prompt, verified), the `Agent` tool is removed,
+  and commit/push are denied at the CLI (agent-level Bash denies do NOT survive
+  `--dangerously-skip-permissions`; CLI ones do — `tests/test_e2e_agent.py`). Inline agents are not
+  restored by `--resume`, so `_relaunch` re-passes the flags; the session records `agent:
+  "relay-executor"` and `build_packet` picks the short per-packet footer (`AGENT_PACKET_FOOTER`)
+  for such sessions, the full legacy `TEMPLATE_FOOTER` for older ones.
 - **MCP set** is decided at launch and is per-PROCESS: executors start with **no** MCP servers
   (`--strict-mcp-config --mcp-config '{"mcpServers":{}}'`) unless the packet's `MCP:` line (or
   `spawn --mcp`) says otherwise (`lead_guard.mcp_cli_flags`, `packet_mcp_spec`). Because

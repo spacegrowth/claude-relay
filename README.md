@@ -22,8 +22,9 @@ wakes you when an executor finishes.
   `/relay:handoff` exist for exactly that.
 - **Real parallelism.** Independent packets run concurrently, each in its own tab — no serializing
   unrelated work through one context.
-- **Lean executors.** An executor launches with no MCP servers at all (no connector/plugin tool
-  rosters in its context every turn) unless its packet says `MCP: linear`; it gets a pinned model
+- **Lean, fenced executors.** An executor launches as a dedicated agent with no MCP servers (no
+  connector/plugin tool rosters in its context every turn) unless its packet says `MCP: linear`;
+  it cannot spawn sub-agents or `git commit`/`push` (denied, not just told), gets a pinned model,
   and parks itself when done. The lead carries the integrations; executors carry the diff.
 - **Human gates throughout.** Nothing spawns without your go, nothing lands without your review,
   and executors stage, never commit.
@@ -132,8 +133,9 @@ And the three nouns:
 
 - A **session** = one executor in its own terminal tab (or window/pane), working one worktree/topic. It stays alive
   across packets — one engineer you keep assigning related work to, not a disposable one-shot.
-- A **packet** = a work order (a `.md` file). relay auto-appends the rules every executor follows
-  (stage-don't-commit, one deliverable per packet, required report format) — you never write those.
+- A **packet** = a work order (a `.md` file). The rules every executor follows (stage-don't-commit,
+  one deliverable per packet, required report format) live in the executor agent's system prompt;
+  relay appends only the per-packet report path and closing steps — you never write those.
   A packet also declares the MCP servers its executor needs (`MCP: linear`), if any — executors
   launch with none otherwise.
 - A **report** = what the executor writes back when done, at a path relay assigns.
@@ -437,7 +439,7 @@ done`), which burns the lead's turn, is invisible to relay, and dies whenever th
 state dir and delivered automatically the next time that session goes idle. The trigger is the
 executor's **own Stop hook** — the same one that pushes its report to the lead — so there is no
 poller anywhere; a lead's `relay check` is only a net for sessions whose hook isn't armed. Delivery
-runs the normal send path, so a queued packet is numbered, GATES-stamped at delivery time, and
+runs the normal send path, so a queued packet is numbered, footer-stamped at delivery time, and
 ledgered (`packet_queued` and `queue_delivered` are separate events — a queued packet that never
 landed can never look like one that did).
 
@@ -543,6 +545,19 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 `poll_seconds` must stay under the `Stop` hook's `timeout` in `hooks/hooks.json` (currently 1900s) — the harness kills the hook's background poller at that timeout regardless of `poll_seconds`, so raising one without the other silently breaks auto-wake (see [async-rewake-findings.md](docs/async-rewake-findings.md#addendum-silent-auto-wake-death-2026-07-10)).
 
 Per-spawn override for `executor_skip_permissions`: pass `--skip-perms` or `--no-skip-perms` at `relay spawn` time.
+
+### The executor agent
+
+Every executor is launched as a Claude Code **agent** (`agents/executor.md`, passed inline as
+`--agents … --agent relay-executor`, so it works whether relay is installed or loaded via
+`--plugin-dir`). The standing GATES and REPORT FORMAT live in its system prompt — never compacted
+away, re-applied on every resume/restart — so the packet only carries the task plus the per-packet
+report path, self-diff command and closing line. Two things become *enforced* rather than asked:
+the `Agent` tool is removed (an executor can never spawn sub-agents), and `git commit` / `git push`
+are denied at the CLI (`--disallowedTools`, which holds even under `--dangerously-skip-permissions`
+— verified live, `tests/test_e2e_agent.py`). Sessions spawned before the agent existed keep
+getting the full GATES footer in their packets. There is no lead agent on purpose: leads arm
+mid-session with `/relay:mode`, which `--agent` (launch-time only) can't do.
 
 ### Executor MCP servers
 

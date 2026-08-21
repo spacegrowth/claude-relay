@@ -5832,3 +5832,64 @@ class TestLeadStopHookTriggersAutoClose:
         with pytest.raises(SystemExit):
             mod.main()
         assert any(c[1:] == ["_auto-close-sweep", "--lead", "lead-1"] for c in calls)
+
+
+class TestExecutorAgentWiring:
+    """spawn passes the inline executor agent, records it, writes the SHORT packet footer; relaunch
+    re-passes it; legacy (agent-less) sessions keep the full GATES footer on send."""
+    def _spawn(self, relay, tmp_path, name="a1"):
+        pkt = tmp_path / "p.md"; pkt.write_text("# T\n\ndo it")
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt), model=None,
+                                            name=name, scope=None, skip_perms=None, pane=None))
+        return cap
+
+    def test_spawn_passes_agent_and_short_footer(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path)
+        flags = cap["agent_flags"]
+        assert flags[2:4] == ["--agent", "relay-executor"] and "Bash(git commit*)" in flags[5]
+        assert relay.read_session("a1")["agent"] == "relay-executor"
+        packet = (relay.packets_dir("a1") / "001-packet.md").read_text()
+        assert "REPORT: write your full report" in packet and "001-report.md" in packet
+        assert "STAGE, NEVER COMMIT" not in packet          # GATES live in the agent now
+        assert "✅ [relay]" in packet and "relay diff a1" in packet
+
+    def test_build_claude_cmd_carries_agent_flags(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path)
+        cmd = relay.iterm.build_claude_cmd("x", model="sonnet", session_uuid="u", agent_flags=cap["agent_flags"])
+        assert "--agent relay-executor" in cmd and "--disallowedTools 'Bash(git commit*),Bash(git push*)'" in cmd
+        assert cmd.rstrip().endswith(" x")                   # prompt still last, not swallowed
+
+    def test_no_agent_file_falls_back_to_full_gates(self, relay, tmp_path):
+        with mock.patch.object(relay.lead_guard, "executor_agent_flags", return_value=[]):
+            cap = self._spawn(relay, tmp_path, name="legacy")
+        assert cap["agent_flags"] == [] and relay.read_session("legacy")["agent"] is None
+        assert "STAGE, NEVER COMMIT" in (relay.packets_dir("legacy") / "001-packet.md").read_text()
+
+    def test_relaunch_repasses_agent_only_for_agent_sessions(self, relay, tmp_path):
+        self._spawn(relay, tmp_path)
+        s = relay.read_session("a1")
+        for agent, expect in (("relay-executor", True), (None, False)):
+            s["agent"] = agent; relay.write_session("a1", s)
+            cap = {}
+            bk = SimpleNamespace(spawn=lambda **kw: cap.update(kw))
+            with mock.patch.object(relay, "term_backend", return_value=bk), mock.patch.object(relay, "auto_trust"), \
+                 mock.patch.object(relay, "read_pid", return_value=124), mock.patch.object(relay, "read_iterm_id", return_value=None), \
+                 mock.patch.object(relay, "_ensure_tab_label"):
+                relay._relaunch("a1", relay.read_session("a1"), "go", resume_id="cs")
+            assert bool(cap["agent_flags"]) is expect
+
+    def test_send_footer_follows_session_agent(self, relay, tmp_path):
+        self._spawn(relay, tmp_path)
+        (relay.packets_dir("a1") / "001-report.md").write_text("done")
+        nxt = tmp_path / "n.md"; nxt.write_text("# next\nmore")
+        for agent, marker in (("relay-executor", "REPORT: write your full report"), (None, "STAGE, NEVER COMMIT")):
+            s = relay.read_session("a1"); s["agent"] = agent; s["status"] = "reported"; s["pid"] = os.getpid()
+            relay.write_session("a1", s)
+            with mock.patch.object(relay.iterm, "send", return_value=True), mock.patch.object(relay.iterm, "is_alive", return_value=True):
+                relay.cmd_send(SimpleNamespace(session_id="a1", packet=str(nxt)))
+            n = relay.read_session("a1")["current_packet"]
+            assert marker in (relay.packets_dir("a1") / f"{n:03d}-packet.md").read_text()
+            (relay.packets_dir("a1") / f"{n:03d}-report.md").write_text("done")

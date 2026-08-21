@@ -3008,3 +3008,26 @@ class TestAutoCloseDecision:
 
     def test_heavy_retires(self):
         assert self._d(heavy=True) == ("retire", "landed")
+
+
+class TestExecutorAgent:
+    def test_parse_agent_file(self):
+        f, body = lg.parse_agent_file("---\nname: x\ndescription: d e\ndisallowedTools: Agent, Foo\n---\nBODY\nline2")
+        assert f == {"name": "x", "description": "d e", "disallowedTools": ["Agent", "Foo"]} and body == "BODY\nline2"
+        assert lg.parse_agent_file("no front matter") == ({}, "no front matter")
+
+    def test_plugin_agent_file_loads_with_gates(self):
+        agents = lg.load_executor_agent(REPO_ROOT)
+        a = agents[lg.EXECUTOR_AGENT_NAME]
+        assert "STAGE, NEVER COMMIT" in a["prompt"] and "REPORT FORMAT" in a["prompt"]
+        assert a["disallowedTools"] == ["Agent"]
+        assert "{report_path}" not in a["prompt"]   # nothing per-packet leaks into the role
+
+    def test_flags_shape(self):
+        flags = lg.executor_agent_flags(REPO_ROOT)
+        assert flags[0] == "--agents" and flags[2:4] == ["--agent", "relay-executor"]
+        assert flags[4] == "--disallowedTools" and flags[5] == "Bash(git commit*),Bash(git push*)"
+        assert json.loads(flags[1])["relay-executor"]["disallowedTools"] == ["Agent"]
+
+    def test_missing_agent_file_means_no_flags(self, tmp_path):
+        assert lg.executor_agent_flags(tmp_path) == []

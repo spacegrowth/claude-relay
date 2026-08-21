@@ -11,8 +11,9 @@ use `/relay:send` on that session instead of spawning fresh (cheaper, keeps cont
 when nothing relevant is idle, the relevant session is dead/stalled, or you're upgrading to a
 stronger model (a session's model is fixed at launch).
 
-Write the task-specific packet content (ROLE / REQUIRED READING / WORK PACKET only — `relay`
-auto-appends GATES and REPORT FORMAT) to a file, then run:
+Write the task-specific packet content (ROLE / REQUIRED READING / WORK PACKET only — the standing
+GATES and REPORT FORMAT are in the executor agent's system prompt, and `relay` appends the
+per-packet report path / self-diff / closing line) to a file, then run:
 
 `${CLAUDE_PLUGIN_ROOT}/bin/relay spawn $worktree $topic $packet --model $model --lead "$CLAUDE_CODE_SESSION_ID"`
 

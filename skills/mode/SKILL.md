@@ -217,9 +217,10 @@ A lead message with no `🚦 [relay]` marker should be the exception, not the ru
    only. **Start each packet with a one-sentence GOAL as its very first line** — the executor's
    opening message is `Task — <that first line>. Read the packet at …`, so a clear goal-first-line
    is what makes the executor's tab legible at a glance instead of just "read the .md". Write each
-   packet to a real file (so it has a path you can show + the user can open). `relay` auto-appends
-   GATES (stage-never-commit, one deliverable per packet) and the REQUIRED REPORT FORMAT; never
-   re-author those yourself. **Self-sufficiency check, every time, before sending:** read the
+   packet to a real file (so it has a path you can show + the user can open). the executor
+   agent's system prompt already carries the GATES (stage-never-commit, one deliverable per packet)
+   and the REQUIRED REPORT FORMAT, and `relay` appends the per-packet report path/closing steps;
+   never re-author those yourself. **Self-sufficiency check, every time, before sending:** read the
    packet back as if you were an executor with zero prior context and no access to this
    conversation — files exist? terms defined? acceptance criteria checkable without asking
    anything? If you can't answer yes to all three from the packet text alone, that gap is a bug in

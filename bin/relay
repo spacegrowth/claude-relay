@@ -166,8 +166,9 @@ GATES
   never raise an interactive question for it. The report → lead-wake channel is your only
   escalation path; the human is never the recipient of an executor's question.
 - STAY IDLE AFTER REPORTING. After you write your report, remain idle — do NOT exit, and do NOT
-  commit (the lead reviews and commits). The lead may reuse this session for a follow-up packet, and
-  will `relay close` it when done. Closing the tab yourself throws away the reusable context.
+  commit (the lead reviews and commits). The lead may reuse this session for a follow-up packet;
+  relay parks the session itself once your work has landed. Closing the tab yourself throws away
+  the reusable context.
   After running the self-diff step, end your final turn with EXACTLY this one line, nothing after it:
       ✅ [relay] — staged + report written — diff: {diff_url} — idle, awaiting the lead's review.
 
@@ -484,10 +485,31 @@ def enqueue_packet(session_id, body, source, heavy_override=None):
     return item
 
 
-def build_packet(body, report_path, diff_cmd, diff_url, transport_v2_step=""):
-    return body.rstrip() + TEMPLATE_FOOTER.format(report_path=report_path, diff_cmd=diff_cmd,
-                                                  diff_url=diff_url,
-                                                  transport_v2_step=transport_v2_step)
+# The per-packet footer for an executor that carries the role as an AGENT (lead_guard
+# "executor agent"): the standing GATES + REPORT FORMAT live in its system prompt, so the packet
+# only needs what varies per packet — the report path, the self-diff command, the closing line.
+AGENT_PACKET_FOOTER = """
+
+---
+(relay — do not remove or reword this section)
+
+REPORT: write your full report (per your REPORT FORMAT: outcome sentence first, then the TL;DR block) to
+  {report_path}
+AFTER writing it, run:
+  {diff_cmd}
+(generates your staged-diff review page; do not open it, do not attach it anywhere — just run it once)
+Then end your final turn with EXACTLY this one line, nothing after it:
+      ✅ [relay] — staged + report written — diff: {diff_url} — idle, awaiting the lead's review.
+{transport_v2_step}"""
+
+
+def build_packet(body, report_path, diff_cmd, diff_url, transport_v2_step="", agent=False):
+    """`agent=True` → the short per-packet footer (the role is in the executor's agent prompt);
+    False → the full legacy GATES footer, for sessions spawned before the agent existed or when the
+    plugin has no agents/executor.md."""
+    footer = AGENT_PACKET_FOOTER if agent else TEMPLATE_FOOTER
+    return body.rstrip() + footer.format(report_path=report_path, diff_cmd=diff_cmd,
+                                         diff_url=diff_url, transport_v2_step=transport_v2_step)
 
 
 def transport_v2_step(session_id, packet_n, owner_lead, cfg=None):
@@ -954,8 +976,14 @@ def cmd_spawn(args):
     # the transport-v2 step has to address that lead; the marker lookups it feeds stay below.
     owner_lead = getattr(args, "lead", None) or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
 
+    # The executor ROLE travels as an inline agent (lead_guard "executor agent"): GATES + REPORT
+    # FORMAT in the system prompt, Agent tool removed, git commit/push denied at the CLI. When the
+    # plugin has no agents/executor.md the packet carries the full legacy footer instead.
+    agent_flags = lead_guard.executor_agent_flags(_plugin_root())
+    agent_name = lead_guard.EXECUTOR_AGENT_NAME if agent_flags else None
     packet_path.write_text(build_packet(body, report_path, diff_cmd, diff_url,
-                                        transport_v2_step(session_id, n, owner_lead, cfg)))
+                                        transport_v2_step(session_id, n, owner_lead, cfg),
+                                        agent=bool(agent_name)))
 
     # Whether the executor runs with --dangerously-skip-permissions. Per-spawn flag wins; else the
     # config default (executor_skip_permissions, default False = safe/prompts). Skip-perms means the
@@ -1005,6 +1033,7 @@ def cmd_spawn(args):
             tab_color=tab_color,
             settings_file=settings_file,
             mcp_flags=mcp_flags,
+            agent_flags=agent_flags,
             lead_handle=owner_marker.get("iterm_session"),
             layout=layout,
         )
@@ -1036,6 +1065,8 @@ def cmd_spawn(args):
         "mcp": mcp_spec,          # resolved MCP set ("none" | "inherit" | [names]) — resume/restart
                                   # relaunch with the same set, never silently inheriting
         "keep": bool(getattr(args, "keep", False)),  # pinned: auto-close never parks it (relay keep)
+        "agent": agent_name,      # "relay-executor" when the role rides the inline agent (None = legacy
+                                  # full-GATES packets); relaunch re-passes it, send picks the footer by it
         "pid": pid,
         "pid_started": pid_start_time(pid) if pid else None,  # pid-reuse guard (see session_pid_alive)
         "iterm_session": iterm_session,
@@ -1108,6 +1139,8 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     except ValueError as e:
         sys.exit(f"relaunch: mcp: {e}")
     s["mcp"] = mcp_spec
+    # The role rides the inline agent and is NOT restored by --resume → re-pass it, like --settings.
+    agent_flags = lead_guard.executor_agent_flags(_plugin_root()) if s.get("agent") else []
     bk.spawn(
         cwd=s["worktree"],
         prompt=prompt,
@@ -1123,6 +1156,7 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
                                                           # a resumed/restarted executor must not
                                                           # silently lose wake coverage
         mcp_flags=mcp_flags,
+        agent_flags=agent_flags,
     )
     pid = read_pid(session_id)
     s["pid"] = pid
@@ -1485,7 +1519,8 @@ def cmd_send(args):
     diff_url = path_to_file_url(diff_path)
     packet_path = packets_dir(args.session_id) / f"{n:03d}-packet.md"
     packet_path.write_text(build_packet(body, report_path, diff_cmd, diff_url,
-                                        transport_v2_step(args.session_id, n, s.get("owner_lead"))))
+                                        transport_v2_step(args.session_id, n, s.get("owner_lead")),
+                                        agent=bool(s.get("agent"))))
 
     pointer = build_pointer_message(str(packet_path), packet_summary(body))
     ok = False if (tab_gone or mcp_relaunch) else term_backend(s).send(s["tab_label"], pointer,
