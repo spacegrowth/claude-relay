@@ -2886,3 +2886,63 @@ class TestTransportV2ConfigDefault:
         (root / "lead").mkdir(parents=True)
         (root / "lead" / "config.json").write_text(json.dumps({"transport_v2": "prototype"}))
         assert lg.load_config(root)["transport_v2"] == "prototype"
+
+
+class TestExecutorMcpPolicy:
+    """executor MCP policy: default none (strict zero servers), inherit, or a strict allowlist
+    copied from the CLI's own config files into a per-executor mcp.json."""
+    def test_normalize(self):
+        n = lg.normalize_mcp_spec
+        assert n(None) == "none" and n("") == "none" and n("none") == "none" and n("off") == "none"
+        assert n("inherit") == "inherit" and n(True) == "inherit" and n("all") == "inherit"
+        assert n("linear, chrome-devtools") == ["chrome-devtools", "linear"]
+        assert n(["b", "a", "a"]) == ["a", "b"] and n([]) == "none"
+        assert lg.mcp_spec_label(["b", "a"]) == "a,b" and lg.mcp_spec_label(None) == "none"
+
+    def test_default_config_is_none(self):
+        assert lg.LEAD_DEFAULTS["executor_mcp"] == "none"
+
+    def test_none_and_inherit_flags(self):
+        assert lg.mcp_cli_flags("inherit") == []
+        assert lg.mcp_cli_flags("none") == ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+
+    def _claude_json(self, tmp_path, cwd):
+        cj = tmp_path / "claude.json"
+        cj.write_text(json.dumps({
+            "mcpServers": {"linear": {"type": "http", "url": "https://mcp.linear.app/mcp"},
+                           "shared": {"command": "user-level"}},
+            "projects": {str(cwd): {"mcpServers": {"shared": {"command": "project-level"},
+                                                   "robinhood": {"command": "rh"}}}},
+        }))
+        return cj
+
+    def test_known_servers_merge_with_project_precedence(self, tmp_path):
+        cwd = tmp_path / "wt"; cwd.mkdir()
+        (cwd / ".mcp.json").write_text(json.dumps({"mcpServers": {"local": {"command": "l"}}}))
+        cj = self._claude_json(tmp_path, cwd)
+        known = lg.known_mcp_servers(cwd=str(cwd), claude_json=cj)
+        assert set(known) == {"linear", "shared", "robinhood", "local"}
+        assert known["shared"] == {"command": "project-level"}
+
+    def test_allowlist_writes_per_executor_mcp_json(self, root, tmp_path):
+        cwd = tmp_path / "wt"; cwd.mkdir()
+        cj = self._claude_json(tmp_path, cwd)
+        flags = lg.mcp_cli_flags("linear,robinhood", state_root=root, exec_name="e1",
+                                         cwd=str(cwd), claude_json=cj)
+        assert flags[:2] == ["--strict-mcp-config", "--mcp-config"]
+        p = Path(flags[2])
+        assert p == root / "e1" / "mcp.json"
+        assert json.loads(p.read_text()) == {"mcpServers": {
+            "linear": {"type": "http", "url": "https://mcp.linear.app/mcp"},
+            "robinhood": {"command": "rh"}}}
+
+    def test_unknown_server_refuses_loudly(self, root, tmp_path):
+        cwd = tmp_path / "wt"; cwd.mkdir()
+        cj = self._claude_json(tmp_path, cwd)
+        with pytest.raises(ValueError) as ei:
+            lg.mcp_cli_flags(["linear", "gmail"], state_root=root, exec_name="e1",
+                                     cwd=str(cwd), claude_json=cj)
+        assert "gmail" in str(ei.value) and "inherit" in str(ei.value)
+
+    def test_missing_claude_json_is_not_fatal(self, tmp_path):
+        assert lg.known_mcp_servers(cwd=str(tmp_path), claude_json=tmp_path / "nope.json") == {}

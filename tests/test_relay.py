@@ -5471,3 +5471,73 @@ class TestTransportV2PrototypeStep:
         e = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()][0]
         assert e["event"] == "msg_send_failed" and e["packet"] == 7
         assert e["reason"] == "unspecified"
+
+
+class TestSpawnExecutorMcp:
+    """cmd_spawn pins the executor's MCP set (executor MCP policy): default strict-none, `--mcp`
+    overrides config, the resolved spec is recorded so resume/restart relaunch identically."""
+    def _run(self, relay, tmp_path, cfg=None, mcp=None, name="s1"):
+        pkt = tmp_path / "packet.md"; pkt.write_text("do the thing")
+        if cfg is not None:
+            (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+            (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps(cfg))
+        captured = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: captured.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123), \
+             mock.patch.object(relay.lead_guard, "known_mcp_servers",
+                               return_value={"linear": {"type": "http", "url": "u"}}):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt),
+                model=None, name=name, scope=None, skip_perms=None, pane=None, mcp=mcp))
+        return captured
+
+    NONE = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+
+    def test_default_is_strict_none(self, relay, tmp_path):
+        assert self._run(relay, tmp_path)["mcp_flags"] == self.NONE
+        assert relay.read_session("s1")["mcp"] == "none"
+
+    def test_bare_flag_inherits(self, relay, tmp_path):
+        assert self._run(relay, tmp_path, mcp="inherit")["mcp_flags"] == []
+        assert relay.read_session("s1")["mcp"] == "inherit"
+
+    def test_config_inherit_overridden_by_flag_none(self, relay, tmp_path):
+        assert self._run(relay, tmp_path, cfg={"executor_mcp": "inherit"})["mcp_flags"] == []
+        assert self._run(relay, tmp_path, cfg={"executor_mcp": "inherit"}, mcp="none", name="s2")["mcp_flags"] == self.NONE
+
+    def test_allowlist_writes_mcp_json_and_records_list(self, relay, tmp_path):
+        flags = self._run(relay, tmp_path, mcp="linear")["mcp_flags"]
+        assert flags[:2] == ["--strict-mcp-config", "--mcp-config"]
+        assert json.loads(Path(flags[2]).read_text()) == {"mcpServers": {"linear": {"type": "http", "url": "u"}}}
+        assert relay.read_session("s1")["mcp"] == ["linear"]
+
+    def test_unknown_allowlist_name_refuses_spawn(self, relay, tmp_path):
+        with pytest.raises(SystemExit) as ei:
+            self._run(relay, tmp_path, mcp="gmail")
+        assert "gmail" in str(ei.value)
+        assert not relay.session_dir("s1").joinpath("session.json").exists() or relay.read_session("s1") is None
+
+    def test_relaunch_reuses_recorded_spec(self, relay, tmp_path):
+        self._run(relay, tmp_path, mcp="inherit")
+        captured = {}
+        bk = SimpleNamespace(spawn=lambda **kw: captured.update(kw))
+        with mock.patch.object(relay, "term_backend", return_value=bk), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=124), \
+             mock.patch.object(relay, "read_iterm_id", return_value=None), \
+             mock.patch.object(relay, "_ensure_tab_label"):
+            relay._relaunch("s1", relay.read_session("s1"), "go", resume_id="cs")
+        assert captured["mcp_flags"] == []
+
+    def test_relaunch_legacy_record_uses_config_default(self, relay, tmp_path):
+        self._run(relay, tmp_path, mcp="inherit")
+        s = relay.read_session("s1"); s.pop("mcp"); relay.write_session("s1", s)
+        captured = {}
+        bk = SimpleNamespace(spawn=lambda **kw: captured.update(kw))
+        with mock.patch.object(relay, "term_backend", return_value=bk), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=124), \
+             mock.patch.object(relay, "read_iterm_id", return_value=None), \
+             mock.patch.object(relay, "_ensure_tab_label"):
+            relay._relaunch("s1", relay.read_session("s1"), "go", resume_id="cs")
+        assert captured["mcp_flags"] == self.NONE

@@ -908,3 +908,20 @@ class TestGuardDoesNotWedgeVictimShell:
         assert r.returncode == 0, (r.stdout, r.stderr)
         assert r.stdout.count("mis-delivered") == 1
         assert "should-not-run" not in r.stdout
+
+
+class TestBuildClaudeCmdMcpFlags:
+    """mcp_flags (from lead_guard.mcp_cli_flags) land verbatim, shell-quoted, on fresh AND resumed
+    launches — MCP loading is per-process, so a resume needs them again."""
+    def test_none_spec_flags_are_quoted_and_present(self):
+        flags = lead_guard.mcp_cli_flags("none")
+        cmd = iterm.build_claude_cmd("x", mcp_flags=flags)
+        assert "--strict-mcp-config" in cmd
+        assert "--mcp-config '{\"mcpServers\":{}}'" in cmd
+
+    def test_resume_keeps_mcp_flags(self):
+        cmd = iterm.build_claude_cmd("x", resume_id="cs-1", mcp_flags=["--strict-mcp-config", "--mcp-config", "/p/mcp.json"])
+        assert "--resume cs-1" in cmd and "--strict-mcp-config --mcp-config /p/mcp.json" in cmd
+
+    def test_inherit_adds_nothing(self):
+        assert "mcp" not in iterm.build_claude_cmd("x", mcp_flags=lead_guard.mcp_cli_flags("inherit"))

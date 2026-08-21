@@ -496,6 +496,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_skip_permissions` | false | Spawn executors with `--dangerously-skip-permissions` (false = prompt before edits/commands; true = hands-off but requires careful review before landing) |
 | `executor_default_model` | "sonnet" | Model an executor launches with when `--model` is omitted — relay's own policy, never the CLI's personal `/model` default |
 | `executor_model_ceiling` | "opus" | Spawn refuses a requested executor model above this tier unless `--model-override "<reason>"` is passed (recorded in the ledger) |
+| `executor_mcp` | "none" | MCP servers an executor launches with. `"none"` = strict mode, zero servers (no connector/plugin/user/project MCPs — their tool rosters and instruction blocks never enter the executor's context, which is a real per-turn token saving and removes a side-effect surface). `"inherit"` = plain launch (whatever the CLI would load). `["linear", …]` = strict allowlist of servers configured in `~/.claude.json` / `<worktree>/.mcp.json`. Plugin/connector MCPs have no config entry and are only reachable via `inherit` |
 | `terminal_app` | "auto" | "iterm" \| "terminal" \| "auto" (auto-detect via `$TERM_PROGRAM`; iTerm default) |
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
@@ -508,6 +509,8 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 `poll_seconds` must stay under the `Stop` hook's `timeout` in `hooks/hooks.json` (currently 1900s) — the harness kills the hook's background poller at that timeout regardless of `poll_seconds`, so raising one without the other silently breaks auto-wake (see [async-rewake-findings.md](docs/async-rewake-findings.md#addendum-silent-auto-wake-death-2026-07-10)).
 
 Per-spawn override for `executor_skip_permissions`: pass `--skip-perms` or `--no-skip-perms` at `relay spawn` time.
+
+Per-spawn override for `executor_mcp`: `--mcp` (bare = inherit everything), `--mcp none`, or `--mcp linear,chrome-devtools` (strict allowlist) at `relay spawn` time. The resolved set is recorded on the session and re-applied on `resume`/`restart` (MCP loading is per-process); an allowlist naming a server no config file defines refuses the spawn rather than launching an executor missing its tool.
 
 **Environment variable overrides:**
 - `RELAY_TERMINAL`: force "iterm" or "terminal" (beats `terminal_app` in config)

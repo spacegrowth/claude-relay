@@ -35,4 +35,9 @@ See `/relay:retire`.
 (`--model` optional — omit for the default. Add `--name <label>` for a custom session name, or
 `--scope <tag>` for the short area tag shown in `/relay:list`. Add `--pane` to open this executor
 as a split pane in your own window instead of a tab (`--tab` to force a tab), overriding the
-`executor_layout` config default; iTerm only, falls back to a tab if your session can't be found.)
+`executor_layout` config default; iTerm only, falls back to a tab if your session can't be found.
+Executors launch with NO MCP servers by default (`executor_mcp: "none"` — saves tokens every turn
+and removes a side-effect surface). If the packet genuinely needs one, pass `--mcp linear` (a
+strict allowlist of servers configured in `~/.claude.json` / the worktree's `.mcp.json`) or bare
+`--mcp` to inherit everything incl. plugin/connector MCPs like Chrome or Gmail. Decide per packet;
+don't default to inherit.)

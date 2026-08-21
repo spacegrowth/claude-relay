@@ -70,6 +70,13 @@ LEAD_DEFAULTS = {
                                   # that has its own five-condition gate (#16 phase 2) — see
                                   # report_verify.clearance, `relay verify --for-autocommit`, and
                                   # skills/mode/SKILL.md's stop-list.
+    "executor_mcp": "none",       # which MCP servers an executor launches with (see "executor MCP
+                                  # policy" below): "none" (default — strict mode, ZERO servers:
+                                  # no connector/plugin/user/project MCPs, their tool names and
+                                  # instruction blocks never enter the executor's context),
+                                  # "inherit" (plain launch: whatever the CLI would load), or a
+                                  # list of configured server names ["linear", ...] (strict
+                                  # allowlist). `relay spawn --mcp …` overrides per executor.
     "executor_escalation": True,  # arm every spawned executor with the escalation Stop hook
                                   # (wake-watch design §9): once its report lands and it goes idle,
                                   # push a nudge into the owning lead's tab, once. A net UNDER the
@@ -1422,6 +1429,105 @@ def escalation_decision(state_root, exec_sid, packet, owner_lead):
         return "send"
     except Exception:
         return "owner-missing"
+
+
+# ---- executor MCP policy -----------------------------------------------------------------------
+# An executor does worktree file/git work; every MCP server it inherits (claude.ai connectors like
+# Gmail/Linear, plugin MCPs like claude-in-chrome, user/project servers) costs tokens on EVERY turn
+# (tool-name roster + per-server instruction blocks, plus schemas once loaded) and is a side-effect
+# surface nobody asked for. Relay therefore decides an executor's MCP set itself, like its model:
+# default "none", a lead opts in per packet with `relay spawn --mcp` / `--mcp a,b`.
+#
+# Mechanism (verified live 2026-08-21): `claude --strict-mcp-config --mcp-config '{"mcpServers":{}}'`
+# yields a session with NO mcp__* tools at all — connectors and plugin MCPs included. An allowlist
+# is the same flags with a per-executor mcp.json holding just the named servers, copied from the
+# places the CLI reads them (~/.claude.json top-level `mcpServers`, its `projects[<cwd>].mcpServers`,
+# and <cwd>/.mcp.json). Connector/plugin MCPs have no config entry to copy, so they can only come
+# back via "inherit".
+
+MCP_NONE_JSON = '{"mcpServers":{}}'
+
+
+def normalize_mcp_spec(raw):
+    """Canonical form of an executor MCP spec: "none" | "inherit" | sorted list of server names.
+    Accepts the config value, the `--mcp` CLI value (bare flag → "inherit"; "a,b" → list), or a
+    stored session value. None/"" → "none" (the policy default, never silent inheritance)."""
+    if raw is None or raw is True:
+        return "inherit" if raw is True else "none"
+    if isinstance(raw, (list, tuple, set)):
+        names = sorted({str(n).strip() for n in raw if str(n).strip()})
+        return names or "none"
+    s = str(raw).strip()
+    if s.lower() in ("", "none", "off", "false", "0"):
+        return "none"
+    if s.lower() in ("inherit", "all", "on", "true", "1"):
+        return "inherit"
+    return normalize_mcp_spec(s.split(","))
+
+
+def mcp_spec_label(spec):
+    """Short human form for `relay list`/ledgers: none | inherit | linear,chrome."""
+    spec = normalize_mcp_spec(spec)
+    return ",".join(spec) if isinstance(spec, list) else spec
+
+
+def known_mcp_servers(cwd=None, claude_json=None):
+    """Name → server-config dict for every MCP server the CLI would load for a session in `cwd`
+    from CONFIG FILES (user ~/.claude.json `mcpServers`, its `projects[cwd].mcpServers`, and
+    <cwd>/.mcp.json). Later sources win on a name clash, matching the CLI's project-over-user
+    precedence. Best-effort: unreadable files contribute nothing. Does NOT see plugin or claude.ai
+    connector MCPs (they have no file entry)."""
+    servers = {}
+    cj = Path(claude_json) if claude_json else Path.home() / ".claude.json"
+    try:
+        d = json.loads(cj.read_text())
+        if isinstance(d.get("mcpServers"), dict):
+            servers.update(d["mcpServers"])
+        if cwd:
+            proj = (d.get("projects") or {}).get(str(cwd)) or {}
+            if isinstance(proj.get("mcpServers"), dict):
+                servers.update(proj["mcpServers"])
+    except Exception:
+        pass
+    if cwd:
+        try:
+            d = json.loads((Path(cwd) / ".mcp.json").read_text())
+            if isinstance(d.get("mcpServers"), dict):
+                servers.update(d["mcpServers"])
+        except Exception:
+            pass
+    return servers
+
+
+def mcp_cli_flags(spec, state_root=None, exec_name=None, cwd=None, claude_json=None):
+    """The extra `claude` flags (a list of argv words, NOT yet shell-quoted) that realise an
+    executor MCP spec:
+      "inherit" → []                              (plain launch, CLI loads whatever it normally would)
+      "none"    → --strict-mcp-config --mcp-config '{"mcpServers":{}}'
+      [names]   → --strict-mcp-config --mcp-config <state_root>/<exec_name>/mcp.json
+                  holding exactly those servers (copied from known_mcp_servers(cwd)).
+    Raises ValueError naming the unknown servers (and the known ones) when an allowlist asks for
+    something no config file defines — a spawn must refuse loudly rather than launch an executor
+    silently missing the tool the packet depends on."""
+    spec = normalize_mcp_spec(spec)
+    if spec == "inherit":
+        return []
+    if spec == "none":
+        return ["--strict-mcp-config", "--mcp-config", MCP_NONE_JSON]
+    known = known_mcp_servers(cwd=cwd, claude_json=claude_json)
+    missing = [n for n in spec if n not in known]
+    if missing:
+        raise ValueError(
+            f"unknown MCP server(s) {', '.join(missing)} — configured servers for {cwd or 'this cwd'}: "
+            f"{', '.join(sorted(known)) or '(none)'}. Plugin/connector MCPs (e.g. claude-in-chrome, "
+            f"claude.ai Gmail) have no config entry and are only reachable with --mcp inherit.")
+    if not state_root or not exec_name:
+        raise ValueError("an MCP allowlist needs state_root and exec_name to write its mcp.json")
+    d = Path(state_root) / str(exec_name)
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "mcp.json"
+    p.write_text(json.dumps({"mcpServers": {n: known[n] for n in spec}}, indent=2))
+    return ["--strict-mcp-config", "--mcp-config", str(p)]
 
 
 # ---- executor escalation settings file (wake-watch design's "Key integration fact") --------------

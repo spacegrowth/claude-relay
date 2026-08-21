@@ -5,7 +5,7 @@ iTerm tabs, reusing a live session for related follow-up packets instead of spaw
 one each time.
 
 Commands:
-  relay spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL]
+  relay spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL] [--mcp [SPEC]]
   relay send  <session_id> <packet.md>
   relay check [<session_id> | --all] [--json]
   relay status [session_id] [--statusline]    # read-only, statusline-safe one-liner; never writes
@@ -910,6 +910,18 @@ def cmd_spawn(args):
         append_ledger("model_ceiling_override", session_id=session_id, model=resolved_model,
                       reason=args.model_override)
 
+    # Resolve the executor's MCP set the same way (see "executor MCP policy" in lead_guard.py):
+    # `--mcp` (bare → inherit; "none"; "a,b" allowlist) wins, else config executor_mcp (default
+    # "none" — strict mode, zero servers). Resolved BEFORE files are written so an unknown allowlist
+    # name refuses the spawn cleanly instead of launching an executor missing its tool.
+    mcp_spec = lead_guard.normalize_mcp_spec(
+        getattr(args, "mcp", None) if getattr(args, "mcp", None) is not None else cfg.get("executor_mcp", "none"))
+    try:
+        mcp_flags = lead_guard.mcp_cli_flags(mcp_spec, state_root=STATE_ROOT, exec_name=session_id,
+                                             cwd=worktree)
+    except ValueError as e:
+        sys.exit(f"spawn: --mcp: {e}")
+
     auto_trust(worktree)
     label = f"[Exec] {session_id}"  # role-prefixed: exec tabs and lead tabs are told apart at a glance
     d = packets_dir(session_id)
@@ -976,6 +988,7 @@ def cmd_spawn(args):
             session_uuid=claude_session,
             tab_color=tab_color,
             settings_file=settings_file,
+            mcp_flags=mcp_flags,
             lead_handle=owner_marker.get("iterm_session"),
             layout=layout,
         )
@@ -1004,6 +1017,8 @@ def cmd_spawn(args):
         "model": resolved_model,  # the resolved effective model, even when --model was omitted —
                                   # never store null just because the caller didn't pass one (that's
                                   # what let `relay list` render `-` for a live executor)
+        "mcp": mcp_spec,          # resolved MCP set ("none" | "inherit" | [names]) — resume/restart
+                                  # relaunch with the same set, never silently inheriting
         "pid": pid,
         "pid_started": pid_start_time(pid) if pid else None,  # pid-reuse guard (see session_pid_alive)
         "iterm_session": iterm_session,
@@ -1066,6 +1081,16 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     if session_uuid and not model:
         model = cfg.get("executor_default_model", "sonnet")
         s["model"] = model
+    # MCP set: what this executor was spawned with; a legacy record (no "mcp") gets the config
+    # default — MCP loading is per-process, so resume and restart both need the flags again.
+    mcp_spec = lead_guard.normalize_mcp_spec(s.get("mcp") if s.get("mcp") is not None
+                                             else cfg.get("executor_mcp", "none"))
+    try:
+        mcp_flags = lead_guard.mcp_cli_flags(mcp_spec, state_root=STATE_ROOT, exec_name=session_id,
+                                             cwd=s["worktree"])
+    except ValueError as e:
+        sys.exit(f"relaunch: mcp: {e}")
+    s["mcp"] = mcp_spec
     bk.spawn(
         cwd=s["worktree"],
         prompt=prompt,
@@ -1080,6 +1105,7 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
         settings_file=_maybe_escalation_settings_file(session_id),  # re-arm escalation on the fresh tab too —
                                                           # a resumed/restarted executor must not
                                                           # silently lose wake coverage
+        mcp_flags=mcp_flags,
     )
     pid = read_pid(session_id)
     s["pid"] = pid
@@ -2757,6 +2783,7 @@ def build_successor_seed(session_id, s, entries, generated):
          "## Territory", ""]
     for label, val in (("Worktree", s.get("worktree")), ("Topic", s.get("topic")),
                        ("Scope", s.get("scope")), ("Model", s.get("model")),
+                       ("MCP", lead_guard.mcp_spec_label(s.get("mcp")) if s.get("mcp") is not None else None),
                        ("Retired session", session_id)):
         L.append(f"- {label}: {val or '(unrecorded)'}")
     L += [f"- Packets worked: {len(entries)} ({reported} reported, {unreported} unreported)",
@@ -3625,6 +3652,11 @@ def main():
     sp.add_argument("--model-override", metavar="REASON",
                     help="required to spawn a model above executor_model_ceiling — the reason is "
                     "recorded in the ledger (model_ceiling_override)")
+    sp.add_argument("--mcp", nargs="?", const="inherit", default=None, metavar="SPEC",
+                    help="MCP servers for this executor (overrides config executor_mcp, default "
+                         "none): bare --mcp = inherit everything the CLI would load; --mcp none = "
+                         "strict zero servers; --mcp linear,chrome-devtools = strict allowlist of "
+                         "servers configured in ~/.claude.json / <worktree>/.mcp.json")
     sp.add_argument("--name")
     sp.add_argument("--scope")
     sp.add_argument("--seed", metavar="PATH_OR_SID",
