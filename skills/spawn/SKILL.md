@@ -32,7 +32,9 @@ path — not bare `relay`, which often isn't on the Bash tool's non-interactive 
 report's outcome/risk/UNVERIFIED lines get appended to this packet as context, ahead of the GATES.
 See `/relay:retire`.
 
-(`--model` optional — omit for the default. Add `--name <label>` for a custom session name, or
+(`--model` optional — omit for the default. Add `--keep` if you already know a follow-up packet is
+coming soon and don't want auto-close to park it in between (it can always be resumed; `relay keep
+<sid> --off` unpins). Add `--name <label>` for a custom session name, or
 `--scope <tag>` for the short area tag shown in `/relay:list`. Add `--pane` to open this executor
 as a split pane in your own window instead of a tab (`--tab` to force a tab), overriding the
 `executor_layout` config default; iTerm only, falls back to a tab if your session can't be found.

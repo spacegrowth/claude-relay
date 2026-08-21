@@ -20,6 +20,11 @@ ones still show), which is harmless.
 By default, closed/superseded/dead sessions are hidden — pass `--closed` to reveal them (capped at
 15 most recent by update time); use `relay prune --dry-run` to see which ones are safe to delete.
 
+Running `list` also **auto-closes** finished executors (reported, report already seen by you,
+work landed in the worktree or idle past `auto_close_idle_minutes`) and prints a 🛏 line for each —
+they show as `closed (auto)` under `--closed`, and `/relay:send` brings one back with full context.
+A `reported 📌` status is a pinned session (`relay keep`) that auto-close leaves alone.
+
 Use `${CLAUDE_PLUGIN_ROOT}/bin/relay list --all` for the **global** view — every executor across
 every project, regardless of owner.
 

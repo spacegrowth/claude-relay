@@ -120,8 +120,9 @@ The flow, in five beats:
 4. **Spawn** — executors build in parallel, each in its own tab/pane, each on the model the lead
    picked for it (`--model`, per executor — see [Why](#why)); the lead wakes you as each one
    reports.
-5. **Review → commit → close** — diff page per executor, you approve, the lead commits, sessions
-   close (or take follow-up packets).
+5. **Review → commit** — diff page per executor, you approve, the lead commits. Finished
+   executors then **park themselves** (auto-close once their work has landed or they've idled out;
+   `relay send` brings one back with full context) — or take follow-up packets.
 
 And the three nouns:
 
@@ -129,6 +130,8 @@ And the three nouns:
   across packets — one engineer you keep assigning related work to, not a disposable one-shot.
 - A **packet** = a work order (a `.md` file). relay auto-appends the rules every executor follows
   (stage-don't-commit, one deliverable per packet, required report format) — you never write those.
+  A packet also declares the MCP servers its executor needs (`MCP: linear`), if any — executors
+  launch with none otherwise.
 - A **report** = what the executor writes back when done, at a path relay assigns.
 
 ## Commands
@@ -136,18 +139,24 @@ And the three nouns:
 ```
 /relay:mode                          adopt the lead role (arms the gate + auto-wake)
 /relay:spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL] [--seed SID|PATH]
-/relay:send  <session_id> <packet.md>      follow-up into the SAME session (reuse > respawn)
+             [--mcp [SPEC]] [--keep]       MCP servers (default none; packet `MCP:` line usually
+                                            decides); --keep pins it against auto-close
+/relay:send  <session_id> <packet.md>      follow-up into the SAME session (reuse > respawn);
+                                            a packet `MCP:` line the executor lacks → relaunches
+                                            its conversation with the wider set, then delivers
              [--when-idle]                 busy target? queue it; delivers when it next goes idle
 relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --when-idle
 /relay:check [<session_id> | --all]        busy / reported / stalled / dead
-/relay:list                                leads + active executors (closed hidden; --closed shows)
-/relay:close <session_id> [--supersede <new_id>]
+/relay:list                                leads + active executors (closed hidden; --closed shows);
+                                            also parks finished executors (auto-close)
+/relay:close <session_id> [--supersede <new_id>]   (rarely needed — finished executors auto-close)
+relay keep <session_id> [--off]            pin/unpin an executor against auto-close
 /relay:retire <session_id> [--force]       close it AND leave a successor-seed.md, so respawning
                                             fresh over the same territory is cheap
 /relay:stop                                unarm: step down from lead mode (gate + auto-wake off)
 /relay:focus <session_id>                  jump to that session's tab/pane/window (executor or lead)
-/relay:resume <session_id>                 reopen a dead tab's conversation, context intact
-/relay:restart <session_id>                re-run a dead session's packet fresh (loses context)
+/relay:resume <session_id> [--mcp SPEC]    reopen a dead tab's conversation, context intact
+/relay:restart <session_id> [--mcp SPEC]   re-run a dead session's packet fresh (loses context)
 /relay:route retain "<reason>"             open a grace window when the gate blocks lead work
 /relay:auto on|off|status                  autonomous posture: proceed by default on routine in-plan
                                             steps instead of asking (per-session; committing still stops)

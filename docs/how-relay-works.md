@@ -53,8 +53,10 @@ stateDiagram-v2
     stalled --> reported: report appears
     stalled --> dead: tab also gone
     reported --> closed: relay close
+    reported --> closed: auto-close (landed / idle) — check, list, lead turn-end
     reported --> superseded: relay close --supersede
     reported --> superseded: relay retire (+ successor-seed.md)
+    reported --> superseded: auto-close of a HEAVY session = retire
     busy --> closed: relay close (manual)
     dead --> [*]: relay prune (--days)
     closed --> [*]: relay prune (--days)
@@ -73,6 +75,21 @@ stateDiagram-v2
   `resumed`.
 - **`restart`** (`cmd_restart`, `bin/relay`) re-runs the session's current packet as a brand
   new conversation (fresh `session_uuid`) — loses prior context. Writes `restarted`.
+- **auto-close** (`auto_close_sweep`, `bin/relay`; policy in `lead_guard.auto_close_decision`)
+  parks a `reported` executor without anyone asking, on two deterministic signals: *landed* — the
+  report's "What changed" files are clean in the worktree (the lead committed/discarded the work;
+  2-minute grace), or *idle* — reported longer than `auto_close_idle_minutes`. Both require the
+  owning lead to have already surfaced the report (§3's dedup set), and skip busy/stalled,
+  queued (`--when-idle`), unowned and pinned (`relay keep`) sessions; a heavy one is retired
+  instead. It runs inside `relay check`, `relay list`, and the lead's Stop hook (`relay
+  _auto-close-sweep --lead <sid>`). Teardown is delegated to `cmd_close`/`cmd_retire`. Writes
+  `auto_closed` (action, reason, trigger); `relay list --closed` shows `closed (auto)`.
+- **MCP set** is decided at launch and is per-PROCESS: executors start with **no** MCP servers
+  (`--strict-mcp-config --mcp-config '{"mcpServers":{}}'`) unless the packet's `MCP:` line (or
+  `spawn --mcp`) says otherwise (`lead_guard.mcp_cli_flags`, `packet_mcp_spec`). Because
+  `claude --resume` does NOT restore `--mcp-config` (verified, `tests/test_e2e_mcp.py`), every
+  relaunch path re-passes the recorded set, and a `send` whose packet needs more than the executor
+  has goes through the resume path below with the widened set (`packet_sent` `via="resume-mcp"`).
 - **`send` into a closed/dead session** (`cmd_send`, `bin/relay`) is the "tab_gone" path: if
   the target has no live tab but a captured `claude_session`, it kills any lingering process,
   closes the stale tab, then resumes the conversation *and* delivers the new packet in one shot —
@@ -93,7 +110,7 @@ always re-run this before deciding anything, so a session that finished after yo
 never reads as falsely busy.
 
 Ledger events written along these transitions: `spawned`, `packet_sent`, `resumed`, `restarted`,
-`reported`, `stalled`, `closed`, `superseded`, `adopted`, `pruned`, `lead_pruned`. Lead-side events
+`reported`, `stalled`, `closed`, `superseded`, `auto_closed`, `keep`, `adopted`, `pruned`, `lead_pruned`. Lead-side events
 from §4 (`lead_started`, `blocked`, `retained`, `lead_handoff`, `lead_stepped_down`,
 `handoff_nudged`, `session_end`) share the same `sessions.jsonl` file — one flat, append-only
 history across every lead and executor on the machine.
