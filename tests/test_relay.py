@@ -1951,8 +1951,11 @@ class TestSpawnSeed:
         # ordering is load-bearing: the seed must never sit between the executor and its GATES
         self._retired(relay)
         packet = self._spawn(relay, tmp_path, "old-1")
+        # (the standing GATES now live in the executor agent; the packet's own footer is the
+        # per-packet REPORT/self-diff/closing-line block — the seed must still sit before it)
         assert packet.index("Finish the export work.") < packet.index("INHERITED CONTEXT") \
-            < packet.index("# Successor seed") < packet.index("GATES") < packet.index("REPORT FORMAT")
+            < packet.index("# Successor seed") < packet.index("REPORT: write your full report") \
+            < packet.index("✅ [relay]")
 
     def test_seed_is_framed_as_context_not_instructions(self, relay, tmp_path):
         self._retired(relay)
@@ -1965,7 +1968,8 @@ class TestSpawnSeed:
         assert "INHERITED CONTEXT" not in with_none
         assert with_none == relay.build_packet(
             "Finish the export work.", str(relay.packets_dir("a") / "001-report.md"),
-            f"{relay.RELAY_BIN} diff a", relay.path_to_file_url(relay.packets_dir("a") / "001-diff.html"))
+            f"{relay.RELAY_BIN} diff a", relay.path_to_file_url(relay.packets_dir("a") / "001-diff.html"),
+            agent=True)  # agent-roled spawn → the short per-packet footer
 
     def test_refuses_a_seed_that_does_not_exist(self, relay, tmp_path):
         with pytest.raises(SystemExit) as ei:
