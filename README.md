@@ -75,6 +75,19 @@ Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
 Either way the skills invoke relay by its plugin-absolute path
 (`${CLAUDE_PLUGIN_ROOT}/bin/relay`), so nothing needs to be on PATH.
 
+**Updating** (marketplace install):
+
+```
+/plugin update relay@claude-relay
+/reload-plugins
+```
+
+then, in any lead you keep using, take one normal turn and check `relay list` — its `VER` column
+re-stamps itself from the live hooks, so if it shows the new version you're current; if it doesn't,
+restart that session (details and why under [Troubleshooting](#troubleshooting)). A running
+executor keeps the role/flags it was launched with until it is resumed or restarted. A local-clone
+install picks up changes on the next `claude --plugin-dir …` launch.
+
 Optional, for typing bare `relay` in your own terminal:
 
 ```
@@ -147,6 +160,9 @@ And the three nouns:
 /relay:spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL] [--seed SID|PATH]
              [--mcp [SPEC]] [--keep]       MCP servers (default none; packet `MCP:` line usually
                                             decides); --keep pins it against auto-close
+                                            context window: `--model sonnet[1m]`, or the packet's
+                                            `CONTEXT: 1m` line, or relay picks 1m when the packet's
+                                            referenced reading is big; default 200K
 /relay:send  <session_id> <packet.md>      follow-up into the SAME session (reuse > respawn);
                                             a packet `MCP:` line the executor lacks → relaunches
                                             its conversation with the wider set, then delivers
@@ -556,8 +572,24 @@ report path, self-diff command and closing line. Two things become *enforced* ra
 the `Agent` tool is removed (an executor can never spawn sub-agents), and `git commit` / `git push`
 are denied at the CLI (`--disallowedTools`, which holds even under `--dangerously-skip-permissions`
 — verified live, `tests/test_e2e_agent.py`). Sessions spawned before the agent existed keep
-getting the full GATES footer in their packets. There is no lead agent on purpose: leads arm
+getting the full GATES footer in their packets. The denies are prefix rules (`git commit…`,
+`git push…`) — a guard against the ordinary mistake, not a sandbox; `git -C <dir> commit` would
+slip past, and the staged-diff review is still where anything lands or doesn't. There is no lead agent on purpose: leads arm
 mid-session with `/relay:mode`, which `--agent` (launch-time only) can't do.
+
+### Executor context window (200K vs 1M)
+
+Claude Code opens the default 200K window for a bare model alias and the 1M window for the
+`[1m]` suffix (`sonnet[1m]`, `opus[1m]`; Haiku 4.5 has no 1M flavour). The window is fixed when
+the executor process starts and `--resume` keeps the conversation's model, so this is a **spawn-time
+decision** — and the lead makes it, or relay does mechanically on the lead's behalf; the executor
+never picks its own. Precedence: an explicit `[1m]` on `--model` → the packet's `CONTEXT: 1m` /
+`CONTEXT: 200k` line → relay's heuristic (it stats the files the packet names; ≥ ~600KB of
+referenced reading ≈ 150K tokens → `[1m]`, printed as `context: 1m (from referenced reading ~720KB)`)
+→ 200K. Default is 200K on purpose: most packets are bounded, and a smaller window reinforces
+"treat every packet cold". A session that ran heavy is widened by `relay retire` + respawn — the
+successor seed says `declare CONTEXT: 1m` when that applies. `haiku[1m]` is refused; a
+packet/heuristic asking for 1M on haiku degrades to 200K with a note.
 
 ### Executor MCP servers
 

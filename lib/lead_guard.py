@@ -1545,6 +1545,110 @@ def auto_close_decision(s, *, report_age, surfaced, queued, claimed, dirty, heav
     return ("retire" if heavy else "close"), reason
 
 
+# ---- executor context window -------------------------------------------------------------------
+# Claude Code opens the default (200K) window for a bare model alias and the 1M window for the
+# `[1m]` suffix (`sonnet[1m]` → claude-sonnet-5[1m]; verified live 2026-08-21). Haiku 4.5 is a
+# 200K model — no real 1M flavour. The window is fixed when the executor PROCESS starts, and a
+# `--resume` keeps the conversation's model, so this is a spawn-time decision; a session that ran
+# heavy is widened by retire + respawn (the successor seed says so), never in place.
+#
+# Who decides: the LEAD, explicitly (`CONTEXT: 1m` in the packet, or `--model sonnet[1m]`); else
+# relay mechanically (the packet's referenced files are big enough that reading them would crowd a
+# 200K window); else 200K. The executor never picks its own window.
+
+CONTEXT_RE = re.compile(r"^\s*(?:[-*>]\s*)?\**\s*CONTEXT\s*\**\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+CONTEXT_1M_BYTES = 600_000        # ~150K tokens of referenced reading → the 200K window is crowded
+NO_1M_TIERS = ("haiku",)          # tiers with no 1M window
+_PATH_RE = re.compile(r"(?<![\w/.-])((?:~|\.{1,2})?/?(?:[\w.@-]+/)+[\w.@-]+\.[A-Za-z0-9]{1,8}|[\w.@-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|kt|rb|php|cs|c|h|cpp|hpp|md|txt|json|yaml|yml|toml|sql|sh|html|css))(?![\w/])")
+
+
+def normalize_context_spec(raw):
+    """"1m" | "200k" | None. Accepts 1m/1M/1000k/1000000, 200k/200K/default/standard."""
+    if raw is None:
+        return None
+    v = str(raw).strip().lower().replace(" ", "")
+    if v in ("1m", "1000k", "1000000", "1mtok", "1m-context"):
+        return "1m"
+    if v in ("200k", "200000", "default", "standard", "normal"):
+        return "200k"
+    return None
+
+
+def packet_context_spec(body):
+    """The window a PACKET declares via a `CONTEXT: 1m` / `CONTEXT: 200k` line, or None."""
+    if not body:
+        return None
+    m = CONTEXT_RE.search(body)
+    return normalize_context_spec(m.group(1)) if m else None
+
+
+def model_has_1m(model):
+    return bool(model) and str(model).strip().lower().endswith("[1m]")
+
+
+def model_with_context(model, ctx):
+    """Apply a window to a model string: "1m" adds the `[1m]` suffix, "200k" strips it, None
+    leaves it alone."""
+    if not model:
+        return model
+    base = str(model).strip()
+    if base.lower().endswith("[1m]"):
+        base = base[:-4]
+    if ctx == "1m":
+        return base + "[1m]"
+    return base
+
+
+def model_supports_1m(model):
+    return model_tier(model) not in NO_1M_TIERS
+
+
+def packet_reading_bytes(body, cwd=None):
+    """Total size of the files a packet refers to (paths that exist — relative to `cwd` or
+    absolute/home). Pure-mechanical: a proxy for "how much must the executor read", which is the
+    only signal relay has for the window. Missing paths count nothing."""
+    total, seen = 0, set()
+    for m in _PATH_RE.finditer(body or ""):
+        raw = m.group(1)
+        cands = [Path(raw).expanduser()]
+        if cwd and not raw.startswith(("/", "~")):
+            cands.insert(0, Path(cwd) / raw)
+        for c in cands:
+            try:
+                rp = c.resolve()
+                if rp in seen:
+                    break
+                if rp.is_file():
+                    seen.add(rp)
+                    total += rp.stat().st_size
+                    break
+            except Exception:
+                continue
+    return total
+
+
+def decide_context(model, packet_ctx, reading_bytes, threshold=CONTEXT_1M_BYTES):
+    """(resolved_model, ctx, source) — the executor's context window. Precedence:
+      explicit `[1m]` on the model string  > packet CONTEXT: line > reading-size heuristic > 200k.
+    A tier with no 1M window (haiku) is never given the suffix; an EXPLICIT request for it on such
+    a tier raises ValueError (the lead asked for something that doesn't exist); a packet/heuristic
+    request just degrades to 200k with source "200k (no 1M on this tier)"."""
+    if model_has_1m(model):
+        if not model_supports_1m(model):
+            raise ValueError(f"'{model}': the {model_tier(model)} tier has no 1M context window")
+        return model, "1m", "--model"
+    want, src = None, None
+    if packet_ctx:
+        want, src = packet_ctx, "packet CONTEXT: line"
+    elif reading_bytes >= threshold:
+        want, src = "1m", f"referenced reading ~{reading_bytes // 1024}KB"
+    if want == "1m" and not model_supports_1m(model):
+        return model_with_context(model, "200k"), "200k", f"200k (no 1M window on {model_tier(model)}; wanted 1m from {src})"
+    if want == "1m":
+        return model_with_context(model, "1m"), "1m", src
+    return model_with_context(model, "200k"), "200k", src or "default"
+
+
 # ---- executor MCP policy -----------------------------------------------------------------------
 # An executor does worktree file/git work; every MCP server it inherits (claude.ai connectors like
 # Gmail/Linear, plugin MCPs like claude-in-chrome, user/project servers) costs tokens on EVERY turn

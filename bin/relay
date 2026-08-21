@@ -928,6 +928,17 @@ def cmd_spawn(args):
     # ledgered reason.
     cfg = lead_guard.load_config(STATE_ROOT)
     resolved_model = args.model or cfg.get("executor_default_model", "sonnet")
+    # Context window (lead_guard "executor context window"): explicit `[1m]` on --model wins; else
+    # the packet's `CONTEXT:` line; else the size of what the packet tells the executor to read;
+    # else the 200K default. Decided here, before the ceiling check (the suffix doesn't change tier).
+    try:
+        resolved_model, ctx_window, ctx_src = lead_guard.decide_context(
+            resolved_model, lead_guard.packet_context_spec(authored_body),
+            lead_guard.packet_reading_bytes(authored_body, cwd=worktree))
+    except ValueError as e:
+        sys.exit(f"spawn: --model: {e}")
+    if ctx_window == "1m" or "no 1M" in ctx_src:
+        print(f"  context: {ctx_window} (from {ctx_src}) → model {resolved_model}")
     ceiling = cfg.get("executor_model_ceiling", "opus")
     if lead_guard.model_exceeds_ceiling(resolved_model, ceiling):
         if not args.model_override:
@@ -1065,6 +1076,8 @@ def cmd_spawn(args):
         "mcp": mcp_spec,          # resolved MCP set ("none" | "inherit" | [names]) — resume/restart
                                   # relaunch with the same set, never silently inheriting
         "keep": bool(getattr(args, "keep", False)),  # pinned: auto-close never parks it (relay keep)
+        "context": ctx_window,    # "1m" | "200k" — fixed for the conversation (resume keeps the model);
+                                  # widen by retire + respawn, never in place
         "agent": agent_name,      # "relay-executor" when the role rides the inline agent (None = legacy
                                   # full-GATES packets); relaunch re-passes it, send picks the footer by it
         "pid": pid,
@@ -3007,7 +3020,7 @@ def seed_entries(session_id):
     return entries
 
 
-def build_successor_seed(session_id, s, entries, generated):
+def build_successor_seed(session_id, s, entries, generated, heavy=False):
     """The successor-seed.md text. Contract: a header saying what this file is and is not, the
     inherited TERRITORY (where the work lives), a PACKET INDEX with one summarised entry per packet,
     and a closing INHERIT WITH CARE caveat. Pure — takes the timestamp rather than calling now(),
@@ -3022,9 +3035,13 @@ def build_successor_seed(session_id, s, entries, generated):
          "## Territory", ""]
     for label, val in (("Worktree", s.get("worktree")), ("Topic", s.get("topic")),
                        ("Scope", s.get("scope")), ("Model", s.get("model")),
+                       ("Context window", s.get("context")),
                        ("MCP set", lead_guard.mcp_spec_label(s.get("mcp")) if s.get("mcp") is not None else None),
                        ("Retired session", session_id)):
         L.append(f"- {label}: {val or '(unrecorded)'}")
+    if heavy and s.get("context") != "1m" and lead_guard.model_supports_1m(s.get("model")):
+        L.append("- Hint: this session ran HEAVY on the 200k window — declare `CONTEXT: 1m` in the "
+                 "successor's packet (or spawn `--model <model>[1m]`) so it doesn't compact as early")
     L += [f"- Packets worked: {len(entries)} ({reported} reported, {unreported} unreported)",
           f"- Packet/report files: {packets_dir(session_id)}", "",
           "## Packet index", ""]
@@ -3081,7 +3098,8 @@ def cmd_retire(args):
 
     entries = seed_entries(args.session_id)
     seed_path.parent.mkdir(parents=True, exist_ok=True)
-    seed_path.write_text(build_successor_seed(args.session_id, s, entries, now()))
+    heavy = _is_heavy(_transcript_mb_for(s.get("claude_session")), _heaviness_threshold_mb())
+    seed_path.write_text(build_successor_seed(args.session_id, s, entries, now(), heavy=heavy))
 
     cmd_close(SimpleNamespace(session_id=args.session_id, supersede=SEED_RETIRED_BY_SEED,
                               self_session=None, keep_tab=args.keep_tab))

@@ -5893,3 +5893,40 @@ class TestExecutorAgentWiring:
             n = relay.read_session("a1")["current_packet"]
             assert marker in (relay.packets_dir("a1") / f"{n:03d}-packet.md").read_text()
             (relay.packets_dir("a1") / f"{n:03d}-report.md").write_text("done")
+
+
+class TestSpawnContextWindow:
+    def _spawn(self, relay, tmp_path, body, model=None, name="c1"):
+        pkt = tmp_path / "p.md"; pkt.write_text(body)
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt), model=model,
+                                            name=name, scope=None, skip_perms=None, pane=None))
+        return cap
+
+    def test_default_200k(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path, "# T\ndo it")
+        assert cap["model"] == "sonnet" and relay.read_session("c1")["context"] == "200k"
+
+    def test_packet_context_line(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path, "# T\nCONTEXT: 1m\ndo it")
+        assert cap["model"] == "sonnet[1m]" and relay.read_session("c1")["context"] == "1m"
+
+    def test_big_required_reading_picks_1m(self, relay, tmp_path):
+        (tmp_path / "huge.py").write_text("x" * 700_000)
+        cap = self._spawn(relay, tmp_path, "# T\nREQUIRED READING: huge.py\ndo it")
+        assert cap["model"] == "sonnet[1m]"
+
+    def test_explicit_model_suffix_and_haiku(self, relay, tmp_path):
+        assert self._spawn(relay, tmp_path, "# T\nCONTEXT: 200k", model="opus[1m]")["model"] == "opus[1m]"
+        assert self._spawn(relay, tmp_path, "# T\nCONTEXT: 1m", model="haiku", name="c2")["model"] == "haiku"
+        with pytest.raises(SystemExit):
+            self._spawn(relay, tmp_path, "# T", model="haiku[1m]", name="c3")
+
+    def test_seed_hint_when_heavy(self, relay, tmp_path):
+        s = {"session_id": "h", "worktree": "/w", "topic": "t", "scope": "t", "model": "sonnet", "context": "200k"}
+        text = relay.build_successor_seed("h", s, [], "now", heavy=True)
+        assert "CONTEXT: 1m" in text
+        assert "CONTEXT: 1m" not in relay.build_successor_seed("h", {**s, "context": "1m"}, [], "now", heavy=True)
+        assert "CONTEXT: 1m" not in relay.build_successor_seed("h", s, [], "now", heavy=False)

@@ -93,6 +93,10 @@ stateDiagram-v2
   restored by `--resume`, so `_relaunch` re-passes the flags; the session records `agent:
   "relay-executor"` and `build_packet` picks the short per-packet footer (`AGENT_PACKET_FOOTER`)
   for such sessions, the full legacy `TEMPLATE_FOOTER` for older ones.
+- **Context window** is decided at launch too (`lead_guard.decide_context`): explicit `[1m]` on
+  `--model` > packet `CONTEXT:` line > `packet_reading_bytes` heuristic (≥ 600KB of referenced
+  files) > 200K. Recorded as `context` on the session; `--resume` keeps the model so it can only be
+  widened by retire + respawn (`build_successor_seed` adds the hint when the session ran heavy).
 - **MCP set** is decided at launch and is per-PROCESS: executors start with **no** MCP servers
   (`--strict-mcp-config --mcp-config '{"mcpServers":{}}'`) unless the packet's `MCP:` line (or
   `spawn --mcp`) says otherwise (`lead_guard.mcp_cli_flags`, `packet_mcp_spec`). Because

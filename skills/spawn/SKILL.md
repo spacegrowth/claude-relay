@@ -46,4 +46,9 @@ side-effect surface. **If the packet genuinely needs one, declare it IN the pack
 like Chrome or Gmail). The packet is the source of truth — relay reads the line at spawn and, on a
 later `/relay:send`, relaunches the executor's conversation with the wider set if it lacks what the
 new packet declares. `--mcp SPEC` on the command line overrides the line. Decide per packet; don't
-declare inherit by habit.)
+declare inherit by habit.
+Context window: executors get the 200K window by default. If the packet needs a lot of reading or
+the session is meant to live across many packets, declare `CONTEXT: 1m` in the packet (or pass
+`--model sonnet[1m]`); relay also picks 1m on its own when the files the packet names are big
+(≥ ~600KB). Haiku has no 1M window. The window can't change on resume — a heavy session is
+widened by `/relay:retire` + respawn, and its seed will say so.)

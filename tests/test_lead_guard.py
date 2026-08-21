@@ -3031,3 +3031,41 @@ class TestExecutorAgent:
 
     def test_missing_agent_file_means_no_flags(self, tmp_path):
         assert lg.executor_agent_flags(tmp_path) == []
+
+
+class TestExecutorContextWindow:
+    def test_packet_line(self):
+        assert lg.packet_context_spec("# T\nCONTEXT: 1m\n") == "1m"
+        assert lg.packet_context_spec("- **Context**: 200K") == "200k"
+        assert lg.packet_context_spec("context: huge") is None and lg.packet_context_spec("nothing") is None
+
+    def test_model_suffix_helpers(self):
+        assert lg.model_with_context("sonnet", "1m") == "sonnet[1m]"
+        assert lg.model_with_context("sonnet[1m]", "200k") == "sonnet"
+        assert lg.model_with_context("opus[1m]", None) == "opus" and lg.model_has_1m("claude-opus-5[1m]")
+        assert not lg.model_supports_1m("haiku") and lg.model_supports_1m("sonnet[1m]")
+
+    def test_reading_bytes(self, tmp_path):
+        (tmp_path / "src").mkdir(); (tmp_path / "src" / "big.py").write_text("x" * 10_000)
+        (tmp_path / "README.md").write_text("y" * 500)
+        body = "Read `src/big.py` and README.md, also missing/none.py and src/big.py again"
+        assert lg.packet_reading_bytes(body, cwd=str(tmp_path)) == 10_500
+        assert lg.packet_reading_bytes(f"see {tmp_path}/src/big.py", cwd="/nonexistent") == 10_000
+
+    def test_decide_precedence(self):
+        d = lg.decide_context
+        assert d("sonnet[1m]", "200k", 0) == ("sonnet[1m]", "1m", "--model")          # explicit suffix wins
+        assert d("sonnet", "1m", 0) == ("sonnet[1m]", "1m", "packet CONTEXT: line")
+        assert d("sonnet", "200k", 10**7) == ("sonnet", "200k", "packet CONTEXT: line")  # line beats heuristic
+        m, c, src = d("sonnet", None, 700_000)
+        assert (m, c) == ("sonnet[1m]", "1m") and "referenced reading" in src
+        assert d("sonnet", None, 1000) == ("sonnet", "200k", "default")
+
+    def test_haiku_never_gets_1m(self):
+        m, c, src = lg.decide_context("haiku", "1m", 0)
+        assert (m, c) == ("haiku", "200k") and "no 1M" in src
+        with pytest.raises(ValueError):
+            lg.decide_context("haiku[1m]", None, 0)
+
+    def test_ceiling_ignores_suffix(self):
+        assert not lg.model_exceeds_ceiling("sonnet[1m]", "opus") and lg.model_exceeds_ceiling("opus[1m]", "sonnet")
