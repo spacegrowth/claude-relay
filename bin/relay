@@ -6,11 +6,13 @@ one each time.
 
 Commands:
   relay spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL] [--mcp [SPEC]]
-  relay send  <session_id> <packet.md>
+  relay send  <session_id> <packet.md> [--rotate]   # --rotate: retire + seeded respawn (1M), packet first
   relay check [<session_id> | --all] [--json]
   relay status [session_id] [--statusline]    # read-only, statusline-safe one-liner; never writes
   relay list [--lead <session_id> | --all] [--json]
   relay keep <session_id> [--off]             # pin/unpin against auto-close (finished executors are parked automatically)
+  relay lint <packet.md> [--worktree W] [--model M] [--strict] [--json]   # advisory packet checks (also run at spawn/send)
+  relay doctor [--offline] [--quick] [--json]   # prove the installed claude CLI still honours relay's launch flags
   relay report <session_id> [--packet N]      # print an executor's report, framed in green
   relay verify <session_id> [--packet N] [--rerun]   # machine-check a report against its staged
                                               # reality: MALFORMED/MISMATCH/INCONCLUSIVE/COUNTS-MATCH
@@ -546,6 +548,39 @@ def packet_missing_preconditions(body):
     return PRECONDITIONS_HEADING_RE.search(body) is None
 
 
+def print_lint(body, cwd=None, model=None, skip=("no-preconditions",)):
+    """Print lead_guard.lint_packet findings for an outgoing packet (spawn/send). Advisory; the
+    Preconditions nag is skipped here by default because warn_missing_preconditions already prints
+    it with the verb-specific wording those paths (and their tests) rely on."""
+    try:
+        known = set(lead_guard.known_mcp_servers(cwd=cwd)) if cwd else None
+        for level, code, msg in lead_guard.lint_packet(body, cwd=cwd, known_servers=known, model=model):
+            if code in skip:
+                continue
+            mark = "⚠" if level == "warn" else "ℹ"
+            print(c(f"  {mark} lint[{code}]: {msg}", "red" if level == "warn" else "dim"))
+    except Exception:
+        pass
+
+
+def cmd_lint(args):
+    """Lint a packet file without sending it. Exit 1 under --strict when any warn-level finding."""
+    body = Path(args.packet).read_text()
+    cwd = str(Path(args.worktree).expanduser().resolve()) if args.worktree else None
+    known = set(lead_guard.known_mcp_servers(cwd=cwd)) if cwd else None
+    findings = lead_guard.lint_packet(body, cwd=cwd, known_servers=known, model=args.model)
+    if args.json:
+        print(json.dumps([{"level": l, "code": k, "message": m} for l, k, m in findings], indent=2))
+    else:
+        if not findings:
+            print(c("✓ packet lint: no findings", "green"))
+        for level, code, msg in findings:
+            mark = "⚠" if level == "warn" else "ℹ"
+            print(c(f"{mark} [{code}] {msg}", "red" if level == "warn" else "dim"))
+    if args.strict and any(l == "warn" for l, _, _ in findings):
+        sys.exit(1)
+
+
 def warn_missing_preconditions(body, verb):
     """Print the §7-h1 nag if `body` has no Preconditions section. One helper for all three
     outgoing-packet paths (spawn / send / --when-idle queue) so the wording can't drift between
@@ -970,6 +1005,7 @@ def cmd_spawn(args):
         sys.exit(f"spawn: MCP ({mcp_src}): {e}")
     if mcp_spec != "none":
         print(f"  MCP: {lead_guard.mcp_spec_label(mcp_spec)} (from {mcp_src})")
+    print_lint(authored_body, cwd=worktree, model=resolved_model)
 
     auto_trust(worktree)
     label = f"[Exec] {session_id}"  # role-prefixed: exec tabs and lead tabs are told apart at a glance
@@ -1419,6 +1455,32 @@ def cmd_resume(args):
     print(f"resumed '{sid}' (tab '{label}', pid {pid}) — reopened conversation with full context")
 
 
+def _rotate_and_send(args, s, mb=None):
+    """retire `s` → spawn its successor (seeded, same territory, 1M window when the tier has one) with
+    args.packet as packet 001. Prints the new session id; ledgers `rotated`."""
+    sid = args.session_id
+    n = 2
+    while read_session(f"{sid}-r{n}"):
+        n += 1
+    new_sid = f"{sid}-r{n}"
+    model = s.get("model") or lead_guard.load_config(STATE_ROOT).get("executor_default_model", "sonnet")
+    widened = False
+    if not lead_guard.model_has_1m(model) and lead_guard.model_supports_1m(model):
+        model, widened = lead_guard.model_with_context(model, "1m"), True
+    mcp = s.get("mcp")
+    mcp_arg = lead_guard.mcp_spec_label(mcp) if mcp is not None else None
+    print(f"rotating '{sid}'" + (f" ({mb:.1f}MB transcript)" if mb else "") + f" → retire + spawn '{new_sid}' on {model}"
+          + (" (widened to the 1M window)" if widened else ""))
+    cmd_retire(SimpleNamespace(session_id=sid, force=False, keep_tab=False))
+    cmd_spawn(SimpleNamespace(worktree=s["worktree"], topic=s.get("topic") or sid, packet=args.packet, model=model,
+                              name=new_sid, scope=s.get("scope"), skip_perms=None, pane=None,
+                              lead=s.get("owner_lead"), seed=sid, mcp=mcp_arg, keep=bool(s.get("keep")),
+                              model_override=None))
+    append_ledger("rotated", session_id=sid, successor=new_sid, model=model, widened=widened,
+                  mb=round(mb, 1) if mb else None)
+    print(f"rotated: '{sid}' retired, '{new_sid}' spawned with this packet (seed inherited)")
+
+
 def cmd_send(args):
     s = read_session(args.session_id)
     if not s:
@@ -1482,14 +1544,21 @@ def cmd_send(args):
     # what "heavy" means. mb is None (unlocatable transcript) never gates — nothing to warn about.
     mb = _transcript_mb_for(s.get("claude_session"))
     threshold = _heaviness_threshold_mb()
+    # --rotate: the one-flag answer to the heaviness gate — retire THIS session (successor seed) and
+    # spawn a fresh executor over the same territory (same worktree/topic/scope/model/MCP, widened to
+    # the 1M window when the tier has one), with this packet as its first. Works on a non-heavy
+    # session too (a deliberate rotation), it just isn't suggested there.
+    if getattr(args, "rotate", False):
+        return _rotate_and_send(args, s, mb)
     if _is_heavy(mb, threshold):
         if not getattr(args, "heavy_override", None):
             sys.exit(f"session '{args.session_id}' is heavy — its transcript is {mb:.1f}MB, past the "
                      f"{threshold:g}MB threshold. That's not a verdict on its work — a disciplined "
                      f"executor does its best work deep into a session — it's just a point worth a "
                      f"conscious choice: `relay retire {args.session_id}` and a fresh spawn keeps "
-                     f"the next packet's context cheap, or pass --heavy-override \"<reason>\" to "
-                     f"send into this one anyway.")
+                     f"the next packet's context cheap — `relay send {args.session_id} <packet> --rotate` "
+                     f"does exactly that in one step (retire + seeded respawn, this packet first) — or pass "
+                     f"--heavy-override \"<reason>\" to send into this one anyway.")
         append_ledger("heavy_override", session_id=args.session_id, mb=round(mb, 1),
                       reason=args.heavy_override)
 
@@ -1500,6 +1569,7 @@ def cmd_send(args):
     n = next_packet_number(args.session_id)
     body = Path(args.packet).read_text()
     warn_missing_preconditions(body, "sending")
+    print_lint(body, cwd=s.get("worktree"), model=s.get("model"))
     # MCP coverage (executor MCP policy): MCP servers load at PROCESS start and `--resume` does not
     # restore them (verified live, tests/test_e2e_mcp.py), so a follow-up packet declaring `MCP: x`
     # that this executor wasn't launched with can only be honoured by relaunching the SAME
@@ -1975,6 +2045,126 @@ def _print_auto_closed(acted):
                 f"it with full context", "dim"))
 
 
+# ── relay doctor ──────────────────────────────────────────────────────────────────────────────
+# Relay leans on CLI behaviours it does not control: `--strict-mcp-config` really loading zero
+# servers, `--agent` applying (and not replacing the harness prompt), `--disallowedTools` holding
+# under --dangerously-skip-permissions, model aliases resolving. A Claude Code update can change any
+# of them silently; the unit suite mocks them all. `relay doctor` proves them against the INSTALLED
+# cli the way tests/test_e2e_mcp.py / test_e2e_agent.py do, plus the offline plumbing checks.
+
+def _probe_claude(prompt, extra_flags=(), cwd=None, skip_perms=False, model="haiku", timeout=180):
+    """One headless `claude -p` with relay's own command builder. Returns (init_event|None,
+    result_text, error_text)."""
+    cmd = iterm_backend.build_claude_cmd(prompt, model=model, skip_perms=skip_perms,
+                                         mcp_flags=list(extra_flags))
+    cmd += " -p --output-format stream-json --verbose"
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+    except Exception as e:
+        return None, "", str(e)
+    init, result = None, ""
+    for line in r.stdout.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") == "system" and d.get("subtype") == "init":
+            init = d
+        if d.get("type") == "result":
+            result = d.get("result") or ""
+    return init, result, (r.stderr[-400:] if r.returncode != 0 else "")
+
+
+def cmd_doctor(args):
+    checks = []  # (name, status, detail) status ∈ PASS/FAIL/SKIP
+
+    def add(name, ok, detail="", skip=False):
+        checks.append((name, "SKIP" if skip else ("PASS" if ok else "FAIL"), detail))
+
+    # ---- offline plumbing ----
+    bin_path = shutil.which("claude") or iterm_backend.CLAUDE_BIN
+    ver = ""
+    try:
+        ver = subprocess.run([bin_path, "--version"], capture_output=True, text=True, timeout=20).stdout.strip()
+    except Exception as e:
+        ver = f"(error: {e})"
+    add("claude binary", bool(ver) and "error" not in ver, f"{bin_path} — {ver}")
+    root = _plugin_root()
+    agents = lead_guard.load_executor_agent(root)
+    add("executor agent file", bool(agents), f"{root}/agents/{lead_guard.EXECUTOR_AGENT_FILE}"
+        + ("" if agents else " missing/unparsable → executors fall back to full-GATES packets"))
+    hooks_ok = (root / "hooks" / "executor_escalation.py").exists() and (root / "hooks" / "hooks.json").exists()
+    add("plugin hooks present", hooks_ok, str(root / "hooks"))
+    try:
+        STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        probe = STATE_ROOT / ".doctor-write"; probe.write_text("x"); probe.unlink()
+        add("state root writable", True, str(STATE_ROOT))
+    except Exception as e:
+        add("state root writable", False, f"{STATE_ROOT}: {e}")
+    cfg = lead_guard.load_config(STATE_ROOT)
+    add("config loads", True, f"auto_close={cfg.get('auto_close')} escalation={cfg.get('executor_escalation')} "
+        f"default_model={cfg.get('executor_default_model')} ceiling={cfg.get('executor_model_ceiling')}")
+    known = lead_guard.known_mcp_servers(cwd=os.getcwd())
+    add("configured MCP servers (allowlist-able)", True, ", ".join(sorted(known)) or "(none — only `MCP: inherit` can add servers)")
+
+    # ---- live probes ----
+    if args.offline:
+        for name in ("strict MCP → zero servers", "executor agent applies", "git commit denied under skip-perms",
+                     "model aliases (sonnet, sonnet[1m])"):
+            add(name, False, "--offline", skip=True)
+    else:
+        model = args.model or "haiku"
+        init, res, err = _probe_claude("Reply: ok", lead_guard.mcp_cli_flags("none"), model=model)
+        add("strict MCP → zero servers", bool(init) and not (init.get("mcp_servers") or []),
+            (f"mcp_servers={[x.get('name') for x in init.get('mcp_servers') or []]}" if init else f"no init event {err}"))
+        aflags = lead_guard.executor_agent_flags(root)
+        if aflags:
+            init, res, err = _probe_claude(
+                "Reply with exactly two lines. Line 1: GATES=<YES if your instructions contain a GATES section about "
+                "staging and never committing, else NO>. Line 2: HARNESS=<YES if your system prompt also contains "
+                "Claude Code's own instructions about tools such as Bash, else NO>", aflags, model=model)
+            tools = (init or {}).get("tools") or []
+            ok = bool(init) and "Agent" not in tools and "Bash" in tools and "GATES=YES" in res and "HARNESS=YES" in res
+            add("executor agent applies", ok, (f"tools={len(tools)} Agent={'absent' if 'Agent' not in tools else 'PRESENT'}; "
+                                               f"{res.strip().replace(chr(10), ' ')[:60]}") if init else f"no init event {err}")
+            if args.quick:
+                add("git commit denied under skip-perms", False, "--quick", skip=True)
+            else:
+                import tempfile
+                d = tempfile.mkdtemp(prefix="relay-doctor-")
+                subprocess.run(["git", "-C", d, "init", "-q"], capture_output=True)
+                init, res, err = _probe_claude("Run exactly this shell command and say in one line whether it "
+                                               "succeeded or was blocked: git commit --allow-empty -m doctor",
+                                               aflags, cwd=d, skip_perms=True, model=model)
+                log = subprocess.run(["git", "-C", d, "log", "--oneline"], capture_output=True, text=True).stdout.strip()
+                add("git commit denied under skip-perms", bool(init) and log == "",
+                    ("no commit created" if log == "" else f"COMMIT WENT THROUGH: {log}") if init else f"no init event {err}")
+                shutil.rmtree(d, ignore_errors=True)
+        else:
+            add("executor agent applies", False, "no agent file", skip=True)
+            add("git commit denied under skip-perms", False, "no agent file", skip=True)
+        if args.quick:
+            add("model aliases (sonnet, sonnet[1m])", False, "--quick", skip=True)
+        else:
+            i1, _, e1 = _probe_claude("Reply: ok", model="sonnet")
+            i2, _, e2 = _probe_claude("Reply: ok", model="sonnet[1m]")
+            m1 = (i1 or {}).get("model") or ""; m2 = (i2 or {}).get("model") or ""
+            add("model aliases (sonnet, sonnet[1m])", "sonnet" in m1 and m2.endswith("[1m]"),
+                f"sonnet→{m1 or e1 or '?'}  sonnet[1m]→{m2 or e2 or '?'}")
+
+    if args.json:
+        print(json.dumps([{"check": n, "status": st, "detail": d} for n, st, d in checks], indent=2))
+    else:
+        for n, st, d in checks:
+            col = {"PASS": "green", "FAIL": "red", "SKIP": "dim"}[st]
+            print(f"{c(st.ljust(4), col, 'bold')}  {n}" + (c(f"  — {d}", "dim") if d else ""))
+        fails = [n for n, st, _ in checks if st == "FAIL"]
+        print(c(f"\n{'✗ ' + str(len(fails)) + ' failing: ' + ', '.join(fails) if fails else '✓ relay doctor: all checks passed'}",
+                "red" if fails else "green"))
+    if any(st == "FAIL" for _, st, _ in checks):
+        sys.exit(1)
+
+
 def cmd_keep(args):
     """Pin / unpin an executor against auto-close (lead_guard "auto-close policy")."""
     s = read_session(args.session_id)
@@ -2053,6 +2243,9 @@ def cmd_check(args):
         rep_c = c("✅ report ready", "green", "bold") if reported else c("not yet", "dim")
         q = s.get("queued") or 0
         q_c = c(f" 📥 {q} queued", "yellow") if q else ""
+        u = _usage_for_session(s)
+        if u:
+            q_c += c(f"  · tokens {lead_guard.usage_cell(u)} over {u['requests']} requests", "dim")
         print(f"{s['session_id']}: status={status_c} packet={n:03d} {rep_c}{q_c}")
 
 
@@ -2343,6 +2536,33 @@ def _transcript_mb_for(claude_session):
     return lead_guard.transcript_mb(str(path)) if path else None
 
 
+def _usage_for_session(s):
+    """Token usage for an executor's conversation (lead_guard.transcript_usage), cached in its
+    state dir as usage.json keyed by the transcript's (size, mtime) so `relay list` doesn't re-parse
+    a multi-MB file on every run. None when the transcript can't be located."""
+    cs = s.get("claude_session")
+    if not cs:
+        return None
+    path = _find_transcript_path(cs)
+    if not path:
+        return None
+    try:
+        st = path.stat()
+        key = [st.st_size, int(st.st_mtime)]
+        cache = session_dir(s["session_id"]) / "usage.json"
+        if cache.exists():
+            d = json.loads(cache.read_text())
+            if d.get("key") == key and d.get("usage"):
+                return d["usage"]
+        usage = lead_guard.transcript_usage(str(path))
+        if usage:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"key": key, "usage": usage}))
+        return usage
+    except Exception:
+        return None
+
+
 def _mb_cell_text(mb):
     """'-' for an unlocatable transcript (mb is None), else one decimal place — the shared cell
     formatter behind both the LEADS and EXECUTORS MB columns."""
@@ -2414,6 +2634,9 @@ def cmd_list(args):
 
     if args.json:
         # --json: fully unfiltered (programmatic surface, filtering is human-display concern)
+        for r in rows:
+            r["usage"] = _usage_for_session(r)
+            r["launch"] = lead_guard.launch_cell(r)
         print(json.dumps({"leads": leads, "executors": rows}, indent=2))
         return
 
@@ -2605,6 +2828,10 @@ def cmd_list(args):
     # touches, so re-reading it twice per row is worth avoiding.
     mb_by_sid = {s["session_id"]: _transcript_mb_for(s.get("claude_session")) for s in rows}
     heavy_threshold = _heaviness_threshold_mb()
+    # TOKENS: real prompt/output spend per executor from its transcript (cached per size/mtime) —
+    # the MB column is a proxy; this is what the model choice actually cost. LAUNCH: mcp/context/
+    # role, so "why does this executor lack a tool / compact early" is a glance.
+    usage_by_sid = {s["session_id"]: _usage_for_session(s) for s in rows}
 
     # Calculate dynamic widths for EXECUTORS table with per-column caps.
     exec_cols = [
@@ -2620,6 +2847,8 @@ def cmd_list(args):
         # exec" is a glance instead of archaeology. A proxy for transcript size, not context-window
         # occupancy (same caveat lead_guard.transcript_mb's own docstring carries).
         ("MB", 6, [_mb_cell_text(mb_by_sid[s["session_id"]]) for s in rows]),
+        ("TOKENS", 12, [lead_guard.usage_cell(usage_by_sid[s["session_id"]]) for s in rows]),
+        ("LAUNCH", 16, [lead_guard.launch_cell(s) for s in rows]),
         ("REPORTED", 8, ["yes" if s["reported"] else "no" for s in rows]),
     ]
     exec_widths = {name: min(cap, max(len(name), max((len(str(v)) for v in vals), default=0)))
@@ -2645,9 +2874,13 @@ def cmd_list(args):
             cell(str(s.get("model") or "-"), exec_widths["MODEL"]),
             cell(str(s["current_packet"]).zfill(4), exec_widths["PKT"]),
             cell(_mb_cell_text(mb_by_sid[s["session_id"]]), exec_widths["MB"]),
+            cell(lead_guard.usage_cell(usage_by_sid[s["session_id"]]), exec_widths["TOKENS"]),
+            cell(lead_guard.launch_cell(s), exec_widths["LAUNCH"]),
             rep_cell,
         ]
         print(" ".join(row_parts))
+    print(c("  TOKENS = prompt/output tokens billed so far (prompt incl. cache reads/writes); "
+            "LAUNCH = mcp/context/role (A agent, G legacy GATES footer)", "dim"))
 
     # heavy footnote (§6e e1's "warning-stamp" shape, ver?/stale-hooks style — say it in words, not
     # just a skimmable column) — NUDGE wording per §9: state the fact and the alternative, never
@@ -3945,6 +4178,10 @@ def main():
                     help="required to send into a session whose transcript is past the heaviness "
                          "threshold (§6e e2) — the reason is ledgered (model_ceiling_override's "
                          "sibling)")
+    sd.add_argument("--rotate", action="store_true",
+                    help="retire this session and spawn a seeded successor over the same territory "
+                         "(1M window when the tier has one) with this packet as its first — the one-flag "
+                         "answer to the heaviness gate")
     sd.add_argument("--when-idle", dest="when_idle", action="store_true",
                     help="if the session is busy/stalled, QUEUE this packet instead of refusing; "
                          "it is delivered automatically the next time the session goes idle "
@@ -3960,6 +4197,22 @@ def main():
     dq = sub.add_parser("_deliver-queued", help=argparse.SUPPRESS)  # internal: see cmd_deliver_queued
     dq.add_argument("session_id")
     dq.set_defaults(func=cmd_deliver_queued)
+
+    dr = sub.add_parser("doctor", help="prove the installed claude CLI still behaves as relay assumes "
+                                       "(strict MCP, executor agent, commit deny, model aliases) + plumbing")
+    dr.add_argument("--offline", action="store_true", help="plumbing checks only, no claude calls")
+    dr.add_argument("--quick", action="store_true", help="skip the slower probes (commit deny, [1m] alias)")
+    dr.add_argument("--model", help="model for the probes (default haiku)")
+    dr.add_argument("--json", action="store_true")
+    dr.set_defaults(func=cmd_doctor)
+
+    ln = sub.add_parser("lint", help="lint a packet file before sending it (advisory; --strict exits 1 on warnings)")
+    ln.add_argument("packet")
+    ln.add_argument("--worktree", help="resolve referenced files / configured MCP servers against this dir")
+    ln.add_argument("--model", help="the model the executor would get (for the 1M-window check)")
+    ln.add_argument("--strict", action="store_true")
+    ln.add_argument("--json", action="store_true")
+    ln.set_defaults(func=cmd_lint)
 
     kp = sub.add_parser("keep", help="pin an executor so auto-close never parks it (--off to unpin)")
     kp.add_argument("session_id")

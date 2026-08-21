@@ -20,6 +20,11 @@ ones still show), which is harmless.
 By default, closed/superseded/dead sessions are hidden — pass `--closed` to reveal them (capped at
 15 most recent by update time); use `relay prune --dry-run` to see which ones are safe to delete.
 
+Two columns worth reading: `TOKENS` is the executor's real spend so far (prompt/output tokens
+summed from its transcript — use it to judge whether a territory deserves sonnet or haiku next
+time), and `LAUNCH` is `mcp/context/role` (e.g. `none/200k/A`) — the first place to look when an
+executor "doesn't have" a tool or compacts early.
+
 Running `list` also **auto-closes** finished executors (reported, report already seen by you,
 work landed in the worktree or idle past `auto_close_idle_minutes`) and prints a 🛏 line for each —
 they show as `closed (auto)` under `--closed`, and `/relay:send` brings one back with full context.

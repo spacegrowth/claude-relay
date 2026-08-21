@@ -5930,3 +5930,92 @@ class TestSpawnContextWindow:
         assert "CONTEXT: 1m" in text
         assert "CONTEXT: 1m" not in relay.build_successor_seed("h", {**s, "context": "1m"}, [], "now", heavy=True)
         assert "CONTEXT: 1m" not in relay.build_successor_seed("h", s, [], "now", heavy=False)
+
+
+class TestLintCommandAndSpawnLint:
+    def test_cmd_lint_strict_exit_and_json(self, relay, tmp_path, capsys):
+        p = tmp_path / "p.md"; p.write_text("do it, then commit your changes")
+        relay.cmd_lint(SimpleNamespace(packet=str(p), worktree=None, model=None, strict=False, json=True))
+        out = json.loads(capsys.readouterr().out)
+        assert {f["code"] for f in out} >= {"short-packet", "asks-to-commit"}
+        with pytest.raises(SystemExit):
+            relay.cmd_lint(SimpleNamespace(packet=str(p), worktree=None, model=None, strict=True, json=False))
+
+    def test_spawn_prints_lint_but_not_duplicate_preconditions(self, relay, tmp_path, capsys):
+        pkt = tmp_path / "p.md"; pkt.write_text("# T\nCreate the Linear issue for this and stage the fix in src.\n" * 3)
+        with mock.patch.object(relay.iterm, "spawn"), mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123), \
+             mock.patch.object(relay.lead_guard, "known_mcp_servers", return_value={}):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt), model=None,
+                                            name="l1", scope=None, skip_perms=None, pane=None))
+        out = capsys.readouterr().out
+        assert "lint[mcp-mentioned-not-declared]" in out
+        assert out.count("Preconditions") == 1   # the existing nag only, not doubled by lint
+
+
+class TestListTokensAndLaunch:
+    def test_list_shows_tokens_and_launch_with_cache(self, relay, tmp_path, capsys):
+        # a fake transcript the locator can find
+        proj = tmp_path / "projects" / "p"; proj.mkdir(parents=True)
+        t = proj / "cs-42.jsonl"
+        t.write_text(json.dumps({"type": "assistant", "message": {"id": "m", "model": "claude-sonnet-5", "usage": {
+            "input_tokens": 10, "cache_read_input_tokens": 990, "cache_creation_input_tokens": 0, "output_tokens": 200}}}) + "\n")
+        relay.packets_dir("u1").mkdir(parents=True, exist_ok=True)
+        relay.write_session("u1", {"session_id": "u1", "worktree": "/w", "topic": "t", "scope": "t", "tab_label": "x",
+            "model": "sonnet", "mcp": "none", "context": "200k", "agent": "relay-executor", "pid": None,
+            "claude_session": "cs-42", "status": "busy", "current_packet": 1, "busy_since": relay.now(),
+            "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir("u1") / "001-packet.md").write_text("p")
+        with mock.patch.object(relay, "_transcript_project_dirs", return_value=[proj]), \
+             mock.patch.object(relay, "session_pid_alive", return_value=True):
+            relay.cmd_list(SimpleNamespace(json=False, lead=None, all=True, closed=False))
+            out = capsys.readouterr().out
+            assert "1.0k/200" in out and "none/200k/A" in out and "TOKENS" in out and "LAUNCH" in out
+            assert (relay.session_dir("u1") / "usage.json").exists()            # cached
+            relay.cmd_list(SimpleNamespace(json=True, lead=None, all=True, closed=False))
+            row = json.loads(capsys.readouterr().out)["executors"][0]
+            assert row["usage"]["prompt"] == 1000 and row["launch"] == "none/200k/A"
+
+
+class TestSendRotate:
+    def test_rotate_retires_and_spawns_seeded_successor_on_1m(self, relay, tmp_path):
+        sid = "heavy1"
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": str(tmp_path), "topic": "parser", "scope": "p",
+            "tab_label": "x", "model": "sonnet", "mcp": ["linear"], "context": "200k", "agent": "relay-executor",
+            "pid": None, "claude_session": "cs-h", "status": "reported", "current_packet": 1, "owner_lead": "lead-1",
+            "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("first")
+        (relay.packets_dir(sid) / "001-report.md").write_text("Done.\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: x")
+        nxt = tmp_path / "n.md"; nxt.write_text("# next\n\n## Preconditions\n- ok\n\ndo more in src/a.py please")
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=False), \
+             mock.patch.object(relay.iterm, "close", return_value=True), \
+             mock.patch.object(relay, "_kill_and_wait"), mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123), \
+             mock.patch.object(relay.lead_guard, "known_mcp_servers", return_value={"linear": {"type": "http", "url": "u"}}):
+            relay.cmd_send(SimpleNamespace(session_id=sid, packet=str(nxt), rotate=True))
+        old = relay.read_session(sid)
+        assert old["status"] == "superseded" and (relay.STATE_ROOT / sid / relay.SEED_FILENAME).exists()
+        new = relay.read_session(f"{sid}-r2")
+        assert new and new["model"] == "sonnet[1m]" and new["context"] == "1m" and new["mcp"] == ["linear"]
+        assert new["owner_lead"] == "lead-1" and new["topic"] == "parser"
+        assert cap["model"] == "sonnet[1m]"
+        packet = (relay.packets_dir(f"{sid}-r2") / "001-packet.md").read_text()
+        assert "do more in src/a.py" in packet and "Successor seed" in packet
+        assert any(json.loads(l).get("event") == "rotated" for l in relay.LEDGER.read_text().splitlines())
+
+    def test_heavy_gate_mentions_rotate(self, relay, tmp_path):
+        sid = "heavy2"
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": str(tmp_path), "topic": "t", "scope": "t", "tab_label": "x",
+            "model": "sonnet", "pid": None, "claude_session": "cs-h2", "status": "reported", "current_packet": 1,
+            "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("first"); (relay.packets_dir(sid) / "001-report.md").write_text("done")
+        nxt = tmp_path / "n.md"; nxt.write_text("next")
+        with mock.patch.object(relay, "_transcript_mb_for", return_value=99.0), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_send(SimpleNamespace(session_id=sid, packet=str(nxt)))
+        assert "--rotate" in str(ei.value)

@@ -326,6 +326,11 @@ backwards. Its threshold (`stall_threshold_seconds`, default 2700) is a separate
 `poll_seconds` (1800) precisely so the two clocks can't flip an executor to `stalled` at the same
 instant layer 1's poller would time out.
 
+`relay doctor` (`cmd_doctor`, `bin/relay`) is the live counterpart of this table for the CLI
+assumptions relay can't control — it runs relay's own command builder headless and reads the
+`system/init` event (mcp_servers, tools, model) plus a real `git commit` attempt under
+skip-permissions; `tests/test_e2e_mcp.py` / `test_e2e_agent.py` are the same probes as tests.
+
 ## 6. Name resolution
 
 Every sid-accepting relay command routes through `resolve_sid` (`bin/relay`, wired centrally

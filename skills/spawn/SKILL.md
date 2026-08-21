@@ -28,6 +28,11 @@ executor inherits your ownership — it's stamped with your lead id and project.
 (Call relay via `${CLAUDE_PLUGIN_ROOT}/bin/relay` — Claude Code substitutes the plugin's absolute
 path — not bare `relay`, which often isn't on the Bash tool's non-interactive PATH.)
 
+Relay lints every outgoing packet (advisory ⚠/ℹ lines at spawn and send — e.g. the text mentions
+Linear but no `MCP:` line; big reading pinned to 200K; the packet tells the executor to commit or
+to ask someone). Fix what it flags before the executor burns a turn on it; `relay lint <packet>
+--worktree <dir>` runs the same checks without sending.
+
 **Succeeding a retired session?** Pass `--seed <retired_session_id>` (or a path to its
 `successor-seed.md`) to inherit what that session did on this territory — its packet index and each
 report's outcome/risk/UNVERIFIED lines get appended to this packet as context, ahead of the GATES.

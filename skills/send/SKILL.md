@@ -54,3 +54,9 @@ preserved; it just costs a new window instead of reusing the tab in place.
 auto-wake to the acting lead — which matters after a handoff (an inherited executor otherwise
 keeps waking its old, retired lead, silently, forever). If it's currently owned by a live *other*
 lead, relay warns instead of stealing it; `relay adopt <session_id> --force` takes it explicitly.
+
+**Heavy session?** The heaviness gate refuses a plain send past the threshold. Instead of
+`--heavy-override`, prefer `relay send $session_id $packet --rotate`: relay retires the session
+(successor seed written), spawns `<sid>-r2` over the same worktree/topic/model/MCP set on the 1M
+window, and delivers this packet to it as packet 001 — one command, context handed over via the
+seed.

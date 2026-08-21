@@ -1649,6 +1649,156 @@ def decide_context(model, packet_ctx, reading_bytes, threshold=CONTEXT_1M_BYTES)
     return model_with_context(model, "200k"), "200k", src or "default"
 
 
+# ---- transcript usage (tokens per session) -----------------------------------------------------
+# Claude Code's transcript JSONL carries the API `usage` of every assistant message. Summing it gives
+# REAL spend per session (prompt = input + cache_read + cache_creation; output), not the MB proxy.
+# Assistant lines are repeated once per content block with the same message id and usage — dedup by
+# message id (last wins) or every multi-block turn is counted N times (observed live 2026-08-21:
+# 201 of 262 message ids duplicated in one transcript).
+
+def transcript_usage(path):
+    """Aggregate usage for one transcript: {"requests", "prompt", "input", "cache_read",
+    "cache_create", "output", "models": {model: requests}} — or None when unreadable."""
+    try:
+        by_id = {}
+        order = []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "assistant":
+                    continue
+                m = d.get("message") or {}
+                u = m.get("usage") or {}
+                if not u:
+                    continue
+                mid = m.get("id") or d.get("requestId") or d.get("uuid")
+                if mid not in by_id:
+                    order.append(mid)
+                by_id[mid] = (u, m.get("model"))
+        agg = {"requests": 0, "prompt": 0, "input": 0, "cache_read": 0, "cache_create": 0, "output": 0,
+               "models": {}}
+        for mid in order:
+            u, model = by_id[mid]
+            i = int(u.get("input_tokens") or 0); cr = int(u.get("cache_read_input_tokens") or 0)
+            cc = int(u.get("cache_creation_input_tokens") or 0); o = int(u.get("output_tokens") or 0)
+            agg["requests"] += 1; agg["input"] += i; agg["cache_read"] += cr; agg["cache_create"] += cc
+            agg["output"] += o; agg["prompt"] += i + cr + cc
+            if model:
+                agg["models"][model] = agg["models"].get(model, 0) + 1
+        return agg
+    except Exception:
+        return None
+
+
+def human_tokens(n):
+    """1234 → '1.2k', 1_234_567 → '1.2M', 0 → '0'."""
+    try:
+        n = int(n)
+    except Exception:
+        return "-"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k" if n >= 10_000 else f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def usage_cell(usage):
+    """'<prompt>/<output>' e.g. '1.2M/34k', or '-' when unknown."""
+    if not usage:
+        return "-"
+    return f"{human_tokens(usage.get('prompt', 0))}/{human_tokens(usage.get('output', 0))}"
+
+
+def launch_cell(s):
+    """Compact 'what was this executor launched with': mcp/context/role, e.g. 'none/200k/A'
+    (A = agent-roled, G = legacy full-GATES packets; '?' for records that predate the field)."""
+    mcp = mcp_spec_label(s.get("mcp")) if s.get("mcp") is not None else "?"
+    ctx = s.get("context") or ("1m" if model_has_1m(s.get("model")) else "?")
+    role = "A" if s.get("agent") else ("G" if "agent" in s else "?")
+    return f"{mcp}/{ctx}/{role}"
+
+
+# ---- packet lint -------------------------------------------------------------------------------
+# Zero-token sanity pass over an OUTGOING packet (spawn / send / `relay lint`). Advisory only —
+# prints, never blocks (spawn's hard refusals, e.g. an unknown MCP allowlist name, stay where they
+# are). Exists because a packet can now carry declarations (`MCP:`, `CONTEXT:`, `## Preconditions`)
+# whose absence is silent: an executor launched without the Linear server just lacks the tool, and
+# the lead only finds out from the report.
+
+PRECONDITIONS_RE = re.compile(r"^#{1,6}[ \t]*preconditions\b", re.IGNORECASE | re.MULTILINE)
+MCP_HINT_WORDS = ("linear", "jira", "gmail", "google calendar", "google drive", "notion", "slack",
+                  "chrome", "browser", "playwright", "puppeteer", "github mcp", "mcp server", "mcp tool")
+COMMIT_RE = re.compile(r"\bgit (commit|push)\b|\b(commit|push) (your|the|these|all|this|it)\b", re.IGNORECASE)
+ASK_RE = re.compile(r"\b(ask|check with|confirm with|clarify with) (the )?(user|human|lead|me)\b", re.IGNORECASE)
+
+
+def lint_packet(body, cwd=None, known_servers=None, model=None, reading_bytes=None):
+    """List of (level, code, message) findings. level ∈ {"warn", "info"}. Pure given its inputs;
+    `known_servers` is the name set from known_mcp_servers(cwd) (None → skip the unknown-name
+    check), `reading_bytes` the packet_reading_bytes(body, cwd) total (None → computed here)."""
+    out = []
+    text = body or ""
+    low = text.lower()
+    if len(text.strip()) < 80:
+        out.append(("warn", "short-packet", "packet body is very short — an executor treats it cold, "
+                    "with no access to this conversation; spell out the task and acceptance criteria"))
+    if PRECONDITIONS_RE.search(text) is None:
+        out.append(("warn", "no-preconditions", "no ## Preconditions section — authoring one forces the "
+                    "world-state walk before send (checkout pulled? code live? DDL applied?)"))
+    # MCP
+    mcp_line = PACKET_MCP_RE.search(text)
+    mcp_spec = packet_mcp_spec(text)
+    if mcp_line and mcp_spec is None:
+        out.append(("warn", "mcp-unparsable", f"MCP: line present but its value isn't none/inherit/a,b: "
+                    f"'{mcp_line.group(1)}'"))
+    if mcp_spec is None:
+        hits = sorted({w for w in MCP_HINT_WORDS if w in low})
+        if known_servers:
+            hits += sorted(n for n in known_servers if n.lower() in low and n.lower() not in hits)
+        if hits:
+            out.append(("warn", "mcp-mentioned-not-declared",
+                        f"packet mentions {', '.join(hits)} but declares no MCP: line — executors launch "
+                        f"with NO MCP servers; add `MCP: <server>` (configured) or `MCP: inherit` if the "
+                        f"task really needs the tool"))
+    elif isinstance(mcp_spec, list) and known_servers is not None:
+        unknown = [n for n in mcp_spec if n not in known_servers]
+        if unknown:
+            out.append(("warn", "mcp-unknown-server", f"MCP: names {', '.join(unknown)} — not configured in "
+                        f"~/.claude.json / <worktree>/.mcp.json (spawn will refuse); plugin/connector MCPs "
+                        f"need `MCP: inherit`"))
+    # context window
+    ctx_m = CONTEXT_RE.search(text)
+    ctx = packet_context_spec(text)
+    if ctx_m and ctx is None:
+        out.append(("warn", "context-unparsable", f"CONTEXT: line present but value isn't 1m/200k: "
+                    f"'{ctx_m.group(1)}'"))
+    rb = reading_bytes if reading_bytes is not None else packet_reading_bytes(text, cwd=cwd)
+    if rb >= CONTEXT_1M_BYTES:
+        if ctx == "200k":
+            out.append(("warn", "context-200k-big-reading", f"packet references ~{rb // 1024}KB of files but "
+                        f"pins CONTEXT: 200k — the executor will compact early"))
+        elif ctx is None:
+            out.append(("info", "context-auto-1m", f"packet references ~{rb // 1024}KB of files — relay will "
+                        f"launch the executor on the 1M window (declare CONTEXT: 200k to override)"))
+    if ctx == "1m" and model and not model_supports_1m(model):
+        out.append(("warn", "context-1m-on-haiku", f"CONTEXT: 1m but model '{model}' has no 1M window — "
+                    f"it will run on 200k"))
+    # role violations the executor can't honour
+    if COMMIT_RE.search(text):
+        out.append(("warn", "asks-to-commit", "packet tells the executor to commit/push — executors stage "
+                    "only (commit/push are denied); phrase it as 'stage for review'"))
+    if ASK_RE.search(text):
+        out.append(("warn", "asks-to-ask", "packet tells the executor to ask someone — executors never ask "
+                    "in the tab; phrase it as 'stop and report the blocker'"))
+    return out
+
+
 # ---- executor MCP policy -----------------------------------------------------------------------
 # An executor does worktree file/git work; every MCP server it inherits (claude.ai connectors like
 # Gmail/Linear, plugin MCPs like claude-in-chrome, user/project servers) costs tokens on EVERY turn

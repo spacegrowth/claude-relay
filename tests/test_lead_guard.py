@@ -3069,3 +3069,69 @@ class TestExecutorContextWindow:
 
     def test_ceiling_ignores_suffix(self):
         assert not lg.model_exceeds_ceiling("sonnet[1m]", "opus") and lg.model_exceeds_ceiling("opus[1m]", "sonnet")
+
+
+class TestPacketLint:
+    GOOD = ("# Task\n\n## Preconditions\n- checkout pulled\n\n## Work packet\nImplement the thing in src/a.py, "
+            "add tests, stage for review. Acceptance: suite green.\n")
+
+    def codes(self, body, **kw):
+        return [c for _, c, _ in lg.lint_packet(body, **kw)]
+
+    def test_clean_packet(self):
+        assert self.codes(self.GOOD) == []
+
+    def test_short_and_no_preconditions(self):
+        assert set(self.codes("do it")) >= {"short-packet", "no-preconditions"}
+
+    def test_mcp_mentioned_not_declared(self):
+        assert "mcp-mentioned-not-declared" in self.codes(self.GOOD + "Create the Linear issue when done.\n")
+        assert "mcp-mentioned-not-declared" not in self.codes(self.GOOD + "MCP: linear\nCreate the Linear issue.\n")
+        # configured server name in text counts too
+        assert "mcp-mentioned-not-declared" in self.codes(self.GOOD + "use the robinhood tool\n", known_servers={"robinhood"})
+
+    def test_mcp_unknown_and_unparsable(self):
+        assert "mcp-unknown-server" in self.codes(self.GOOD + "MCP: gmail\n", known_servers={"linear"})
+        assert "mcp-unknown-server" not in self.codes(self.GOOD + "MCP: linear\n", known_servers={"linear"})
+        assert "mcp-unparsable" not in self.codes(self.GOOD + "MCP: inherit\n")
+
+    def test_context_findings(self, tmp_path):
+        big = tmp_path / "big.py"; big.write_text("x" * 700_000)
+        body = self.GOOD + f"Read {big}\n"
+        assert "context-auto-1m" in self.codes(body)
+        assert "context-200k-big-reading" in self.codes(body + "CONTEXT: 200k\n")
+        assert "context-1m-on-haiku" in self.codes(self.GOOD + "CONTEXT: 1m\n", model="haiku")
+        assert "context-unparsable" in self.codes(self.GOOD + "CONTEXT: huge\n")
+
+    def test_role_violations(self):
+        assert "asks-to-commit" in self.codes(self.GOOD + "Then commit your changes and push the branch.\n")
+        assert "asks-to-ask" in self.codes(self.GOOD + "If unsure, ask the user.\n")
+        assert "asks-to-commit" not in self.codes(self.GOOD)  # "stage for review" is fine
+
+
+class TestTranscriptUsage:
+    def _write(self, tmp_path):
+        p = tmp_path / "t.jsonl"
+        def a(mid, i, cr, cc, o, model="claude-sonnet-5"):
+            return json.dumps({"type": "assistant", "message": {"id": mid, "model": model, "usage": {
+                "input_tokens": i, "cache_read_input_tokens": cr, "cache_creation_input_tokens": cc, "output_tokens": o}}})
+        lines = [a("m1", 2, 1000, 500, 50), a("m1", 2, 1000, 500, 50),   # duplicated per content block
+                 json.dumps({"type": "user", "message": {"content": "x"}}),
+                 a("m2", 3, 1500, 0, 70, model="claude-haiku-4-5"), "not json"]
+        p.write_text("\n".join(lines) + "\n")
+        return p
+
+    def test_dedups_by_message_id_and_sums(self, tmp_path):
+        u = lg.transcript_usage(self._write(tmp_path))
+        assert u["requests"] == 2 and u["output"] == 120
+        assert u["prompt"] == (2 + 1000 + 500) + (3 + 1500 + 0)
+        assert u["models"] == {"claude-sonnet-5": 1, "claude-haiku-4-5": 1}
+        assert lg.transcript_usage(tmp_path / "missing.jsonl") is None
+
+    def test_cells(self):
+        assert lg.human_tokens(999) == "999" and lg.human_tokens(1234) == "1.2k"
+        assert lg.human_tokens(34567) == "35k" and lg.human_tokens(1_234_567) == "1.2M"
+        assert lg.usage_cell({"prompt": 1_234_567, "output": 34_567}) == "1.2M/35k" and lg.usage_cell(None) == "-"
+        assert lg.launch_cell({"mcp": "none", "context": "200k", "agent": "relay-executor"}) == "none/200k/A"
+        assert lg.launch_cell({"mcp": ["linear"], "context": "1m", "agent": None}) == "linear/1m/G"
+        assert lg.launch_cell({"model": "sonnet[1m]"}) == "?/1m/?"

@@ -166,11 +166,20 @@ And the three nouns:
 /relay:send  <session_id> <packet.md>      follow-up into the SAME session (reuse > respawn);
                                             a packet `MCP:` line the executor lacks → relaunches
                                             its conversation with the wider set, then delivers
+             [--rotate]                    heavy session? retire it + spawn a seeded successor
+                                            (1M window when the tier has one) with this packet first
              [--when-idle]                 busy target? queue it; delivers when it next goes idle
 relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --when-idle
 /relay:check [<session_id> | --all]        busy / reported / stalled / dead
+relay doctor [--offline] [--quick]         prove the installed claude CLI still honours relay's launch
+                                            flags (strict MCP, executor agent, commit deny, model
+                                            aliases) + plumbing; run after every Claude Code update
+relay lint <packet.md> [--worktree W]      advisory packet checks (MCP mentioned but not declared,
+             [--model M] [--strict]          big reading on 200K, asks to commit/ask, no Preconditions…);
+                                            the same checks print at spawn/send
 /relay:list                                leads + active executors (closed hidden; --closed shows);
-                                            also parks finished executors (auto-close)
+                                            TOKENS (real prompt/output spend) and LAUNCH
+                                            (mcp/context/role) per executor; parks finished ones
 /relay:close <session_id> [--supersede <new_id>]   (rarely needed — finished executors auto-close)
 relay keep <session_id> [--off]            pin/unpin an executor against auto-close
 /relay:retire <session_id> [--force]       close it AND leave a successor-seed.md, so respawning
@@ -202,7 +211,12 @@ UUIDs. `relay focus webapp` and `relay stop docs-site` just work. A project name
 matches more than one lead (e.g. an old + new lead after a handoff) never guesses: it exits listing
 every candidate sid instead, newest-first, so you can pick one or pass a unique prefix.
 
-Also: `relay list` hides closed/superseded/dead sessions by default; pass `--closed` to reveal them (capped at 15 most recent). `relay report <sid>` prints a finished report in a green banner, and
+Also: `relay list`'s `TOKENS` column is real spend — prompt (incl. cache reads/writes) / output
+tokens summed from the executor's transcript (deduped per message, cached per transcript size) — so
+"what did sonnet vs haiku actually cost on this territory" is a glance; `--json` carries the full
+breakdown (`usage`: input, cache_read, cache_create, output, requests, models). `LAUNCH` is
+`mcp/context/role` (`none/200k/A`: no MCP servers, 200K window, agent-roled; `G` = pre-agent session
+on full-GATES packets). `relay list` hides closed/superseded/dead sessions by default; pass `--closed` to reveal them (capped at 15 most recent). `relay report <sid>` prints a finished report in a green banner, and
 `relay prune [--days N] [--dry-run]` clears old closed/dead session state, and also clears dead
 lead markers older than `--days` ("ghost" leads from crashed/abandoned tabs — a lead you're
 actively using is never pruned). `relay diff <sid>
@@ -484,6 +498,11 @@ session something you'll actually do rather than piling one more packet onto it.
 Retire refuses on a session that's still busy with an unreported packet — that work would die
 unsummarised — unless you pass `--force` (the packet is then seeded as `NO REPORT`).
 
+`relay send <sid> <packet.md> --rotate` is the one-step form: retire the session, spawn
+`<sid>-r2` over the same worktree/topic/scope/model/MCP set — widened to the 1M window when the
+tier has one — with the seed inherited and this packet as its first. The heaviness gate's refusal
+message points at it.
+
 ### Auto-close: finished executors park themselves
 
 Executors used to sit idle for hours after reporting because nobody said `relay close` — tabs piling
@@ -600,6 +619,13 @@ packet/heuristic asking for 1M on haiku degrades to 200K with a note.
 - `RELAY_NO_NOTIFY`: suppress all notification banners (useful for tests, CI)
 
 ## Troubleshooting
+
+- **First, `relay doctor`.** It proves the installed Claude Code still behaves the way relay's launch
+  line assumes — `--strict-mcp-config` loads zero servers, the executor agent applies without
+  replacing the harness prompt, `git commit` is denied under skip-permissions, `sonnet`/`sonnet[1m]`
+  resolve — plus the plumbing (binary, agent file, hooks, state dir, config, configured MCP servers).
+  A few small haiku calls; `--offline` for plumbing only, `--quick` to skip the slow probes. Run it
+  after every Claude Code update and before a relay release.
 
 - **`/relay:check --all`** tells you the real state (busy/reported/stalled/dead) — trust it over how
   a tab looks. `stalled` means go look at that tab.
