@@ -3,8 +3,8 @@
 A Claude Code plugin for macOS (iTerm2 or Terminal.app) that delegates work from one Claude Code
 session (the lead) to executor sessions in their own terminal tabs, windows, or split panes, each
 seeded with a work packet. The lead plans, delegates, and reviews; executors **stage their work
-(never commit)**, write a report, and stay idle for reuse; the lead reviews the staged diff and
-commits. You stay in the loop at every gate: the lead proposes a split and waits for your go, and
+(never commit)**, write a report, and stay idle for reuse (parking themselves once their work has
+landed); the lead reviews the staged diff and commits. You stay in the loop at every gate: the lead proposes a split and waits for your go, and
 wakes you when an executor finishes.
 
 ## Why
@@ -22,6 +22,9 @@ wakes you when an executor finishes.
   `/relay:handoff` exist for exactly that.
 - **Real parallelism.** Independent packets run concurrently, each in its own tab — no serializing
   unrelated work through one context.
+- **Lean executors.** An executor launches with no MCP servers at all (no connector/plugin tool
+  rosters in its context every turn) unless its packet says `MCP: linear`; it gets a pinned model
+  and parks itself when done. The lead carries the integrations; executors carry the diff.
 - **Human gates throughout.** Nothing spawns without your go, nothing lands without your review,
   and executors stage, never commit.
 - **Hallucination risk is contained, not eliminated.** An executor can be confidently wrong —
@@ -102,7 +105,8 @@ Then, inside that session:
    **waits for your explicit go**. It never spawns without it.
 4. On your go, executors open in their own tabs and work in parallel. `relay list` shows what's in
    flight; you get a notification as each one reports.
-5. Review each report + staged diff (the lead helps), commit yourself, and close the executors.
+5. Review each report + staged diff (the lead helps) and commit yourself. Finished executors park
+   themselves (auto-close) — or send them follow-up packets.
 
 More examples: [`textkit`](examples/textkit/) (parallel fan-out) and [`calc`](examples/calc/)
 (the full serial → parallel → serial build).
