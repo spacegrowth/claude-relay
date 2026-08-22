@@ -976,6 +976,18 @@ def cmd_spawn(args):
         sys.exit(f"spawn: --model: {e}")
     if ctx_window == "1m" or "no 1M" in ctx_src:
         print(f"  context: {ctx_window} (from {ctx_src}) → model {resolved_model}")
+    # Launch with the CONCRETE id this machine's Claude Code resolves the alias to (lead_guard "model
+    # alias resolution") — same model everywhere, and `[1m]` always rides a full id.
+    requested_model = resolved_model
+    try:
+        resolved_model, model_src = resolve_model_for_launch(resolved_model)
+    except ValueError as e:
+        sys.exit(f"spawn: {e}")
+    if resolved_model != requested_model:
+        print(f"  model: {requested_model} → {resolved_model} ({model_src})")
+    elif model_src.startswith("unresolved"):
+        print(c(f"  ⚠ model: could not resolve '{requested_model}' through the local claude ({model_src}); "
+                f"launching with the alias as-is", "yellow"))
     ceiling = cfg.get("executor_model_ceiling", "opus")
     if lead_guard.model_exceeds_ceiling(resolved_model, ceiling):
         if not args.model_override:
@@ -1180,6 +1192,12 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     if session_uuid and not model:
         model = cfg.get("executor_default_model", "sonnet")
         s["model"] = model
+    if session_uuid and lead_guard.is_model_alias(model):   # fresh launch of a legacy alias record
+        try:
+            model, _src = resolve_model_for_launch(model)
+            s["model"] = model
+        except ValueError as e:
+            sys.exit(f"restart: {e}")
     # MCP set: what this executor was spawned with; a legacy record (no "mcp") gets MCP_DEFAULT —
     # MCP loading is per-process, so resume and restart both need the flags again.
     mcp_spec = lead_guard.normalize_mcp_spec(s.get("mcp") if s.get("mcp") is not None
@@ -2077,6 +2095,46 @@ def _probe_claude(prompt, extra_flags=(), cwd=None, skip_perms=False, model="hai
     return init, result, (r.stderr[-400:] if r.returncode != 0 else "")
 
 
+def _cli_version():
+    try:
+        return subprocess.run([shutil.which("claude") or iterm_backend.CLAUDE_BIN, "--version"],
+                              capture_output=True, text=True, timeout=20).stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _probe_model(alias):
+    """(resolved_id|None, error|None) for one alias via the installed CLI (lead_guard "model alias
+    resolution"). Uses relay's own command builder so the probe is the launch line minus the extras."""
+    cmd = iterm_backend.build_claude_cmd("Reply: ok", model=alias)
+    cmd += " -p --output-format stream-json --verbose --max-turns 1"
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        return None, str(e)
+    init_model, err = None, None
+    for line in r.stdout.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") == "system" and d.get("subtype") == "init":
+            init_model = d.get("model")
+        if d.get("type") == "result" and d.get("is_error"):
+            err = d.get("result") or "error"
+    if r.returncode != 0 and not err:
+        err = r.stderr.strip()[-200:] or f"exit {r.returncode}"
+    if "unrecognized_model" in (r.stderr or ""):
+        err = (err or "") + " unrecognized_model"
+    return (None if err else init_model), err
+
+
+def resolve_model_for_launch(model):
+    """The concrete model id relay launches an executor with, resolved through this machine's CLI
+    (cached per CLI version in <state_root>/models.json). Returns (model, source)."""
+    return lead_guard.resolve_model(model, STATE_ROOT / "models.json", _cli_version(), _probe_model)
+
+
 def cmd_doctor(args):
     checks = []  # (name, status, detail) status ∈ PASS/FAIL/SKIP
 
@@ -2108,6 +2166,9 @@ def cmd_doctor(args):
         f"default_model={cfg.get('executor_default_model')} ceiling={cfg.get('executor_model_ceiling')}")
     known = lead_guard.known_mcp_servers(cwd=os.getcwd())
     add("configured MCP servers (allowlist-able)", True, ", ".join(sorted(known)) or "(none — only `MCP: inherit` can add servers)")
+    mc = lead_guard.load_model_cache(STATE_ROOT / "models.json").get(_cli_version()) or {}
+    add("model alias cache (this CLI version)", True,
+        ", ".join(f"{k}→{v}" for k, v in sorted(mc.items())) or "(empty — filled on first spawn per alias)")
 
     # ---- live probes ----
     if args.offline:

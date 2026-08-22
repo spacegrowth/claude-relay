@@ -93,6 +93,11 @@ stateDiagram-v2
   restored by `--resume`, so `_relaunch` re-passes the flags; the session records `agent:
   "relay-executor"` and `build_packet` picks the short per-packet footer (`AGENT_PACKET_FOOTER`)
   for such sessions, the full legacy `TEMPLATE_FOOTER` for older ones.
+- **Model** is launched as a CONCRETE id: a bare alias on `--model`/config is resolved through the
+  installed Claude Code (`resolve_model_for_launch` → `lead_guard.resolve_model`, a cached `-p`
+  probe per alias per CLI version) so `sonnet` can't quietly mean 4.6 on one machine and 5 on
+  another, and `[1m]` is always attached to a full id. Recorded on the session; `relay list`/board
+  therefore show the real id.
 - **Context window** is decided at launch too (`lead_guard.decide_context`): explicit `[1m]` on
   `--model` > packet `CONTEXT:` line > `packet_reading_bytes` heuristic (≥ 600KB of referenced
   files) > 200K. Recorded as `context` on the session; `--resume` keeps the model so it can only be

@@ -34,6 +34,7 @@ def load_relay_module(state_root):
     loader.exec_module(mod)
     mod.STATE_ROOT = state_root
     mod.LEDGER = state_root / "sessions.jsonl"
+    mod._probe_model = lambda alias: (None, "disabled in tests"); mod._cli_version = lambda: "test"
     return mod
 
 
@@ -3135,3 +3136,25 @@ class TestTranscriptUsage:
         assert lg.launch_cell({"mcp": "none", "context": "200k", "agent": "relay-executor"}) == "none/200k/A"
         assert lg.launch_cell({"mcp": ["linear"], "context": "1m", "agent": None}) == "linear/1m/G"
         assert lg.launch_cell({"model": "sonnet[1m]"}) == "?/1m/?"
+
+
+class TestModelAliasResolution:
+    def test_helpers(self):
+        assert lg.split_model_suffix("sonnet[1m]") == ("sonnet", "[1m]") and lg.split_model_suffix("claude-opus-5") == ("claude-opus-5", "")
+        assert lg.is_model_alias("Sonnet[1m]") and not lg.is_model_alias("claude-sonnet-5")
+
+    def test_explicit_cache_probe_and_failure(self, tmp_path):
+        cache = tmp_path / "models.json"
+        calls = []
+        def probe(alias):
+            calls.append(alias); return ("claude-sonnet-5", None)
+        assert lg.resolve_model("claude-opus-5[1m]", cache, "2.1.238", probe) == ("claude-opus-5[1m]", "explicit")
+        assert lg.resolve_model("sonnet[1m]", cache, "2.1.238", probe) == ("claude-sonnet-5[1m]", "probe")
+        assert lg.resolve_model("sonnet", cache, "2.1.238", probe) == ("claude-sonnet-5", "cache")
+        assert calls == ["sonnet"]                                   # one probe, then cache
+        assert json.loads(cache.read_text()) == {"2.1.238": {"sonnet": "claude-sonnet-5"}}
+        assert lg.resolve_model("sonnet", cache, "9.9.9", probe)[1] == "probe"   # new CLI version → re-probe
+        m, src = lg.resolve_model("opus", cache, "2.1.238", lambda a: (None, "timeout"))
+        assert m == "opus" and src.startswith("unresolved")          # fail-open
+        with pytest.raises(ValueError):
+            lg.resolve_model("haiku", cache, "2.1.238", lambda a: (None, "There's an issue with the selected model (haiku). It may not exist unrecognized_model"))

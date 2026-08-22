@@ -32,6 +32,11 @@ def load_relay_module(state_root):
     loader.exec_module(mod)
     mod.STATE_ROOT = state_root
     mod.LEDGER = state_root / "sessions.jsonl"
+    # Model-alias resolution probes the REAL claude CLI (lead_guard "model alias resolution"); tests
+    # must never do that — neutralise to the fail-open path (alias passes through unchanged) unless a
+    # test patches _probe_model itself.
+    mod._probe_model = lambda alias: (None, "disabled in tests")
+    mod._cli_version = lambda: "test"
     return mod
 
 
@@ -6023,3 +6028,39 @@ class TestSendRotate:
             with pytest.raises(SystemExit) as ei:
                 relay.cmd_send(SimpleNamespace(session_id=sid, packet=str(nxt)))
         assert "--rotate" in str(ei.value)
+
+
+class TestSpawnResolvesModelAlias:
+    def _spawn(self, relay, tmp_path, model=None, name="m1"):
+        pkt = tmp_path / "p.md"; pkt.write_text("# T\n\ndo it")
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt), model=model,
+                                            name=name, scope=None, skip_perms=None, pane=None))
+        return cap
+
+    def test_alias_launches_with_concrete_id_and_caches(self, relay, tmp_path):
+        with mock.patch.object(relay, "_cli_version", return_value="2.1.238"), \
+             mock.patch.object(relay, "_probe_model", return_value=("claude-sonnet-5", None)) as probe:
+            cap = self._spawn(relay, tmp_path, model="sonnet[1m]")
+            assert cap["model"] == "claude-sonnet-5[1m]" and relay.read_session("m1")["model"] == "claude-sonnet-5[1m]"
+            cap = self._spawn(relay, tmp_path, model="sonnet", name="m2")
+            assert cap["model"] == "claude-sonnet-5" and probe.call_count == 1    # second spawn hit the cache
+        assert json.loads((relay.STATE_ROOT / "models.json").read_text())["2.1.238"]["sonnet"] == "claude-sonnet-5"
+
+    def test_full_id_passes_through_without_probe(self, relay, tmp_path):
+        with mock.patch.object(relay, "_probe_model") as probe:
+            cap = self._spawn(relay, tmp_path, model="claude-opus-5")
+        assert cap["model"] == "claude-opus-5" and not probe.called
+
+    def test_unrecognised_refuses_probe_failure_falls_back(self, relay, tmp_path):
+        with mock.patch.object(relay, "_cli_version", return_value="x"), \
+             mock.patch.object(relay, "_probe_model", return_value=(None, "unrecognized_model may not exist")):
+            with pytest.raises(SystemExit) as ei:
+                self._spawn(relay, tmp_path, model="fable")
+            assert "not recognised" in str(ei.value)
+        with mock.patch.object(relay, "_cli_version", return_value="x"), \
+             mock.patch.object(relay, "_probe_model", return_value=(None, "timeout")):
+            cap = self._spawn(relay, tmp_path, model="opus", name="m3")
+        assert cap["model"] == "opus"    # fail-open: alias as-is

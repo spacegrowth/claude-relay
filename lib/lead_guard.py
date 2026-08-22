@@ -1799,6 +1799,65 @@ def lint_packet(body, cwd=None, known_servers=None, model=None, reading_bytes=No
     return out
 
 
+# ---- model alias resolution --------------------------------------------------------------------
+# A bare alias (`sonnet`, `opus`, `haiku`, `fable`) means "the latest THIS Claude Code build knows" —
+# the same alias resolves to different models on machines running different CLI versions, and on
+# some the 1M window only takes with the full id (`claude-sonnet-5[1m]`). Relay therefore resolves
+# an alias through the installed CLI itself at spawn time (`claude --model <alias> -p` emits a
+# system/init event naming the concrete id — the same probe relay doctor reads; an unknown model is
+# reported as an error before any work) and LAUNCHES WITH THE CONCRETE ID. One probe per alias per
+# Claude Code version per machine, cached in <state_root>/models.json; `/model` remains the human's
+# tool — relay just stops passing ambiguous strings. Fail-open: if the probe itself fails (offline,
+# timeout) the alias is passed through unchanged, with a note.
+
+MODEL_ALIASES = ("sonnet", "opus", "haiku", "fable")
+
+
+def split_model_suffix(model):
+    """('sonnet', '[1m]') for 'sonnet[1m]'; ('claude-opus-5', '') for a full id."""
+    m = str(model or "").strip()
+    return (m[:-4], "[1m]") if m.lower().endswith("[1m]") else (m, "")
+
+
+def is_model_alias(model):
+    base, _ = split_model_suffix(model)
+    return base.lower() in MODEL_ALIASES
+
+
+def load_model_cache(cache_path):
+    try:
+        return json.loads(Path(cache_path).read_text())
+    except Exception:
+        return {}
+
+
+def resolve_model(model, cache_path, cli_version, probe):
+    """(resolved_model, source). `probe(alias)` → (resolved_id|None, error_text|None). Full ids are
+    returned untouched ("explicit"); aliases come from the cache ("cache") or the probe ("probe");
+    a probe failure returns the alias unchanged ("unresolved: <why>"); an unrecognised model raises
+    ValueError. The `[1m]` suffix is preserved across resolution."""
+    base, suffix = split_model_suffix(model)
+    if not is_model_alias(base):
+        return model, "explicit"
+    cache = load_model_cache(cache_path)
+    per_ver = cache.get(str(cli_version)) or {}
+    hit = per_ver.get(base.lower())
+    if hit:
+        return hit + suffix, "cache"
+    rid, err = probe(base)
+    if err and ("unrecognized" in err.lower() or "may not exist" in err.lower()):
+        raise ValueError(f"model '{base}' is not recognised by this Claude Code ({cli_version}): {err.strip()[:120]}")
+    if not rid:
+        return model, f"unresolved: {(err or 'no init event').strip()[:80]}"
+    try:
+        cache.setdefault(str(cli_version), {})[base.lower()] = rid
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(cache_path).write_text(json.dumps(cache, indent=2))
+    except Exception:
+        pass
+    return rid + suffix, "probe"
+
+
 # ---- executor MCP policy -----------------------------------------------------------------------
 # An executor does worktree file/git work; every MCP server it inherits (claude.ai connectors like
 # Gmail/Linear, plugin MCPs like claude-in-chrome, user/project servers) costs tokens on EVERY turn

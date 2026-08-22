@@ -16,6 +16,7 @@ def load_relay_module(state_root):
     spec = importlib.util.spec_from_file_location("relay_cli", path, loader=loader)
     mod = importlib.util.module_from_spec(spec); sys.modules["relay_cli"] = mod; loader.exec_module(mod)
     mod.STATE_ROOT = state_root; mod.LEDGER = state_root / "sessions.jsonl"
+    mod._probe_model = lambda alias: (None, "disabled in tests"); mod._cli_version = lambda: "test"
     return mod
 
 
