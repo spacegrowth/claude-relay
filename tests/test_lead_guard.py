@@ -3068,6 +3068,19 @@ class TestExecutorContextWindow:
         with pytest.raises(ValueError):
             lg.decide_context("haiku[1m]", None, 0)
 
+    def test_default_ctx_config(self):
+        # default_ctx applies only when nothing else asks
+        assert lg.decide_context("sonnet", None, 0, default_ctx="1m") == ("sonnet[1m]", "1m", "default")
+        assert lg.decide_context("sonnet", None, 0, default_ctx="200k") == ("sonnet", "200k", "default")
+        # a packet pinning 200k overrides a 1m default
+        assert lg.decide_context("sonnet", "200k", 0, default_ctx="1m") == ("sonnet", "200k", "packet CONTEXT: line")
+        # haiku default 1m degrades quietly to 200k (no "wanted 1m" scolding)
+        m, c, src = lg.decide_context("haiku", None, 0, default_ctx="1m")
+        assert (m, c) == ("haiku", "200k") and "no 1M" in src and "wanted" not in src
+
+    def test_shipped_default_is_1m(self):
+        assert lg.LEAD_DEFAULTS["executor_default_context"] == "1m"
+
     def test_ceiling_ignores_suffix(self):
         assert not lg.model_exceeds_ceiling("sonnet[1m]", "opus") and lg.model_exceeds_ceiling("opus[1m]", "sonnet")
 

@@ -971,7 +971,8 @@ def cmd_spawn(args):
     try:
         resolved_model, ctx_window, ctx_src = lead_guard.decide_context(
             resolved_model, lead_guard.packet_context_spec(authored_body),
-            lead_guard.packet_reading_bytes(authored_body, cwd=worktree))
+            lead_guard.packet_reading_bytes(authored_body, cwd=worktree),
+            default_ctx=cfg.get("executor_default_context", "1m"))
     except ValueError as e:
         sys.exit(f"spawn: --model: {e}")
     if ctx_window == "1m" or "no 1M" in ctx_src:

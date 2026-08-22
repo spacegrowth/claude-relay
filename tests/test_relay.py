@@ -537,7 +537,9 @@ class TestSpawnModel:
     a requested model above executor_model_ceiling is refused without --model-override. iterm.spawn/
     auto_trust/read_pid mocked so no real iTerm/AppleScript is touched."""
     def _run(self, relay, tmp_path, cfg=None, model=None, model_override=None, name="s1"):
-        pkt = tmp_path / "packet.md"; pkt.write_text("do the thing")
+        # CONTEXT: 200k pins the window so these MODEL-policy assertions aren't perturbed by the
+        # executor_default_context (1m) default — the context axis is covered by TestSpawnContextWindow.
+        pkt = tmp_path / "packet.md"; pkt.write_text("do the thing\nCONTEXT: 200k")
         if cfg is not None:
             (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
             (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps(cfg))
@@ -5914,9 +5916,17 @@ class TestSpawnContextWindow:
                                             name=name, scope=None, skip_perms=None, pane=None))
         return cap
 
-    def test_default_200k(self, relay, tmp_path):
+    def test_default_is_1m(self, relay, tmp_path):
+        # shipped default_context is 1m — a plain packet gets the 1M window (probe neutralised in the
+        # test fixture, so the alias keeps its [1m] suffix rather than resolving to a concrete id)
         cap = self._spawn(relay, tmp_path, "# T\ndo it")
-        assert cap["model"] == "sonnet" and relay.read_session("c1")["context"] == "200k"
+        assert cap["model"] == "sonnet[1m]" and relay.read_session("c1")["context"] == "1m"
+
+    def test_config_can_force_200k_default(self, relay, tmp_path):
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps({"executor_default_context": "200k"}))
+        cap = self._spawn(relay, tmp_path, "# T\ndo it", name="c9")
+        assert cap["model"] == "sonnet" and relay.read_session("c9")["context"] == "200k"
 
     def test_packet_context_line(self, relay, tmp_path):
         cap = self._spawn(relay, tmp_path, "# T\nCONTEXT: 1m\ndo it")
@@ -6032,7 +6042,7 @@ class TestSendRotate:
 
 class TestSpawnResolvesModelAlias:
     def _spawn(self, relay, tmp_path, model=None, name="m1"):
-        pkt = tmp_path / "p.md"; pkt.write_text("# T\n\ndo it")
+        pkt = tmp_path / "p.md"; pkt.write_text("# T\n\nCONTEXT: 200k\ndo it")  # isolate from the 1m default
         cap = {}
         with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
              mock.patch.object(relay, "auto_trust"), mock.patch.object(relay, "read_pid", return_value=123):

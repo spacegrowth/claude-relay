@@ -587,6 +587,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
 | `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) for the handoff nudge — a proxy for session weight, not context-window occupancy; calibrated on real sessions (a full working day ≈ 3MB, the heaviest marathon session ever ≈ 6MB) |
+| `executor_default_context` | "1m" | Context window an executor launches with when nothing else decides it (no packet `CONTEXT:` line, no `[1m]` on `--model`, referenced reading under the heuristic). `"1m"` or `"200k"`. Shipped `1m`: the window is a **ceiling, not consumption** — you pay for tokens used, so a bounded packet costs the same either way, and 1M stops executors compacting early on real work. A packet can still pin `CONTEXT: 200k`; haiku (no 1M window) always runs 200K |
 | `auto_close` | true | Park finished executors automatically — see [Auto-close](#auto-close-finished-executors-park-themselves) |
 | `auto_close_idle_minutes` | 60 | Idle-after-report threshold for the auto-close timer path; 0 = timer off (the landed path still applies) |
 | `executor_escalation` | true | Arm every spawned executor with the second-layer one-shot push (see [Auto-wake and notifications](#auto-wake-and-notifications)) |
@@ -621,8 +622,10 @@ decision** — and the lead makes it, or relay does mechanically on the lead's b
 never picks its own. Precedence: an explicit `[1m]` on `--model` → the packet's `CONTEXT: 1m` /
 `CONTEXT: 200k` line → relay's heuristic (it stats the files the packet names; ≥ ~600KB of
 referenced reading ≈ 150K tokens → `[1m]`, printed as `context: 1m (from referenced reading ~720KB)`)
-→ 200K. Default is 200K on purpose: most packets are bounded, and a smaller window reinforces
-"treat every packet cold". A session that ran heavy is widened by `relay retire` + respawn — the
+→ the `executor_default_context` config (**shipped `1m`** — the window is a ceiling, not
+consumption, so a bounded packet costs the same either way; set it to `200k` to reinstate
+early-compaction discipline). A packet can pin `CONTEXT: 200k` to opt one executor down. A session
+that ran heavy is widened by `relay retire` + respawn — the
 successor seed says `declare CONTEXT: 1m` when that applies. `haiku[1m]` is refused; a
 packet/heuristic asking for 1M on haiku degrades to 200K with a note.
 

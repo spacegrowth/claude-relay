@@ -70,6 +70,14 @@ LEAD_DEFAULTS = {
                                   # that has its own five-condition gate (#16 phase 2) — see
                                   # report_verify.clearance, `relay verify --for-autocommit`, and
                                   # skills/mode/SKILL.md's stop-list.
+    "executor_default_context": "1m",  # the context window an executor launches with when nothing
+                                  # else decides it (no packet CONTEXT: line, no [1m] on --model, and
+                                  # its referenced reading is under the heuristic threshold): "1m" or
+                                  # "200k". Shipped "1m" — the window is a ceiling, not consumption
+                                  # (you pay for tokens used, so a bounded packet costs the same at
+                                  # either), and it stops executors compacting early on real work. A
+                                  # packet can still pin `CONTEXT: 200k`; haiku (no 1M window) always
+                                  # runs 200k. See lead_guard "executor context window".
     "auto_close": True,           # park finished executors automatically (see "auto-close policy"
                                   # below): an idle, REPORTED executor whose report the owning lead
                                   # has already seen is closed once its work has landed (its
@@ -1627,26 +1635,31 @@ def packet_reading_bytes(body, cwd=None):
     return total
 
 
-def decide_context(model, packet_ctx, reading_bytes, threshold=CONTEXT_1M_BYTES):
+def decide_context(model, packet_ctx, reading_bytes, threshold=CONTEXT_1M_BYTES, default_ctx="200k"):
     """(resolved_model, ctx, source) — the executor's context window. Precedence:
-      explicit `[1m]` on the model string  > packet CONTEXT: line > reading-size heuristic > 200k.
-    A tier with no 1M window (haiku) is never given the suffix; an EXPLICIT request for it on such
-    a tier raises ValueError (the lead asked for something that doesn't exist); a packet/heuristic
-    request just degrades to 200k with source "200k (no 1M on this tier)"."""
+      explicit `[1m]` on the model string > packet CONTEXT: line > reading-size heuristic >
+      `default_ctx` (the executor_default_context config, "1m" shipped).
+    A tier with no 1M window (haiku) is never given the suffix; an EXPLICIT `[1m]` on such a tier
+    raises ValueError (the lead asked for something that doesn't exist); a packet/heuristic/default
+    ask for 1m just degrades to 200k. The window is a CEILING, not consumption — you pay for tokens
+    actually used, so 1m-by-default costs nothing extra on a bounded packet."""
     if model_has_1m(model):
         if not model_supports_1m(model):
             raise ValueError(f"'{model}': the {model_tier(model)} tier has no 1M context window")
         return model, "1m", "--model"
-    want, src = None, None
     if packet_ctx:
         want, src = packet_ctx, "packet CONTEXT: line"
     elif reading_bytes >= threshold:
         want, src = "1m", f"referenced reading ~{reading_bytes // 1024}KB"
+    else:
+        want, src = normalize_context_spec(default_ctx) or "200k", "default"
     if want == "1m" and not model_supports_1m(model):
-        return model_with_context(model, "200k"), "200k", f"200k (no 1M window on {model_tier(model)}; wanted 1m from {src})"
+        note = f"200k (no 1M window on {model_tier(model)}"
+        note += ")" if src == "default" else f"; wanted 1m from {src})"
+        return model_with_context(model, "200k"), "200k", note
     if want == "1m":
         return model_with_context(model, "1m"), "1m", src
-    return model_with_context(model, "200k"), "200k", src or "default"
+    return model_with_context(model, "200k"), "200k", src
 
 
 # ---- transcript usage (tokens per session) -----------------------------------------------------
