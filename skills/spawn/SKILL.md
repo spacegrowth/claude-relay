@@ -25,6 +25,9 @@ plausible result, never by file count:**
 - **Upgrade signals**: two fix-list rounds haven't landed it (respawn stronger + `--supersede`);
   ambiguity you can't spec away in the packet. **Downgrade signal**: your acceptance criteria could
   be checked by a script.
+- **Effort rides the same judgment** (packet `EFFORT:` line or `--effort`): mechanical/
+  script-checkable → `low`/`medium`; leave unset for ordinary work; `xhigh` for unknown-root-cause
+  or core-logic packets (`max` when correctness beats cost). Fixed per process, like the model.
 - **Version hygiene**: pass the TIER alias (`haiku`/`sonnet`/`opus`) and let relay resolve the
   concrete id through this machine's CLI — never type version ids (`…-4-6`) from memory; a stale id
   silently pins an old model. `relay doctor` shows what each alias resolves to here.

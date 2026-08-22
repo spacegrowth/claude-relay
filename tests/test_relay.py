@@ -6074,3 +6074,54 @@ class TestSpawnResolvesModelAlias:
              mock.patch.object(relay, "_probe_model", return_value=(None, "timeout")):
             cap = self._spawn(relay, tmp_path, model="opus", name="m3")
         assert cap["model"] == "opus"    # fail-open: alias as-is
+
+
+class TestExecutorEffortWiring:
+    def _spawn(self, relay, tmp_path, body="# T\n\ndo it", effort=None, name="ef1"):
+        pkt = tmp_path / "p.md"; pkt.write_text(body)
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt), model=None,
+                                            name=name, scope=None, skip_perms=None, pane=None, effort=effort))
+        return cap
+
+    def test_packet_line_and_flag_precedence(self, relay, tmp_path):
+        assert self._spawn(relay, tmp_path, "# T\nEFFORT: low\ndo it")["effort"] == "low"
+        assert relay.read_session("ef1")["effort"] == "low"
+        assert self._spawn(relay, tmp_path, "# T\nEFFORT: low\ndo it", effort="xhigh", name="ef2")["effort"] == "xhigh"
+        assert self._spawn(relay, tmp_path, name="ef3")["effort"] is None      # unset → CLI default
+
+    def test_invalid_flag_refused(self, relay, tmp_path):
+        with pytest.raises(SystemExit) as ei:
+            self._spawn(relay, tmp_path, effort="turbo", name="ef4")
+        assert "valid:" in str(ei.value)
+
+    def test_build_claude_cmd_carries_effort(self, relay):
+        cmd = relay.iterm.build_claude_cmd("x", model="sonnet", session_uuid="u", effort="low")
+        assert "--effort low" in cmd and cmd.rstrip().endswith(" x")
+        assert "--effort" not in relay.iterm.build_claude_cmd("x", model="sonnet")
+
+    def test_relaunch_repasses_effort(self, relay, tmp_path):
+        self._spawn(relay, tmp_path, "# T\nEFFORT: max\ndo it", name="ef5")
+        cap = {}
+        bk = SimpleNamespace(spawn=lambda **kw: cap.update(kw))
+        with mock.patch.object(relay, "term_backend", return_value=bk), mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=124), mock.patch.object(relay, "read_iterm_id", return_value=None), \
+             mock.patch.object(relay, "_ensure_tab_label"):
+            relay._relaunch("ef5", relay.read_session("ef5"), "go", resume_id="cs")
+        assert cap["effort"] == "max"
+
+    def test_resume_effort_flag_updates_record(self, relay, tmp_path):
+        self._spawn(relay, tmp_path, name="ef6")
+        s = relay.read_session("ef6"); s["status"] = "closed"; relay.write_session("ef6", s)
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay, "session_pid_alive", return_value=False), \
+             mock.patch.object(relay, "auto_trust"), mock.patch.object(relay, "read_pid", return_value=125), \
+             mock.patch.object(relay, "read_iterm_id", return_value=None), \
+             mock.patch.object(relay, "_ensure_tab_label", return_value=True), \
+             mock.patch.object(relay, "_launch_survived", return_value=True), \
+             mock.patch.object(relay, "conversation_transcript_exists", return_value=None):
+            relay.cmd_resume(SimpleNamespace(session_id="ef6", force=False, mcp=None, effort="high"))
+        assert cap["effort"] == "high" and relay.read_session("ef6")["effort"] == "high"

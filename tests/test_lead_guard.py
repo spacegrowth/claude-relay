@@ -3171,3 +3171,36 @@ class TestModelAliasResolution:
         assert m == "opus" and src.startswith("unresolved")          # fail-open
         with pytest.raises(ValueError):
             lg.resolve_model("haiku", cache, "2.1.238", lambda a: (None, "There's an issue with the selected model (haiku). It may not exist unrecognized_model"))
+
+
+class TestExecutorEffort:
+    def test_parse_and_normalize(self):
+        assert lg.packet_effort_spec("# T\nEFFORT: xhigh\n") == "xhigh"
+        assert lg.packet_effort_spec("- **Effort**: LOW") == "low"
+        assert lg.packet_effort_spec("EFFORT: turbo") is None and lg.packet_effort_spec("no line") is None
+        assert lg.normalize_effort_spec("Max") == "max" and lg.normalize_effort_spec("bogus") is None
+
+    def test_launch_cell_includes_effort(self):
+        assert lg.launch_cell({"mcp": "none", "context": "1m", "agent": "x", "effort": "low"}) == "none/1m/A/low"
+        assert lg.launch_cell({"mcp": "none", "context": "1m", "agent": "x"}) == "none/1m/A"
+
+    def test_lint_flags_unparsable_effort(self):
+        codes = [c for _, c, _ in lg.lint_packet("# T\n\n## Preconditions\n- ok\n\nDo the thing in src/a.py, stage for review, acceptance criteria included.\nEFFORT: turbo\n")]
+        assert "effort-unparsable" in codes
+
+
+class TestClosedExecutorsNeverNag:
+    """Field bug 2026-08-21: closed executors kept waking their lead ('still complains') — the
+    surfaced stamp can be refused (invoker gate) or miss older packets, and new_reports_for never
+    looked at status. closed/superseded are silenced; dead still nags (crash with unseen report)."""
+    def _exec(self, root, sid, status, owner="lead-1", packet=1):
+        d = root / sid / "packets"; d.mkdir(parents=True, exist_ok=True)
+        (root / sid / "session.json").write_text(json.dumps(
+            {"session_id": sid, "current_packet": packet, "status": status, "owner_lead": owner}))
+        (d / f"{packet:03d}-report.md").write_text("done")
+
+    def test_closed_and_superseded_silent_dead_still_nags(self, root):
+        for sid, st in (("e-closed", "closed"), ("e-sup", "superseded"), ("e-dead", "dead"), ("e-rep", "reported")):
+            self._exec(root, sid, st)
+        got = {sid for _, sid, _, _ in lg.new_reports_for(root, "lead-1")}
+        assert got == {"e-dead", "e-rep"}

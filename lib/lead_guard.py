@@ -1036,6 +1036,15 @@ def _executor_owner(state_root, exec_sid):
         return None
 
 
+def _executor_status(state_root, exec_sid):
+    """`status` recorded in this executor's session.json (None if missing/unreadable)."""
+    try:
+        s = json.loads((Path(state_root) / str(exec_sid) / "session.json").read_text())
+        return s.get("status")
+    except Exception:
+        return None
+
+
 def new_reports_for(state_root, lead_sid):
     """Executor reports this lead hasn't been told about yet — as (key, session_id, packet, path).
 
@@ -1049,6 +1058,14 @@ def new_reports_for(state_root, lead_sid):
     for sid, packet, path in executor_reports(state_root):
         if _executor_owner(state_root, sid) != lead_sid:
             continue  # not owned by THIS lead (another lead's, or unowned) → never wakes it
+        # A closed/superseded executor is a DELIBERATE "done with it" (manual close, retire, or
+        # auto-close) — its reports must never nag again, even when the surfaced stamp was refused
+        # (a close run from a terminal or a foreign session under the #27 invoker gate) or an older
+        # packet's key was never stamped (close stamps only the current packet). Field bug
+        # 2026-08-21: closed executors kept waking their lead forever. `dead` stays nag-worthy on
+        # purpose — a crash with an unseen report is exactly what the wake exists for.
+        if _executor_status(state_root, sid) in ("closed", "superseded"):
+            continue
         key = f"{sid}:{packet}"
         if key not in surfaced:
             fresh.append((key, sid, packet, path))
@@ -1734,7 +1751,38 @@ def launch_cell(s):
     mcp = mcp_spec_label(s.get("mcp")) if s.get("mcp") is not None else "?"
     ctx = s.get("context") or ("1m" if model_has_1m(s.get("model")) else "?")
     role = "A" if s.get("agent") else ("G" if "agent" in s else "?")
-    return f"{mcp}/{ctx}/{role}"
+    cell = f"{mcp}/{ctx}/{role}"
+    if s.get("effort"):
+        cell += f"/{s['effort']}"
+    return cell
+
+
+# ---- executor effort ---------------------------------------------------------------------------
+# Effort is the second half of the model dial: WHICH model (the rubric) and HOW HARD it thinks.
+# Per-process like the model — set at launch via `claude --effort`, verified live 2026-08-21 (an
+# unknown value is warned-and-ignored by the CLI, never fatal). Relay passes it only when asked
+# (packet `EFFORT:` line or `--effort` flag); unspecified executors keep the CLI's own default.
+# Pairing guidance lives in the spawn skill: mechanical/script-checkable → low/medium; the
+# workhorse default; unknown-root-cause / core-logic → xhigh (max when correctness beats cost).
+
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+EFFORT_RE = re.compile(r"^\s*(?:[-*>]\s*)?\**\s*EFFORT\s*\**\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def normalize_effort_spec(raw):
+    """A valid effort level or None."""
+    if raw is None:
+        return None
+    v = str(raw).strip().lower()
+    return v if v in EFFORT_LEVELS else None
+
+
+def packet_effort_spec(body):
+    """The effort a PACKET declares via an `EFFORT: <level>` line, or None."""
+    if not body:
+        return None
+    m = EFFORT_RE.search(body)
+    return normalize_effort_spec(m.group(1)) if m else None
 
 
 # ---- packet lint -------------------------------------------------------------------------------
@@ -1802,6 +1850,10 @@ def lint_packet(body, cwd=None, known_servers=None, model=None, reading_bytes=No
     if ctx == "1m" and model and not model_supports_1m(model):
         out.append(("warn", "context-1m-on-haiku", f"CONTEXT: 1m but model '{model}' has no 1M window — "
                     f"it will run on 200k"))
+    ef_m = EFFORT_RE.search(text)
+    if ef_m and normalize_effort_spec(ef_m.group(1)) is None:
+        out.append(("warn", "effort-unparsable", f"EFFORT: line present but value isn't one of "
+                    f"{'/'.join(EFFORT_LEVELS)}: '{ef_m.group(1)}' — the CLI would ignore it"))
     # role violations the executor can't honour
     if COMMIT_RE.search(text):
         out.append(("warn", "asks-to-commit", "packet tells the executor to commit/push — executors stage "

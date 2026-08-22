@@ -160,6 +160,9 @@ And the three nouns:
 /relay:spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL] [--seed SID|PATH]
              [--mcp [SPEC]] [--keep]       MCP servers (default none; packet `MCP:` line usually
                                             decides); --keep pins it against auto-close
+             [--effort LEVEL]              thinking effort (low|medium|high|xhigh|max), or an
+                                            `EFFORT:` line in the packet; unset = the CLI default;
+                                            fixed per process (resume/restart --effort changes it)
                                             context window: `--model sonnet[1m]`, or the packet's
                                             `CONTEXT: 1m` line, or relay picks 1m when the packet's
                                             referenced reading is big; default 200K
@@ -628,6 +631,17 @@ early-compaction discipline). A packet can pin `CONTEXT: 200k` to opt one execut
 that ran heavy is widened by `relay retire` + respawn — the
 successor seed says `declare CONTEXT: 1m` when that applies. `haiku[1m]` is refused; a
 packet/heuristic asking for 1M on haiku degrades to 200K with a note.
+
+### Executor effort
+
+Effort is the second half of the model dial: which model (the rubric in `/relay:spawn`) and how
+hard it thinks. Declare it in the packet (`EFFORT: low` … `EFFORT: max`) or pass `--effort` at
+spawn (flag wins); unset leaves the CLI's own default. Like the model, it's fixed per process —
+`relay resume|restart --effort` changes it, `send --rotate` carries it to the successor, and a
+follow-up packet declaring a different `EFFORT:` gets an ℹ note instead of a silent ignore.
+Pairing guidance: mechanical/script-checkable packets → `low`/`medium`; unknown-root-cause or
+core-logic work → `xhigh` (`max` when correctness beats cost). Shown in `relay list`'s LAUNCH
+column as a fourth segment when set (`none/1m/A/low`).
 
 ### Executor MCP servers
 

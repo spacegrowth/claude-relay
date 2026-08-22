@@ -121,7 +121,7 @@ def is_alive(label, handle=None, pid=None):
 
 
 def build_claude_cmd(prompt, model=None, skip_perms=False, session_uuid=None, resume_id=None,
-                     settings_file=None, mcp_flags=None, agent_flags=None):
+                     settings_file=None, mcp_flags=None, agent_flags=None, effort=None):
     """The `claude …` invocation both backends launch. resume_id reopens an existing conversation
     (no --model — the session already has one); otherwise a fresh session, optionally pinned to
     session_uuid so relay can `--resume` it later without scraping transcripts.
@@ -141,6 +141,8 @@ def build_claude_cmd(prompt, model=None, skip_perms=False, session_uuid=None, re
         base += " --settings " + shlex.quote(settings_file)
     for w in list(mcp_flags or []) + list(agent_flags or []):
         base += " " + shlex.quote(str(w))
+    if effort:
+        base += " --effort " + shlex.quote(str(effort))
     if resume_id:
         base += " --resume " + shlex.quote(resume_id)
     else:
@@ -483,7 +485,7 @@ def _match_session_block(label, action):
 
 def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_delay=1.5, env_prefix="",
           iterm_id_file=None, session_uuid=None, resume_id=None, tab_color=None, lead_handle=None,
-          layout="tab", settings_file=None, mcp_flags=None, agent_flags=None):
+          layout="tab", settings_file=None, mcp_flags=None, agent_flags=None, effort=None):
     """Open a new iTerm tab (or pane), cd into `cwd`, launch `claude [--model X] <prompt>`, then
     (after a delay for claude to finish starting) send `/rename <label>` into the SAME session — one
     AppleScript call that resolves the target ONCE to a session id and then addresses every write by
@@ -550,7 +552,7 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     base = build_claude_cmd(prompt, model=model, skip_perms=skip_perms,
                             session_uuid=session_uuid, resume_id=resume_id,
                             settings_file=settings_file, mcp_flags=mcp_flags,
-                            agent_flags=agent_flags)
+                            agent_flags=agent_flags, effort=effort)
     # Record the new session's own iTerm id (ITERM_SESSION_ID, set in the interactive iTerm shell;
     # fall back to TERM_SESSION_ID) into a file BEFORE exec replaces the shell — the handle used by
     # the rename-retry (_ensure_tab_label) and the lead tab-color path. Best-effort; empty var →

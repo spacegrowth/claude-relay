@@ -1022,6 +1022,18 @@ def cmd_spawn(args):
         print(f"  MCP: {lead_guard.mcp_spec_label(mcp_spec)} (from {mcp_src})")
     print_lint(authored_body, cwd=worktree, model=resolved_model)
 
+    # Effort (lead_guard "executor effort"): --effort flag > packet EFFORT: line > unset (the CLI's
+    # own default). Invalid flag values are refused here; the CLI would only warn-and-ignore.
+    effort = None
+    if getattr(args, "effort", None) is not None:
+        effort = lead_guard.normalize_effort_spec(args.effort)
+        if effort is None:
+            sys.exit(f"spawn: --effort '{args.effort}' — valid: {', '.join(lead_guard.EFFORT_LEVELS)}")
+    else:
+        effort = lead_guard.packet_effort_spec(authored_body)
+    if effort:
+        print(f"  effort: {effort}")
+
     auto_trust(worktree)
     label = f"[Exec] {session_id}"  # role-prefixed: exec tabs and lead tabs are told apart at a glance
     d = packets_dir(session_id)
@@ -1096,6 +1108,7 @@ def cmd_spawn(args):
             settings_file=settings_file,
             mcp_flags=mcp_flags,
             agent_flags=agent_flags,
+            effort=effort,
             lead_handle=owner_marker.get("iterm_session"),
             layout=layout,
         )
@@ -1131,6 +1144,8 @@ def cmd_spawn(args):
                                   # widen by retire + respawn, never in place
         "agent": agent_name,      # "relay-executor" when the role rides the inline agent (None = legacy
                                   # full-GATES packets); relaunch re-passes it, send picks the footer by it
+        "effort": effort,         # thinking-effort level, or None = the CLI's default; per-process,
+                                  # re-passed on relaunch (lead_guard "executor effort")
         "pid": pid,
         "pid_started": pid_start_time(pid) if pid else None,  # pid-reuse guard (see session_pid_alive)
         "iterm_session": iterm_session,
@@ -1211,6 +1226,7 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     s["mcp"] = mcp_spec
     # The role rides the inline agent and is NOT restored by --resume → re-pass it, like --settings.
     agent_flags = lead_guard.executor_agent_flags(_plugin_root()) if s.get("agent") else []
+    effort = lead_guard.normalize_effort_spec(s.get("effort"))
     bk.spawn(
         cwd=s["worktree"],
         prompt=prompt,
@@ -1227,6 +1243,7 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
                                                           # silently lose wake coverage
         mcp_flags=mcp_flags,
         agent_flags=agent_flags,
+        effort=effort,
     )
     pid = read_pid(session_id)
     s["pid"] = pid
@@ -1316,6 +1333,8 @@ def cmd_restart(args):
     s = _maybe_adopt(sid, s)
     if getattr(args, "mcp", None) is not None:
         s["mcp"] = lead_guard.normalize_mcp_spec(args.mcp)   # _relaunch applies it
+    if getattr(args, "effort", None) is not None:
+        s["effort"] = lead_guard.normalize_effort_spec(args.effort)
     pid, label = _relaunch(sid, s, pointer, session_uuid=str(uuid.uuid4()))
     append_ledger("restarted", session_id=sid, packet=n)
     print(f"restarted '{sid}' (tab '{label}', pid {pid}) — re-running packet {n:03d} as a fresh session")
@@ -1460,6 +1479,8 @@ def cmd_resume(args):
     s = _maybe_adopt(sid, s)
     if getattr(args, "mcp", None) is not None:
         s["mcp"] = lead_guard.normalize_mcp_spec(args.mcp)   # _relaunch applies it (MCP is per-process)
+    if getattr(args, "effort", None) is not None:
+        s["effort"] = lead_guard.normalize_effort_spec(args.effort)  # effort is per-process too
     pid, label = _relaunch(sid, s, nudge, resume_id=cs)
     append_ledger("resumed", session_id=sid, claude_session=cs)
     # _relaunch has already written a `busy` marker off the freshly-read pid. Only report success
@@ -1496,7 +1517,7 @@ def _rotate_and_send(args, s, mb=None):
     cmd_spawn(SimpleNamespace(worktree=s["worktree"], topic=s.get("topic") or sid, packet=args.packet, model=model,
                               name=new_sid, scope=s.get("scope"), skip_perms=None, pane=None,
                               lead=s.get("owner_lead"), seed=sid, mcp=mcp_arg, keep=bool(s.get("keep")),
-                              model_override=None))
+                              effort=s.get("effort"), model_override=None))
     append_ledger("rotated", session_id=sid, successor=new_sid, model=model, widened=widened,
                   mb=round(mb, 1) if mb else None)
     print(f"rotated: '{sid}' retired, '{new_sid}' spawned with this packet (seed inherited)")
@@ -1591,6 +1612,12 @@ def cmd_send(args):
     body = Path(args.packet).read_text()
     warn_missing_preconditions(body, "sending")
     print_lint(body, cwd=s.get("worktree"), model=s.get("model"))
+    want_effort = lead_guard.packet_effort_spec(body)
+    if want_effort and want_effort != s.get("effort"):
+        print(c(f"  ℹ packet declares EFFORT: {want_effort} but this session runs "
+                f"{s.get('effort') or 'the default'} — effort is fixed per process; use "
+                f"`relay send --rotate` or `relay resume {args.session_id} --effort {want_effort}` "
+                f"to change it", "dim"))
     # MCP coverage (executor MCP policy): MCP servers load at PROCESS start and `--resume` does not
     # restore them (verified live, tests/test_e2e_mcp.py), so a follow-up packet declaring `MCP: x`
     # that this executor wasn't launched with can only be honoured by relaunching the SAME
@@ -3365,7 +3392,14 @@ def cmd_close(args):
     s = read_session(args.session_id)
     if not s:
         sys.exit(f"no such session: {args.session_id}")
-    _mark_report_surfaced(s)  # the lead is done with this executor's report — dedup it (§5b)
+    # Closing is "done with this executor" — stamp EVERY packet's report surfaced (not just the
+    # current one), so no reader of the surfaced set ever re-announces an older packet of a
+    # deliberately-closed session. Same invoker gate as _mark_report_surfaced (it re-checks per call).
+    for rf in sorted(packets_dir(args.session_id).glob("*-report.md")):
+        try:
+            _mark_report_surfaced({**s, "current_packet": int(rf.stem.split("-")[0])})
+        except Exception:
+            pass
     if args.supersede:
         s["status"] = "superseded"
         s["superseded_by"] = args.supersede
@@ -4349,6 +4383,9 @@ def main():
                          "none): bare --mcp = inherit everything the CLI would load; --mcp none = "
                          "strict zero servers; --mcp linear,chrome-devtools = strict allowlist of "
                          "servers configured in ~/.claude.json / <worktree>/.mcp.json")
+    sp.add_argument("--effort", metavar="LEVEL",
+                    help="thinking-effort for this executor (low|medium|high|xhigh|max; overrides "
+                         "the packet's EFFORT: line; unset = the CLI's default)")
     sp.add_argument("--keep", action="store_true",
                     help="pin this executor: auto-close never parks it (see `relay keep`)")
     sp.add_argument("--name")
@@ -4549,6 +4586,7 @@ def main():
     rs.add_argument("--force", action="store_true", help="restart even if the process still looks alive")
     rs.add_argument("--mcp", nargs="?", const="inherit", default=None, metavar="SPEC",
                     help="change the executor's MCP set for the fresh process (inherit | none | a,b)")
+    rs.add_argument("--effort", metavar="LEVEL", help="change the effort level for the fresh process")
     rs.set_defaults(func=cmd_restart)
 
     rsm = sub.add_parser("resume")
@@ -4557,6 +4595,7 @@ def main():
     rsm.add_argument("--mcp", nargs="?", const="inherit", default=None, metavar="SPEC",
                     help="change the executor's MCP set for the resumed process (inherit | none | a,b) — "
                          "MCP servers load per process, so a resume is when the set can change")
+    rsm.add_argument("--effort", metavar="LEVEL", help="change the effort level for the resumed process")
     rsm.set_defaults(func=cmd_resume)
 
     pr = sub.add_parser("prune")
