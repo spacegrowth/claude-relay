@@ -88,6 +88,14 @@ LEAD_DEFAULTS = {
                                   # Heavy sessions are retired (seed written) instead of closed.
     "auto_close_idle_minutes": 60,  # idle-after-report threshold for the timer path; 0 = timer off
                                     # (the landed path still applies while auto_close is true)
+    "executor_fallback_model": None,  # when set (a concrete model id, or a list tried in order),
+                                  # every executor's per-launch --settings file carries
+                                  # {"fallbackModel": ...} so an OVERLOADED primary falls back to a
+                                  # model YOU chose, with the CLI's visible notice — instead of
+                                  # wherever. Settings-file route on purpose: the --fallback-model
+                                  # FLAG is print-mode-only, the settings key works interactively
+                                  # (docs: model-config "Fallback model chains"). Default None =
+                                  # no configured fallback (the documented default).
     "executor_escalation": True,  # arm every spawned executor with the escalation Stop hook
                                   # (wake-watch design §9): once its report lands and it goes idle,
                                   # push a nudge into the owning lead's tab, once. A net UNDER the
@@ -2105,7 +2113,8 @@ def build_escalation_settings(plugin_root, exec_name, timeout=30):
     }
 
 
-def write_escalation_settings(state_root, plugin_root, exec_name, timeout=30):
+def write_escalation_settings(state_root, plugin_root, exec_name, timeout=30, include_hooks=True,
+                              fallback=None):
     """Write this executor's own `--settings` file into its state dir. PER-EXECUTOR (not shared),
     because the file carries that executor's relay name as a hook argument — see
     build_escalation_settings for why the hook can't derive it. Regenerated on each call so it
@@ -2116,8 +2125,10 @@ def write_escalation_settings(state_root, plugin_root, exec_name, timeout=30):
         d = Path(state_root) / str(exec_name)
         d.mkdir(parents=True, exist_ok=True)
         p = d / "settings.json"
-        p.write_text(json.dumps(
-            build_escalation_settings(plugin_root, exec_name, timeout=timeout), indent=2))
+        content = build_escalation_settings(plugin_root, exec_name, timeout=timeout) if include_hooks else {}
+        if fallback:
+            content["fallbackModel"] = fallback
+        p.write_text(json.dumps(content, indent=2))
         return str(p)
     except Exception:
         return None

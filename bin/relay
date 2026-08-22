@@ -138,10 +138,13 @@ def _maybe_escalation_settings_file(exec_name):
     identity from Claude Code's payload, which carries the Claude session id while relay files
     state under the relay name. See lead_guard.build_escalation_settings."""
     cfg = lead_guard.load_config(STATE_ROOT)
-    if not cfg.get("executor_escalation", True):
+    esc = bool(cfg.get("executor_escalation", True))
+    fallback = cfg.get("executor_fallback_model")
+    if not esc and not fallback:
         return None
     return lead_guard.write_escalation_settings(STATE_ROOT, _plugin_root(), exec_name,
-                                                timeout=EXECUTOR_ESCALATION_TIMEOUT_SECONDS)
+                                                timeout=EXECUTOR_ESCALATION_TIMEOUT_SECONDS,
+                                                include_hooks=esc, fallback=fallback)
 
 TEMPLATE_FOOTER = """
 

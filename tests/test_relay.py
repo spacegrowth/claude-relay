@@ -6125,3 +6125,36 @@ class TestExecutorEffortWiring:
              mock.patch.object(relay, "conversation_transcript_exists", return_value=None):
             relay.cmd_resume(SimpleNamespace(session_id="ef6", force=False, mcp=None, effort="high"))
         assert cap["effort"] == "high" and relay.read_session("ef6")["effort"] == "high"
+
+
+class TestExecutorFallbackModel:
+    """executor_fallback_model config rides the per-executor --settings file (the flag is
+    print-mode-only; the settings key works interactively), so an overloaded primary falls back to
+    a model the USER chose, with the CLI's visible notice."""
+    def _spawn(self, relay, tmp_path, cfg, name="fb1"):
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps(cfg))
+        pkt = tmp_path / "p.md"; pkt.write_text("do")
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay, "auto_trust"), mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt), model=None,
+                                            name=name, scope=None, skip_perms=None, pane=None))
+        return cap
+
+    def test_fallback_in_settings_alongside_hooks(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path, {"executor_fallback_model": "claude-opus-4-8"})
+        d = json.loads(Path(cap["settings_file"]).read_text())
+        assert d["fallbackModel"] == "claude-opus-4-8" and "hooks" in d
+
+    def test_fallback_alone_when_escalation_off(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path, {"executor_escalation": False,
+                                            "executor_fallback_model": ["claude-opus-4-8", "claude-sonnet-4-6"]}, name="fb2")
+        d = json.loads(Path(cap["settings_file"]).read_text())
+        assert d == {"fallbackModel": ["claude-opus-4-8", "claude-sonnet-4-6"]}
+
+    def test_unset_means_no_key_and_kill_switch_still_omits_file(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path, {}, name="fb3")
+        assert "fallbackModel" not in json.loads(Path(cap["settings_file"]).read_text())
+        cap = self._spawn(relay, tmp_path, {"executor_escalation": False}, name="fb4")
+        assert cap.get("settings_file") is None
