@@ -2229,6 +2229,16 @@ def cmd_doctor(args):
 
 
 # ── relay board: one page for everything relay knows ─────────────────────────────────────────
+def _read_capped(path, limit):
+    """A file's text for inline display on the board, capped so a huge report can't bloat the page.
+    Returns {"text", "truncated", "path"} or None. Best-effort; unreadable → None."""
+    try:
+        raw = Path(path).read_text(errors="replace")
+        return {"text": raw[:limit], "truncated": len(raw) > limit, "path": str(path)}
+    except Exception:
+        return None
+
+
 def _lead_age_text(m):
     """Relative 'Nm ago' / 'Nh ago' / 'Nd ago' for a marker's last_active, or '-'."""
     try:
@@ -2294,8 +2304,8 @@ def board_data(include_all=True, lead_sid=None):
             pp, rp = e.get("packet_path"), e.get("report_path")
             dp = packets_dir(sid) / f"{e['n']}-diff.html"
             packets.append({"n": e["n"], "gist": e.get("gist"), "tldr": e.get("tldr"),
-                            "packet_path": pp, "packet_url": path_to_file_url(Path(pp)) if pp else None,
-                            "report_path": rp, "report_url": path_to_file_url(Path(rp)) if rp else None,
+                            "packet_path": pp, "packet_body": _read_capped(pp, 6000) if pp else None,
+                            "report_path": rp, "report_body": _read_capped(rp, 8000) if rp else None,
                             "diff_path": str(dp) if dp.exists() else None, "diff_url": path_to_file_url(dp) if dp.exists() else None,
                             "current": cur is not None and int(e["n"]) == int(cur)})
         st = r.get("status")

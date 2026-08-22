@@ -29,31 +29,41 @@ class TestRenderer:
     def test_empty_and_escaping(self):
         html = board_render.render({"leads": [], "executors": []})
         assert "relay board" in html and "localStorage" in html and "data-theme" in html
+        assert 'class="app"' in html and 'class="side"' in html    # two-pane master/detail
+        assert "no executor sessions yet" in html
         html = board_render.render({"leads": [{"session_id": "L<1>", "project": "<b>x</b>"}],
                                     "executors": [{"session_id": "e&1", "owner_lead": "L<1>", "status": "busy", "topic": "<t>"}]})
         assert "<b>x</b>" not in html and "&lt;b&gt;x&lt;/b&gt;" in html and "e&amp;1" in html
 
-    def test_light_default_no_left_accent(self):
+    def test_light_default_lead_colour_as_dot(self):
         html = board_render.render({"leads": [{"session_id": "L", "project": "p", "color": [1, 2, 3]}], "executors": []})
-        assert "border-left-color" not in html          # no accent stripe
-        assert 'class="dot"' in html and "rgb(1,2,3)" in html   # tab colour only as a dot
-        assert "prefers-color-scheme" not in html      # light by default, toggle decides
+        assert "prefers-color-scheme" not in html                  # light by default, toggle decides
+        assert 'class="cdot"' in html and "rgb(1,2,3)" in html      # tab colour is a dot only
 
-    def test_executor_rows_and_timeline(self):
+    def test_reported_pinned_and_detail_panel(self):
         ex = {"session_id": "e1", "owner_lead": "L", "status": "reported", "topic": "parser", "model": "sonnet[1m]",
-              "launch": "none/1m/A", "tokens": "1.2M/34k", "mb": "3.1", "pkt": "002", "reported": True, "heavy": True,
-              "keep": True, "queued": 1, "worktree": "/w",
-              "packets": [{"n": "001", "gist": "first", "packet_path": "/p/1", "packet_url": "file:///p/1",
-                           "report_path": "/p/r1", "report_url": "file:///p/r1", "diff_path": "/p/d1", "diff_url": "file:///p/d1",
-                           "tldr": {"outcome": "Did it.", "status": "clean", "risk": "none", "unverified": "none"}},
-                          {"n": "002", "gist": "second", "packet_path": "/p/2", "packet_url": "file:///p/2", "current": True}]}
-        html = board_render.render({"leads": [{"session_id": "L", "project": "proj"}], "executors": [ex], "relay_bin": "/x/relay"})
-        for needle in ("parser", "sonnet[1m]", "none/1m/A", "1.2M/34k", "heavy", "pinned", "1 queued", "Did it.",
-                       "Status: clean", 'href="file:///p/d1"', "/x/relay send e1", "/x/relay verify e1", "in flight"):
+              "launch": "none/1m/A", "context": "1m", "agent": "relay-executor", "mcp": "none", "tokens": "1.2M/34k",
+              "mb": "3.1", "pkt": "002", "reported": True, "heavy": True, "keep": True, "queued": 1, "worktree": "/w",
+              "packets": [{"n": "001", "gist": "first", "report_path": "/p/r1",
+                           "report_body": {"text": "FULL REPORT BODY HERE", "truncated": False, "path": "/p/r1"},
+                           "diff_path": "/p/001-diff.html",
+                           "tldr": {"outcome": "Did it.", "status": "clean", "risk": "weakened a test", "unverified": "the retry path"}},
+                          {"n": "002", "gist": "second", "current": True}]}
+        html = board_render.render({"leads": [{"session_id": "L", "project": "proj", "wake": "ok"}],
+                                    "executors": [ex], "relay_bin": "/x/relay"})
+        # rail: reported executor pinned under a "Needs review" group and selectable
+        assert "Needs review" in html and 'data-target="ex-e1"' in html
+        # detail panel: chips + dot-strip + full task/outcome + clean TL;DR grid + INLINE report (no file:// link)
+        for needle in ('id="ex-e1"', "sonnet[1m]", "1.2M/34k", "pinned", "Did it.", 'class="pdot',
+                       '<dl class="tldr">', "weakened a test", "the retry path",
+                       "FULL REPORT BODY HERE", "Verify report", "Send follow-up", "in flight"):
             assert needle in html, needle
+        assert "file://" not in html and "open report ↗" not in html   # inline, not a new path
+        # closed executor: no destructive command, shown under a Closed group
         closed = dict(ex, status="closed", auto_closed="landed", rendered_status="closed (auto)")
-        html = board_render.render({"leads": [{"session_id": "L"}], "executors": [closed]})
-        assert "closed-row" in html and "auto: landed" in html and "/x/relay" not in html
+        html2 = board_render.render({"leads": [{"session_id": "L"}], "executors": [closed], "relay_bin": "/x/relay"})
+        assert ">Closed<" in html2 and "auto: landed" in html2
+        assert "/x/relay close e1" not in html2 and "/x/relay resume e1" in html2
 
 
 class TestCmdBoard:
@@ -82,7 +92,7 @@ class TestCmdBoard:
             assert [m["session_id"] for m in d["leads"]] == ["lead-1"] and d["leads"][0]["liveness"] == "live"
             ex = {e["session_id"]: e for e in d["executors"]}
             assert ex["e1"]["launch"] == "none/200k/A" and ex["e1"]["packets"][0]["tldr"]["outcome"] == "Done the thing."
-            assert ex["e1"]["packets"][0]["report_url"].startswith("file://")
+            assert ex["e1"]["packets"][0]["report_body"]["text"].startswith("Done the thing.")
             assert ex["orph"]["orphan"] is True and any("no longer armed" in w["text"] for w in d["warnings"])
             out = tmp_path / "b.html"
             relay.cmd_board(SimpleNamespace(json=False, out=str(out), open=False, lead=None))
