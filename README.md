@@ -171,6 +171,9 @@ And the three nouns:
              [--when-idle]                 busy target? queue it; delivers when it next goes idle
 relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --when-idle
 /relay:check [<session_id> | --all]        busy / reported / stalled / dead
+/relay:board [--open] [--out PATH] [--lead] one HTML page for everything: leads → executors →
+                                            packet timelines (gist, outcome, TL;DR), status, launch,
+                                            tokens, warnings, copyable commands; light/dark toggle
 relay doctor [--offline] [--quick]         prove the installed claude CLI still honours relay's launch
                                             flags (strict MCP, executor agent, commit deny, model
                                             aliases) + plumbing; run after every Claude Code update
@@ -502,6 +505,19 @@ unsummarised — unless you pass `--force` (the packet is then seeded as `NO REP
 `<sid>-r2` over the same worktree/topic/scope/model/MCP set — widened to the 1M window when the
 tier has one — with the seed inherited and this packet as its first. The heaviness gate's refusal
 message points at it.
+
+### The board: one page for everything
+
+`/relay:board` (`relay board --open`) renders a self-contained HTML snapshot of everything relay
+knows: a summary strip, warning banners (orphaned executors, reports not yet proven delivered to
+their lead, heavy sessions, stale wake hooks), then one card per lead with its executors — status,
+model + `LAUNCH`, `TOKENS`/MB, packet count — each row expanding to the executor's packet timeline
+(gist, the report's outcome sentence and TL;DR, links to the packet / report / diff page) and
+copyable `relay …` commands. Filter box, "show closed", light theme by default with a remembered
+☀️/🌙 switch. It is built from exactly the functions `relay list` uses (and runs the same liveness
+refresh and auto-close sweep), so it can't disagree with the table; it is a **snapshot** — re-run to
+refresh. Written to `~/.relay-tasks/board.html` (`--out` to change), `--lead <sid>` to scope,
+`--json` for the data.
 
 ### Auto-close: finished executors park themselves
 

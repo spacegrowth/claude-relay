@@ -326,6 +326,10 @@ backwards. Its threshold (`stall_threshold_seconds`, default 2700) is a separate
 `poll_seconds` (1800) precisely so the two clocks can't flip an executor to `stalled` at the same
 instant layer 1's poller would time out.
 
+`relay board` (`board_data` + `lib/board_render.py`) is the same health surface as one page —
+it calls the identical helpers (`_check_one`, `_lead_liveness`, `wake_hook_state`,
+`new_reports_for`, `_usage_for_session`, `seed_entries`) and adds the packet timelines.
+
 `relay doctor` (`cmd_doctor`, `bin/relay`) is the live counterpart of this table for the CLI
 assumptions relay can't control — it runs relay's own command builder headless and reads the
 `system/init` event (mcp_servers, tools, model) plus a real `git commit` attempt under

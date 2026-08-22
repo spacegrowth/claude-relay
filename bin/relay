@@ -12,6 +12,7 @@ Commands:
   relay list [--lead <session_id> | --all] [--json]
   relay keep <session_id> [--off]             # pin/unpin against auto-close (finished executors are parked automatically)
   relay lint <packet.md> [--worktree W] [--model M] [--strict] [--json]   # advisory packet checks (also run at spawn/send)
+  relay board [--open] [--out PATH] [--lead SID] [--json]   # one HTML page: leads → executors → packets, status/launch/tokens/warnings
   relay doctor [--offline] [--quick] [--json]   # prove the installed claude CLI still honours relay's launch flags
   relay report <session_id> [--packet N]      # print an executor's report, framed in green
   relay verify <session_id> [--packet N] [--rerun]   # machine-check a report against its staged
@@ -47,6 +48,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import backend
 import diff_render
+import board_render
 import lead_guard
 import report_verify
 import iterm as iterm_backend  # the REAL scripts/iterm.py module, always -- distinct from the
@@ -2165,6 +2167,134 @@ def cmd_doctor(args):
         sys.exit(1)
 
 
+# ── relay board: one page for everything relay knows ─────────────────────────────────────────
+def _lead_age_text(m):
+    """Relative 'Nm ago' / 'Nh ago' / 'Nd ago' for a marker's last_active, or '-'."""
+    try:
+        t = time.mktime(time.strptime(m.get("last_active"), "%Y-%m-%dT%H:%M:%S"))
+        d = int(time.time() - t)
+        if d < 3600:
+            return f"{max(d // 60, 0)}m ago"
+        if d < 86400:
+            return f"{d // 3600}h ago"
+        return f"{d // 86400}d ago"
+    except Exception:
+        return "-"
+
+
+def board_data(include_all=True, lead_sid=None):
+    """Everything `relay board` renders, assembled from the SAME functions `relay list` uses
+    (_check_one, _lead_liveness, wake_hook_state, _usage_for_session, seed_entries…) so the page and
+    the table can't disagree. Also runs the auto-close sweep like list does."""
+    cfg = lead_guard.load_config(STATE_ROOT)
+    poll_seconds = cfg.get("poll_seconds", 1800)
+    poll_interval = cfg.get("poll_interval", 5)
+    leads = []
+    for m in lead_guard.list_leads(STATE_ROOT):
+        sid = m.get("session_id")
+        wake = lead_guard.wake_hook_state(m, poll_seconds)
+        if lead_guard.poll_lock_state(STATE_ROOT, sid, poll_interval) == "stale":
+            wake = "stuck"
+        on, _src = lead_guard.autonomous_state(m)
+        leads.append({**m, "wake": wake, "liveness": _lead_liveness(m), "auto": bool(on),
+                      "paused": bool(m.get("paused")), "last_active_age": _lead_age_text(m),
+                      "mb": _mb_cell_text(_transcript_mb_for(sid))})
+    rows = []
+    for sid in all_session_ids():
+        s = _check_one(sid)
+        if "error" in s:
+            continue
+        n = s.get("current_packet")
+        rows.append({**s, "reported": (packets_dir(sid) / f"{n:03d}-report.md").exists()})
+    acted = auto_close_sweep("board", sids=[r["session_id"] for r in rows])
+    if acted:
+        hit = {a[0] for a in acted}
+        rows = [({**read_session(r["session_id"]), "reported": r["reported"]} if r["session_id"] in hit else r) for r in rows]
+    if lead_sid:
+        rows = [r for r in rows if r.get("owner_lead") in (None, lead_sid)]
+    threshold = _heaviness_threshold_mb()
+    lead_ids = {m.get("session_id") for m in leads}
+    unannounced = set()
+    for m in leads:
+        try:
+            for exsid, packet in lead_guard.new_reports_for(STATE_ROOT, m.get("session_id")):
+                unannounced.add(exsid)
+        except Exception:
+            pass
+    execs = []
+    for r in rows:
+        sid = r["session_id"]
+        mb = _transcript_mb_for(r.get("claude_session"))
+        usage = _usage_for_session(r)
+        entries = seed_entries(sid)
+        cur = r.get("current_packet")
+        packets = []
+        for e in entries:
+            pp, rp = e.get("packet_path"), e.get("report_path")
+            dp = packets_dir(sid) / f"{e['n']}-diff.html"
+            packets.append({"n": e["n"], "gist": e.get("gist"), "tldr": e.get("tldr"),
+                            "packet_path": pp, "packet_url": path_to_file_url(Path(pp)) if pp else None,
+                            "report_path": rp, "report_url": path_to_file_url(Path(rp)) if rp else None,
+                            "diff_path": str(dp) if dp.exists() else None, "diff_url": path_to_file_url(dp) if dp.exists() else None,
+                            "current": cur is not None and int(e["n"]) == int(cur)})
+        st = r.get("status")
+        rendered = st
+        if st == "busy":
+            el = _busy_elapsed(r)
+            rendered = f"busy {int(el / 60)}m" if el is not None else "busy"
+        elif st in ("closed", "superseded") and r.get("auto_closed"):
+            rendered = f"{st} (auto)"
+        execs.append({**r, "rendered_status": rendered, "launch": lead_guard.launch_cell(r),
+                      "tokens": lead_guard.usage_cell(usage), "usage": usage, "mb": _mb_cell_text(mb),
+                      "heavy": _is_heavy(mb, threshold), "queued": len(read_queue(sid)),
+                      "pkt": str(cur).zfill(3) if cur is not None else "-", "packets": packets,
+                      "unannounced": sid in unannounced,
+                      "orphan": bool(r.get("owner_lead")) and r.get("owner_lead") not in lead_ids
+                                and st not in ("closed", "superseded", "dead", LAUNCH_FAILED)})
+    warnings = []
+    orphans = [e["session_id"] for e in execs if e["orphan"]]
+    if orphans:
+        warnings.append({"level": "bad", "text": f"⚠ {len(orphans)} executor(s) owned by a lead that is no longer armed: "
+                         f"{', '.join(orphans)} — wake is dead for them until claimed (relay adopt <sid>, or just send/resume)"})
+    if unannounced:
+        warnings.append({"level": "warn", "text": f"🚦 {len(unannounced)} report(s) not yet proven delivered to their lead: "
+                         f"{', '.join(sorted(unannounced))} — relay check <sid> / relay report <sid>"})
+    heavy = [e["session_id"] for e in execs if e["heavy"] and e.get("status") not in ("closed", "superseded", "dead")]
+    if heavy:
+        warnings.append({"level": "info", "text": f"heavy: {', '.join(heavy)} — `relay send <sid> <packet> --rotate` retires + respawns seeded on the 1M window"})
+    stale = [m.get("project") or m.get("session_id") for m in leads if m["wake"] in ("stale", "stuck")]
+    if stale:
+        warnings.append({"level": "bad", "text": f"wake STALE/stuck on: {', '.join(stale)} — see README Troubleshooting"})
+    for sid, action, reason in acted:
+        warnings.append({"level": "info", "text": f"🛏 auto-{'retired' if action == 'retire' else 'closed'} '{sid}' ({reason}) just now"})
+    ledger_tail = []
+    try:
+        lines = LEDGER.read_text().splitlines()[-40:]
+        for l in lines:
+            d = json.loads(l)
+            ts = d.get("ts") or d.get("time") or ""
+            rest = {k: v for k, v in d.items() if k not in ("ts", "time", "event")}
+            ledger_tail.append(f"{ts}  {d.get('event', '?'):<22} " + json.dumps(rest, ensure_ascii=False)[:160])
+    except Exception:
+        pass
+    return {"generated": now(), "plugin_version": plugin_version(), "state_root": str(STATE_ROOT),
+            "relay_bin": RELAY_BIN, "leads": leads, "executors": execs, "warnings": warnings, "ledger_tail": ledger_tail}
+
+
+def cmd_board(args):
+    data = board_data(lead_sid=getattr(args, "lead", None))
+    if args.json:
+        print(json.dumps(data, indent=2, default=str))
+        return
+    out = Path(args.out).expanduser() if args.out else (STATE_ROOT / "board.html")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(board_render.render(data))
+    print(str(out))
+    print(path_to_file_url(out))
+    if args.open:
+        subprocess.run(["open", str(out)])
+
+
 def cmd_keep(args):
     """Pin / unpin an executor against auto-close (lead_guard "auto-close policy")."""
     s = read_session(args.session_id)
@@ -4198,6 +4328,14 @@ def main():
     dq.add_argument("session_id")
     dq.set_defaults(func=cmd_deliver_queued)
 
+    bd = sub.add_parser("board", help="render everything relay knows (leads → executors → packets, "
+                                      "status, launch, tokens, warnings) to a self-contained HTML page")
+    bd.add_argument("--open", action="store_true", help="open the page after writing it")
+    bd.add_argument("--out", help="write the page here (default ~/.relay-tasks/board.html)")
+    bd.add_argument("--lead", help="scope executors to this lead's (plus unowned)")
+    bd.add_argument("--json", action="store_true", help="emit the board data instead of HTML")
+    bd.set_defaults(func=cmd_board)
+
     dr = sub.add_parser("doctor", help="prove the installed claude CLI still behaves as relay assumes "
                                        "(strict MCP, executor agent, commit deny, model aliases) + plumbing")
     dr.add_argument("--offline", action="store_true", help="plumbing checks only, no claude calls")
@@ -4398,7 +4536,7 @@ def main():
         "auto": ["session"],
         "diff": ["session_id"], "verify": ["session_id"], "focus": ["session_id"],
         "restart": ["session_id"],
-        "resume": ["session_id"], "spawn": ["lead"], "list": ["lead"],
+        "resume": ["session_id"], "spawn": ["lead"], "list": ["lead"], "board": ["lead"],
         "nudge-lead": ["lead"],
     }
     for field in RESOLVE_FIELDS.get(args.cmd, []):
