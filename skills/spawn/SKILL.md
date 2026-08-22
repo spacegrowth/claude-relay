@@ -11,6 +11,24 @@ use `/relay:send` on that session instead of spawning fresh (cheaper, keeps cont
 when nothing relevant is idle, the relevant session is dead/stalled, or you're upgrading to a
 stronger model (a session's model is fixed at launch).
 
+**Choosing each executor's model — decide per packet, by judgment demanded and cost of a wrong-but-
+plausible result, never by file count:**
+
+- **Haiku-class** — mechanical, fully-specified, verifiable-by-command: rename sweeps, boilerplate
+  tests from a shown template, config plumbing, doc formatting. The packet must be tight (exact
+  files, exact acceptance commands). If the packet needs a "why" explained, it's not haiku work.
+- **Sonnet-class (the workhorse, default)** — bounded features, bugfixes with a repro, test suites,
+  refactors within one module. Most packets land here.
+- **Opus-class** — unknown-root-cause debugging, cross-cutting changes, anything touching core
+  logic/ledgers/parity tests, and any task where a wrong-but-plausible result would likely survive
+  your review. Pay for judgment exactly where review can't catch its absence.
+- **Upgrade signals**: two fix-list rounds haven't landed it (respawn stronger + `--supersede`);
+  ambiguity you can't spec away in the packet. **Downgrade signal**: your acceptance criteria could
+  be checked by a script.
+- **Version hygiene**: pass the TIER alias (`haiku`/`sonnet`/`opus`) and let relay resolve the
+  concrete id through this machine's CLI — never type version ids (`…-4-6`) from memory; a stale id
+  silently pins an old model. `relay doctor` shows what each alias resolves to here.
+
 Write the task-specific packet content (ROLE / REQUIRED READING / WORK PACKET only — the standing
 GATES and REPORT FORMAT are in the executor agent's system prompt, and `relay` appends the
 per-packet report path / self-diff / closing line) to a file, then run:

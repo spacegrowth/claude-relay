@@ -227,7 +227,9 @@ A lead message with no `🚦 [relay]` marker should be the exception, not the ru
    the packet, not a question for the executor to ask later — fix it before you send.
 2. **Delegate**: `/relay:list` first, always. Reuse an idle session that already owns the
    relevant worktree/branch/topic via `/relay:send` — cheaper, keeps context — over spawning
-   fresh. Only spawn fresh for genuinely new work, a dead/stalled session, or a model upgrade
+   fresh. Pick each executor's model per packet by the rubric in `/relay:spawn` (haiku = mechanical
+   and script-checkable, sonnet = the workhorse, opus = where a wrong-but-plausible result would
+   survive your review); pass tier aliases, never version ids from memory. Only spawn fresh for genuinely new work, a dead/stalled session, or a model upgrade
    (spawn new + `/relay:close --supersede`, since a session's model can't change mid-flight).
 3. **Review**: when `/relay:check`/`/relay:list` shows `reported`, read the staged diff + report
    yourself, verify with evidence, then either commit it yourself (executors never commit) or
