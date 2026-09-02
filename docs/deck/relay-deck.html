@@ -1,0 +1,476 @@
+<title>Relay</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    color-scheme: light;
+    --ground: #FFFFFF;
+    --ink: #17181C;
+    --muted: #666A73;
+    --line: #E2E4EA;
+    --soft: #EEF1FB;
+    --accent: #1F3FCF;
+    --display: "Fraunces", Georgia, "Times New Roman", serif;
+    --body: "IBM Plex Sans", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  html, body { margin: 0; height: 100%; background: var(--ground); color: var(--ink); font-family: var(--body); }
+  body { overflow: hidden; }
+  .deck { position: relative; width: 100vw; height: 100vh; }
+  .slide { position: absolute; inset: 0; display: none; padding: 6vh 7vw 8vh; box-sizing: border-box; flex-direction: column; }
+  .slide.current { display: flex; }
+  .eyebrow { font-family: var(--mono); font-size: 1.1vw; color: var(--accent); letter-spacing: .08em; text-transform: uppercase; margin: 0 0 2vh; }
+  h1 { font-family: var(--display); font-weight: 500; font-size: 4.2vw; line-height: 1.05; margin: 0 0 4vh; text-wrap: balance; letter-spacing: -.01em; }
+  h1.big { font-size: 7vw; margin-top: 16vh; }
+  p, li { font-size: 1.65vw; line-height: 1.45; margin: 0; max-width: 62ch; }
+  p + p { margin-top: 1.6vh; }
+  .lead { font-size: 2.1vw; }
+  .muted { color: var(--muted); }
+  .small { font-size: 1.3vw; }
+  code { font-family: var(--mono); font-size: .92em; background: var(--soft); padding: .08em .4em; border-radius: 3px; }
+  pre { font-family: var(--mono); font-size: 1.2vw; line-height: 1.5; margin: 0; background: var(--soft); padding: 2vh 1.6vw; border-radius: 4px; overflow-x: auto; }
+  ul { padding-left: 1.2em; margin: 0; }
+  li + li { margin-top: 1vh; }
+  .cols { display: grid; gap: 3vw; align-items: start; }
+  .cols-2 { grid-template-columns: 1fr 1fr; }
+  .cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .rule { border: 0; border-top: 1px solid var(--line); margin: 3vh 0; }
+  .foot { margin-top: auto; font-size: 1.25vw; color: var(--muted); max-width: none; }
+  .num { position: fixed; right: 2.4vw; bottom: 2.2vh; font-family: var(--mono); font-size: 1vw; color: var(--muted); }
+  .bar { position: fixed; left: 0; top: 0; height: 3px; background: var(--accent); width: 0; transition: width .25s ease; }
+  .notes { display: none; position: fixed; left: 0; right: 0; bottom: 0; background: var(--ink); color: var(--ground); padding: 2vh 4vw; font-size: 1.3vw; line-height: 1.45; max-height: 30vh; overflow: auto; }
+  .slide .notes { display: none !important; }
+  body.notes #notesbox { display: block; }
+  .help { display: none; position: fixed; inset: 0; background: rgba(23,24,28,.92); color: var(--ground); padding: 8vh 10vw; font-size: 1.6vw; line-height: 1.7; }
+  body.help .help { display: block; }
+  .help code { background: rgba(255,255,255,.12); color: inherit; }
+  .step { opacity: 0; transform: translateY(6px); transition: opacity .35s ease, transform .35s ease; }
+  .step.on { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) { .step { transition: none; opacity: 1; transform: none; } .bar { transition: none; } }
+  .tabular { font-variant-numeric: tabular-nums; }
+  .box { border: 1px solid var(--line); padding: 1.6vh 1.4vw; font-family: var(--mono); font-size: 1.25vw; line-height: 1.45; background: var(--ground); }
+  .box b { font-family: var(--body); font-weight: 600; font-size: 1.45vw; display: block; margin-bottom: .4vh; }
+  .box.lead-box { border-color: var(--accent); }
+  .arrow { font-family: var(--mono); font-size: 1.2vw; color: var(--muted); display: flex; align-items: center; gap: .8vw; }
+  .arrow .ln { flex: 1; height: 1px; background: var(--muted); position: relative; }
+  .arrow .ln::after { content: ""; position: absolute; right: -1px; top: -4px; border: 4px solid transparent; border-left-color: var(--muted); }
+  .arrow.back .ln::after { right: auto; left: -1px; border-left-color: transparent; border-right-color: var(--muted); }
+  .arrow.accent { color: var(--accent); } .arrow.accent .ln { background: var(--accent); } .arrow.accent .ln::after { border-left-color: var(--accent); }
+  .tabs { display: flex; gap: 2px; font-family: var(--mono); font-size: 1.2vw; }
+  .tab { border: 1px solid var(--line); border-bottom: 0; padding: 1.2vh 1.4vw; color: var(--muted); }
+  .tab.on { color: var(--ink); border-color: var(--ink); }
+  .gauge { height: 2.2vh; background: var(--line); position: relative; }
+  .gauge i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ink); }
+  .gauge s { position: absolute; top: -.6vh; bottom: -.6vh; width: 2px; background: var(--accent); text-decoration: none; }
+  .turns { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1vw; font-family: var(--mono); font-size: 1.1vw; }
+  .turn { border: 1px solid var(--line); padding: 1.2vh 1vw; line-height: 1.5; }
+  .turn .w { color: var(--accent); }
+  .bars { display: grid; grid-template-columns: 8vw 1fr; gap: 1.2vh 1.4vw; align-items: center; font-family: var(--mono); font-size: 1.2vw; }
+  .bars i { display: block; height: 3vh; background: var(--ink); }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2.2vh 2vw; }
+  .grid div { font-size: 1.25vw; line-height: 1.4; }
+  .grid code { display: block; margin-bottom: .4vh; background: none; padding: 0; color: var(--accent); font-size: 1.35vw; }
+  .steps6 { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1.2vw; }
+  .steps6 div { border-top: 2px solid var(--ink); padding-top: 1.4vh; font-size: 1.2vw; line-height: 1.4; }
+  .steps6 code { display: block; background: none; padding: 0; color: var(--accent); margin-bottom: .6vh; }
+  .report { font-family: var(--mono); font-size: 1.15vw; line-height: 1.55; white-space: pre; }
+  .report em { font-style: normal; color: var(--accent); }
+  .light { font-family: var(--display); font-weight: 500; font-size: 2.5vw; line-height: 1.15; letter-spacing: -.01em; }
+</style>
+
+<div class="bar" id="bar"></div>
+<div class="deck" id="deck">
+
+<section class="slide">
+  <p class="eyebrow">🚦 relay</p>
+  <h1 class="big">One session that thinks.<br>Several that do.</h1>
+  <p class="lead muted">A Claude Code plugin: a lead session that hands work to executor sessions in their own tabs, and reviews all of it before anything is committed.</p>
+  <p class="foot">About thirty minutes, then a live run.</p>
+  <aside class="notes">Say the one-liner and move on. The whole talk is the loop on slide 3 and the money on slides 9–12.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">why</p>
+  <h1>The best model should be making the decisions, not doing the typing.</h1>
+  <div class="cols cols-2">
+    <div>
+      <p>You want Opus or Fable as your lead. Judgment is the expensive thing to get wrong: what to build, whether a diff is really mergeable, when a report is lying to you.</p>
+      <p>But you don't want that model doing every rename, every boilerplate test, every doc fix. That's where the bill goes.</p>
+    </div>
+    <div>
+      <p class="step">Smaller models aren't worse workers. They need a <strong>bounded</strong> task: exact files, a finish line you can check with a command, and no "figure out why" in the middle.</p>
+      <p class="step">Give Haiku a contained job like that and it does it. Give it an open question and it produces something that looks right and isn't.</p>
+    </div>
+  </div>
+  <p class="foot">So: one strong session that plans, delegates and reviews. Cheaper sessions that do the work, in parallel, with a written contract each way.</p>
+  <aside class="notes">This is the thesis. Everything else is mechanics. Land "bounded task" here because the model rubric later depends on it.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">how it works</p>
+  <h1>The loop</h1>
+  <div style="display:grid;grid-template-columns:22vw 1fr 22vw;gap:2vw;align-items:center;margin:1vh 0 4vh">
+    <div class="box lead-box"><b>[Lead] your project</b>writes the packet<br>reads diff + report<br>commits</div>
+    <div style="display:grid;gap:2.4vh">
+      <div class="arrow step"><span>1 · packet file</span><span class="ln"></span></div>
+      <div class="arrow back step"><span class="ln"></span><span>3 · report file + staged changes</span></div>
+      <div class="arrow accent step"><span>🚦 4 · relay's Stop hook, in the lead's own session, wakes it</span><span class="ln" style="max-width:5vw;visibility:hidden"></span></div>
+    </div>
+    <div class="box"><b>[Exec] topic</b>2 · works in the shared worktree<br>stages, never commits<br>writes the report</div>
+  </div>
+  <p class="step">The wake isn't the executor calling you. It's relay, on your side, watching the report path while you're idle — then announcing <code>🚦 [relay] — review needed</code> in your session.</p>
+  <p class="foot">Executors can't commit (denied at launch). Leads can't make large inline edits (a hook blocks it). The asymmetry is the design.</p>
+  <aside class="notes">Walk the arrows in order. Stress that the wake originates in the lead's session, from a hook — there is no arrow from the executor to the lead except the report file.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">tabs</p>
+  <h1>Every executor is a tab you can look at.</h1>
+  <div class="tabs" style="margin-bottom:3vh">
+    <div class="tab on">[Lead] claude-relay</div>
+    <div class="tab">[Exec] ctx-gate-205156</div>
+    <div class="tab">[Exec] relay-stats-205203</div>
+    <div class="tab">[Exec] relay-deck-221602</div>
+  </div>
+  <div class="cols cols-2">
+    <p><code>relay spawn</code> opens a new iTerm tab, titled by topic, running <code>claude</code> with the executor agent, no MCP servers, and the packet as its first message. The tab is the process: close it and the executor is gone. Its staged work isn't.</p>
+    <p><code>/relay:focus &lt;name&gt;</code> jumps to a tab. <code>/relay:list</code> is the table: status, model, packet number, live context, tokens spent. <code>/relay:board</code> is the same thing as one page.</p>
+  </div>
+  <pre class="step" style="margin-top:3vh">SESSION            STATUS     TOPIC       MODEL     PKT  CTX   TOKENS          LAUNCH
+ctx-gate-205156    reported   ctx-gate    sonnet-5  002  264k  6.0M/35k ·warm  none/1m/A
+relay-stats-205203 busy 12m   relay-stats sonnet-5  001  210k  8.3M/45k ·warm  none/1m/A</pre>
+  <aside class="notes">People ask "where does it run" first. Answer it before the mechanics. These are real rows from today.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">the contract, outbound</p>
+  <h1>A packet</h1>
+  <div class="cols cols-2">
+<pre>Replace the MB-on-disk "heavy" proxy with the
+executor's real live context size (tokens).
+
+REPO: ~/development/claude-relay — files:
+lib/lead_guard.py, bin/relay, tests/test_relay.py
+
+REQUIRED READING: lib/lead_guard.py L1692-1766
+
+## Preconditions
+- main clean; suite green at baseline (record count)
+
+CHANGES (priority order):
+1. transcript_usage returns last_prompt, last_ts …
+
+ACCEPTANCE:
+- tests for each; full suite green; number in report
+- hand-check against one real transcript, paste it
+
+BOUNDARIES: stage only, never commit.
+Don't touch hooks/.</pre>
+    <div>
+      <p><strong>First line is the goal.</strong> It becomes the executor's opening message and its tab title.</p>
+      <p class="step"><strong>Acceptance is commands, not adjectives.</strong> If you can't write the check, you haven't finished thinking.</p>
+      <p class="step"><strong>Boundaries say what not to do</strong> and what to do when stuck: stop and report, never ask in the tab.</p>
+      <p class="step">Before sending, read it as someone with no access to this conversation. Every gap you'd have to explain later is a bug in the packet now.</p>
+    </div>
+  </div>
+  <aside class="notes">A real packet from this afternoon, trimmed. The "cold reader" test is the one habit that makes delegation work.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">the contract, inbound</p>
+  <h1>A report, and what you do with it</h1>
+  <div class="cols cols-2">
+<div class="report"><em>one-line gist of what happened</em>
+
+Status: <em>clean</em> | clean-with-caveats | partial | blocked
+Risk flags: <em>none</em>
+UNVERIFIED: <em>none</em>
+Changed: lib/lead_guard.py, bin/relay, tests/…
+
+## What changed     file:line for each
+## Verification     commands run, counts
+## Not done         and why</div>
+    <div>
+      <p><code>/relay:diff &lt;sid&gt;</code> renders the staged changes as a review page. You read it. There's no substitute.</p>
+      <p class="step"><code>/relay:verify &lt;sid&gt;</code> checks the report against the index: are the claimed files actually staged, do the counts agree. Its best verdict is <code>COUNTS-MATCH</code> — deliberately not "PASS". The others: <code>MISMATCH</code>, <code>MALFORMED</code>, <code>INCONCLUSIVE</code>.</p>
+      <p class="step">Then you commit, or you send a fix-list back into the same executor. Executors never commit; you do, with your name on it.</p>
+    </div>
+  </div>
+  <p class="foot">The TL;DR block is machine-read. <code>clean-with-caveats</code> is a stop on purpose: the caveats are the point.</p>
+  <aside class="notes">Pair with slide 5. The report format is enforced by the executor's system prompt, not something you ask for each time.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">choosing a model</p>
+  <h1>Who gets the packet?</h1>
+  <div class="cols cols-3">
+    <div><p class="light">A script could check it's done.</p><p class="muted step"><strong>Haiku.</strong> Rename sweeps, boilerplate from a shown template, config plumbing. The packet must be tight. If it needs a "why" explained, it isn't Haiku work.</p></div>
+    <div><p class="light">A plausible wrong answer could slip past you.</p><p class="muted step"><strong>Opus.</strong> Unknown root causes, cross-cutting changes, core logic. Pay for judgment exactly where review can't catch its absence.</p></div>
+    <div><p class="light">Everything else.</p><p class="muted step"><strong>Sonnet.</strong> Bounded features, bugs with a repro, refactors inside one module. Most packets land here.</p></div>
+  </div>
+  <hr class="rule">
+  <p class="step"><strong>If you guessed low, you'll know:</strong> two fix-list rounds and it still hasn't landed. That's the signal to respawn on a stronger model and mark the old session superseded. The reverse signal is the first question again: if the acceptance could be a script, you're overpaying.</p>
+  <p class="foot">Pass the tier name (<code>haiku</code> / <code>sonnet</code> / <code>opus</code>). Relay resolves it through this machine's CLI, so nobody types a stale version id from memory.</p>
+  <aside class="notes">Check the cheap case first, then the expensive one; Sonnet is what is left. The "two rounds" rule is the only feedback most people will actually use.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">effort</p>
+  <h1>Effort is how long it thinks before each action. It doesn't make a model smarter.</h1>
+  <div class="cols cols-2">
+    <div>
+      <p>A Sonnet at <code>max</code> effort is a Sonnet that takes longer. Effort is a quality lever on top of the right model: turn it up (<code>xhigh</code>) only for an Opus executor whose whole job is finding root causes.</p>
+      <p class="step">Don't turn it down to save money. Here's why:</p>
+    </div>
+    <div class="bars step">
+      <span>prompt</span><i style="width:100%"></i>
+      <span>output</span><i style="width:.6%;min-width:3px"></i>
+      <span></span><span class="muted small">one real executor session today: 5.1M prompt tokens, 29k output. Thinking lives inside that 29k.</span>
+    </div>
+  </div>
+  <p class="foot">Set per packet with an <code>EFFORT:</code> line or <code>--effort</code>. It's fixed for the process, and executors get reused — so you're setting it for every packet that session will ever see. Unset is the right default.</p>
+  <aside class="notes">The bar is the argument. Output, thinking included, is under one percent of what the session cost. The lever people actually want is the model tier.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">caching</p>
+  <h1>Caching, in one minute</h1>
+  <div class="cols cols-3">
+    <p><strong>Claude has no memory between turns.</strong> Each turn, your whole conversation is sent to the API again — and billed again.</p>
+    <p class="step"><strong>The cache is the API holding on to the start of that conversation</strong> for 60 minutes. Text it already holds costs 10% to send again. Text it has to store costs 125–200%, once.</p>
+    <p class="step"><strong>Every turn resets the 60-minute clock.</strong> Go quiet for an hour and the whole history gets stored again, at the full storing price.</p>
+  </div>
+  <div class="step" style="margin:3.5vh 0 0">
+    <p class="small muted" style="margin-bottom:.8vh">what's in it — the exact bytes of the request, from the start, in this order</p>
+    <div style="display:flex;gap:2px;font-family:var(--mono);font-size:1.05vw;line-height:1.35">
+      <div style="flex:3;border:1px solid var(--line);padding:1vh .8vw">system prompt<br><span class="muted">Claude Code + executor role + CLAUDE.md</span></div>
+      <div style="flex:1.4;border:1px solid var(--line);padding:1vh .8vw">tool<br>definitions</div>
+      <div style="flex:1.6;border:1px solid var(--line);padding:1vh .8vw">the packet</div>
+      <div style="flex:3.2;border:1px solid var(--line);padding:1vh .8vw">every file it read<br><span class="muted">tool results are part of the conversation</span></div>
+      <div style="flex:2;border:1px solid var(--line);padding:1vh .8vw">command output</div>
+      <div style="flex:1.6;border:1px solid var(--line);padding:1vh .8vw">its own replies</div>
+      <div style="flex:1.4;border:1px solid var(--accent);color:var(--accent);padding:1vh .8vw">this turn<br><span style="opacity:.8">not held yet</span></div>
+    </div>
+    <p class="small muted" style="margin-top:.8vh">Same system prompt, same zero-MCP tool list on every executor → that first stretch is shared between them. A file read on turn 3 is re-sent on every turn after — at 10%, but forever.</p>
+  </div>
+  <aside class="notes">Beat one is the whole idea: no memory, so everything is re-sent. The strip shows what "everything" is. Point at "every file it read".</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">caching, turn by turn</p>
+  <h1>Why a warm executor is cheap and a huge one isn't</h1>
+  <div class="turns" style="margin:1vh 0 4vh">
+    <div class="turn step">turn 1<br><span class="w">store</span> system + packet<br>×1.25</div>
+    <div class="turn step">turn 2<br>re-send turn 1 ×0.1<br><span class="w">store</span> the new part</div>
+    <div class="turn step">turn 3<br>re-send 1–2 ×0.1<br><span class="w">store</span> the new part</div>
+    <div class="turn step">… turn 40<br>re-send everything ×0.1<br>this is the 97% hit-rate</div>
+    <div class="turn step">1 hour idle, turn 41<br><span class="w">store everything again</span><br>×1.25–2 on the whole history</div>
+  </div>
+  <div class="cols cols-3 step">
+    <p><strong>It's a prefix.</strong> Change anything early — the system prompt, an old message — and everything after it has to be stored again.</p>
+    <p><strong>It's per model.</strong> Move the executor to Opus and you start from nothing.</p>
+    <p><strong>Held isn't free.</strong> A 200k history still costs about 20k tokens' worth every single turn.</p>
+  </div>
+  <aside class="notes">Most people think caching is a discount. It's the reason reusing a warm executor is cheap and a huge one is a tax on every turn — which is the next two slides.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">the bill</p>
+  <h1>What one executor session actually cost</h1>
+  <div class="cols cols-2">
+<pre class="tabular">prompt tokens       5,087,364
+  from cache        4,963,695   ×0.10  →  496k
+  written to cache    123,543   ×1.25  →  154k
+  plain                   126   ×1.00  →    0k
+output                 29,242   ×5     →  146k   (output ≈ 5× input price)
+
+billed like            ≈ 800k input-equivalent
+without a cache        ≈ 5.2M</pre>
+    <div>
+      <p>The things that move the bill, biggest first:</p>
+      <ul>
+        <li class="step"><strong>Which tier.</strong> Multiples, not percents.</li>
+        <li class="step"><strong>How much it reads per turn.</strong> Tight packets. No MCP servers by default; their tool lists would sit in every turn.</li>
+        <li class="step"><strong>Warm reuse vs. cold spawn.</strong> Previous slide.</li>
+        <li class="step"><strong>Past 200k of live context.</strong> Long-context pricing kicks in.</li>
+        <li class="step"><strong>Effort.</strong> Last, and small.</li>
+      </ul>
+    </div>
+  </div>
+  <aside class="notes">Real numbers from one of today's sessions. The ×5 on output is approximate; the point is the shape, not the decimals.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">reuse, rotate, hand off</p>
+  <h1>Keep using an executor while it's cheap. Replace it when it isn't.</h1>
+  <div class="cols cols-2">
+    <div>
+      <p><code>/relay:send</code> puts a follow-up into an executor you already have. Warm cache, and it knows the codebase. Always the first choice over spawning.</p>
+      <p class="step">Its live context grows with every turn. <code>relay list</code> shows it as <strong>CTX</strong>, with <code>·warm</code> or <code>·cold~N</code> beside the tokens. At 150k, <code>relay send</code> refuses:</p>
+      <pre class="step" style="margin-top:1.4vh;font-size:1.05vw">session 'ctx-gate' is heavy — its live context is 264k tokens,
+past the 150k nudge (long-context pricing starts at 200k) …
+  --rotate           retire it, spawn a seeded successor, this packet first
+  --heavy-override   send anyway; the reason goes in the ledger</pre>
+    </div>
+    <div>
+      <div class="step">
+        <p class="small muted" style="margin-bottom:.6vh">what the old signal saw — transcript size</p>
+        <div class="gauge"><i style="width:34%"></i><s style="left:100%"></s></div>
+        <p class="small tabular">1.7 MB of a 5 MB threshold: "fine"</p>
+      </div>
+      <div class="step" style="margin-top:3vh">
+        <p class="small muted" style="margin-bottom:.6vh">what the new signal saw — live context</p>
+        <div class="gauge"><i style="width:88%"></i><s style="left:50%"></s></div>
+        <p class="small tabular">264k against a 150k line: "rotate"</p>
+      </div>
+      <p class="step" style="margin-top:3vh">The executor that built this gate this afternoon was the first session it caught.</p>
+    </div>
+  </div>
+  <p class="foot">The lead has the same problem at a slower rate. Its statusline shows its own transcript size; past 5 MB relay nudges once — write a handoff note, <code>/relay:handoff</code>, and a fresh lead picks up with the note as context.</p>
+  <aside class="notes">Rotate = retire the old one (it writes a successor seed indexing its packets and reports) and spawn a new one that reads the seed first. You lose the conversation, you keep the knowledge.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">lifecycle</p>
+  <h1>When executors close, and how</h1>
+  <div class="cols cols-3">
+    <div><p class="light">Landed</p><p class="muted">You committed (or discarded) its work — the files it claimed are clean in the tree. Two minutes later relay closes the tab on its own.</p></div>
+    <div><p class="light">Idle</p><p class="muted">It reported, you've seen the report, and 60 minutes passed. Closed.</p></div>
+    <div><p class="light">By hand</p><p class="muted"><code>/relay:close</code> now. <code>/relay:retire</code> to close <em>and</em> write the successor seed. <code>--keep</code> at spawn, or <code>relay keep</code>, pins one you know you'll need.</p></div>
+  </div>
+  <hr class="rule">
+  <p class="step"><strong>Closed isn't gone.</strong> <code>/relay:send</code> to a closed session reopens the same conversation with everything it knew. <code>/relay:resume</code> does that for a tab that crashed. <code>/relay:restart</code> re-runs the packet in a fresh conversation when you'd rather it forgot.</p>
+  <p class="foot">Nothing is auto-closed until the lead has actually seen its report. Busy, stalled, queued and pinned sessions are never touched.</p>
+  <aside class="notes">The question behind this slide is "will I lose work?" No: staged changes live in the worktree, reports live on disk, and the conversation is resumable.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">guardrails</p>
+  <h1>What stops a bad afternoon</h1>
+  <div class="cols cols-2">
+    <div>
+      <p><strong>The edit gate.</strong> Armed by <code>/relay:mode</code>. A lead that tries a large inline edit is blocked and told to delegate. Packet files are exempt. <code>/relay:route retain "reason"</code> opens a two-minute window when it really is lead work, with the reason in the ledger.</p>
+      <p class="step"><strong>Announce and wait.</strong> By default, when the wake fires, the lead tells you what's ready and stops. <code>/relay:auto on</code> flips that to proceed-by-default — inside a plan you already approved, and it resets each time lead mode is re-armed.</p>
+    </div>
+    <div>
+      <p class="step"><strong>Committing needs all five, even in auto:</strong></p>
+      <ul class="step">
+        <li><code>verify</code> says <code>COUNTS-MATCH</code></li>
+        <li>report says <code>clean</code>, risk flags <code>none</code>, unverified <code>none</code></li>
+        <li>the packet was in the approved plan</li>
+        <li>nothing sign-off-gated is touched: core logic, ledgers, migrations, deploys</li>
+        <li>the lead has actually read the diff</li>
+      </ul>
+      <p class="step muted small">The last two are the lead's own attestations. The tool can't check them, so it refuses unless they're passed — and passing them falsely is a false statement in the ledger, not a shortcut.</p>
+    </div>
+  </div>
+  <aside class="notes">Today every commit stopped at the gate anyway, because the packets touched lib/lead_guard.py. That's the gate working.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">using it</p>
+  <h1>Six steps</h1>
+  <div class="steps6">
+    <div class="step"><code>/relay:mode</code>Arm the lead. Model check, edit gate on, wake on.</div>
+    <div class="step"><code>write a packet</code>Goal on the first line, files, acceptance commands, boundaries.</div>
+    <div class="step"><code>/relay:spawn</code>Worktree, topic, packet, <code>--model sonnet</code>. Or <code>/relay:send</code> into one you have.</div>
+    <div class="step"><code>wait</code>The wake announces the report. <code>/relay:check</code> if you're impatient.</div>
+    <div class="step"><code>/relay:diff</code> <code>/relay:verify</code>Read the diff. Check the claims.</div>
+    <div class="step"><code>git commit</code>You, not the executor. Then relay parks it.</div>
+  </div>
+  <p class="foot">The first spawn of a session always asks for your go, even in auto. Deciding how work splits is yours.</p>
+  <aside class="notes">Leave this slide up during questions.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">skills</p>
+  <h1>Everything is <code>/relay:</code>something</h1>
+  <div class="grid">
+    <div><code>mode</code>become the lead; arm the gate and the wake</div>
+    <div><code>auto</code>proceed-by-default inside an approved plan, or back to waiting</div>
+    <div><code>spawn</code>new executor tab, seeded with a packet</div>
+    <div><code>send</code>follow-up into an existing executor (<code>--rotate</code>, <code>--when-idle</code>)</div>
+    <div><code>list</code>every session: status, model, packet, CTX, tokens</div>
+    <div><code>board</code>the same, as one page</div>
+    <div><code>check</code>poll one or all for a report</div>
+    <div><code>focus</code>jump iTerm to a session's tab</div>
+    <div><code>diff</code>staged changes as a review page</div>
+    <div><code>verify</code>report against the index: COUNTS-MATCH or not</div>
+    <div><code>close</code>park an executor now; <code>--supersede</code> when replaced</div>
+    <div><code>retire</code>close and write a successor seed</div>
+    <div><code>resume</code>bring back a closed or crashed tab with its context</div>
+    <div><code>restart</code>re-run a packet in a fresh conversation</div>
+    <div><code>handoff</code>hand this lead to a fresh successor</div>
+    <div><code>route</code>the edit gate's escape hatch, with a reason</div>
+  </div>
+  <p class="foot"><code>stop</code> steps down from lead mode. <code>relay doctor</code> proves the installed CLI still honours what relay assumes; run it after every Claude Code update.</p>
+  <aside class="notes">Don't read this out. Point at the four you'll use daily: mode, spawn, send, diff.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">what's next</p>
+  <h1>Turning the rubric into data</h1>
+  <div class="cols cols-2">
+    <div>
+      <p><code>relay stats</code> (landed today) joins every packet's model and effort to what happened to it: rounds before it was accepted, the verify verdict, tokens per packet.</p>
+      <pre class="step tabular" style="margin-top:2vh">MODEL   PACKETS  % CLEAN  TOK/PKT
+opus    11       36%      7.6M
+sonnet  253      18%      10.0M</pre>
+    </div>
+    <div>
+      <p class="step">Rounds is still empty: relay never saw a manual <code>git commit</code>. The fix is in flight — a <code>landed</code> event recorded per packet the moment its claimed files are clean, so "how many fix-lists did this take" becomes a number.</p>
+      <p class="step">Then "did I pick the right model" stops being a feeling.</p>
+    </div>
+  </div>
+  <hr class="rule">
+  <p class="lead">Now the live run: arm, spawn a Haiku packet, watch the wake, verify, diff, commit.</p>
+  <aside class="notes">Demo script is in docs/deck/README.md. Ten minutes. Keep the packet tiny so the wake lands inside the talk.</aside>
+</section>
+
+</div>
+
+<div class="num" id="num"></div>
+<div class="help" id="help">
+  <p><code>→</code> <code>space</code> next step, then next slide · <code>←</code> back · <code>Home</code> / <code>End</code> · <code>n</code> speaker notes · <code>?</code> this</p>
+  <p>Deep link: <code>#/9</code></p>
+</div>
+
+<script>
+(function () {
+  var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+  var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var i = 0;
+  var box = document.createElement('div'); box.className = 'notes'; box.id = 'notesbox'; document.body.appendChild(box);
+  function steps(s) { return Array.prototype.slice.call(s.querySelectorAll('.step')); }
+  function show(n, revealAll) {
+    i = Math.max(0, Math.min(slides.length - 1, n));
+    slides.forEach(function (s, k) { s.classList.toggle('current', k === i); });
+    steps(slides[i]).forEach(function (el) { el.classList.toggle('on', !!revealAll || reduced); });
+    document.getElementById('num').textContent = (i + 1) + ' / ' + slides.length;
+    document.getElementById('bar').style.width = ((i + 1) / slides.length * 100) + '%';
+    var notes = slides[i].querySelector('.notes');
+    box.textContent = notes ? notes.textContent : '';
+    if (location.hash !== '#/' + (i + 1)) history.replaceState(null, '', '#/' + (i + 1));
+  }
+  function next() {
+    var pending = steps(slides[i]).filter(function (el) { return !el.classList.contains('on'); });
+    if (pending.length) { pending[0].classList.add('on'); return; }
+    if (i < slides.length - 1) show(i + 1, false);
+  }
+  function prev() { if (i > 0) show(i - 1, true); }
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); next(); }
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prev(); }
+    else if (e.key === 'Home') show(0, true);
+    else if (e.key === 'End') show(slides.length - 1, true);
+    else if (e.key === 'n') document.body.classList.toggle('notes');
+    else if (e.key === '?') document.body.classList.toggle('help');
+    else if (e.key === 'Escape') document.body.classList.remove('help');
+  });
+  document.getElementById('help').addEventListener('click', function () { document.body.classList.remove('help'); });
+  var m = location.hash.match(/#\/(\d+)/);
+  show(m ? parseInt(m[1], 10) - 1 : 0, !!m);
+  window.addEventListener('hashchange', function () {
+    var m2 = location.hash.match(/#\/(\d+)/); if (m2) show(parseInt(m2[1], 10) - 1, true);
+  });
+})();
+</script>
