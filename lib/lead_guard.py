@@ -1875,6 +1875,18 @@ MCP_HINT_WORDS = ("linear", "jira", "gmail", "google calendar", "google drive", 
 COMMIT_RE = re.compile(r"\bgit (commit|push)\b|\b(commit|push) (your|the|these|all|this|it)\b", re.IGNORECASE)
 ASK_RE = re.compile(r"\b(ask|check with|confirm with|clarify with) (the )?(user|human|lead|me)\b", re.IGNORECASE)
 
+# Packet-shape hints (spawn skill's model rubric, quoted not paraphrased): a packet that's fully
+# specified and script-checkable is haiku work; a packet that carries an unanswered question is
+# opus work. These are INFO nudges on the packet's own shape, independent of what model was chosen.
+OPUS_SHAPE_WORDS = ("investigate", "figure out", "root cause", "unknown", "diagnose", "why does")
+HAIKU_DISQUALIFY_WORDS = ("investigate", "figure out", "root cause", "why", "unclear", "diagnose")
+ACCEPTANCE_CMD_RE = re.compile(
+    r"^#{1,6}[ \t]*acceptance\b.*?(?:```|^\s*(?:pytest|npm|make|python3 -m|go test)\b)",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL)
+FILES_LIST_RE = re.compile(r"^\s*files\s*:", re.IGNORECASE | re.MULTILINE)
+BACKTICK_PATH_RE = re.compile(r"`[^`\n]*[/.][^`\n]*`")
+REPRO_RE = re.compile(r"\brepro(?:duce)?\b|\bsteps to\b", re.IGNORECASE)
+
 
 def lint_packet(body, cwd=None, known_servers=None, model=None, reading_bytes=None):
     """List of (level, code, message) findings. level ∈ {"warn", "info"}. Pure given its inputs;
@@ -1927,6 +1939,10 @@ def lint_packet(body, cwd=None, known_servers=None, model=None, reading_bytes=No
     if ctx == "1m" and model and not model_supports_1m(model):
         out.append(("warn", "context-1m-on-haiku", f"CONTEXT: 1m but model '{model}' has no 1M window — "
                     f"it will run on 200k"))
+    if rb >= 2 * CONTEXT_1M_BYTES:
+        out.append(("warn", "reading-front-loaded", f"packet front-loads ~{rb // 1024}KB of required "
+                    f"reading — every rotate/resume re-writes that prefix at cache-write price; trim "
+                    f"REQUIRED READING to what the first task needs"))
     ef_m = EFFORT_RE.search(text)
     if ef_m and normalize_effort_spec(ef_m.group(1)) is None:
         out.append(("warn", "effort-unparsable", f"EFFORT: line present but value isn't one of "
@@ -1938,6 +1954,19 @@ def lint_packet(body, cwd=None, known_servers=None, model=None, reading_bytes=No
     if ASK_RE.search(text):
         out.append(("warn", "asks-to-ask", "packet tells the executor to ask someone — executors never ask "
                     "in the tab; phrase it as 'stop and report the blocker'"))
+    # packet shape (spawn skill's model rubric, echoed not reinterpreted)
+    tier = model_tier(model)
+    has_acceptance_cmd = bool(ACCEPTANCE_CMD_RE.search(text))
+    has_file_list = bool(FILES_LIST_RE.search(text)) or len(BACKTICK_PATH_RE.findall(text)) >= 2
+    if tier != "haiku" and has_acceptance_cmd and has_file_list \
+            and not any(w in low for w in HAIKU_DISQUALIFY_WORDS):
+        out.append(("info", "shape-haiku", "packet is fully specified and script-checkable — "
+                    "haiku-shaped (rubric: 'mechanical, fully-specified, verifiable-by-command')"))
+    if tier not in ("opus", "fable") and any(w in low for w in OPUS_SHAPE_WORDS) \
+            and REPRO_RE.search(text) is None:
+        out.append(("info", "shape-opus", "packet carries a question the lead couldn't answer — "
+                    "opus-shaped; effort xhigh is the pairing (rubric: 'unknown-root-cause… "
+                    "wrong-but-plausible would survive review')"))
     return out
 
 

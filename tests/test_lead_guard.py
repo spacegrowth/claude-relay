@@ -3122,6 +3122,44 @@ class TestPacketLint:
         assert "asks-to-ask" in self.codes(self.GOOD + "If unsure, ask the user.\n")
         assert "asks-to-commit" not in self.codes(self.GOOD)  # "stage for review" is fine
 
+    HAIKU_SHAPED = ("# Task\n\n## Preconditions\n- checkout pulled\n\nRename the widget in `src/a.py` "
+                    "and `src/b.py`.\n\n## ACCEPTANCE\n```\npytest tests/test_widget.py\n```\n")
+
+    def test_shape_haiku_fires_on_fully_specified_packet(self):
+        assert "shape-haiku" in self.codes(self.HAIKU_SHAPED)
+
+    def test_shape_haiku_silent_without_file_list_or_acceptance_command(self):
+        assert "shape-haiku" not in self.codes(self.GOOD)  # one bare path, no acceptance command
+
+    def test_shape_haiku_silent_when_question_words_present(self):
+        assert "shape-haiku" not in self.codes(self.HAIKU_SHAPED + "Not sure why this broke; unclear.\n")
+
+    def test_shape_haiku_suppressed_when_model_already_haiku(self):
+        assert "shape-haiku" not in self.codes(self.HAIKU_SHAPED, model="haiku")
+
+    OPUS_SHAPED = ("# Task\n\n## Preconditions\n- checkout pulled\n\nInvestigate why the ledger drifts; "
+                   "root cause unknown.\n")
+
+    def test_shape_opus_fires_on_open_question_packet(self):
+        assert "shape-opus" in self.codes(self.OPUS_SHAPED)
+
+    def test_shape_opus_silent_with_repro_block(self):
+        assert "shape-opus" not in self.codes(self.OPUS_SHAPED + "Repro: run x then y.\n")
+
+    def test_shape_opus_silent_without_question_words(self):
+        assert "shape-opus" not in self.codes(self.GOOD)
+
+    def test_shape_opus_suppressed_when_model_already_opus_or_fable(self):
+        assert "shape-opus" not in self.codes(self.OPUS_SHAPED, model="opus")
+        assert "shape-opus" not in self.codes(self.OPUS_SHAPED, model="fable")
+
+    def test_reading_front_loaded_at_double_threshold(self, tmp_path):
+        small = tmp_path / "small.py"; small.write_text("x" * 700_000)
+        huge = tmp_path / "huge.py"; huge.write_text("x" * 1_300_000)
+        assert "reading-front-loaded" not in self.codes(self.GOOD + f"Read {small}\n")
+        codes = self.codes(self.GOOD + f"Read {huge}\n")
+        assert "reading-front-loaded" in codes and "context-auto-1m" in codes
+
 
 class TestTranscriptUsage:
     def _write(self, tmp_path, ts1="2026-01-01T00:00:00.000Z", ts2="2026-01-01T00:05:00.000Z"):

@@ -185,7 +185,8 @@ relay doctor [--offline] [--quick]         prove the installed claude CLI still 
                                             flags (strict MCP, executor agent, commit deny, model
                                             aliases) + plumbing; run after every Claude Code update
 relay lint <packet.md> [--worktree W]      advisory packet checks (MCP mentioned but not declared,
-             [--model M] [--strict]          big reading on 200K, asks to commit/ask, no Preconditions…);
+             [--model M] [--strict]          big reading on 200K, asks to commit/ask, no Preconditions,
+                                            haiku/opus packet-shape hints, front-loaded reading…);
                                             the same checks print at spawn/send
 /relay:list                                leads + active executors (closed hidden; --closed shows);
                                             TOKENS (real prompt/output spend) and LAUNCH
@@ -691,6 +692,14 @@ follow-up packet declaring a different `EFFORT:` gets an ℹ note instead of a s
 Pairing guidance: mechanical/script-checkable packets → `low`/`medium`; unknown-root-cause or
 core-logic work → `xhigh` (`max` when correctness beats cost). Shown in `relay list`'s LAUNCH
 column as a fourth segment when set (`none/1m/A/low`).
+
+**Round-count nudge.** `relay send` prints an ℹ note once the outgoing packet is the 3rd (or later)
+sent to that session: `round 3 into this session on <tier> — if the last two were fix-lists on the
+same work, the spawn rubric says respawn stronger and --supersede`. It doesn't try to detect
+whether the last two rounds were actually the same work — that's the lead's call — it just names the
+round count so the spawn skill's upgrade signal (two fix-list rounds haven't landed it → respawn
+stronger + `--supersede`) isn't silently missed on a session that's just accumulating packets.
+Advisory only; never blocks the send.
 
 ### Executor MCP servers
 

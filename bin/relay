@@ -1640,6 +1640,10 @@ def cmd_send(args):
     body = Path(args.packet).read_text()
     warn_missing_preconditions(body, "sending")
     print_lint(body, cwd=s.get("worktree"), model=s.get("model"))
+    if n >= 3:
+        tier = lead_guard.model_tier(s.get("model")) or s.get("model") or "?"
+        print(c(f"  ℹ round {n} into this session on {tier} — if the last two were fix-lists on "
+                f"the same work, the spawn rubric says respawn stronger and --supersede", "dim"))
     want_effort = lead_guard.packet_effort_spec(body)
     if want_effort and want_effort != s.get("effort"):
         print(c(f"  ℹ packet declares EFFORT: {want_effort} but this session runs "

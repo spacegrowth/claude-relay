@@ -2364,6 +2364,27 @@ class TestSend:
         close.assert_called_once()                         # old tab closed
         assert cap["resume_id"] == "cs-x"                  # then the conversation resumed
 
+    def test_round_nudge_on_third_send_not_second(self, relay, tmp_path, capsys):
+        # Round-count escalation (spawn skill's upgrade signal, echoed as an ℹ, never a refusal):
+        # the note appears once this send is the 3rd packet into the session, not before.
+        self._mk(relay, status="reported", pid=os.getpid(), claude_session="cs-x", report=True)
+        s = relay.read_session("e1")
+        s["model"] = "sonnet"
+        relay.write_session("e1", s)
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        out = capsys.readouterr().out
+        assert "round" not in out  # 2nd packet into the session — too early
+
+        (relay.packets_dir("e1") / "002-report.md").write_text("done")
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        out = capsys.readouterr().out
+        assert "ℹ round 3 into this session on sonnet" in out
+        assert "respawn stronger and --supersede" in out
+
     def test_send_fails_without_claude_session_marks_dead(self, relay, tmp_path):
         # No captured Claude session → today's behavior: mark dead, tell them to spawn.
         self._mk(relay, status="reported", pid=999999, claude_session=None, report=True)
