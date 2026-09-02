@@ -6158,3 +6158,219 @@ class TestExecutorFallbackModel:
         assert "fallbackModel" not in json.loads(Path(cap["settings_file"]).read_text())
         cap = self._spawn(relay, tmp_path, {"executor_escalation": False}, name="fb4")
         assert cap.get("settings_file") is None
+
+
+class TestCmdStats:
+    """`relay stats`: one row per packet ever sent to any session (incl. closed/dead), joining
+    (model, effort) to outcome (rounds, verify verdict, report status) via the ledger + seed_entries,
+    plus a per-session token trailer and a SUMMARY grouped by (model, effort)."""
+
+    def _mk(self, relay, sid, model=None, effort=None, owner_lead=None, status="reported",
+            claude_session=None, current_packet=1):
+        relay.write_session(sid, {"session_id": sid, "status": status, "tab_label": f"[Exec] {sid}",
+            "pid": None, "current_packet": current_packet, "topic": "t", "scope": "s", "worktree": "/w",
+            "model": model, "effort": effort, "owner_lead": owner_lead, "superseded_by": None,
+            "claude_session": claude_session, "busy_since": relay.now()})
+
+    def _packet(self, relay, sid, n, report=None):
+        d = relay.packets_dir(sid)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{n:03d}-packet.md").write_text(f"Task {n} — do the thing.\n")
+        if report is not None:
+            (d / f"{n:03d}-report.md").write_text(report)
+
+    def _report(self, status):
+        return f"Outcome sentence.\n\nStatus: {status}\nRisk flags: none\nUNVERIFIED: none\nChanged: x\n"
+
+    def _args(self, lead=None, json=False, since=None):
+        return SimpleNamespace(lead=lead, json=json, since=since)
+
+    # ── basic row shape ──────────────────────────────────────────
+    def test_row_per_packet_joins_model_effort_to_outcome(self, relay):
+        self._mk(relay, "s1", model="claude-sonnet-4-6", effort="high")
+        self._packet(relay, "s1", 1, report=self._report("clean"))
+        self._packet(relay, "s1", 2)  # unreported: no verify, no report → '-' / '-'
+        relay.append_ledger("packet_sent", session_id="s1", packet=1)
+        relay.append_ledger("packet_sent", session_id="s1", packet=2)
+        relay.append_ledger("report_verify", session_id="s1", packet=1, verdict="COUNTS-MATCH")
+        data = relay.stats_data()
+        rows = {r["packet"]: r for r in data["rows"] if r["session_id"] == "s1"}
+        assert rows["001"]["model"] == "sonnet" and rows["001"]["effort"] == "high"
+        assert rows["001"]["verdict"] == "COUNTS-MATCH" and rows["001"]["status"] == "clean"
+        assert rows["002"]["verdict"] == "-" and rows["002"]["status"] == "-"
+
+    def test_model_falls_back_to_raw_string_when_tier_unrecognized(self, relay):
+        self._mk(relay, "s1", model="some-custom-id")
+        self._packet(relay, "s1", 1)
+        row = relay.stats_data()["rows"][0]
+        assert row["model"] == "some-custom-id"
+
+    def test_no_model_or_effort_renders_dash(self, relay):
+        self._mk(relay, "s1")
+        self._packet(relay, "s1", 1)
+        row = relay.stats_data()["rows"][0]
+        assert row["model"] == "-" and row["effort"] == "-"
+
+    def test_session_with_no_verify_event_is_dash(self, relay):
+        self._mk(relay, "s1", model="opus")
+        self._packet(relay, "s1", 1, report=self._report("partial"))
+        row = relay.stats_data()["rows"][0]
+        assert row["verdict"] == "-"
+
+    def test_last_verify_event_wins(self, relay):
+        self._mk(relay, "s1", model="opus")
+        self._packet(relay, "s1", 1)
+        relay.append_ledger("report_verify", session_id="s1", packet=1, verdict="MISMATCH")
+        relay.append_ledger("report_verify", session_id="s1", packet=1, verdict="COUNTS-MATCH")
+        row = relay.stats_data()["rows"][0]
+        assert row["verdict"] == "COUNTS-MATCH"
+
+    # ── closed/dead/superseded sessions are included ──────────────
+    def test_closed_and_dead_sessions_are_included(self, relay):
+        self._mk(relay, "closed-1", model="opus", status="closed")
+        self._packet(relay, "closed-1", 1)
+        self._mk(relay, "dead-1", model="haiku", status="dead")
+        self._packet(relay, "dead-1", 1)
+        sids = {r["session_id"] for r in relay.stats_data()["rows"]}
+        assert {"closed-1", "dead-1"} <= sids
+
+    def test_session_with_no_packets_is_skipped(self, relay):
+        self._mk(relay, "empty-1", model="opus")  # spawned then never sent a packet
+        assert relay.stats_data()["rows"] == []
+        assert relay.stats_data()["sessions"] == []
+
+    # ── tokens: real usage, or '-' with no crash on a missing transcript ──────
+    def test_missing_transcript_gives_dash_tokens_no_crash(self, relay):
+        self._mk(relay, "s1", model="opus", claude_session=None)
+        self._packet(relay, "s1", 1)
+        data = relay.stats_data()  # must not raise
+        sess = data["sessions"][0]
+        assert sess["prompt"] is None and sess["output"] is None and sess["tok_per_pkt"] is None
+        relay.cmd_stats(self._args())  # the printed table path must not crash either
+
+    def test_tok_per_pkt_is_the_session_average(self, relay, monkeypatch):
+        self._mk(relay, "s1", model="opus", claude_session="cs-1")
+        self._packet(relay, "s1", 1)
+        self._packet(relay, "s1", 2)
+        monkeypatch.setattr(relay, "_usage_for_session",
+                            lambda s: {"prompt": 800, "output": 200} if s["session_id"] == "s1" else None)
+        sess = relay.stats_data()["sessions"][0]
+        assert sess["prompt"] == 800 and sess["output"] == 200 and sess["tok_per_pkt"] == 500
+
+    # ── rounds: derivable only via a real auto_commit event after the packet's send ───────────
+    def test_rounds_dash_when_no_auto_commit_event_at_all(self, relay):
+        self._mk(relay, "s1", model="opus")
+        self._packet(relay, "s1", 1)
+        self._packet(relay, "s1", 2)
+        relay.append_ledger("packet_sent", session_id="s1", packet=1, ts="2026-01-01T00:00:00")
+        relay.append_ledger("packet_sent", session_id="s1", packet=2, ts="2026-01-01T01:00:00")
+        rows = {r["packet"]: r for r in relay.stats_data()["rows"]}
+        assert rows["001"]["rounds"] == "-" and rows["002"]["rounds"] == "-"
+
+    def test_rounds_counts_followups_before_the_next_auto_commit(self, relay):
+        self._mk(relay, "s1", model="opus")
+        self._packet(relay, "s1", 1)
+        self._packet(relay, "s1", 2)
+        self._packet(relay, "s1", 3)
+        relay.append_ledger("packet_sent", session_id="s1", packet=1, ts="2026-01-01T00:00:00")
+        relay.append_ledger("packet_sent", session_id="s1", packet=2, ts="2026-01-01T01:00:00")
+        relay.append_ledger("auto_commit", session_id="s1", packet=2, ts="2026-01-01T02:00:00", cleared=True)
+        relay.append_ledger("packet_sent", session_id="s1", packet=3, ts="2026-01-01T03:00:00")
+        rows = {r["packet"]: r for r in relay.stats_data()["rows"]}
+        assert rows["001"]["rounds"] == 1     # packet 2 sent before the commit that followed packet 1
+        assert rows["002"]["rounds"] == 0     # nothing sent between packet 2 and its own commit
+        assert rows["003"]["rounds"] == "-"   # no auto_commit event follows packet 3's send at all
+
+    def test_auto_commit_blocked_is_not_a_commit_event(self, relay):
+        # auto_commit_blocked means NOTHING was committed — it must never satisfy the rounds window.
+        self._mk(relay, "s1", model="opus")
+        self._packet(relay, "s1", 1)
+        relay.append_ledger("packet_sent", session_id="s1", packet=1, ts="2026-01-01T00:00:00")
+        relay.append_ledger("auto_commit_blocked", session_id="s1", packet=1, ts="2026-01-01T01:00:00")
+        row = relay.stats_data()["rows"][0]
+        assert row["rounds"] == "-"
+
+    # ── --since filters on the packet's send ts; unknown ts is never filtered out ──────
+    def test_since_filters_out_old_packets(self, relay, monkeypatch):
+        monkeypatch.setattr(relay.time, "time", lambda: relay._ts_epoch("2026-01-10T00:00:00"))
+        self._mk(relay, "s1", model="opus")
+        self._packet(relay, "s1", 1)
+        self._packet(relay, "s1", 2)
+        relay.append_ledger("packet_sent", session_id="s1", packet=1, ts="2026-01-01T00:00:00")  # 9d old
+        relay.append_ledger("packet_sent", session_id="s1", packet=2, ts="2026-01-09T00:00:00")  # 1d old
+        pkts = {r["packet"] for r in relay.stats_data(since_days=3)["rows"]}
+        assert pkts == {"002"}
+
+    def test_since_never_drops_a_packet_with_unknown_send_ts(self, relay, monkeypatch):
+        monkeypatch.setattr(relay.time, "time", lambda: relay._ts_epoch("2026-01-10T00:00:00"))
+        self._mk(relay, "s1", model="opus")
+        self._packet(relay, "s1", 1)  # never got a packet_sent ledger event
+        pkts = {r["packet"] for r in relay.stats_data(since_days=3)["rows"]}
+        assert pkts == {"001"}
+
+    # ── --lead scoping mirrors board_data: owned-by + unowned ──────
+    def test_lead_scoping_keeps_owned_and_unowned_hides_other(self, relay):
+        self._mk(relay, "mine", model="opus", owner_lead="lead-1")
+        self._packet(relay, "mine", 1)
+        self._mk(relay, "theirs", model="opus", owner_lead="lead-2")
+        self._packet(relay, "theirs", 1)
+        self._mk(relay, "free", model="opus", owner_lead=None)
+        self._packet(relay, "free", 1)
+        sids = {r["session_id"] for r in relay.stats_data(lead_sid="lead-1")["rows"]}
+        assert sids == {"mine", "free"}
+
+    # ── SUMMARY grouped by (model, effort), computed numerically ──────
+    def test_summary_grouping_numbers(self, relay, monkeypatch):
+        monkeypatch.setattr(relay, "_usage_for_session", lambda s: None)
+        self._mk(relay, "a", model="opus", effort="high")
+        self._packet(relay, "a", 1, report=self._report("clean"))
+        self._packet(relay, "a", 2, report=self._report("partial"))
+        relay.append_ledger("report_verify", session_id="a", packet=1, verdict="COUNTS-MATCH")
+        self._mk(relay, "b", model="opus", effort="high")
+        self._packet(relay, "b", 1, report=self._report("clean"))
+        relay.append_ledger("report_verify", session_id="b", packet=1, verdict="MISMATCH")
+        self._mk(relay, "c", model="haiku")
+        self._packet(relay, "c", 1, report=self._report("clean"))
+        summary = {(g["model"], g["effort"]): g for g in relay.stats_data()["summary"]}
+        opus_high = summary[("opus", "high")]
+        assert opus_high["packets"] == 3
+        assert opus_high["pct_counts_match"] == round(100 / 3, 1)   # 1 of 3 rows
+        assert opus_high["pct_clean"] == round(200 / 3, 1)          # 2 of 3 rows have Status: clean
+        haiku = summary[("haiku", "-")]
+        assert haiku["packets"] == 1 and haiku["pct_clean"] == 100.0
+
+    def test_clean_with_caveats_does_not_count_as_clean(self, relay):
+        self._mk(relay, "a", model="opus")
+        self._packet(relay, "a", 1, report=self._report("clean-with-caveats"))
+        summary = relay.stats_data()["summary"][0]
+        assert summary["pct_clean"] == 0.0
+
+    def test_avg_tok_per_pkt_weighted_by_session_packet_count(self, relay, monkeypatch):
+        usage = {"s1": {"prompt": 900, "output": 100}, "s2": {"prompt": 300, "output": 0}}
+        monkeypatch.setattr(relay, "_usage_for_session", lambda s: usage.get(s["session_id"]))
+        self._mk(relay, "s1", model="opus", claude_session="cs1")
+        self._packet(relay, "s1", 1)      # 1000 tokens / 1 packet
+        self._mk(relay, "s2", model="opus", claude_session="cs2")
+        self._packet(relay, "s2", 1)
+        self._packet(relay, "s2", 2)      # 300 tokens / 2 packets
+        summary = relay.stats_data()["summary"][0]
+        # (1000 + 300) tokens over (1 + 2) packets = 433.33 avg — not a naive mean of the two sessions
+        assert summary["avg_tok_per_pkt"] == pytest.approx(1300 / 3)
+
+    # ── cmd_stats: --json round-trips and matches the printed table ──────
+    def test_json_round_trips_and_matches_table(self, relay, capsys):
+        self._mk(relay, "s1", model="opus", effort="high")
+        self._packet(relay, "s1", 1, report=self._report("clean"))
+        relay.append_ledger("report_verify", session_id="s1", packet=1, verdict="COUNTS-MATCH")
+        relay.cmd_stats(self._args(json=True))
+        data = json.loads(capsys.readouterr().out)
+        assert data["rows"][0]["session_id"] == "s1"
+        assert data["rows"][0]["verdict"] == "COUNTS-MATCH"
+        relay.cmd_stats(self._args(json=False))
+        table = capsys.readouterr().out
+        assert "s1" in table and "COUNTS-MATCH" in table and "opus" in table and "high" in table
+        assert "SUMMARY" in table
+
+    def test_no_packets_at_all_prints_placeholder_not_a_crash(self, relay, capsys):
+        relay.cmd_stats(self._args())
+        assert "(no packets recorded)" in capsys.readouterr().out

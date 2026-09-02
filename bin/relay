@@ -2397,6 +2397,212 @@ def cmd_board(args):
         subprocess.run(["open", str(out)])
 
 
+# ── relay stats: (model, effort) → outcome, joined across every packet ever sent ────────────────
+def _ledger_by_session():
+    """Every ledger record, grouped by session_id, each session's list kept in file (== chronological)
+    order. Read-only — never used to derive a WRITE, only to answer questions about the past."""
+    by_sid = {}
+    if not LEDGER.exists():
+        return by_sid
+    with open(LEDGER) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            sid = d.get("session_id")
+            if sid:
+                by_sid.setdefault(sid, []).append(d)
+    return by_sid
+
+
+def _packet_send_ts(events, packet_n):
+    """The FIRST 'packet_sent' ts for this packet number in one session's ledger slice (spawn/send/
+    queue-delivery all funnel through it) — or None when the ledger has no record of it (pruned, or
+    predates packet_sent logging)."""
+    for e in events:
+        if e.get("event") == "packet_sent" and e.get("packet") == packet_n:
+            return e.get("ts")
+    return None
+
+
+def _packet_verdict(events, packet_n):
+    """DEFINITIONS 'Verdict': the LAST report_verify ledger event for this packet, else None (→ '-').
+    (The ledger event name is `report_verify`, not `verify` — see the `verify` CLI subcommand that
+    writes it, cmd_verify.)"""
+    verdict = None
+    for e in events:
+        if e.get("event") == "report_verify" and e.get("packet") == packet_n:
+            verdict = e.get("verdict")
+    return verdict
+
+
+def _packet_rounds(events, packet_n, sent_ts):
+    """DEFINITIONS 'Rounds' (approximation, see README): relay's ledger doesn't record follow-up
+    linkage between packets, so this counts packets sent to the SAME session strictly after
+    `packet_n`'s own send, up to the next real 'auto_commit' ledger event (a CLEARED auto-commit —
+    never `auto_commit_blocked`, which is not a commit). Returns None — render '-', never a fabricated
+    number — when `sent_ts` is unknown, or no auto_commit event follows it at all (true for almost
+    every session today: manual `git commit` by the lead isn't ledgered)."""
+    if sent_ts is None:
+        return None
+    commit_ts = min((e["ts"] for e in events if e.get("event") == "auto_commit"
+                     and e.get("ts") and e["ts"] > sent_ts), default=None)
+    if commit_ts is None:
+        return None
+    return sum(1 for e in events if e.get("event") == "packet_sent" and e.get("packet") != packet_n
+               and e.get("ts") and sent_ts < e["ts"] < commit_ts)
+
+
+def _ts_epoch(ts):
+    """Parse a ledger 'ts' (now()'s local "%Y-%m-%dT%H:%M:%S") to epoch seconds, or None on any
+    parse failure — an unparseable/missing timestamp is never treated as 'too old', only as unknown."""
+    if not ts:
+        return None
+    try:
+        return time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return None
+
+
+def stats_data(lead_sid=None, since_days=None):
+    """The `relay stats` data: one row per packet ever sent to any session — INCLUDING closed/
+    superseded/dead ones, that's the history — joining (model, effort) to outcome (rounds, verify
+    verdict, report status), plus a per-session token trailer and a SUMMARY grouped by (model,
+    effort). Pure read: never touches session state, writes the ledger, or bypasses the existing
+    usage.json cache path (_usage_for_session)."""
+    by_sid = _ledger_by_session()
+    cutoff = (time.time() - float(since_days) * 86400) if since_days else None
+    rows, sessions = [], []
+    for sid in all_session_ids():
+        s = read_session(sid)
+        if not s:
+            continue
+        if lead_sid and s.get("owner_lead") not in (None, lead_sid):
+            continue
+        entries = seed_entries(sid)
+        if not entries:
+            continue
+        events = by_sid.get(sid, [])
+        model = lead_guard.model_tier(s.get("model")) or (s.get("model") or "-")
+        effort = s.get("effort") or "-"
+        session_rows = []
+        for e in entries:
+            n = int(e["n"])
+            sent_ts = _packet_send_ts(events, n)
+            if cutoff is not None:
+                epoch = _ts_epoch(sent_ts)
+                if epoch is not None and epoch < cutoff:
+                    continue  # unknown send time is never filtered out — see _ts_epoch
+            verdict = _packet_verdict(events, n) or "-"
+            status = (e.get("tldr") or {}).get("status") or "-"
+            rounds = _packet_rounds(events, n, sent_ts)
+            row = {"session_id": sid, "packet": e["n"], "model": model, "effort": effort,
+                   "rounds": rounds if rounds is not None else "-", "verdict": verdict, "status": status}
+            rows.append(row)
+            session_rows.append(row)
+        if not session_rows:
+            continue
+        usage = _usage_for_session(s)
+        pkt_count = len(session_rows)
+        prompt = usage["prompt"] if usage else None
+        output = usage["output"] if usage else None
+        tok_per_pkt = (prompt + output) / pkt_count if usage else None
+        sessions.append({"session_id": sid, "model": model, "effort": effort, "packets": pkt_count,
+                         "prompt": prompt, "output": output, "tok_per_pkt": tok_per_pkt})
+
+    groups = {}
+    for r in rows:
+        key = (r["model"], r["effort"])
+        g = groups.setdefault(key, {"model": r["model"], "effort": r["effort"], "packets": 0,
+                                    "rounds_sum": 0, "rounds_n": 0, "counts_match": 0, "clean": 0})
+        g["packets"] += 1
+        if r["rounds"] != "-":
+            g["rounds_sum"] += r["rounds"]
+            g["rounds_n"] += 1
+        if r["verdict"] == "COUNTS-MATCH":
+            g["counts_match"] += 1
+        if r["status"] == "clean":  # exact `Status: clean`, not `clean-with-caveats` — see README
+            g["clean"] += 1
+    tok_by_group = {}
+    for sess in sessions:
+        key = (sess["model"], sess["effort"])
+        d = tok_by_group.setdefault(key, {"tokens": 0, "packets": 0, "known": False})
+        if sess["tok_per_pkt"] is not None:
+            d["tokens"] += (sess["prompt"] or 0) + (sess["output"] or 0)
+            d["packets"] += sess["packets"]
+            d["known"] = True
+
+    summary = []
+    for key in sorted(groups):
+        g = groups[key]
+        tg = tok_by_group.get(key)
+        avg_tok = (tg["tokens"] / tg["packets"]) if tg and tg["known"] and tg["packets"] else None
+        summary.append({
+            "model": g["model"], "effort": g["effort"], "packets": g["packets"],
+            "mean_rounds": (g["rounds_sum"] / g["rounds_n"]) if g["rounds_n"] else None,
+            "pct_counts_match": round(100.0 * g["counts_match"] / g["packets"], 1),
+            "pct_clean": round(100.0 * g["clean"] / g["packets"], 1),
+            "avg_tok_per_pkt": avg_tok,
+        })
+    return {"rows": rows, "sessions": sessions, "summary": summary}
+
+
+def cmd_stats(args):
+    data = stats_data(lead_sid=getattr(args, "lead", None), since_days=getattr(args, "since", None))
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    rows = data["sessions"]
+    if not rows:
+        print("(no packets recorded)")
+        return
+    row_cols = ["session_id", "packet", "model", "effort", "rounds", "verdict", "status"]
+    headers = ["SESSION", "PKT", "MODEL", "EFFORT", "ROUNDS", "VERDICT", "STATUS"]
+    caps = [36, 4, 8, 8, 6, 14, 22]
+    widths = {h: min(cap, max(len(h), max((len(str(r[k])) for r in data["rows"]), default=0)))
+              for h, cap, k in zip(headers, caps, row_cols)}
+    print(c(" ".join(cell(h, widths[h]) for h in headers), "bold"))
+    sess_by_id = {s["session_id"]: s for s in rows}
+    seen = set()
+    for r in data["rows"]:
+        print(" ".join(cell(r[k], widths[h]) for h, k in zip(headers, row_cols)))
+        sid = r["session_id"]
+        if sid in seen:
+            continue
+        seen.add(sid)
+        sess = sess_by_id.get(sid)
+        if sess and sess["prompt"] is None:
+            print(c(f"    {sid}: {sess['packets']} packet(s), tokens - , tok/pkt (avg) -", "dim"))
+        elif sess:
+            tok = f"{lead_guard.human_tokens(sess['prompt'])}/{lead_guard.human_tokens(sess['output'])}"
+            avg = lead_guard.human_tokens(sess["tok_per_pkt"])
+            print(c(f"    {sid}: {sess['packets']} packet(s), tokens {tok} (prompt/output), "
+                    f"tok/pkt (avg) {avg}", "dim"))
+    print()
+    print(c("SUMMARY (by model, effort)", "bold"))
+    scols = ["model", "effort", "packets", "mean_rounds", "pct_counts_match", "pct_clean", "avg_tok_per_pkt"]
+    sheaders = ["MODEL", "EFFORT", "PACKETS", "MEAN ROUNDS", "% COUNTS-MATCH", "% CLEAN", "TOK/PKT (AVG)"]
+    scaps = [8, 8, 7, 12, 15, 8, 14]
+    srender = []
+    for g in data["summary"]:
+        srender.append({
+            "model": g["model"], "effort": g["effort"], "packets": str(g["packets"]),
+            "mean_rounds": f"{g['mean_rounds']:.1f}" if g["mean_rounds"] is not None else "-",
+            "pct_counts_match": f"{g['pct_counts_match']:.0f}%",
+            "pct_clean": f"{g['pct_clean']:.0f}%",
+            "avg_tok_per_pkt": lead_guard.human_tokens(g["avg_tok_per_pkt"]) if g["avg_tok_per_pkt"] is not None else "-",
+        })
+    swidths = {h: min(cap, max(len(h), max((len(row[k]) for row in srender), default=0)))
+               for h, cap, k in zip(sheaders, scaps, scols)}
+    print(" ".join(cell(h, swidths[h]) for h in sheaders))
+    for row in srender:
+        print(" ".join(cell(row[k], swidths[h]) for h, k in zip(sheaders, scols)))
+
+
 def cmd_keep(args):
     """Pin / unpin an executor against auto-close (lead_guard "auto-close policy")."""
     s = read_session(args.session_id)
@@ -4447,6 +4653,13 @@ def main():
     bd.add_argument("--lead", help="scope executors to this lead's (plus unowned)")
     bd.add_argument("--json", action="store_true", help="emit the board data instead of HTML")
     bd.set_defaults(func=cmd_board)
+
+    stp = sub.add_parser("stats", help="join each executor packet's (model, effort) to its outcome "
+                                       "(rounds, verify verdict, tok/pkt) across ALL sessions, incl. closed")
+    stp.add_argument("--lead", help="scope to this lead's executors (its owned executors plus unowned ones)")
+    stp.add_argument("--json", action="store_true")
+    stp.add_argument("--since", type=int, metavar="DAYS", help="only packets sent within the last DAYS days")
+    stp.set_defaults(func=cmd_stats)
 
     dr = sub.add_parser("doctor", help="prove the installed claude CLI still behaves as relay assumes "
                                        "(strict MCP, executor agent, commit deny, model aliases) + plumbing")

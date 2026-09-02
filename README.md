@@ -177,6 +177,10 @@ relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --whe
 /relay:board [--open] [--out PATH] [--lead] one HTML page for everything: leads → executors →
                                             packet timelines (gist, outcome, TL;DR), status, launch,
                                             tokens, warnings, copyable commands; light/dark toggle
+relay stats [--lead SID] [--json]          one row per packet ever sent (incl. closed/dead): (model,
+             [--since DAYS]                  effort) → outcome (rounds, verify verdict, report status),
+                                            + a per-session token trailer and a SUMMARY grouped by
+                                            (model, effort); see "relay stats" below
 relay doctor [--offline] [--quick]         prove the installed claude CLI still honours relay's launch
                                             flags (strict MCP, executor agent, commit deny, model
                                             aliases) + plumbing; run after every Claude Code update
@@ -521,6 +525,38 @@ copyable `relay …` commands. Filter box, "show closed", light theme by default
 refresh and auto-close sweep), so it can't disagree with the table; it is a **snapshot** — re-run to
 refresh. Written to `~/.relay-tasks/board.html` (`--out` to change), `--lead <sid>` to scope,
 `--json` for the data.
+
+### relay stats
+
+`relay stats` joins each executor packet's (model, effort) to what actually happened to it, so the
+model/effort rubric in [Executor effort](#executor-effort) and the spawn skill can be checked
+against data instead of memory. It reads ONLY what's already on disk (the ledger, packets, reports,
+the same `_usage_for_session` cache `relay list`/`relay board` use) — it writes nothing. Definitions:
+
+- A **packet** = one `NNN-packet.md` under a session's packets dir.
+- **Rounds** = number of packets sent to that session whose gist/first line marks them as a
+  follow-up on an earlier packet. relay's ledger doesn't record that linkage, so this falls back to
+  counting packets sent to the same session strictly after this one, up to the lead's next real
+  commit — approximated by the `auto_commit` ledger event (only the `--for-autocommit` path emits
+  it; a plain manual `git commit` by the lead is invisible to relay). When no `auto_commit` event
+  follows a packet's send at all — true for almost every session today — ROUNDS renders `-` rather
+  than a fabricated number.
+- **Verdict** = the last `report_verify` ledger event for that session+packet (`COUNTS-MATCH` /
+  `MISMATCH` / `MALFORMED` / `INCONCLUSIVE`, see [Verifying a report](#verifying-a-report-and-why-it-cant-tell-you-the-report-is-true)),
+  else `-`.
+- **Tokens**: per-packet spend isn't recorded anywhere, only per-SESSION prompt/output (same
+  `transcript_usage` `relay list` uses). `relay stats` reports that per-session total plus its
+  packet count, so `tok/pkt (avg)` is an honest average, not a per-packet measurement — labeled as
+  such in the table and the SUMMARY.
+
+The table is one row per packet (SESSION, PKT, MODEL — the concrete id resolved back to its tier
+word — EFFORT, ROUNDS, VERDICT, STATUS from the report's TL;DR `Status:` line), a per-session
+trailer line with its token totals, then a SUMMARY grouped by (MODEL, EFFORT): packet count, mean
+rounds, % `COUNTS-MATCH`, % exactly `Status: clean` (`clean-with-caveats` does not count), and avg
+tok/pkt. Closed/superseded/dead sessions are included — that's where the history is. `--lead <sid>`
+scopes to that lead's executors plus unowned ones (same rule as `relay board --lead`); `--since
+DAYS` filters on the packet's send ledger timestamp (a packet with no recorded send time is never
+filtered out); `--json` emits `{rows, sessions, summary}`.
 
 ### Auto-close: finished executors park themselves
 
