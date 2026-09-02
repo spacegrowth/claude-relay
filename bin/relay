@@ -1584,28 +1584,53 @@ def cmd_send(args):
     # (§6e e2) Heaviness gate: mirrors executor_model_ceiling above (refuse unless an override with
     # a ledgered reason) — but the WORDING must NUDGE, not scold (§9): heaviness is not degradation,
     # a disciplined executor does its best work deep into a session, and this override will be used
-    # often and legitimately. Same threshold (handoff_nudge_mb) and same MB reading the EXECUTORS
-    # table's MB column/heavy footnote use, so `relay list` and `relay send` never disagree about
-    # what "heavy" means. mb is None (unlocatable transcript) never gates — nothing to warn about.
+    # often and legitimately. Same reading (transcript_usage's `last_prompt`) the EXECUTORS table's
+    # CTX column/heavy footnote use, so `relay list` and `relay send` never disagree about what
+    # "heavy" means. usage/mb both None (unlocatable transcript) never gates — nothing to warn about.
+    usage = _usage_for_session(s)
     mb = _transcript_mb_for(s.get("claude_session"))
-    threshold = _heaviness_threshold_mb()
+    token_threshold = _heaviness_threshold_tokens()
+    mb_threshold = _heaviness_threshold_mb()
     # --rotate: the one-flag answer to the heaviness gate — retire THIS session (successor seed) and
     # spawn a fresh executor over the same territory (same worktree/topic/scope/model/MCP, widened to
     # the 1M window when the tier has one), with this packet as its first. Works on a non-heavy
     # session too (a deliberate rotation), it just isn't suggested there.
     if getattr(args, "rotate", False):
         return _rotate_and_send(args, s, mb)
-    if _is_heavy(mb, threshold):
+    if _is_heavy(usage, mb, token_threshold, mb_threshold):
         if not getattr(args, "heavy_override", None):
-            sys.exit(f"session '{args.session_id}' is heavy — its transcript is {mb:.1f}MB, past the "
-                     f"{threshold:g}MB threshold. That's not a verdict on its work — a disciplined "
-                     f"executor does its best work deep into a session — it's just a point worth a "
-                     f"conscious choice: `relay retire {args.session_id}` and a fresh spawn keeps "
+            if usage is not None:
+                reading = (f"its live context is {lead_guard.human_tokens(usage.get('last_prompt') or 0)} "
+                           f"tokens, past the {lead_guard.human_tokens(token_threshold)} nudge (long-context "
+                           f"pricing starts at 200k)")
+            else:
+                reading = f"its transcript is {mb:.1f}MB, past the {mb_threshold:g}MB threshold"
+            sys.exit(f"session '{args.session_id}' is heavy — {reading}. That's not a verdict on its work — "
+                     f"a disciplined executor does its best work deep into a session — it's just a point "
+                     f"worth a conscious choice: `relay retire {args.session_id}` and a fresh spawn keeps "
                      f"the next packet's context cheap — `relay send {args.session_id} <packet> --rotate` "
                      f"does exactly that in one step (retire + seeded respawn, this packet first) — or pass "
                      f"--heavy-override \"<reason>\" to send into this one anyway.")
-        append_ledger("heavy_override", session_id=args.session_id, mb=round(mb, 1),
+        append_ledger("heavy_override", session_id=args.session_id,
+                      tokens=(usage or {}).get("last_prompt"), mb=round(mb, 1) if mb is not None else None,
                       reason=args.heavy_override)
+
+    # Advisory (in addition to, not instead of, the gate above): the live context / cache-state
+    # readout on EVERY send, heavy or not, so the reuse-vs-rotate call is always made on the numbers
+    # relay has, not just at the moment they cross the nudge threshold.
+    if usage is not None:
+        cfg = lead_guard.load_config(STATE_ROOT)
+        cache = lead_guard.cache_state(usage, time.time(), cfg.get("cache_ttl_minutes",
+                lead_guard.LEAD_DEFAULTS["cache_ttl_minutes"]))
+        parts = [f"ctx: {lead_guard.human_tokens(usage.get('last_prompt') or 0)}"]
+        if cache and cache[0] == "warm":
+            parts.append("cache warm")
+        elif cache and cache[0] == "cold":
+            parts.append(f"cache cold (~{lead_guard.human_tokens(cache[1])} rewrite on next turn)")
+        hit_rate = usage.get("cache_hit_rate")
+        if hit_rate is not None:
+            parts.append(f"hit-rate {round(hit_rate * 100)}%")
+        print(c("  " + ", ".join(parts), "dim"))
 
     # Claim ownership BEFORE delivery, so the poller arms for the CALLING lead the moment the
     # packet lands — whether it's delivered via the live-tab path or the resume-fallback below.
@@ -2041,7 +2066,8 @@ def auto_close_sweep(trigger, sids=None, lead_sid=None):
         if not cfg.get("auto_close", True):
             return acted
         idle_minutes = cfg.get("auto_close_idle_minutes", 60)
-        threshold = _heaviness_threshold_mb()
+        token_threshold = _heaviness_threshold_tokens()
+        mb_threshold = _heaviness_threshold_mb()
         for sid in (sids if sids is not None else all_session_ids()):
             try:
                 s = read_session(sid)
@@ -2061,7 +2087,8 @@ def auto_close_sweep(trigger, sids=None, lead_sid=None):
                 dirty = _git_dirty_paths(s.get("worktree") or "")
                 if dirty is None:
                     claimed = []  # git unreadable → the landed path is unavailable, timer only
-                heavy = _is_heavy(_transcript_mb_for(s.get("claude_session")), threshold)
+                heavy = _is_heavy(_usage_for_session(s), _transcript_mb_for(s.get("claude_session")),
+                                  token_threshold, mb_threshold)
                 decision = lead_guard.auto_close_decision(
                     s, report_age=report_age, surfaced=surfaced, queued=queued, claimed=claimed,
                     dirty=dirty, heavy=heavy, idle_minutes=idle_minutes)
@@ -2314,7 +2341,9 @@ def board_data(include_all=True, lead_sid=None):
         rows = [({**read_session(r["session_id"]), "reported": r["reported"]} if r["session_id"] in hit else r) for r in rows]
     if lead_sid:
         rows = [r for r in rows if r.get("owner_lead") in (None, lead_sid)]
-    threshold = _heaviness_threshold_mb()
+    token_threshold = _heaviness_threshold_tokens()
+    mb_threshold = _heaviness_threshold_mb()
+    ttl_minutes = cfg.get("cache_ttl_minutes", lead_guard.LEAD_DEFAULTS["cache_ttl_minutes"])
     lead_ids = {m.get("session_id") for m in leads}
     unannounced = set()
     for m in leads:
@@ -2346,9 +2375,12 @@ def board_data(include_all=True, lead_sid=None):
             rendered = f"busy {int(el / 60)}m" if el is not None else "busy"
         elif st in ("closed", "superseded") and r.get("auto_closed"):
             rendered = f"{st} (auto)"
+        cache = lead_guard.cache_state(usage, time.time(), ttl_minutes)
+        hit_rate = usage.get("cache_hit_rate") if usage else None
         execs.append({**r, "rendered_status": rendered, "launch": lead_guard.launch_cell(r),
-                      "tokens": lead_guard.usage_cell(usage), "usage": usage, "mb": _mb_cell_text(mb),
-                      "heavy": _is_heavy(mb, threshold), "queued": len(read_queue(sid)),
+                      "tokens": lead_guard.usage_cell(usage, cache), "usage": usage, "mb": _mb_cell_text(mb),
+                      "hit_rate": round(hit_rate * 100) if hit_rate is not None else None,
+                      "heavy": _is_heavy(usage, mb, token_threshold, mb_threshold), "queued": len(read_queue(sid)),
                       "pkt": str(cur).zfill(3) if cur is not None else "-", "packets": packets,
                       "unannounced": sid in unannounced,
                       "orphan": bool(r.get("owner_lead")) and r.get("owner_lead") not in lead_ids
@@ -3016,19 +3048,41 @@ def _lead_mb_cell(m):
     return _mb_cell_text(_transcript_mb_for(m.get("session_id")))
 
 
+def _heaviness_threshold_tokens():
+    """§6e's heaviness threshold, in tokens (`context_nudge_tokens`, default 150000) — the LIVE
+    context (transcript_usage's `last_prompt`) actually driving cost/compaction, not the MB proxy.
+    Replaces `handoff_nudge_mb` as the executor-heaviness signal; see LEAD_DEFAULTS."""
+    return float(lead_guard.load_config(STATE_ROOT).get("context_nudge_tokens",
+                 lead_guard.LEAD_DEFAULTS["context_nudge_tokens"]))
+
+
 def _heaviness_threshold_mb():
-    """§6e's heaviness threshold (MB) — reuses the EXISTING handoff-nudge threshold
-    (`handoff_nudge_mb`, default 5) rather than inventing a new config key, per the backlog's own
-    design note: "Reuse the existing handoff-nudge thresholds rather than inventing new ones." One
-    number now means one thing everywhere it's read (a lead's own weight via --statusline, an
-    executor's weight here) instead of two thresholds silently drifting apart."""
+    """The MB-fallback threshold (`handoff_nudge_mb`, default 5) — used ONLY when an executor's
+    transcript can't be parsed for real usage (§6e e2's fallback, so an unreadable transcript never
+    silently reads as 'never heavy'). Also still the LEAD's own transcript-weight nudge threshold
+    (`_weight_segment`) — a separate, untouched feature that happens to share the same config key."""
     return float(lead_guard.load_config(STATE_ROOT).get("handoff_nudge_mb", 5))
 
 
-def _is_heavy(mb, threshold):
-    """Whether an MB reading counts as 'heavy' for §6e e1/e2 — None (unlocatable transcript) is
-    never heavy; there's nothing to warn about, and guessing would be worse than staying quiet."""
-    return mb is not None and mb >= threshold
+def _is_heavy(usage, mb, token_threshold, mb_threshold):
+    """Whether an executor counts as 'heavy' for §6e e1/e2. `usage` (lead_guard.transcript_usage's
+    dict, or None) is the primary signal: heavy when its `last_prompt` (the live context) is at/above
+    `token_threshold`. `usage is None` means the transcript couldn't be parsed for real usage at all
+    (unlocatable, or not a Claude Code transcript) — falls back to the raw MB reading against
+    `mb_threshold` so that case never silently reads as 'never heavy'. Both unavailable (mb is also
+    None) → never heavy; there's nothing to warn about, and guessing would be worse than quiet."""
+    if usage is not None:
+        return (usage.get("last_prompt") or 0) >= token_threshold
+    return mb is not None and mb >= mb_threshold
+
+
+def _heavy_reading_text(usage, mb):
+    """The human-readable 'how heavy' reading behind both the heavy footnote (cmd_list) and the
+    send-time gate message: token reading when usage parsed (the real signal), else the MB-fallback
+    reading with a note that it's a proxy."""
+    if usage is not None:
+        return f"{lead_guard.human_tokens(usage.get('last_prompt') or 0)} ctx"
+    return f"{mb:.1f}MB (transcript unreadable for usage; MB proxy)" if mb is not None else "unknown"
 
 
 def cmd_list(args):
@@ -3261,15 +3315,22 @@ def cmd_list(args):
             st = "reported \U0001f4cc"  # pinned: auto-close leaves it alone
         rendered_statuses.append(st)
     # §6e e1: one transcript-MB reading per executor, computed up front (same memoize-once
-    # rationale the LEADS liveness column uses above) — the table needs it in both the MB cell and
-    # the heavy footnote, and a heavy session's transcript is the single biggest file this command
-    # touches, so re-reading it twice per row is worth avoiding.
+    # rationale the LEADS liveness column uses above) — kept as the heaviness gate's fallback
+    # reading (usage unparseable) and it's the single biggest file this command touches, so
+    # re-reading it twice per row is worth avoiding.
     mb_by_sid = {s["session_id"]: _transcript_mb_for(s.get("claude_session")) for s in rows}
-    heavy_threshold = _heaviness_threshold_mb()
-    # TOKENS: real prompt/output spend per executor from its transcript (cached per size/mtime) —
-    # the MB column is a proxy; this is what the model choice actually cost. LAUNCH: mcp/context/
+    token_threshold = _heaviness_threshold_tokens()
+    mb_threshold = _heaviness_threshold_mb()
+    # TOKENS: real prompt/output spend per executor from its transcript (cached per size/mtime).
+    # CTX: the LIVE context (last request's live prompt) — what the heaviness gate actually reads,
+    # and the number that answers "would the next turn re-write its cache". LAUNCH: mcp/context/
     # role, so "why does this executor lack a tool / compact early" is a glance.
     usage_by_sid = {s["session_id"]: _usage_for_session(s) for s in rows}
+    ttl_minutes = lead_guard.load_config(STATE_ROOT).get("cache_ttl_minutes",
+                  lead_guard.LEAD_DEFAULTS["cache_ttl_minutes"])
+    cache_by_sid = {sid: lead_guard.cache_state(usage_by_sid[sid], time.time(), ttl_minutes) for sid in usage_by_sid}
+    ctx_by_sid = {sid: (lead_guard.human_tokens(usage_by_sid[sid].get("last_prompt"))
+                        if usage_by_sid[sid] else "-") for sid in usage_by_sid}
 
     # Calculate dynamic widths for EXECUTORS table with per-column caps.
     exec_cols = [
@@ -3281,11 +3342,11 @@ def cmd_list(args):
         ("PROJECT", 14, [str(s.get("owner_project") or "-") for s in rows]),
         ("MODEL", 8, [str(s.get("model") or "-") for s in rows]),
         ("PKT", 4, [str(s["current_packet"]).zfill(4) for s in rows]),
-        # MB: §6e e1 — the same context-weight visibility leads got in #3, so "how heavy is this
-        # exec" is a glance instead of archaeology. A proxy for transcript size, not context-window
-        # occupancy (same caveat lead_guard.transcript_mb's own docstring carries).
-        ("MB", 6, [_mb_cell_text(mb_by_sid[s["session_id"]]) for s in rows]),
-        ("TOKENS", 12, [lead_guard.usage_cell(usage_by_sid[s["session_id"]]) for s in rows]),
+        # CTX: §6e e1 — the same context-weight visibility leads got in #3, so "how heavy is this
+        # exec" is a glance instead of archaeology. The REAL live context (last request's tokens),
+        # not the transcript-MB proxy the column used to show.
+        ("CTX", 6, [ctx_by_sid[s["session_id"]] for s in rows]),
+        ("TOKENS", 18, [lead_guard.usage_cell(usage_by_sid[s["session_id"]], cache_by_sid[s["session_id"]]) for s in rows]),
         ("LAUNCH", 16, [lead_guard.launch_cell(s) for s in rows]),
         ("REPORTED", 8, ["yes" if s["reported"] else "no" for s in rows]),
     ]
@@ -3311,22 +3372,26 @@ def cmd_list(args):
             cell(str(s.get("owner_project") or "-"), exec_widths["PROJECT"]),
             cell(str(s.get("model") or "-"), exec_widths["MODEL"]),
             cell(str(s["current_packet"]).zfill(4), exec_widths["PKT"]),
-            cell(_mb_cell_text(mb_by_sid[s["session_id"]]), exec_widths["MB"]),
-            cell(lead_guard.usage_cell(usage_by_sid[s["session_id"]]), exec_widths["TOKENS"]),
+            cell(ctx_by_sid[s["session_id"]], exec_widths["CTX"]),
+            cell(lead_guard.usage_cell(usage_by_sid[s["session_id"]], cache_by_sid[s["session_id"]]), exec_widths["TOKENS"]),
             cell(lead_guard.launch_cell(s), exec_widths["LAUNCH"]),
             rep_cell,
         ]
         print(" ".join(row_parts))
-    print(c("  TOKENS = prompt/output tokens billed so far (prompt incl. cache reads/writes); "
+    print(c("  CTX = live context (last request's tokens: input+cache_read+cache_create); "
+            "TOKENS = prompt/output billed so far ·cache warm/cold~rewrite; "
             "LAUNCH = mcp/context/role (A agent, G legacy GATES footer)", "dim"))
 
     # heavy footnote (§6e e1's "warning-stamp" shape, ver?/stale-hooks style — say it in words, not
     # just a skimmable column) — NUDGE wording per §9: state the fact and the alternative, never
-    # imply the executor's work is degraded. Same threshold cmd_send's gate (§6e e2) refuses on, so
+    # imply the executor's work is degraded. Same reading cmd_send's gate (§6e e2) refuses on, so
     # the column, the footnote, and the send-time gate never disagree about what "heavy" means.
-    heavy = [(s, mb_by_sid[s["session_id"]]) for s in rows if _is_heavy(mb_by_sid[s["session_id"]], heavy_threshold)]
+    heavy = [s for s in rows if _is_heavy(usage_by_sid[s["session_id"]], mb_by_sid[s["session_id"]],
+                                          token_threshold, mb_threshold)]
     if heavy:
-        parts = ", ".join(f"{s['session_id']} ({s['current_packet']} pkts / {mb:.1f}MB)" for s, mb in heavy)
+        parts = ", ".join(f"{s['session_id']} ({s['current_packet']} pkts / "
+                          f"{_heavy_reading_text(usage_by_sid[s['session_id']], mb_by_sid[s['session_id']])})"
+                          for s in heavy)
         print(c(f"  ⚠ heavy: {parts} — no verdict on the work, just a heads up: `relay retire "
                 f"<sid>` and a fresh spawn keeps the next packet's context cheap; `relay send "
                 f"--heavy-override \"<reason>\"` keeps going in this one.", "yellow"))
@@ -3776,7 +3841,8 @@ def cmd_retire(args):
 
     entries = seed_entries(args.session_id)
     seed_path.parent.mkdir(parents=True, exist_ok=True)
-    heavy = _is_heavy(_transcript_mb_for(s.get("claude_session")), _heaviness_threshold_mb())
+    heavy = _is_heavy(_usage_for_session(s), _transcript_mb_for(s.get("claude_session")),
+                      _heaviness_threshold_tokens(), _heaviness_threshold_mb())
     seed_path.write_text(build_successor_seed(args.session_id, s, entries, now(), heavy=heavy))
 
     cmd_close(SimpleNamespace(session_id=args.session_id, supersede=SEED_RETIRED_BY_SEED,

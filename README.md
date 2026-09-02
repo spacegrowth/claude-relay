@@ -518,7 +518,7 @@ message points at it.
 `/relay:board` (`relay board --open`) renders a self-contained HTML snapshot of everything relay
 knows: a summary strip, warning banners (orphaned executors, reports not yet proven delivered to
 their lead, heavy sessions, stale wake hooks), then one card per lead with its executors — status,
-model + `LAUNCH`, `TOKENS`/MB, packet count — each row expanding to the executor's packet timeline
+model + `LAUNCH`, `TOKENS` (with cache warm/cold and a hit-rate chip)/MB, packet count — each row expanding to the executor's packet timeline
 (gist, the report's outcome sentence and TL;DR, links to the packet / report / diff page) and
 copyable `relay …` commands. Filter box, "show closed", light theme by default with a remembered
 ☀️/🌙 switch. It is built from exactly the functions `relay list` uses (and runs the same liveness
@@ -625,7 +625,9 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
-| `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) for the handoff nudge — a proxy for session weight, not context-window occupancy; calibrated on real sessions (a full working day ≈ 3MB, the heaviest marathon session ever ≈ 6MB) |
+| `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) for the LEAD's own handoff nudge — a proxy for session weight, not context-window occupancy; calibrated on real sessions (a full working day ≈ 3MB, the heaviest marathon session ever ≈ 6MB). **Deprecated as the EXECUTOR heaviness signal** (`relay send`'s gate, `relay list`'s heavy footnote, the board) — see `context_nudge_tokens` below, which replaced it there; still read as the fallback threshold when an executor's transcript can't be parsed for real usage, and still drives the lead's own nudge above |
+| `context_nudge_tokens` | 150000 | The executor heaviness signal: an executor is "heavy" when its LAST request's live context (input + cache_read + cache_creation tokens — the real spend the next turn pays, not a transcript-size proxy) is at/above this many tokens. Read by `relay send`'s heaviness gate, `relay list`'s heavy footnote, and the board |
+| `cache_ttl_minutes` | 60 | Claude Code's prompt-cache TTL — how long an executor's last request stays cached free. Drives the warm/cold readout in `relay list`'s TOKENS column, the board, and `relay send`'s advisory line — see [Cache state](#executor-context-window-200k-vs-1m) |
 | `executor_default_context` | "1m" | Context window an executor launches with when nothing else decides it (no packet `CONTEXT:` line, no `[1m]` on `--model`, referenced reading under the heuristic). `"1m"` or `"200k"`. Shipped `1m`: the window is a **ceiling, not consumption** — you pay for tokens used, so a bounded packet costs the same either way, and 1M stops executors compacting early on real work. A packet can still pin `CONTEXT: 200k`; haiku (no 1M window) always runs 200K |
 | `auto_close` | true | Park finished executors automatically — see [Auto-close](#auto-close-finished-executors-park-themselves) |
 | `auto_close_idle_minutes` | 60 | Idle-after-report threshold for the auto-close timer path; 0 = timer off (the landed path still applies) |
@@ -668,6 +670,16 @@ early-compaction discipline). A packet can pin `CONTEXT: 200k` to opt one execut
 that ran heavy is widened by `relay retire` + respawn — the
 successor seed says `declare CONTEXT: 1m` when that applies. `haiku[1m]` is refused; a
 packet/heuristic asking for 1M on haiku degrades to 200K with a note.
+
+**Cache state.** Separate from the window size, Claude Code caches an executor's last request's
+prefix for `cache_ttl_minutes` (default 60, matching the CLI's own 1-hour prompt-cache TTL) — inside
+that window the next turn's send is nearly free; past it, the cache has expired and the next turn
+re-writes the whole prefix from scratch. `relay list`'s TOKENS column, the board, and `relay send`'s
+advisory line all show it as `warm` (still cached) or `cold~<N>` (expired; `<N>` is the estimated
+rewrite — the live context tokens that will be re-sent). It's a read, not a gate: a cold session
+isn't heavy by itself, but a heavy AND cold session is the strongest case for `relay send --rotate`
+over sending straight in — the rewrite is happening either way, so a fresh executor gets it instead
+of a bloated one.
 
 ### Executor effort
 

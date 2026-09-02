@@ -4459,31 +4459,51 @@ class TestLeadTranscriptMB:
 
 
 class TestHeavinessHelpers:
-    """§6e: the shared MB/threshold helpers behind both the EXECUTORS MB column (e1) and
-    cmd_send's heaviness gate (e2) — one number, read the same way everywhere."""
+    """§6e (retargeted, ctx-gate): the shared token/threshold helpers behind both the EXECUTORS
+    CTX column (e1) and cmd_send's heaviness gate (e2) — one reading, one number, read the same
+    way everywhere. `context_nudge_tokens` (live context, transcript_usage's `last_prompt`) is now
+    the primary heaviness signal; `handoff_nudge_mb` survives only as the fallback for when a
+    transcript can't be parsed for real usage at all."""
 
-    def _set_threshold(self, relay, mb):
+    def _set_config(self, relay, **over):
         (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
-        relay.lead_guard.config_path(relay.STATE_ROOT).write_text(json.dumps({"handoff_nudge_mb": mb}))
+        relay.lead_guard.config_path(relay.STATE_ROOT).write_text(json.dumps(over))
 
-    def test_threshold_default_matches_handoff_nudge_default(self, relay):
-        # §6e design note: "reuse the existing handoff-nudge thresholds rather than inventing new
-        # ones" — same key, same default, not a second number to keep in sync.
+    def test_token_threshold_default(self, relay):
+        assert relay._heaviness_threshold_tokens() == relay.lead_guard.LEAD_DEFAULTS["context_nudge_tokens"]
+
+    def test_token_threshold_reads_config_override(self, relay):
+        self._set_config(relay, context_nudge_tokens=200000)
+        assert relay._heaviness_threshold_tokens() == 200000.0
+
+    def test_mb_fallback_threshold_default_matches_handoff_nudge_default(self, relay):
+        # the MB fallback deliberately reuses the pre-existing handoff-nudge key/default rather
+        # than inventing a second one just for a rarely-hit fallback path.
         assert relay._heaviness_threshold_mb() == relay.lead_guard.LEAD_DEFAULTS["handoff_nudge_mb"]
 
-    def test_threshold_reads_config_override(self, relay):
-        self._set_threshold(relay, 2)
+    def test_mb_fallback_threshold_reads_config_override(self, relay):
+        self._set_config(relay, handoff_nudge_mb=2)
         assert relay._heaviness_threshold_mb() == 2.0
 
-    def test_is_heavy_at_or_above_threshold(self, relay):
-        assert relay._is_heavy(5.0, 5.0) is True
-        assert relay._is_heavy(5.1, 5.0) is True
-        assert relay._is_heavy(4.9, 5.0) is False
+    def test_is_heavy_tokens_at_or_above_threshold(self, relay):
+        assert relay._is_heavy({"last_prompt": 150000}, None, 150000, 5.0) is True
+        assert relay._is_heavy({"last_prompt": 150001}, None, 150000, 5.0) is True
+        assert relay._is_heavy({"last_prompt": 149999}, None, 150000, 5.0) is False
 
-    def test_is_heavy_none_is_never_heavy(self, relay):
-        # an unlocatable transcript must never gate/warn — nothing to warn about, and guessing
-        # would be worse than staying quiet.
-        assert relay._is_heavy(None, 0.0) is False
+    def test_is_heavy_zero_usage_is_a_real_reading_not_unreadable(self, relay):
+        # usage WAS parsed (even to all-zero, e.g. a brand-new session) — that's a real reading,
+        # never treated as "unreadable"; a huge MB alongside it must not override it.
+        assert relay._is_heavy({"last_prompt": 0}, 999.0, 150000, 5.0) is False
+
+    def test_is_heavy_falls_back_to_mb_when_usage_unreadable(self, relay):
+        # usage is None only when the transcript itself couldn't be parsed at all — THAT'S the
+        # "old MB test" fallback so it never silently regresses to 'never heavy'.
+        assert relay._is_heavy(None, 6.0, 150000, 5.0) is True
+        assert relay._is_heavy(None, 4.0, 150000, 5.0) is False
+
+    def test_is_heavy_both_unavailable_is_never_heavy(self, relay):
+        # nothing to warn about, and guessing would be worse than staying quiet.
+        assert relay._is_heavy(None, None, 150000, 5.0) is False
 
     def test_transcript_mb_for_missing_session_is_none(self, relay):
         assert relay._transcript_mb_for(None) is None
@@ -4506,9 +4526,25 @@ class TestHeavinessHelpers:
         assert relay._mb_cell_text(None) == "-"
 
 
-class TestExecutorMBColumn:
-    """§6e e1: `relay list`'s EXECUTORS table gains the same MB visibility leads got in #3, plus
-    a ver?/stale-hooks-style "heavy" footnote naming executors past the threshold."""
+def _write_usage_transcript(tmp_path, monkeypatch, name, last_prompt, ts="2026-01-01T00:00:00.000Z",
+                            output=10):
+    """A minimal but real-shaped Claude Code transcript line: one assistant `usage` entry whose
+    input+cache_read+cache_creation sums to `last_prompt` (all of it parked in cache_read, for a
+    simple, deterministic reading) — enough for lead_guard.transcript_usage to parse a live context
+    and a timestamp, unlike the old MB-fixture's raw byte content (which has no usage at all)."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+    d = tmp_path / "cfg" / "projects" / "-p"
+    d.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({"type": "assistant", "timestamp": ts, "message": {"id": "m1",
+        "model": "claude-sonnet-5", "usage": {"input_tokens": 0, "cache_read_input_tokens": last_prompt,
+        "cache_creation_input_tokens": 0, "output_tokens": output}}})
+    (d / f"{name}.jsonl").write_text(line + "\n")
+
+
+class TestExecutorCTXColumn:
+    """§6e e1 (retargeted, ctx-gate): `relay list`'s EXECUTORS table shows the REAL live context
+    (CTX, `last_prompt`) instead of the transcript-MB proxy, plus a ver?/stale-hooks-style "heavy"
+    footnote naming executors past the token threshold."""
 
     def _exec(self, relay, sid, claude_session, status="reported", packet=3):
         relay.write_session(sid, {"session_id": sid, "current_packet": packet, "status": status,
@@ -4518,37 +4554,31 @@ class TestExecutorMBColumn:
         relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
         (relay.packets_dir(sid) / f"{packet:03d}-report.md").write_text("done")
 
-    def _transcript(self, tmp_path, monkeypatch, name, mb):
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
-        d = tmp_path / "cfg" / "projects" / "-p"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / f"{name}.jsonl").write_bytes(b"x" * int(mb * 1024 * 1024))
-
-    def test_light_and_heavy_rows_both_show_mb(self, relay, capsys, tmp_path, monkeypatch):
-        self._transcript(tmp_path, monkeypatch, "cs-light", 0.5)
-        d = tmp_path / "cfg" / "projects" / "-p"
-        (d / "cs-heavy.jsonl").write_bytes(b"x" * int(6 * 1024 * 1024))
+    def test_light_and_heavy_rows_both_show_ctx(self, relay, capsys, tmp_path, monkeypatch):
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-light", 1200)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-heavy", 212000)
         self._exec(relay, "light-1", "cs-light")
         self._exec(relay, "heavy-1", "cs-heavy")
         relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
         out = capsys.readouterr().out
-        assert "MB" in out
+        header = [l for l in out.splitlines() if l.split()[:1] == ["SESSION"]][0]
+        assert "CTX" in header.split() and "MB" not in header.split()  # MB column is gone
         light_row = [l for l in out.splitlines() if l.startswith("light-1")][0]
         heavy_row = [l for l in out.splitlines() if l.startswith("heavy-1")][0]
-        assert "0.5" in light_row.split()
-        assert "6.0" in heavy_row.split()
+        assert "1.2k" in light_row.split()
+        assert "212k" in heavy_row.split()
 
-    def test_heavy_footnote_names_the_session_pkts_and_mb(self, relay, capsys, tmp_path, monkeypatch):
-        self._transcript(tmp_path, monkeypatch, "cs-heavy", 6)
+    def test_heavy_footnote_names_the_session_pkts_and_ctx(self, relay, capsys, tmp_path, monkeypatch):
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-heavy", 212000)
         self._exec(relay, "heavy-1", "cs-heavy", packet=9)
         relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
         out = capsys.readouterr().out
         assert "⚠ heavy:" in out
         footnote = [l for l in out.splitlines() if "⚠ heavy:" in l][0]
-        assert "heavy-1" in footnote and "9 pkts" in footnote and "6.0MB" in footnote
+        assert "heavy-1" in footnote and "9 pkts" in footnote and "212k" in footnote
 
     def test_no_footnote_when_nothing_heavy(self, relay, capsys, tmp_path, monkeypatch):
-        self._transcript(tmp_path, monkeypatch, "cs-light", 0.2)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-light", 500)
         self._exec(relay, "light-1", "cs-light")
         relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
         out = capsys.readouterr().out
@@ -4566,9 +4596,11 @@ class TestExecutorMBColumn:
 
 
 class TestSendHeavinessGate:
-    """§6e e2: `relay send` into a heavy session refuses unless --heavy-override "<reason>" is
-    given (mirrors executor_model_ceiling exactly), and the override reason lands in the ledger.
-    §9 binding constraint: wording must NUDGE (state the fact + the alternative), never scold."""
+    """§6e e2 (retargeted, ctx-gate): `relay send` into a heavy session refuses unless
+    --heavy-override "<reason>" is given (mirrors executor_model_ceiling exactly), and the
+    override reason lands in the ledger. §9 binding constraint: wording must NUDGE (state the
+    fact + the alternative), never scold. Heaviness is now read from the LIVE context
+    (`last_prompt`), not transcript MB."""
 
     def _mk(self, relay, sid="e1", claude_session="cs-x", status="reported"):
         relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
@@ -4584,31 +4616,25 @@ class TestSendHeavinessGate:
         p.write_text("# Follow-up\n\nDo the next thing.")
         return str(p)
 
-    def _transcript(self, tmp_path, monkeypatch, name, mb):
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
-        d = tmp_path / "cfg" / "projects" / "-p"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / f"{name}.jsonl").write_bytes(b"x" * int(mb * 1024 * 1024))
-
     def _ledger_events(self, relay):
         if not relay.LEDGER.exists():
             return []
         return [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
 
     def test_heavy_session_refuses_without_override(self, relay, tmp_path, monkeypatch):
-        self._transcript(tmp_path, monkeypatch, "cs-x", 6)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-x", 212000)
         self._mk(relay)
         with mock.patch.object(relay.iterm, "send") as send:
             with pytest.raises(SystemExit) as ei:
                 relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path),
                                                heavy_override=None))
         msg = str(ei.value)
-        assert "heavy" in msg and "6.0MB" in msg and "--heavy-override" in msg
+        assert "heavy" in msg and "212k" in msg and "tokens" in msg and "--heavy-override" in msg
         send.assert_not_called()  # refused before any delivery attempt
 
     def test_nudge_wording_states_fact_and_alternative_not_a_scold(self, relay, tmp_path, monkeypatch):
         # §9: "heaviness is not degradation... the override will be used often and legitimately."
-        self._transcript(tmp_path, monkeypatch, "cs-x", 6)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-x", 212000)
         self._mk(relay)
         with mock.patch.object(relay.iterm, "send"):
             with pytest.raises(SystemExit) as ei:
@@ -4618,8 +4644,8 @@ class TestSendHeavinessGate:
         assert "not a verdict on its work" in msg or "not degrad" in msg or "disciplined executor" in msg
         assert "relay retire" in msg  # the cheap-escape alternative is named, not just a refusal
 
-    def test_heavy_session_proceeds_with_override_and_ledgers_reason(self, relay, tmp_path, monkeypatch):
-        self._transcript(tmp_path, monkeypatch, "cs-x", 6)
+    def test_heavy_session_proceeds_with_override_and_ledgers_tokens(self, relay, tmp_path, monkeypatch):
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-x", 212000)
         self._mk(relay)
         with mock.patch.object(relay.iterm, "send", return_value=True) as send:
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path),
@@ -4630,10 +4656,11 @@ class TestSendHeavinessGate:
         assert len(override_events) == 1
         assert override_events[0]["session_id"] == "e1"
         assert override_events[0]["reason"] == "need to finish this thread"
-        assert override_events[0]["mb"] == 6.0
+        assert override_events[0]["tokens"] == 212000
+        assert "mb" in override_events[0]  # old readers keep working — mb= is still ledgered too
 
     def test_light_session_sends_silently_no_gate(self, relay, tmp_path, monkeypatch):
-        self._transcript(tmp_path, monkeypatch, "cs-x", 0.5)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-x", 500)
         self._mk(relay)
         with mock.patch.object(relay.iterm, "send", return_value=True) as send:
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path),
@@ -4654,11 +4681,22 @@ class TestSendHeavinessGate:
     def test_missing_heavy_override_attr_treated_as_none(self, relay, tmp_path, monkeypatch):
         # callers that predate this flag (or construct args without it) must not crash — getattr
         # default, same defensive style as args.all/args.closed elsewhere in cmd_list.
-        self._transcript(tmp_path, monkeypatch, "cs-x", 0.5)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-x", 500)
         self._mk(relay)
         with mock.patch.object(relay.iterm, "send", return_value=True) as send:
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path)))
         send.assert_called_once()
+
+    def test_advisory_ctx_line_appears_on_non_heavy_send(self, relay, capsys, tmp_path, monkeypatch):
+        # the ctx/cache/hit-rate readout prints on EVERY send with locatable usage, not just heavy
+        # ones — the reuse-vs-rotate call should be informed before it's ever forced.
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-x", 500)
+        self._mk(relay)
+        with mock.patch.object(relay.iterm, "send", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(tmp_path),
+                                           heavy_override=None))
+        out = capsys.readouterr().out
+        assert "ctx: 500" in out
 
 
 class TestClosePredecessor:

@@ -242,6 +242,8 @@ def _chips(ex):
         out.append('<span class="chip">role<b>agent</b></span>')
     if ex.get("tokens") and ex.get("tokens") != "-":
         out.append(f'<span class="chip">tokens<b>{_e(ex["tokens"])}</b></span>')
+    if ex.get("hit_rate") is not None:
+        out.append(f'<span class="chip">cache hit<b>{ex["hit_rate"]}%</b></span>')
     if ex.get("mb") and ex.get("mb") != "-":
         out.append(f'<span class="chip">size<b>{_e(ex["mb"])} MB</b></span>')
     if ex.get("heavy"):

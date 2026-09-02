@@ -46,7 +46,22 @@ LEAD_DEFAULTS = {
     "tab_colors": True,          # iTerm only: color each lead's tab + its executors' tabs alike
     "executor_layout": "tab",    # "tab" | "pane" (pane: iTerm only, split into the lead's window)
     "handoff_nudge": True,       # suggest handing off when the lead transcript gets heavy
-    "handoff_nudge_mb": 5,       # transcript-size threshold (MB); proxy, not context occupancy
+    "handoff_nudge_mb": 5,       # transcript-size threshold (MB); proxy, not context occupancy.
+                                 # Still drives the LEAD's own transcript-weight nudge above. As the
+                                 # EXECUTOR heaviness signal it is DEPRECATED in favor of
+                                 # context_nudge_tokens (below) — kept only as the fallback reading
+                                 # when an executor's transcript can't be parsed for real usage.
+    "context_nudge_tokens": 150000,  # the executor heaviness signal (bin/relay's cmd_send gate,
+                                 # `relay list`'s heavy footnote, board): an executor is "heavy" when
+                                 # its LAST request's live context (input + cache_read + cache_create
+                                 # — transcript_usage's `last_prompt`) is at/above this many tokens.
+                                 # Replaces handoff_nudge_mb's transcript-MB proxy with the number
+                                 # that actually drives cost/compaction. Falls back to the old MB
+                                 # test (handoff_nudge_mb) only when usage can't be read at all.
+    "cache_ttl_minutes": 60,     # Claude Code's prompt-cache TTL (1 hour by default) — how long the
+                                 # last request's prefix stays cached free. Configurable because a
+                                 # workspace running the 5-minute-TTL tier (usage overage) needs a
+                                 # different number; see lead_guard.cache_state.
     "executor_default_model": "sonnet",  # model an executor launches with when --model is omitted —
                                   # relay's own policy, never the human's personal `/model` default
                                   # (see "executor model policy" section below: incident where a
@@ -1693,13 +1708,33 @@ def decide_context(model, packet_ctx, reading_bytes, threshold=CONTEXT_1M_BYTES,
 # Assistant lines are repeated once per content block with the same message id and usage — dedup by
 # message id (last wins) or every multi-block turn is counted N times (observed live 2026-08-21:
 # 201 of 262 message ids duplicated in one transcript).
+#
+# `last_prompt`/`last_ts` are the LAST request's reading, not a sum — that's the LIVE context (what
+# the next turn actually pays to re-send if the cache is cold), verified against a real transcript
+# 2026-09-02: each line carries a top-level `timestamp` (ISO-8601, e.g. "2026-09-02T03:55:36.209Z").
+
+def _parse_ts(raw):
+    """ISO-8601 timestamp (as Claude Code's transcript writes it) → epoch seconds, or None."""
+    if not raw:
+        return None
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
 
 def transcript_usage(path):
     """Aggregate usage for one transcript: {"requests", "prompt", "input", "cache_read",
-    "cache_create", "output", "models": {model: requests}} — or None when unreadable."""
+    "cache_create", "output", "models": {model: requests}, "last_prompt", "last_ts",
+    "cache_hit_rate"} — or None when unreadable.
+    `last_prompt` is the LAST request's input+cache_read+cache_create (the live context a rotate-
+    vs-reuse call should actually weigh); `last_ts` is that request's timestamp as epoch seconds;
+    `cache_hit_rate` is cache_read / prompt over the WHOLE session (0.0-1.0, None when prompt == 0)."""
     try:
         by_id = {}
         order = []
+        last_mid, last_ts = None, None
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 if '"usage"' not in line:
@@ -1718,8 +1753,10 @@ def transcript_usage(path):
                 if mid not in by_id:
                     order.append(mid)
                 by_id[mid] = (u, m.get("model"))
+                last_mid = mid
+                last_ts = _parse_ts(d.get("timestamp"))
         agg = {"requests": 0, "prompt": 0, "input": 0, "cache_read": 0, "cache_create": 0, "output": 0,
-               "models": {}}
+               "models": {}, "last_prompt": 0, "last_ts": None, "cache_hit_rate": None}
         for mid in order:
             u, model = by_id[mid]
             i = int(u.get("input_tokens") or 0); cr = int(u.get("cache_read_input_tokens") or 0)
@@ -1728,9 +1765,31 @@ def transcript_usage(path):
             agg["output"] += o; agg["prompt"] += i + cr + cc
             if model:
                 agg["models"][model] = agg["models"].get(model, 0) + 1
+        if last_mid is not None:
+            u, _ = by_id[last_mid]
+            agg["last_prompt"] = (int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
+                                   + int(u.get("cache_creation_input_tokens") or 0))
+            agg["last_ts"] = last_ts
+        if agg["prompt"] > 0:
+            agg["cache_hit_rate"] = agg["cache_read"] / agg["prompt"]
         return agg
     except Exception:
         return None
+
+
+def cache_state(usage, now, ttl_minutes):
+    """Cache-warm/cold readout for the lead's reuse-vs-rotate call: `("warm", None)` when `now` is
+    still within `ttl_minutes` of the session's last request (Claude Code's prompt cache — a 1-hour
+    TTL by default — hasn't expired, so the next turn's prefix is still cached free); else
+    `("cold", est_rewrite_tokens)` where the estimate is `last_prompt` (the prefix size that will be
+    re-written on the next turn). `None` when there's nothing to read (no usage, or a usage with no
+    `last_ts` — e.g. a transcript with no per-request timestamp)."""
+    if not usage or not usage.get("last_ts"):
+        return None
+    age = now - usage["last_ts"]
+    if age < ttl_minutes * 60:
+        return ("warm", None)
+    return ("cold", usage.get("last_prompt") or 0)
 
 
 def human_tokens(n):
@@ -1746,11 +1805,21 @@ def human_tokens(n):
     return str(n)
 
 
-def usage_cell(usage):
-    """'<prompt>/<output>' e.g. '1.2M/34k', or '-' when unknown."""
+def usage_cell(usage, cache=None):
+    """'<prompt>/<output>' e.g. '1.2M/34k', or '-' when unknown. `cache` — the (state, est) tuple
+    `cache_state` returns, or None — grows a third segment: '1.2M/34k ·warm' or
+    '1.2M/34k ·cold~212k'; omitted (or an unrecognized state) renders no segment."""
     if not usage:
         return "-"
-    return f"{human_tokens(usage.get('prompt', 0))}/{human_tokens(usage.get('output', 0))}"
+    base = f"{human_tokens(usage.get('prompt', 0))}/{human_tokens(usage.get('output', 0))}"
+    if not cache:
+        return base
+    state, est = cache
+    if state == "warm":
+        return f"{base} ·warm"
+    if state == "cold":
+        return f"{base} ·cold~{human_tokens(est)}"
+    return base
 
 
 def launch_cell(s):

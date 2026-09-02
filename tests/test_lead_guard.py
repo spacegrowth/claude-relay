@@ -3124,14 +3124,17 @@ class TestPacketLint:
 
 
 class TestTranscriptUsage:
-    def _write(self, tmp_path):
+    def _write(self, tmp_path, ts1="2026-01-01T00:00:00.000Z", ts2="2026-01-01T00:05:00.000Z"):
         p = tmp_path / "t.jsonl"
-        def a(mid, i, cr, cc, o, model="claude-sonnet-5"):
-            return json.dumps({"type": "assistant", "message": {"id": mid, "model": model, "usage": {
-                "input_tokens": i, "cache_read_input_tokens": cr, "cache_creation_input_tokens": cc, "output_tokens": o}}})
-        lines = [a("m1", 2, 1000, 500, 50), a("m1", 2, 1000, 500, 50),   # duplicated per content block
+        def a(mid, i, cr, cc, o, model="claude-sonnet-5", ts=None):
+            d = {"type": "assistant", "message": {"id": mid, "model": model, "usage": {
+                "input_tokens": i, "cache_read_input_tokens": cr, "cache_creation_input_tokens": cc, "output_tokens": o}}}
+            if ts:
+                d["timestamp"] = ts
+            return json.dumps(d)
+        lines = [a("m1", 2, 1000, 500, 50, ts=ts1), a("m1", 2, 1000, 500, 50, ts=ts1),   # dup per block
                  json.dumps({"type": "user", "message": {"content": "x"}}),
-                 a("m2", 3, 1500, 0, 70, model="claude-haiku-4-5"), "not json"]
+                 a("m2", 3, 1500, 0, 70, model="claude-haiku-4-5", ts=ts2), "not json"]
         p.write_text("\n".join(lines) + "\n")
         return p
 
@@ -3142,6 +3145,41 @@ class TestTranscriptUsage:
         assert u["models"] == {"claude-sonnet-5": 1, "claude-haiku-4-5": 1}
         assert lg.transcript_usage(tmp_path / "missing.jsonl") is None
 
+    def test_last_prompt_is_the_final_request_not_a_sum(self, tmp_path):
+        # "last" is the LIVE context (rotate-vs-reuse signal) — m2's own reading (3+1500+0), not
+        # the session total, and not thrown off by m1's duplicated content-block lines.
+        u = lg.transcript_usage(self._write(tmp_path))
+        assert u["last_prompt"] == 3 + 1500 + 0
+
+    def test_last_ts_parses_the_transcript_timestamp_field(self, tmp_path):
+        import datetime
+        ts2 = "2026-01-01T00:05:00.000Z"
+        u = lg.transcript_usage(self._write(tmp_path, ts2=ts2))
+        expected = datetime.datetime.fromisoformat(ts2.replace("Z", "+00:00")).timestamp()
+        assert u["last_ts"] == pytest.approx(expected)
+
+    def test_cache_hit_rate_over_whole_session(self, tmp_path):
+        u = lg.transcript_usage(self._write(tmp_path))
+        assert u["cache_hit_rate"] == pytest.approx(u["cache_read"] / u["prompt"])
+
+    def test_cache_hit_rate_none_and_last_fields_zero_when_prompt_is_zero(self, tmp_path):
+        p = tmp_path / "empty.jsonl"
+        p.write_text("not json\nstill not json\n")
+        u = lg.transcript_usage(p)
+        assert u["prompt"] == 0 and u["cache_hit_rate"] is None
+        assert u["last_prompt"] == 0 and u["last_ts"] is None
+
+    def test_cache_state_warm_cold_boundary_at_exactly_ttl(self):
+        usage = {"last_prompt": 5000, "last_ts": 1_000_000.0}
+        just_inside = 1_000_000.0 + 60 * 60 - 1
+        exactly_at_ttl = 1_000_000.0 + 60 * 60
+        assert lg.cache_state(usage, just_inside, 60) == ("warm", None)
+        assert lg.cache_state(usage, exactly_at_ttl, 60) == ("cold", 5000)
+
+    def test_cache_state_none_when_unknown(self):
+        assert lg.cache_state(None, 1000.0, 60) is None
+        assert lg.cache_state({"last_prompt": 1}, 1000.0, 60) is None  # no last_ts
+
     def test_cells(self):
         assert lg.human_tokens(999) == "999" and lg.human_tokens(1234) == "1.2k"
         assert lg.human_tokens(34567) == "35k" and lg.human_tokens(1_234_567) == "1.2M"
@@ -3149,6 +3187,13 @@ class TestTranscriptUsage:
         assert lg.launch_cell({"mcp": "none", "context": "200k", "agent": "relay-executor"}) == "none/200k/A"
         assert lg.launch_cell({"mcp": ["linear"], "context": "1m", "agent": None}) == "linear/1m/G"
         assert lg.launch_cell({"model": "sonnet[1m]"}) == "?/1m/?"
+
+    def test_usage_cell_renders_warm_cold_and_unknown_cache_states(self):
+        u = {"prompt": 1_234_567, "output": 34_567}
+        assert lg.usage_cell(u) == "1.2M/35k"                          # no cache arg → unchanged
+        assert lg.usage_cell(u, None) == "1.2M/35k"                    # unknown → no segment
+        assert lg.usage_cell(u, ("warm", None)) == "1.2M/35k ·warm"
+        assert lg.usage_cell(u, ("cold", 212000)) == "1.2M/35k ·cold~212k"
 
 
 class TestModelAliasResolution:
