@@ -1,16 +1,16 @@
 <title>Relay</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
   :root {
     color-scheme: light;
     --ground: #FFFFFF;
     --ink: #17181C;
-    --muted: #666A73;
+    --muted: #52565F;
     --line: #E2E4EA;
     --soft: #EEF1FB;
     --accent: #1F3FCF;
-    --display: "Fraunces", Georgia, "Times New Roman", serif;
-    --body: "IBM Plex Sans", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    --display: "Inter", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    --body: "Inter", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
     --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
   html, body { margin: 0; height: 100%; background: var(--ground); color: var(--ink); font-family: var(--body); }
@@ -18,63 +18,74 @@
   .deck { position: relative; width: 100vw; height: 100vh; }
   .slide { position: absolute; inset: 0; display: none; padding: 6vh 7vw 8vh; box-sizing: border-box; flex-direction: column; }
   .slide.current { display: flex; }
-  .eyebrow { font-family: var(--mono); font-size: 1.1vw; color: var(--accent); letter-spacing: .08em; text-transform: uppercase; margin: 0 0 2vh; }
-  h1 { font-family: var(--display); font-weight: 500; font-size: 4.2vw; line-height: 1.05; margin: 0 0 4vh; text-wrap: balance; letter-spacing: -.01em; }
-  h1.big { font-size: 7vw; margin-top: 16vh; }
-  p, li { font-size: 1.65vw; line-height: 1.45; margin: 0; max-width: 62ch; }
+  .eyebrow { font-family: var(--mono); font-size: clamp(11px, 1.1vw, 19px); color: var(--accent); letter-spacing: .08em; text-transform: uppercase; margin: 0 0 2vh; }
+  h1 { font-family: var(--display); font-weight: 600; font-size: clamp(30px, 3.3vw, 64px); line-height: 1.12; margin: 0 0 4vh; text-wrap: balance; letter-spacing: -.025em; }
+  h1.big { font-size: clamp(42px, 5.6vw, 104px); line-height: 1.08; letter-spacing: -.03em; margin-top: 16vh; }
+  p, li { font-size: clamp(16px, 1.5vw, 28px); line-height: 1.5; margin: 0; max-width: 62ch; }
   p + p { margin-top: 1.6vh; }
-  .lead { font-size: 2.1vw; }
+  .lead { font-size: clamp(19px, 1.9vw, 35px); line-height: 1.45; }
   .muted { color: var(--muted); }
-  .small { font-size: 1.3vw; }
+  .small { font-size: clamp(13px, 1.2vw, 22px); }
   code { font-family: var(--mono); font-size: .92em; background: var(--soft); padding: .08em .4em; border-radius: 3px; }
-  pre { font-family: var(--mono); font-size: 1.2vw; line-height: 1.5; margin: 0; background: var(--soft); padding: 2vh 1.6vw; border-radius: 4px; overflow-x: auto; }
+  pre { font-family: var(--mono); font-size: clamp(12px, 1.2vw, 22px); line-height: 1.5; margin: 0; background: var(--soft); padding: 2vh 1.6vw; border-radius: 4px; overflow-x: auto; }
   ul { padding-left: 1.2em; margin: 0; }
   li + li { margin-top: 1vh; }
   .cols { display: grid; gap: 3vw; align-items: start; }
   .cols-2 { grid-template-columns: 1fr 1fr; }
   .cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .wide p, .wide li { max-width: 92ch; font-size: clamp(17px, 1.72vw, 33px); }
+  .wide p + p { margin-top: 2.4vh; }
+  .cmp { margin: 1vh 0 0; }
+  .cmp .row { display: grid; grid-template-columns: 13vw 1fr 1fr; gap: 2vw; padding: 1.3vh 0; border-top: 1px solid var(--line); align-items: baseline; }
+  .cmp .row.head { border-top: 0; padding-bottom: .6vh; }
+  .cmp .k, .cmp .hd { font-family: var(--mono); font-size: clamp(11px, 1.05vw, 19px); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  .cmp .hd.on { color: var(--accent); }
+  .cmp p { font-size: clamp(13px, 1.26vw, 24px); line-height: 1.4; max-width: none; }
+  .cmp .old { color: var(--muted); }
+  .cmp .new { font-weight: 500; }
   .rule { border: 0; border-top: 1px solid var(--line); margin: 3vh 0; }
-  .foot { margin-top: auto; font-size: 1.25vw; color: var(--muted); max-width: none; }
+  .foot { margin-top: auto; font-size: clamp(13px, 1.18vw, 22px); color: var(--muted); max-width: none; }
   .num { position: fixed; right: 2.4vw; bottom: 2.2vh; font-family: var(--mono); font-size: 1vw; color: var(--muted); }
   .bar { position: fixed; left: 0; top: 0; height: 3px; background: var(--accent); width: 0; transition: width .25s ease; }
-  .notes { display: none; position: fixed; left: 0; right: 0; bottom: 0; background: var(--ink); color: var(--ground); padding: 2vh 4vw; font-size: 1.3vw; line-height: 1.45; max-height: 30vh; overflow: auto; }
+  .notes { display: none; position: fixed; left: 0; right: 0; bottom: 0; background: var(--ink); color: var(--ground); padding: 2vh 4vw; font-size: 1.2vw; line-height: 1.5; max-height: 30vh; overflow: auto; }
   .slide .notes { display: none !important; }
   body.notes #notesbox { display: block; }
-  .help { display: none; position: fixed; inset: 0; background: rgba(23,24,28,.92); color: var(--ground); padding: 8vh 10vw; font-size: 1.6vw; line-height: 1.7; }
+  .help { display: none; position: fixed; inset: 0; background: rgba(23,24,28,.92); color: var(--ground); padding: 8vh 10vw; font-size: 1.45vw; line-height: 1.7; }
   body.help .help { display: block; }
   .help code { background: rgba(255,255,255,.12); color: inherit; }
   .step { opacity: 0; transform: translateY(6px); transition: opacity .35s ease, transform .35s ease; }
   .step.on { opacity: 1; transform: none; }
   @media (prefers-reduced-motion: reduce) { .step { transition: none; opacity: 1; transform: none; } .bar { transition: none; } }
   .tabular { font-variant-numeric: tabular-nums; }
-  .box { border: 1px solid var(--line); padding: 1.6vh 1.4vw; font-family: var(--mono); font-size: 1.25vw; line-height: 1.45; background: var(--ground); }
-  .box b { font-family: var(--body); font-weight: 600; font-size: 1.45vw; display: block; margin-bottom: .4vh; }
+  .box { border: 1px solid var(--line); padding: 1.6vh 1.4vw; font-family: var(--mono); font-size: clamp(12px, 1.25vw, 22px); line-height: 1.45; background: var(--ground); }
+  .box b { font-family: var(--body); font-weight: 600; font-size: clamp(14px, 1.35vw, 24px); display: block; margin-bottom: .4vh; }
   .box.lead-box { border-color: var(--accent); }
-  .arrow { font-family: var(--mono); font-size: 1.2vw; color: var(--muted); display: flex; align-items: center; gap: .8vw; }
+  .arrow { font-family: var(--mono); font-size: clamp(12px, 1.2vw, 21px); color: var(--muted); display: flex; align-items: center; gap: .8vw; }
   .arrow .ln { flex: 1; height: 1px; background: var(--muted); position: relative; }
   .arrow .ln::after { content: ""; position: absolute; right: -1px; top: -4px; border: 4px solid transparent; border-left-color: var(--muted); }
   .arrow.back .ln::after { right: auto; left: -1px; border-left-color: transparent; border-right-color: var(--muted); }
   .arrow.accent { color: var(--accent); } .arrow.accent .ln { background: var(--accent); } .arrow.accent .ln::after { border-left-color: var(--accent); }
-  .tabs { display: flex; gap: 2px; font-family: var(--mono); font-size: 1.2vw; }
+  .tabs { display: flex; gap: 2px; font-family: var(--mono); font-size: clamp(12px, 1.2vw, 21px); }
   .tab { border: 1px solid var(--line); border-bottom: 0; padding: 1.2vh 1.4vw; color: var(--muted); }
   .tab.on { color: var(--ink); border-color: var(--ink); }
   .gauge { height: 2.2vh; background: var(--line); position: relative; }
   .gauge i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ink); }
   .gauge s { position: absolute; top: -.6vh; bottom: -.6vh; width: 2px; background: var(--accent); text-decoration: none; }
-  .turns { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1vw; font-family: var(--mono); font-size: 1.1vw; }
+  .turns { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1vw; font-family: var(--mono); font-size: clamp(11px, 1.1vw, 20px); }
   .turn { border: 1px solid var(--line); padding: 1.2vh 1vw; line-height: 1.5; }
   .turn .w { color: var(--accent); }
-  .bars { display: grid; grid-template-columns: 8vw 1fr; gap: 1.2vh 1.4vw; align-items: center; font-family: var(--mono); font-size: 1.2vw; }
+  .bars { display: grid; grid-template-columns: 8vw 1fr; gap: 1.2vh 1.4vw; align-items: center; font-family: var(--mono); font-size: clamp(12px, 1.2vw, 21px); }
   .bars i { display: block; height: 3vh; background: var(--ink); }
   .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2.2vh 2vw; }
-  .grid div { font-size: 1.25vw; line-height: 1.4; }
-  .grid code { display: block; margin-bottom: .4vh; background: none; padding: 0; color: var(--accent); font-size: 1.35vw; }
+  .grid div { font-size: clamp(12px, 1.18vw, 21px); line-height: 1.45; }
+  .grid code { display: block; margin-bottom: .4vh; background: none; padding: 0; color: var(--accent); font-size: clamp(13px, 1.35vw, 24px); font-weight: 500; }
   .steps6 { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1.2vw; }
-  .steps6 div { border-top: 2px solid var(--ink); padding-top: 1.4vh; font-size: 1.2vw; line-height: 1.4; }
+  .steps6 div { border-top: 2px solid var(--ink); padding-top: 1.4vh; font-size: clamp(12px, 1.15vw, 21px); line-height: 1.45; }
   .steps6 code { display: block; background: none; padding: 0; color: var(--accent); margin-bottom: .6vh; }
-  .report { font-family: var(--mono); font-size: 1.15vw; line-height: 1.55; white-space: pre; }
+  .report { font-family: var(--mono); font-size: clamp(12px, 1.15vw, 21px); line-height: 1.55; white-space: pre; }
   .report em { font-style: normal; color: var(--accent); }
-  .light { font-family: var(--display); font-weight: 500; font-size: 2.5vw; line-height: 1.15; letter-spacing: -.01em; }
+  .spine { font-family: var(--mono); color: var(--accent); letter-spacing: .06em; font-size: clamp(14px, 1.4vw, 25px); }
+  .light { font-family: var(--display); font-weight: 600; font-size: clamp(20px, 2.1vw, 38px); line-height: 1.2; letter-spacing: -.02em; }
 </style>
 
 <div class="bar" id="bar"></div>
@@ -82,26 +93,38 @@
 
 <section class="slide">
   <p class="eyebrow">🚦 relay</p>
-  <h1 class="big">One session that thinks.<br>Several that do.</h1>
-  <p class="lead muted">A Claude Code plugin: a lead session that hands work to executor sessions in their own tabs, and reviews all of it before anything is committed.</p>
-  <p class="foot">About thirty minutes, then a live run.</p>
-  <aside class="notes">Say the one-liner and move on. The whole talk is the loop on slide 3 and the money on slides 9–12.</aside>
+  <h1 class="big">Several Claude sessions.<br>One of them is in charge.</h1>
+  <p class="lead muted">A Claude Code plugin. The lead session plans the work and hands it to executor sessions in their own terminal tabs. It reads every diff. You make every commit.</p>
+  <p class="foot spine">Delegate. Review. Commit.</p>
+  <aside class="notes">Point at the headline and let the picture land: this is five terminal tabs, not five agents in a box. The three verbs at the bottom are the whole talk. Come back to them in the demo.</aside>
+</section>
+
+<section class="slide">
+  <p class="eyebrow">the obvious question</p>
+  <h1>The difference isn't parallelism. It's who pays, and who signs.</h1>
+  <div class="cmp">
+    <div class="row head"><div class="hd"></div><div class="hd">subagents &amp; agent teams</div><div class="hd on">relay executor</div></div>
+    <div class="row step"><div class="k">model, effort</div><p class="old">Inherit the lead's unless you name one.</p><p class="new">Set per packet. Haiku work costs Haiku.</p></div>
+    <div class="row step"><div class="k">the cache</div><p class="old">In-process teammates hold it 5 minutes.</p><p class="new">Full sessions. Reuse one and it's warm.</p></div>
+    <div class="row step"><div class="k">permissions</div><p class="old">The lead's. Can't differ per agent at spawn.</p><p class="new">Commit denied at launch, every executor.</p></div>
+    <div class="row step"><div class="k">approval</div><p class="old">A teammate's plan is auto-approved.</p><p class="new">Plan, diff and commit are all yours.</p></div>
+    <div class="row step"><div class="k">you get back</div><p class="old">Prose you have to trust.</p><p class="new">A report checked against the git index.</p></div>
+    <div class="row step"><div class="k">afterwards</div><p class="old">Gone. <code>/resume</code> won't restore a teammate.</p><p class="new">Resume it. Send it the fix-list.</p></div>
+  </div>
+  <p class="foot">Teams win when the agents should argue with each other. Everywhere else the tier is yours to pick, packet by packet, and nothing lands without your commit.</p>
+  <aside class="notes">Concede the overlap immediately: teams also get their own context, their own panes, and direct messaging. The difference is that relay treats the executor as untrusted: it cannot commit, its report is machine-checked against the index, and you approve the plan. Facts for Q&A: agent teams need CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1; teammate model falls through to the lead's; effort is always the lead's; permission modes can't be set per teammate at spawn; a named subagent becomes a teammate without confirmation; one team per session; the lead can't be handed off. Relay handles the last one with /relay:handoff.</aside>
 </section>
 
 <section class="slide">
   <p class="eyebrow">why</p>
   <h1>The best model should be making the decisions, not doing the typing.</h1>
-  <div class="cols cols-2">
-    <div>
-      <p>You want Opus or Fable as your lead. Judgment is the expensive thing to get wrong: what to build, whether a diff is really mergeable, when a report is lying to you.</p>
-      <p>But you don't want that model doing every rename, every boilerplate test, every doc fix. That's where the bill goes.</p>
-    </div>
-    <div>
-      <p class="step">Smaller models aren't worse workers. They need a <strong>bounded</strong> task: exact files, a finish line you can check with a command, and no "figure out why" in the middle.</p>
-      <p class="step">Give Haiku a contained job like that and it does it. Give it an open question and it produces something that looks right and isn't.</p>
-    </div>
+  <div class="wide">
+    <p>The lead is where judgment lives: what to build, whether a diff is really mergeable, when a report is lying to you. Worth an Opus or a Fable.</p>
+    <p>Renames, boilerplate tests, doc fixes need none of that judgment. That's where the bill goes.</p>
+    <p class="step">Smaller models aren't worse workers. They need a <strong>bounded</strong> task: exact files, a finish line a command can check, no "figure out why" in the middle.</p>
+    <p class="step">Bounded, Haiku lands it. Open-ended, it hands you something that looks right and isn't.</p>
   </div>
-  <p class="foot">So: one strong session that plans, delegates and reviews. Cheaper sessions that do the work, in parallel, with a written contract each way.</p>
+  <p class="foot">One session plans, delegates and reviews. Cheaper ones do the work in parallel, with a written contract each way.</p>
   <aside class="notes">This is the thesis. Everything else is mechanics. Land "bounded task" here because the model rubric later depends on it.</aside>
 </section>
 
@@ -109,17 +132,17 @@
   <p class="eyebrow">how it works</p>
   <h1>The loop</h1>
   <div style="display:grid;grid-template-columns:22vw 1fr 22vw;gap:2vw;align-items:center;margin:1vh 0 4vh">
-    <div class="box lead-box"><b>[Lead] your project</b>writes the packet<br>reads diff + report<br>commits</div>
+    <div class="box lead-box"><b>[Lead] your project</b>plans; splits it into packets<br>writes one<br>reads diff + report<br>commits</div>
     <div style="display:grid;gap:2.4vh">
-      <div class="arrow step"><span>1 · packet file</span><span class="ln"></span></div>
+      <div class="arrow step"><span>1 · packet file: one bounded piece of the plan</span><span class="ln"></span></div>
       <div class="arrow back step"><span class="ln"></span><span>3 · report file + staged changes</span></div>
       <div class="arrow accent step"><span>🚦 4 · relay's Stop hook, in the lead's own session, wakes it</span><span class="ln" style="max-width:5vw;visibility:hidden"></span></div>
     </div>
     <div class="box"><b>[Exec] topic</b>2 · works in the shared worktree<br>stages, never commits<br>writes the report</div>
   </div>
-  <p class="step">The wake isn't the executor calling you. It's relay, on your side, watching the report path while you're idle — then announcing <code>🚦 [relay] — review needed</code> in your session.</p>
+  <p class="step">The wake isn't the executor calling you. It's relay, on your side, watching the report path while you're idle, then announcing <code>🚦 [relay] — review needed</code> in your session.</p>
   <p class="foot">Executors can't commit (denied at launch). Leads can't make large inline edits (a hook blocks it). The asymmetry is the design.</p>
-  <aside class="notes">Walk the arrows in order. Stress that the wake originates in the lead's session, from a hook — there is no arrow from the executor to the lead except the report file.</aside>
+  <aside class="notes">Start with the plan, not the arrows: splitting the work into bounded pieces is the lead's judgment and relay never does it for you. That's the callback on the last slide. Then walk the arrows in order. Stress that the wake originates in the lead's session, from a hook: there is no arrow from the executor to the lead except the report file.</aside>
 </section>
 
 <section class="slide">
@@ -132,7 +155,7 @@
     <div class="tab">[Exec] relay-deck-221602</div>
   </div>
   <div class="cols cols-2">
-    <p><code>relay spawn</code> opens a new iTerm tab, titled by topic, running <code>claude</code> with the executor agent, no MCP servers, and the packet as its first message. The tab is the process: close it and the executor is gone. Its staged work isn't.</p>
+    <p><code>relay spawn</code> opens a new iTerm tab, or a split pane in your window with <code>--pane</code>, titled by topic, running <code>claude</code> with the executor agent, no MCP servers, and the packet as its first message. The tab is the process: close it and the executor is gone. Its staged work isn't.</p>
     <p><code>/relay:focus &lt;name&gt;</code> jumps to a tab. <code>/relay:list</code> is the table: status, model, packet number, live context, tokens spent. <code>/relay:board</code> is the same thing as one page.</p>
   </div>
   <pre class="step" style="margin-top:3vh">SESSION            STATUS     TOPIC       MODEL     PKT  CTX   TOKENS          LAUNCH
@@ -148,7 +171,7 @@ relay-stats-205203 busy 12m   relay-stats sonnet-5  001  210k  8.3M/45k ·warm  
 <pre>Replace the MB-on-disk "heavy" proxy with the
 executor's real live context size (tokens).
 
-REPO: ~/development/claude-relay — files:
+REPO: ~/development/claude-relay · files:
 lib/lead_guard.py, bin/relay, tests/test_relay.py
 
 REQUIRED READING: lib/lead_guard.py L1692-1766
@@ -191,7 +214,7 @@ Changed: lib/lead_guard.py, bin/relay, tests/…
 ## Not done         and why</div>
     <div>
       <p><code>/relay:diff &lt;sid&gt;</code> renders the staged changes as a review page. You read it. There's no substitute.</p>
-      <p class="step"><code>/relay:verify &lt;sid&gt;</code> checks the report against the index: are the claimed files actually staged, do the counts agree. Its best verdict is <code>COUNTS-MATCH</code> — deliberately not "PASS". The others: <code>MISMATCH</code>, <code>MALFORMED</code>, <code>INCONCLUSIVE</code>.</p>
+      <p class="step"><code>/relay:verify &lt;sid&gt;</code> checks the report against the index: are the claimed files actually staged, do the counts agree. Its best verdict is <code>COUNTS-MATCH</code>, deliberately not "PASS". The others: <code>MISMATCH</code>, <code>MALFORMED</code>, <code>INCONCLUSIVE</code>.</p>
       <p class="step">Then you commit, or you send a fix-list back into the same executor. Executors never commit; you do, with your name on it.</p>
     </div>
   </div>
@@ -227,7 +250,7 @@ Changed: lib/lead_guard.py, bin/relay, tests/…
       <span></span><span class="muted small">one real executor session today: 5.1M prompt tokens, 29k output. Thinking lives inside that 29k.</span>
     </div>
   </div>
-  <p class="foot">Set per packet with an <code>EFFORT:</code> line or <code>--effort</code>. It's fixed for the process, and executors get reused — so you're setting it for every packet that session will ever see. Unset is the right default.</p>
+  <p class="foot">Set per packet with an <code>EFFORT:</code> line or <code>--effort</code>. It's fixed for the process, and executors get reused, so you're setting it for every packet that session will ever see. Unset is the right default.</p>
   <aside class="notes">The bar is the argument. Output, thinking included, is under one percent of what the session cost. The lever people actually want is the model tier.</aside>
 </section>
 
@@ -235,12 +258,12 @@ Changed: lib/lead_guard.py, bin/relay, tests/…
   <p class="eyebrow">caching</p>
   <h1>Caching, in one minute</h1>
   <div class="cols cols-3">
-    <p><strong>Claude has no memory between turns.</strong> Each turn, your whole conversation is sent to the API again — and billed again.</p>
+    <p><strong>Claude has no memory between turns.</strong> Each turn, your whole conversation is sent to the API again, and billed again.</p>
     <p class="step"><strong>The cache is the API holding on to the start of that conversation</strong> for 60 minutes. Text it already holds costs 10% to send again. Text it has to store costs 125–200%, once.</p>
     <p class="step"><strong>Every turn resets the 60-minute clock.</strong> Go quiet for an hour and the whole history gets stored again, at the full storing price.</p>
   </div>
   <div class="step" style="margin:3.5vh 0 0">
-    <p class="small muted" style="margin-bottom:.8vh">what's in it — the exact bytes of the request, from the start, in this order</p>
+    <p class="small muted" style="margin-bottom:.8vh">what's in it: the exact bytes of the request, from the start, in this order</p>
     <div style="display:flex;gap:2px;font-family:var(--mono);font-size:1.05vw;line-height:1.35">
       <div style="flex:3;border:1px solid var(--line);padding:1vh .8vw">system prompt<br><span class="muted">Claude Code + executor role + CLAUDE.md</span></div>
       <div style="flex:1.4;border:1px solid var(--line);padding:1vh .8vw">tool<br>definitions</div>
@@ -250,7 +273,7 @@ Changed: lib/lead_guard.py, bin/relay, tests/…
       <div style="flex:1.6;border:1px solid var(--line);padding:1vh .8vw">its own replies</div>
       <div style="flex:1.4;border:1px solid var(--accent);color:var(--accent);padding:1vh .8vw">this turn<br><span style="opacity:.8">not held yet</span></div>
     </div>
-    <p class="small muted" style="margin-top:.8vh">Same system prompt, same zero-MCP tool list on every executor → that first stretch is shared between them. A file read on turn 3 is re-sent on every turn after — at 10%, but forever.</p>
+    <p class="small muted" style="margin-top:.8vh">Same system prompt, same zero-MCP tool list on every executor → that first stretch is shared between them. A file read on turn 3 is re-sent on every turn after, at 10%, but forever.</p>
   </div>
   <aside class="notes">Beat one is the whole idea: no memory, so everything is re-sent. The strip shows what "everything" is. Point at "every file it read".</aside>
 </section>
@@ -266,11 +289,11 @@ Changed: lib/lead_guard.py, bin/relay, tests/…
     <div class="turn step">1 hour idle, turn 41<br><span class="w">store everything again</span><br>×1.25–2 on the whole history</div>
   </div>
   <div class="cols cols-3 step">
-    <p><strong>It's a prefix.</strong> Change anything early — the system prompt, an old message — and everything after it has to be stored again.</p>
+    <p><strong>It's a prefix.</strong> Change anything early, whether the system prompt or an old message, and everything after it has to be stored again.</p>
     <p><strong>It's per model.</strong> Move the executor to Opus and you start from nothing.</p>
     <p><strong>Held isn't free.</strong> A 200k history still costs about 20k tokens' worth every single turn.</p>
   </div>
-  <aside class="notes">Most people think caching is a discount. It's the reason reusing a warm executor is cheap and a huge one is a tax on every turn — which is the next two slides.</aside>
+  <aside class="notes">Most people think caching is a discount. It's the reason reusing a warm executor is cheap and a huge one is a tax on every turn, which is the next two slides.</aside>
 </section>
 
 <section class="slide">
@@ -313,19 +336,19 @@ past the 150k nudge (long-context pricing starts at 200k) …
     </div>
     <div>
       <div class="step">
-        <p class="small muted" style="margin-bottom:.6vh">what the old signal saw — transcript size</p>
+        <p class="small muted" style="margin-bottom:.6vh">what the old signal saw: transcript size</p>
         <div class="gauge"><i style="width:34%"></i><s style="left:100%"></s></div>
         <p class="small tabular">1.7 MB of a 5 MB threshold: "fine"</p>
       </div>
       <div class="step" style="margin-top:3vh">
-        <p class="small muted" style="margin-bottom:.6vh">what the new signal saw — live context</p>
+        <p class="small muted" style="margin-bottom:.6vh">what the new signal saw: live context</p>
         <div class="gauge"><i style="width:88%"></i><s style="left:50%"></s></div>
         <p class="small tabular">264k against a 150k line: "rotate"</p>
       </div>
       <p class="step" style="margin-top:3vh">The executor that built this gate this afternoon was the first session it caught.</p>
     </div>
   </div>
-  <p class="foot">The lead has the same problem at a slower rate. Its statusline shows its own transcript size; past 5 MB relay nudges once — write a handoff note, <code>/relay:handoff</code>, and a fresh lead picks up with the note as context.</p>
+  <p class="foot">The lead has the same problem at a slower rate. Its statusline shows its own transcript size; past 5 MB relay nudges once: write a handoff note, <code>/relay:handoff</code>, and a fresh lead picks up with the note as context.</p>
   <aside class="notes">Rotate = retire the old one (it writes a successor seed indexing its packets and reports) and spawn a new one that reads the seed first. You lose the conversation, you keep the knowledge.</aside>
 </section>
 
@@ -333,7 +356,7 @@ past the 150k nudge (long-context pricing starts at 200k) …
   <p class="eyebrow">lifecycle</p>
   <h1>When executors close, and how</h1>
   <div class="cols cols-3">
-    <div><p class="light">Landed</p><p class="muted">You committed (or discarded) its work — the files it claimed are clean in the tree. Two minutes later relay closes the tab on its own.</p></div>
+    <div><p class="light">Landed</p><p class="muted">You committed (or discarded) its work, and the files it claimed are clean in the tree. Two minutes later relay closes the tab on its own.</p></div>
     <div><p class="light">Idle</p><p class="muted">It reported, you've seen the report, and 60 minutes passed. Closed.</p></div>
     <div><p class="light">By hand</p><p class="muted"><code>/relay:close</code> now. <code>/relay:retire</code> to close <em>and</em> write the successor seed. <code>--keep</code> at spawn, or <code>relay keep</code>, pins one you know you'll need.</p></div>
   </div>
@@ -349,7 +372,7 @@ past the 150k nudge (long-context pricing starts at 200k) …
   <div class="cols cols-2">
     <div>
       <p><strong>The edit gate.</strong> Armed by <code>/relay:mode</code>. A lead that tries a large inline edit is blocked and told to delegate. Packet files are exempt. <code>/relay:route retain "reason"</code> opens a two-minute window when it really is lead work, with the reason in the ledger.</p>
-      <p class="step"><strong>Announce and wait.</strong> By default, when the wake fires, the lead tells you what's ready and stops. <code>/relay:auto on</code> flips that to proceed-by-default — inside a plan you already approved, and it resets each time lead mode is re-armed.</p>
+      <p class="step"><strong>Announce and wait.</strong> By default, when the wake fires, the lead tells you what's ready and stops. <code>/relay:auto on</code> flips that to proceed-by-default inside a plan you already approved, and it resets each time lead mode is re-armed.</p>
     </div>
     <div>
       <p class="step"><strong>Committing needs all five, even in auto:</strong></p>
@@ -360,7 +383,7 @@ past the 150k nudge (long-context pricing starts at 200k) …
         <li>nothing sign-off-gated is touched: core logic, ledgers, migrations, deploys</li>
         <li>the lead has actually read the diff</li>
       </ul>
-      <p class="step muted small">The last two are the lead's own attestations. The tool can't check them, so it refuses unless they're passed — and passing them falsely is a false statement in the ledger, not a shortcut.</p>
+      <p class="step muted small">The last two are the lead's own attestations. The tool can't check them, so it refuses unless they're passed. Passing them falsely is a false statement in the ledger, not a shortcut.</p>
     </div>
   </div>
   <aside class="notes">Today every commit stopped at the gate anyway, because the packets touched lib/lead_guard.py. That's the gate working.</aside>
@@ -417,7 +440,7 @@ opus    11       36%      7.6M
 sonnet  253      18%      10.0M</pre>
     </div>
     <div>
-      <p class="step">Rounds is still empty: relay never saw a manual <code>git commit</code>. The fix is in flight — a <code>landed</code> event recorded per packet the moment its claimed files are clean, so "how many fix-lists did this take" becomes a number.</p>
+      <p class="step">Rounds is still empty: relay never saw a manual <code>git commit</code>. The fix is in flight: a <code>landed</code> event recorded per packet the moment its claimed files are clean, so "how many fix-lists did this take" becomes a number.</p>
       <p class="step">Then "did I pick the right model" stops being a feeling.</p>
     </div>
   </div>

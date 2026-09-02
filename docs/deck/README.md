@@ -1,6 +1,6 @@
 # Relay deck
 
-`relay-deck.html` — a 17-slide talk about the plugin. Single file, no build, opens from disk.
+`relay-deck.html` — an 18-slide talk about the plugin. Single file, no build, opens from disk.
 
 ## Presenting
 
@@ -12,13 +12,14 @@ next slide; `←` back; `Home` / `End`; `n` toggles speaker notes; `?` shows thi
 
 | slides | minutes | what |
 |---|---|---|
-| 1–2 | 3 | the thesis: strong lead, bounded tasks for the rest |
-| 3–4 | 4 | the loop, the tabs |
-| 5–6 | 5 | the two contracts: packet, report/diff/verify |
-| 7–8 | 4 | choosing a model, effort |
-| 9–11 | 6 | caching (two slides), the bill |
-| 12–13 | 4 | reuse/rotate/hand off, how executors close |
-| 14–17 | 4 | guardrails, six steps, skills, what's next |
+| 1–2 | 3 | the picture, and how it differs from built-in subagents |
+| 3 | 2 | the thesis: strong lead, bounded tasks for the rest |
+| 4–5 | 4 | the loop, the tabs |
+| 6–7 | 5 | the two contracts: packet, report/diff/verify |
+| 8–9 | 4 | choosing a model, effort |
+| 10–12 | 6 | caching (two slides), the bill |
+| 13–14 | 4 | reuse/rotate/hand off, how executors close |
+| 15–18 | 4 | guardrails, six steps, skills, what's next |
 | demo | 10 | below |
 
 ## Demo script (10 min)
