@@ -535,13 +535,23 @@ against data instead of memory. It reads ONLY what's already on disk (the ledger
 the same `_usage_for_session` cache `relay list`/`relay board` use) — it writes nothing. Definitions:
 
 - A **packet** = one `NNN-packet.md` under a session's packets dir.
+- A packet is **landed** when its report exists, claims at least one path under "What changed", and
+  every claimed path is clean in the worktree (nothing staged/modified/untracked for it) at a
+  moment relay looks. It is recorded once per (session, packet) as a `landed` ledger event; a
+  packet whose report claims no paths can never land (investigation packets) and its ROUNDS stays
+  `-`. relay looks at three moments: `relay send` (before delivering the next packet — the common
+  case, since a manual `git commit` is otherwise invisible to relay), `relay list`/`relay check`
+  (when a session reads `reported`), and the auto-close sweep (right before it parks a session for
+  the same reason) — so the fact is ledgered no matter which of the three a lead's workflow hits
+  first.
 - **Rounds** = number of packets sent to that session whose gist/first line marks them as a
   follow-up on an earlier packet. relay's ledger doesn't record that linkage, so this falls back to
   counting packets sent to the same session strictly after this one, up to the lead's next real
-  commit — approximated by the `auto_commit` ledger event (only the `--for-autocommit` path emits
-  it; a plain manual `git commit` by the lead is invisible to relay). When no `auto_commit` event
-  follows a packet's send at all — true for almost every session today — ROUNDS renders `-` rather
-  than a fabricated number.
+  commit boundary — the earlier of a real `auto_commit` ledger event (only the `--for-autocommit`
+  path emits it) or a `landed` event (see above; this is what makes ROUNDS populate for the common
+  case of a lead committing by hand). When neither event follows a packet's send at all — a packet
+  still in flight, or one whose report claims no paths — ROUNDS renders `-` rather than a
+  fabricated number.
 - **Verdict** = the last `report_verify` ledger event for that session+packet (`COUNTS-MATCH` /
   `MISMATCH` / `MALFORMED` / `INCONCLUSIVE`, see [Verifying a report](#verifying-a-report-and-why-it-cant-tell-you-the-report-is-true)),
   else `-`.
@@ -573,8 +583,9 @@ never parks a report nobody looked at — and never touch busy/stalled sessions,
 `--when-idle` queue, unowned ones, or pinned ones (`relay keep <sid>` / `spawn --keep`; `keep --off`
 unpins). A heavy session (past the handoff threshold) is **retired** (seed written) instead of closed.
 The sweep runs on `relay check`, `relay list`, and every lead turn-end (the Stop hook), scoped to
-the lead's own executors; the ledger records `auto_closed` and `relay list --closed` shows
-`closed (auto)`.
+the lead's own executors; the ledger records `auto_closed` (and, right before it, a `landed` event
+when the reason is "landed" — the same fact `relay stats` ROUNDS reads, see below) and `relay list
+--closed` shows `closed (auto)`.
 
 Closing is parking, not loss: the report is on disk, staged work stays in the worktree, and
 `relay send <sid> <packet>` to a closed session resumes the **same conversation**.

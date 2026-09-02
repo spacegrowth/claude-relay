@@ -192,6 +192,24 @@ class TestCheckTransitions:
             result = relay._check_one("s1")
         assert result["status"] == "reported"
 
+    def test_reported_and_clean_records_landed(self, relay, tmp_path):
+        # _check_one is the "relay list/check after a manual commit" landing path — the report's
+        # claimed file is already clean in a real worktree, so this poll alone must ledger `landed`.
+        import subprocess as sp
+        wt = tmp_path / "wt"; wt.mkdir()
+        sp.run(["git", "-C", str(wt), "init", "-q"], check=True)
+        sp.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "--allow-empty", "-m", "init"], check=True)
+        self._make_session(relay, "s1c", pid=os.getpid())
+        s = relay.read_session("s1c"); s["worktree"] = str(wt); relay.write_session("s1c", s)
+        (relay.packets_dir("s1c") / "001-report.md").write_text("## What changed\n- `src/a.py`\n")
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            result = relay._check_one("s1c")
+        assert result["status"] == "reported"
+        events = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
+        assert any(e.get("event") == "landed" and e.get("session_id") == "s1c" and e.get("packet") == 1
+                   for e in events)
+
     def test_title_miss_with_live_pid_is_not_dead(self, relay):
         # REGRESSION: a tab-title match miss must NOT override a live process. Claude Code mutates
         # its own tab title while working, so a miss is not death. Live pid + no report → busy.
@@ -2384,6 +2402,28 @@ class TestSend:
         out = capsys.readouterr().out
         assert "ℹ round 3 into this session on sonnet" in out
         assert "respawn stronger and --supersede" in out
+
+    def test_send_records_landed_for_current_packet_before_next_packet_sent(self, relay, tmp_path):
+        # Ledger event ORDER matters here: packet 001's `landed` must be appended before packet
+        # 002's `packet_sent` — this is the case auto-close misses (the lead commits, then sends
+        # the next packet right away, never leaving the session idle long enough for the sweep).
+        import subprocess as sp
+        wt = tmp_path / "wt"; wt.mkdir()
+        sp.run(["git", "-C", str(wt), "init", "-q"], check=True)
+        sp.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "--allow-empty", "-m", "init"], check=True)
+        self._mk(relay, status="reported", pid=os.getpid(), claude_session="cs-x", report=True)
+        s = relay.read_session("e1"); s["worktree"] = str(wt); relay.write_session("e1", s)
+        (relay.packets_dir("e1") / "001-report.md").write_text("## What changed\n- `src/a.py`\n")
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        events = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
+        landed_idx = next(i for i, e in enumerate(events)
+                           if e.get("event") == "landed" and e.get("packet") == 1)
+        sent_idx = next(i for i, e in enumerate(events)
+                         if e.get("event") == "packet_sent" and e.get("packet") == 2)
+        assert landed_idx < sent_idx
 
     def test_send_fails_without_claude_session_marks_dead(self, relay, tmp_path):
         # No captured Claude session → today's behavior: mark dead, tell them to spawn.
@@ -5804,6 +5844,19 @@ class TestAutoCloseSweep:
         assert s["status"] == "closed" and s["auto_closed"] == "landed"
         assert any(e.get("event") == "auto_closed" for e in map(json.loads, relay.LEDGER.read_text().splitlines()))
 
+    def test_landed_ledgered_before_auto_closed(self, relay, tmp_path):
+        # The sweep must record `landed` for the same reason it's about to close the session — the
+        # two ledger facts must never disagree, and `landed` comes first in the event stream.
+        wt = self._repo(tmp_path)
+        self._exec(relay, wt)
+        self._sweep(relay)
+        events = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
+        landed_idx = next(i for i, e in enumerate(events)
+                           if e.get("event") == "landed" and e.get("session_id") == "e1")
+        closed_idx = next(i for i, e in enumerate(events)
+                           if e.get("event") == "auto_closed" and e.get("session_id") == "e1")
+        assert landed_idx < closed_idx
+
     def test_staged_work_still_present_is_not_landed(self, relay, tmp_path):
         wt = self._repo(tmp_path)
         (wt / "src").mkdir(); (wt / "src" / "a.py").write_text("x")   # untracked claimed file = still here
@@ -5882,6 +5935,91 @@ class TestAutoCloseSweep:
             relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(pkt), model=None,
                                             name="k1", scope=None, skip_perms=None, pane=None, keep=True))
         assert relay.read_session("k1")["keep"] is True
+
+
+class TestRecordLandedIfClean:
+    """record_landed_if_clean: the single ledger-writing decision the send/check/sweep call sites
+    all share. Real tmp git worktrees (no mocking the git plumbing itself) — same pattern as
+    TestAutoCloseSweep._repo."""
+
+    def _repo(self, tmp_path):
+        import subprocess as sp
+        wt = tmp_path / "wt"; wt.mkdir()
+        sp.run(["git", "-C", str(wt), "init", "-q"], check=True)
+        sp.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "--allow-empty", "-m", "init"], check=True)
+        return wt
+
+    def _mk(self, relay, wt, sid="e1", report_body="## What changed\n- `src/a.py`\n"):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": str(wt), "topic": "t", "scope": "t",
+            "tab_label": f"[Exec] {sid}", "status": "reported", "current_packet": 1,
+            "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-report.md").write_text(report_body)
+        return relay.read_session(sid)
+
+    def _landed_events(self, relay):
+        if not relay.LEDGER.exists():
+            return []
+        return [json.loads(l) for l in relay.LEDGER.read_text().splitlines() if l.strip()
+                and json.loads(l).get("event") == "landed"]
+
+    def test_recorded_when_claimed_paths_clean(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        s = self._mk(relay, wt)
+        relay.record_landed_if_clean("e1", s, 1, "test")
+        events = self._landed_events(relay)
+        assert len(events) == 1
+        e = events[0]
+        assert e["session_id"] == "e1" and e["packet"] == 1 and e["trigger"] == "test"
+
+    def test_not_recorded_when_claimed_path_is_dirty(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        (wt / "src").mkdir(); (wt / "src" / "a.py").write_text("x")  # untracked = still dirty
+        s = self._mk(relay, wt)
+        relay.record_landed_if_clean("e1", s, 1, "test")
+        assert self._landed_events(relay) == []
+
+    def test_not_recorded_when_report_claims_no_paths(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        s = self._mk(relay, wt, report_body="## TL;DR\n- outcome: researched, nothing to stage\n")
+        relay.record_landed_if_clean("e1", s, 1, "test")
+        assert self._landed_events(relay) == []
+
+    def test_idempotent_second_call_appends_nothing(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        s = self._mk(relay, wt)
+        relay.record_landed_if_clean("e1", s, 1, "test")
+        relay.record_landed_if_clean("e1", s, 1, "test")
+        assert len(self._landed_events(relay)) == 1
+
+    def test_sha_present_when_git_works(self, relay, tmp_path):
+        wt = self._repo(tmp_path)
+        s = self._mk(relay, wt)
+        relay.record_landed_if_clean("e1", s, 1, "test")
+        sha = self._landed_events(relay)[0]["sha"]
+        assert sha and len(sha) == 40
+
+    def test_sha_none_when_git_rev_parse_fails(self, relay, tmp_path, monkeypatch):
+        # Best-effort per the spec: a failing `git rev-parse HEAD` must not block the landed
+        # event itself, just leave `sha` unknown.
+        wt = self._repo(tmp_path)
+        s = self._mk(relay, wt)
+        real_run = relay.subprocess.run
+
+        def fake_run(cmd, **kw):
+            if "rev-parse" in cmd:
+                raise RuntimeError("boom")
+            return real_run(cmd, **kw)
+        monkeypatch.setattr(relay.subprocess, "run", fake_run)
+        relay.record_landed_if_clean("e1", s, 1, "test")
+        events = self._landed_events(relay)
+        assert len(events) == 1 and events[0]["sha"] is None
+
+    def test_never_raises_on_unreadable_worktree(self, relay, tmp_path):
+        s = self._mk(relay, tmp_path / "not-a-repo")  # never created, no git there
+        relay.record_landed_if_clean("e1", s, 1, "test")  # must not raise
+        assert self._landed_events(relay) == []
 
 
 class TestLeadStopHookTriggersAutoClose:
@@ -6348,6 +6486,33 @@ class TestCmdStats:
         relay.append_ledger("auto_commit_blocked", session_id="s1", packet=1, ts="2026-01-01T01:00:00")
         row = relay.stats_data()["rows"][0]
         assert row["rounds"] == "-"
+
+    def test_landed_event_ends_the_round_count_like_auto_commit(self, relay):
+        # A `landed` event (the report's claimed files went clean — recorded by send/check/sweep,
+        # not just the rare auto_commit hook path) must close the rounds window exactly like a real
+        # auto_commit does — this is the whole point of the ledger addition.
+        self._mk(relay, "s1", model="opus")
+        self._packet(relay, "s1", 1)
+        self._packet(relay, "s1", 2)
+        relay.append_ledger("packet_sent", session_id="s1", packet=1, ts="2026-01-01T00:00:00")
+        relay.append_ledger("packet_sent", session_id="s1", packet=2, ts="2026-01-01T01:00:00")
+        relay.append_ledger("landed", session_id="s1", packet=1, ts="2026-01-01T02:00:00", trigger="send")
+        row = {r["packet"]: r for r in relay.stats_data()["rows"]}["001"]
+        assert row["rounds"] == 1
+
+    def test_earliest_of_landed_and_auto_commit_wins(self, relay):
+        self._mk(relay, "s1", model="opus")
+        self._packet(relay, "s1", 1)
+        self._packet(relay, "s1", 2)
+        self._packet(relay, "s1", 3)
+        relay.append_ledger("packet_sent", session_id="s1", packet=1, ts="2026-01-01T00:00:00")
+        relay.append_ledger("packet_sent", session_id="s1", packet=2, ts="2026-01-01T01:00:00")
+        # landed fires BEFORE auto_commit — the round count must stop at the earlier one.
+        relay.append_ledger("landed", session_id="s1", packet=1, ts="2026-01-01T01:30:00", trigger="check")
+        relay.append_ledger("auto_commit", session_id="s1", packet=1, ts="2026-01-01T03:00:00", cleared=True)
+        relay.append_ledger("packet_sent", session_id="s1", packet=3, ts="2026-01-01T04:00:00")
+        row = {r["packet"]: r for r in relay.stats_data()["rows"]}["001"]
+        assert row["rounds"] == 1   # only packet 2 (sent before 01:30), not packet 3 (sent after)
 
     # ── --since filters on the packet's send ts; unknown ts is never filtered out ──────
     def test_since_filters_out_old_packets(self, relay, monkeypatch):

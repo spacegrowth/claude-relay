@@ -1637,6 +1637,9 @@ def cmd_send(args):
     s = _maybe_adopt(args.session_id, s)
 
     n = next_packet_number(args.session_id)
+    cur = s.get("current_packet")
+    if cur:
+        record_landed_if_clean(args.session_id, s, cur, "send")
     body = Path(args.packet).read_text()
     warn_missing_preconditions(body, "sending")
     print_lint(body, cwd=s.get("worktree"), model=s.get("model"))
@@ -1993,6 +1996,7 @@ def _check_one(session_id):
             if s["status"] != "reported":
                 append_ledger("reported", session_id=session_id, packet=n)
             s["status"] = "reported"
+            record_landed_if_clean(session_id, s, n, "check")
         elif proc_alive:
             elapsed = _busy_elapsed(s)
             if s["status"] == "busy" and elapsed is not None and elapsed > _stall_threshold_seconds():
@@ -2057,6 +2061,42 @@ def _git_dirty_paths(worktree):
         return None
 
 
+def record_landed_if_clean(sid, s, packet_n, trigger):
+    """Ledger a `landed` event for (sid, packet_n) the moment relay can SEE it: the report exists,
+    claims at least one path under "What changed", and every claimed path is clean in the worktree
+    (see the "relay stats" README DEFINITION). This is the same test `auto_close_decision` uses to
+    say "landed" (`lib/lead_guard.py`'s auto-close policy comment) — recorded here independently so
+    a session that gets its NEXT packet right after the lead commits by hand (never idling long
+    enough for the auto-close sweep to see it) still gets the event. Idempotent (a `landed` event
+    already on the ledger for this (sid, packet_n) is a no-op) and best-effort: any failure (unreadable
+    report, non-repo worktree, ledger I/O) is swallowed — this is a nice-to-have stats signal, never
+    something a caller's flow should break on."""
+    try:
+        report = packets_dir(sid) / f"{packet_n:03d}-report.md"
+        if not report.exists():
+            return
+        claimed, _scoped = report_verify.claimed_paths(report.read_text())
+        if not claimed:
+            return  # investigation packets that claim no paths can never land
+        dirty = _git_dirty_paths(s.get("worktree") or "")
+        if dirty is None or (set(claimed) & set(dirty)):
+            return  # unreadable worktree state, or a claimed path is still dirty
+        events = _ledger_by_session().get(sid, [])
+        if any(e.get("event") == "landed" and e.get("packet") == packet_n for e in events):
+            return  # already recorded
+        sha = None
+        try:
+            r = subprocess.run(["git", "-C", str(s.get("worktree") or ""), "rev-parse", "HEAD"],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                sha = r.stdout.strip()
+        except Exception:
+            pass
+        append_ledger("landed", session_id=sid, packet=packet_n, trigger=trigger, sha=sha)
+    except Exception:
+        pass
+
+
 def auto_close_sweep(trigger, sids=None, lead_sid=None):
     """Park finished executors (lead_guard "auto-close policy"). Deterministic, best-effort, never
     raises: evaluates lead_guard.auto_close_decision for each candidate and delegates the teardown
@@ -2099,6 +2139,8 @@ def auto_close_sweep(trigger, sids=None, lead_sid=None):
                 if not decision:
                     continue
                 action, reason = decision
+                if reason == "landed":
+                    record_landed_if_clean(sid, s, n, trigger)
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     if action == "retire":
@@ -2479,13 +2521,16 @@ def _packet_verdict(events, packet_n):
 def _packet_rounds(events, packet_n, sent_ts):
     """DEFINITIONS 'Rounds' (approximation, see README): relay's ledger doesn't record follow-up
     linkage between packets, so this counts packets sent to the SAME session strictly after
-    `packet_n`'s own send, up to the next real 'auto_commit' ledger event (a CLEARED auto-commit —
-    never `auto_commit_blocked`, which is not a commit). Returns None — render '-', never a fabricated
-    number — when `sent_ts` is unknown, or no auto_commit event follows it at all (true for almost
-    every session today: manual `git commit` by the lead isn't ledgered)."""
+    `packet_n`'s own send, up to whichever commit-boundary event comes first: a real 'auto_commit'
+    (a CLEARED auto-commit — never `auto_commit_blocked`, which is not a commit) or a `landed` event
+    (the report's claimed files went clean in the worktree — recorded on `send`/`check`/the
+    auto-close sweep; see record_landed_if_clean). Either one ends the round count; when both are
+    present after `sent_ts`, the earliest wins. Returns None — render '-', never a fabricated number
+    — when `sent_ts` is unknown, or neither event follows it at all (expected for a packet still in
+    flight, or one whose report claims no paths and so can never land)."""
     if sent_ts is None:
         return None
-    commit_ts = min((e["ts"] for e in events if e.get("event") == "auto_commit"
+    commit_ts = min((e["ts"] for e in events if e.get("event") in ("auto_commit", "landed")
                      and e.get("ts") and e["ts"] > sent_ts), default=None)
     if commit_ts is None:
         return None
