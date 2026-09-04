@@ -11,8 +11,10 @@ activity it would otherwise miss, and ANNOUNCE-AND-WAIT (never auto-act). Two th
   App 2 — the lead made NEW commit(s) this turn (covers the Bash/`git commit` vector the PreToolUse
           edit-gate can't see). These already exist at stop time → checked synchronously, instantly.
 
-Also, once per lead ever: if the transcript file has grown past handoff_nudge_mb, nudge a handoff
-(summarize → /relay:stop → fresh session + /relay:mode) — a heavy-session proxy, not automation.
+Also, once per lead ever: if live context (transcript_usage's last_prompt) has grown past
+context_nudge_tokens, OR the transcript file has grown past handoff_nudge_mb (the secondary
+"session age" / compaction-count signal), nudge a handoff (summarize → /relay:stop → fresh session
++ /relay:mode) — a best-effort nudge, not automation.
 
 Contract (proven by the asyncRewake spike — see docs/async-rewake-findings.md): runs in the
 background; exit 0 → silent, lead stays idle; exit 2 → the idle lead WAKES with this script's
@@ -277,23 +279,40 @@ def main():
             rlines, rkeys = _report_lines(lg, sid)
             lines += rlines
             surfaced_keys += rkeys
-        # Handoff nudge — a heavy transcript is a PROXY for session weight (not context-window
-        # occupancy: compaction shrinks context but the file keeps growing), so this fires ONCE
-        # ever per lead (flag file, not the surfaced_keys dedup — it isn't a report) and rides
-        # whatever wake already fires below rather than opening a second exit-2 path.
+        # Handoff nudge — token-first, MB as the secondary "session age" signal: live context
+        # (transcript_usage's last_prompt) is the primary trip, exactly like the executor heaviness
+        # gate (lead_guard.is_heavy); a heavy transcript-MB-on-disk (never shrinks — compaction
+        # shrinks context, not the file) trips it too, since a big MB alone means several
+        # compactions in — the lead's memory of the plan is a summary of summaries. Fires ONCE ever
+        # per lead (flag file, not the surfaced_keys dedup — it isn't a report) and rides whatever
+        # wake already fires below rather than opening a second exit-2 path.
         try:
             if cfg.get("handoff_nudge", True) and not lg.handoff_nudged(STATE_ROOT, sid):
                 mb = lg.transcript_mb(transcript_path)
-                if mb >= float(cfg.get("handoff_nudge_mb", 5)):
+                usage = lg.transcript_usage(transcript_path)
+                token_threshold = float(cfg.get("context_nudge_tokens",
+                                                 lg.LEAD_DEFAULTS["context_nudge_tokens"]))
+                mb_threshold = float(cfg.get("handoff_nudge_mb", 5))
+                tokens = usage.get("last_prompt") if usage else None
+                tokens_over = tokens is not None and tokens >= token_threshold
+                mb_over = mb >= mb_threshold
+                if tokens_over or mb_over:
                     lg.mark_handoff_nudged(STATE_ROOT, sid)  # mark FIRST — a crash after this
                                                               # can't double-nudge; worst case one
                                                               # nudge is silently skipped
+                    if tokens_over:  # token-first: say the real signal when it's the one that tripped
+                        reading = (f"{lg.human_tokens(tokens)} live context, past "
+                                   f"{lg.human_tokens(token_threshold)}")
+                    else:
+                        reading = (f"~{mb:.1f}MB transcript, past {mb_threshold:g}MB: several "
+                                   "compactions in")
                     lines.append(
-                        f"  \U0001f501 this lead session is getting heavy (~{mb:.1f}MB transcript). "
+                        f"  \U0001f501 this lead session is getting heavy ({reading}). "
                         "Consider handing off: write a handoff md, then run /relay:handoff "
                         "<md> — it opens a pre-armed successor and steps this session down."
                     )
-                    lg.append_ledger(STATE_ROOT, "handoff_nudged", session_id=sid, mb=round(mb, 1))
+                    lg.append_ledger(STATE_ROOT, "handoff_nudged", session_id=sid, mb=round(mb, 1),
+                                      tokens=(int(tokens) if tokens is not None else None))
         except Exception:
             pass  # fail-open — the nudge is best-effort, never worth breaking the hook over
         if lines:

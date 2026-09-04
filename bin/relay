@@ -2789,21 +2789,53 @@ def _resolve_status_payload(args):
 
 
 def _weight_segment(state_root, lead_sid, transcript_path):
-    """The transcript-size / handoff-awareness segment: ambient early warning before the one-shot
+    """The context-weight / handoff-awareness segment: ambient early warning before the one-shot
     handoff nudge (stop_lead_watch) fires, persistent pointer after. `transcript_path` is only
     ever set in --statusline mode (see _resolve_status_payload), so this is silent for positional-
-    id/env-var invocations — there's no transcript to measure. Reuses lead_guard.transcript_mb/
-    handoff_nudged rather than re-deriving either. Returns "" when there's nothing to say (below
-    60% of the threshold, unnudged and mb <= 0, or handoff_nudge disabled in config)."""
+    id/env-var invocations — there's no transcript to measure.
+
+    Token-first, like the executor heaviness footnote (_heavy_reading_text): when the transcript's
+    usage can be parsed, live context (last_prompt) is the primary reading — "<ctx>k ctx" from 60%
+    of context_nudge_tokens, "<ctx>k ctx → /relay:handoff" at/after the threshold or once nudged.
+    Transcript-MB stays the secondary "session age" (compaction-count) signal: it's folded in
+    alongside ctx whenever MB alone is past handoff_nudge_mb (or the once-ever nudge already
+    fired) even if tokens haven't crossed their own threshold — a big MB-on-disk means several
+    compactions in regardless of the CURRENT live context. When usage can't be parsed at all
+    (unreadable transcript), falls back to the original MB-only behaviour unchanged.
+    Reuses lead_guard.transcript_mb/transcript_usage/handoff_nudged/human_tokens rather than
+    re-deriving any of them. Returns "" when there's nothing to say (handoff_nudge disabled, or
+    both signals below their 60%-of-threshold "near" mark)."""
     cfg = lead_guard.load_config(state_root)
     if not cfg.get("handoff_nudge", True):
         return ""
     mb = lead_guard.transcript_mb(transcript_path)
-    threshold = float(cfg.get("handoff_nudge_mb", 5))
+    mb_threshold = float(cfg.get("handoff_nudge_mb", 5))
+    token_threshold = float(cfg.get("context_nudge_tokens", lead_guard.LEAD_DEFAULTS["context_nudge_tokens"]))
     nudged = lead_guard.handoff_nudged(state_root, lead_sid)
-    if (mb >= threshold) or (nudged and mb > 0):
-        return f"{mb:.1f}MB → /relay:handoff"
-    if mb >= 0.6 * threshold:
+    mb_over = (mb >= mb_threshold) or (nudged and mb > 0)
+    mb_near = mb >= 0.6 * mb_threshold
+
+    usage = lead_guard.transcript_usage(transcript_path) if transcript_path else None
+    if usage is None:  # unreadable transcript — today's MB-only behaviour, unchanged
+        if mb_over:
+            return f"{mb:.1f}MB → /relay:handoff"
+        if mb_near:
+            return f"{mb:.1f}MB"
+        return ""
+
+    tokens = usage.get("last_prompt") or 0
+    ctx_text = f"{lead_guard.human_tokens(tokens)} ctx"
+    tokens_over = (tokens >= token_threshold) or (nudged and tokens > 0)
+    tokens_near = tokens >= 0.6 * token_threshold
+
+    if tokens_over or mb_over:
+        parts = [ctx_text]
+        if mb_over:  # MB past its OWN threshold is worth saying even when tokens aren't over
+            parts.append(f"{mb:.1f}MB")
+        return " · ".join(parts) + " → /relay:handoff"
+    if tokens_near:
+        return ctx_text
+    if mb_near:
         return f"{mb:.1f}MB"
     return ""
 
@@ -3082,6 +3114,14 @@ def _usage_for_session(s):
         return None
 
 
+def _lead_usage_for(m):
+    """Token usage for a LEAD's own conversation — the CTX-column sibling to `_usage_for_session`
+    (executors). A lead's `claude_session` IS its `session_id` (no separate executor-style field;
+    see the caller comment at `caller in (s.get("claude_session"), s.get("session_id"))`), so this
+    reuses the same shape/caching by handing `_usage_for_session` a synthetic dict."""
+    return _usage_for_session({"session_id": m.get("session_id"), "claude_session": m.get("session_id")})
+
+
 def _mb_cell_text(mb):
     """'-' for an unlocatable transcript (mb is None), else one decimal place — the shared cell
     formatter behind both the LEADS and EXECUTORS MB columns."""
@@ -3114,24 +3154,16 @@ def _heaviness_threshold_mb():
 
 
 def _is_heavy(usage, mb, token_threshold, mb_threshold):
-    """Whether an executor counts as 'heavy' for §6e e1/e2. `usage` (lead_guard.transcript_usage's
-    dict, or None) is the primary signal: heavy when its `last_prompt` (the live context) is at/above
-    `token_threshold`. `usage is None` means the transcript couldn't be parsed for real usage at all
-    (unlocatable, or not a Claude Code transcript) — falls back to the raw MB reading against
-    `mb_threshold` so that case never silently reads as 'never heavy'. Both unavailable (mb is also
-    None) → never heavy; there's nothing to warn about, and guessing would be worse than quiet."""
-    if usage is not None:
-        return (usage.get("last_prompt") or 0) >= token_threshold
-    return mb is not None and mb >= mb_threshold
+    """Whether an executor counts as 'heavy' for §6e e1/e2. Thin wrapper — the actual rule now
+    lives in lead_guard.is_heavy (shared with the lead's own handoff nudge); kept as a local name
+    so every existing call site here stays untouched."""
+    return lead_guard.is_heavy(usage, mb, token_threshold, mb_threshold)
 
 
 def _heavy_reading_text(usage, mb):
     """The human-readable 'how heavy' reading behind both the heavy footnote (cmd_list) and the
-    send-time gate message: token reading when usage parsed (the real signal), else the MB-fallback
-    reading with a note that it's a proxy."""
-    if usage is not None:
-        return f"{lead_guard.human_tokens(usage.get('last_prompt') or 0)} ctx"
-    return f"{mb:.1f}MB (transcript unreadable for usage; MB proxy)" if mb is not None else "unknown"
+    send-time gate message. Thin wrapper over lead_guard.heavy_reading_text — see _is_heavy."""
+    return lead_guard.heavy_reading_text(usage, mb)
 
 
 def cmd_list(args):
@@ -3225,6 +3257,12 @@ def cmd_list(args):
                       "unknown": ("ver?", ("dim",)), "stuck": ("stuck", ("red", "bold"))}
         # One liveness verdict per lead, computed up front — see the LIVE column comment below.
         liveness_by_sid = {m.get("session_id"): _lead_liveness(m) for m in leads}
+        # One usage reading per lead, computed up front (same memoize-once rationale as liveness
+        # above) — feeds the CTX column and is cached on disk itself (_usage_for_session's
+        # usage.json), but still worth reading once rather than twice (width calc + row render).
+        lead_usage_by_sid = {m.get("session_id"): _lead_usage_for(m) for m in leads}
+        lead_ctx_by_sid = {sid: (lead_guard.human_tokens(u.get("last_prompt")) if u else "-")
+                           for sid, u in lead_usage_by_sid.items()}
         # Calculate dynamic widths for LEADS table with per-column caps.
         lead_cols = [
             ("PROJECT", 22, [m.get("project") or "-" for m in leads]),
@@ -3246,8 +3284,13 @@ def cmd_list(args):
             # and this table needs it in four places (sizing, row, two footnotes) — re-probing
             # would add 4×N subprocess round-trips to every `relay list`.
             ("LIVE", 11, [_LIVENESS_CELL[liveness_by_sid[m.get("session_id")]][0] for m in leads]),
-            # MB: §9's cheap sibling to §3 — this lead's own transcript size, so a heavy session is
-            # a visible climbing number all day rather than a surprise at the handoff nudge.
+            # CTX: the LIVE context (last request's live prompt) driving the token-first handoff
+            # nudge/statusline segment — same reading the EXECUTORS CTX column shows, so "how heavy
+            # is this lead" and "how heavy is this executor" never disagree about what they mean.
+            ("CTX", 6, [lead_ctx_by_sid[m.get("session_id")] for m in leads]),
+            # MB: §9's cheap sibling to §3 — this lead's own transcript size on disk, the secondary
+            # "session age" (compaction-count) signal: never shrinks, so a climbing number here
+            # means several compactions in even when CTX (current live context) looks fine.
             ("MB", 6, [_lead_mb_cell(m) for m in leads]),
             ("LAST ACTIVE", 12, [_lead_age_cell(m) for m in leads]),
         ]
@@ -3274,6 +3317,7 @@ def cmd_list(args):
                 cell(term_text, lead_widths["TERM"]) if term_text != "?"
                 else c(cell(term_text, lead_widths["TERM"]), "dim"),
                 c(cell(live_text, lead_widths["LIVE"]), *live_styles),
+                cell(lead_ctx_by_sid[m.get("session_id")], lead_widths["CTX"]),
                 cell(_lead_mb_cell(m), lead_widths["MB"]),
                 cell(_lead_age_cell(m), lead_widths["LAST ACTIVE"]),
             ]

@@ -4518,6 +4518,28 @@ class TestLeadTranscriptMB:
         row = [l for l in out.splitlines() if l.startswith("heavy")][0]
         assert "3.0" in row.split()
 
+    def test_ctx_column_renders_before_mb(self, relay, capsys, monkeypatch, tmp_path):
+        # CTX (live context, the token-first signal) sits immediately before MB (the secondary
+        # session-age signal) — same source as the EXECUTORS CTX column (transcript_usage's
+        # last_prompt), read straight off the lead's own transcript.
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        proj_dir = tmp_path / "cfg" / "projects" / "-p"
+        proj_dir.mkdir(parents=True)
+        line = json.dumps({"type": "assistant", "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": {"id": "m1", "model": "claude-sonnet-5", "usage": {
+                "input_tokens": 0, "cache_read_input_tokens": 84000,
+                "cache_creation_input_tokens": 0, "output_tokens": 10}}})
+        (proj_dir / "lead-1.jsonl").write_text(line + "\n")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="heavy")
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        header = [l for l in out.splitlines() if l.split()[:1] == ["PROJECT"]][0]
+        assert header.split().index("CTX") < header.split().index("MB")
+        row = [l for l in out.splitlines() if l.startswith("heavy")][0]
+        assert "84k" in row.split()
+
 
 class TestHeavinessHelpers:
     """§6e (retargeted, ctx-gate): the shared token/threshold helpers behind both the EXECUTORS
@@ -5030,6 +5052,64 @@ class TestStatus:
         files_after = sorted(p.relative_to(lead_dir) for p in lead_dir.rglob("*") if p.is_file())
         assert session_before == session_after
         assert files_before == files_after
+
+
+class TestWeightSegmentTokenFirst:
+    """_weight_segment (statusline): token-first like the executor heaviness footnote —
+    context_nudge_tokens drives the primary reading; handoff_nudge_mb is the secondary "session
+    age" signal, folded in alongside ctx whenever MB is independently past ITS OWN threshold (even
+    when tokens aren't). Falls back to the original MB-only rendering when usage can't be parsed."""
+
+    def _usage_file(self, path, last_prompt, grow_to_mb=None):
+        """A minimal real-shaped transcript line (`_write_usage_transcript`'s sibling, but writing
+        straight to `path` since `_weight_segment` reads `transcript_path` directly rather than
+        scanning CLAUDE_CONFIG_DIR). `grow_to_mb`, when given, pads the file past the real line with
+        a truncate (sparse trailing bytes) so it also crosses the MB threshold."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"type": "assistant", "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": {"id": "m1", "model": "claude-sonnet-5", "usage": {
+                "input_tokens": 0, "cache_read_input_tokens": last_prompt,
+                "cache_creation_input_tokens": 0, "output_tokens": 10}}})
+        path.write_text(line + "\n")
+        if grow_to_mb is not None:
+            with open(path, "ab") as f:
+                f.truncate(int(grow_to_mb * 1024 * 1024))
+        return path
+
+    def test_tokens_only_over_threshold(self, relay, tmp_path):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1")
+        transcript = self._usage_file(tmp_path / "t.jsonl", 212000)
+        seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", str(transcript))
+        assert seg == "212k ctx → /relay:handoff"
+
+    def test_mb_only_over_threshold_shows_both(self, relay, tmp_path):
+        # MB alone past its threshold still nudges — and still says the (below-threshold) ctx
+        # reading alongside it, since a big MB means several compactions in regardless.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1")
+        transcript = self._usage_file(tmp_path / "t.jsonl", 1200, grow_to_mb=6)
+        seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", str(transcript))
+        assert seg == "1.2k ctx · 6.0MB → /relay:handoff"
+
+    def test_both_over_threshold(self, relay, tmp_path):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1")
+        transcript = self._usage_file(tmp_path / "t.jsonl", 212000, grow_to_mb=6)
+        seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", str(transcript))
+        assert seg == "212k ctx · 6.0MB → /relay:handoff"
+
+    def test_unreadable_usage_falls_back_to_mb_only(self, relay, tmp_path, monkeypatch):
+        # usage is None (transcript can't be parsed at all) — today's MB-only behaviour, unchanged.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1")
+        monkeypatch.setattr(relay.lead_guard, "transcript_usage", lambda path: None)
+        monkeypatch.setattr(relay.lead_guard, "transcript_mb", lambda path: 6.0)
+        seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", "/no/such/file.jsonl")
+        assert seg == "6.0MB → /relay:handoff"
+        assert "ctx" not in seg
+
+    def test_both_below_threshold_silent(self, relay, tmp_path):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1")
+        transcript = self._usage_file(tmp_path / "t.jsonl", 500)
+        seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", str(transcript))
+        assert seg == ""
 
 
 class TestResolveSid:

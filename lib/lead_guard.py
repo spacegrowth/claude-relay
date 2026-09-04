@@ -46,18 +46,22 @@ LEAD_DEFAULTS = {
     "tab_colors": True,          # iTerm only: color each lead's tab + its executors' tabs alike
     "executor_layout": "tab",    # "tab" | "pane" (pane: iTerm only, split into the lead's window)
     "handoff_nudge": True,       # suggest handing off when the lead transcript gets heavy
-    "handoff_nudge_mb": 5,       # transcript-size threshold (MB); proxy, not context occupancy.
-                                 # Still drives the LEAD's own transcript-weight nudge above. As the
-                                 # EXECUTOR heaviness signal it is DEPRECATED in favor of
-                                 # context_nudge_tokens (below) — kept only as the fallback reading
-                                 # when an executor's transcript can't be parsed for real usage.
-    "context_nudge_tokens": 150000,  # the executor heaviness signal (bin/relay's cmd_send gate,
-                                 # `relay list`'s heavy footnote, board): an executor is "heavy" when
-                                 # its LAST request's live context (input + cache_read + cache_create
-                                 # — transcript_usage's `last_prompt`) is at/above this many tokens.
-                                 # Replaces handoff_nudge_mb's transcript-MB proxy with the number
-                                 # that actually drives cost/compaction. Falls back to the old MB
-                                 # test (handoff_nudge_mb) only when usage can't be read at all.
+    "handoff_nudge_mb": 5,       # SESSION-AGE signal (MB on disk, a compaction proxy) for BOTH
+                                 # leads and executors: MB never shrinks, so a big number means
+                                 # several compactions in — "the session's memory of the plan is a
+                                 # summary of summaries" — even when live context is currently small.
+                                 # Secondary to context_nudge_tokens (below) for both: fires the
+                                 # LEAD's handoff nudge/statusline segment alongside tokens, and is
+                                 # the EXECUTOR fallback reading when a transcript can't be parsed
+                                 # for real usage at all.
+    "context_nudge_tokens": 150000,  # the COST/CONTEXT signal for BOTH leads and executors
+                                 # (bin/relay's cmd_send gate, `relay list`'s heavy footnote and CTX
+                                 # columns, board, and the lead's own handoff nudge/statusline
+                                 # segment): heavy when the LAST request's live context (input +
+                                 # cache_read + cache_create — transcript_usage's `last_prompt`) is
+                                 # at/above this many tokens. This is the number that actually drives
+                                 # cost/compaction; handoff_nudge_mb is the fallback reading only
+                                 # when usage can't be read at all.
     "cache_ttl_minutes": 60,     # Claude Code's prompt-cache TTL (1 hour by default) — how long the
                                  # last request's prefix stays cached free. Configurable because a
                                  # workspace running the 5-minute-TTL tier (usage overage) needs a
@@ -1820,6 +1824,29 @@ def usage_cell(usage, cache=None):
     if state == "cold":
         return f"{base} ·cold~{human_tokens(est)}"
     return base
+
+
+def is_heavy(usage, mb, token_threshold, mb_threshold):
+    """Whether a session (lead or executor) counts as 'heavy'. `usage` (transcript_usage's dict, or
+    None) is the primary signal: heavy when its `last_prompt` (the live context) is at/above
+    `token_threshold`. `usage is None` means the transcript couldn't be parsed for real usage at all
+    (unlocatable, or not a Claude Code transcript) — falls back to the raw MB reading against
+    `mb_threshold` so that case never silently reads as 'never heavy'. Both unavailable (mb is also
+    None) → never heavy; there's nothing to warn about, and guessing would be worse than quiet.
+    Shared by bin/relay's executor gate (§6e e2, `relay list`'s heavy footnote/CTX columns) and the
+    lead's own handoff nudge — moved here so both read the exact same rule."""
+    if usage is not None:
+        return (usage.get("last_prompt") or 0) >= token_threshold
+    return mb is not None and mb >= mb_threshold
+
+
+def heavy_reading_text(usage, mb):
+    """The human-readable 'how heavy' reading behind the heavy footnote, the send-time gate message,
+    and the lead's handoff nudge: token reading when usage parsed (the real signal), else the
+    MB-fallback reading with a note that it's a proxy."""
+    if usage is not None:
+        return f"{human_tokens(usage.get('last_prompt') or 0)} ctx"
+    return f"{mb:.1f}MB (transcript unreadable for usage; MB proxy)" if mb is not None else "unknown"
 
 
 def launch_cell(s):

@@ -2299,6 +2299,30 @@ class TestStopHookLivePayload:
                                     "transcript_path": str(transcript)})[0] == 0
 
 
+class TestIsHeavy:
+    """lead_guard.is_heavy / heavy_reading_text — moved here from bin/relay (which now keeps thin
+    _is_heavy/_heavy_reading_text wrappers) so the lead's own handoff nudge reads the exact same
+    heaviness rule the executor gate does, instead of a second copy of it."""
+
+    def test_tokens_at_or_above_threshold(self):
+        assert lg.is_heavy({"last_prompt": 150000}, None, 150000, 5.0) is True
+        assert lg.is_heavy({"last_prompt": 149999}, None, 150000, 5.0) is False
+
+    def test_falls_back_to_mb_when_usage_unreadable(self):
+        assert lg.is_heavy(None, 6.0, 150000, 5.0) is True
+        assert lg.is_heavy(None, 4.0, 150000, 5.0) is False
+
+    def test_both_unavailable_is_never_heavy(self):
+        assert lg.is_heavy(None, None, 150000, 5.0) is False
+
+    def test_heavy_reading_text_prefers_tokens(self):
+        assert lg.heavy_reading_text({"last_prompt": 212000}, 6.0) == "212k ctx"
+
+    def test_heavy_reading_text_mb_fallback(self):
+        assert "proxy" in lg.heavy_reading_text(None, 6.0)
+        assert lg.heavy_reading_text(None, None) == "unknown"
+
+
 class TestHandoffNudge:
     """Stop hook: once-ever nudge to hand off when the lead's transcript grows past
     handoff_nudge_mb. Transcript size is a PROXY for session weight, not context occupancy — hence
@@ -2324,6 +2348,78 @@ class TestHandoffNudge:
         if not p.exists():
             return []
         return [json.loads(l) for l in p.read_text().splitlines()]
+
+    def _usage_file(self, path, last_prompt, grow_to_mb=None):
+        """A minimal real-shaped transcript line (one assistant `usage` entry whose cache_read sums
+        to `last_prompt`) so lg.transcript_usage parses a real live-context reading, like
+        test_relay.py's `_write_usage_transcript`. `grow_to_mb`, when given, pads the file out to
+        that size with a truncate AFTER the real line (sparse trailing bytes, same trick the MB-only
+        tests use) — the token line stays parseable while the file also crosses the MB threshold."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"type": "assistant", "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": {"id": "m1", "model": "claude-sonnet-5", "usage": {
+                "input_tokens": 0, "cache_read_input_tokens": last_prompt,
+                "cache_creation_input_tokens": 0, "output_tokens": 10}}})
+        path.write_text(line + "\n")
+        if grow_to_mb is not None:
+            with open(path, "ab") as f:
+                f.truncate(int(grow_to_mb * 1024 * 1024))
+        return path
+
+    def test_nudges_on_tokens_past_threshold_with_mb_below(self, tmp_path):
+        # token-first: live context alone (transcript file itself stays tiny) trips the nudge.
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        transcript = self._usage_file(tmp_path / "transcript.jsonl", 212000)
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                        "transcript_path": str(transcript)})
+        assert rc == 2
+        assert "getting heavy" in err
+        assert "live context" in err
+        assert lg.handoff_nudged(root, "lead-1")
+        events = self._ledger_events(root)
+        ev = [e for e in events if e["event"] == "handoff_nudged" and e["session_id"] == "lead-1"][0]
+        assert ev["tokens"] == 212000
+        assert ev["mb"] < 1
+
+    def test_nudges_on_mb_past_threshold_with_tokens_below(self, tmp_path):
+        # secondary "session age" signal: a big transcript file alone trips the nudge even though
+        # the LAST request's live context is nowhere near the token threshold.
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        transcript = self._usage_file(tmp_path / "transcript.jsonl", 500, grow_to_mb=6)
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                        "transcript_path": str(transcript)})
+        assert rc == 2
+        assert "getting heavy" in err
+        assert "compactions in" in err
+        assert lg.handoff_nudged(root, "lead-1")
+        events = self._ledger_events(root)
+        ev = [e for e in events if e["event"] == "handoff_nudged" and e["session_id"] == "lead-1"][0]
+        assert ev["tokens"] == 500
+        assert ev["mb"] >= 5
+
+    def test_no_nudge_when_both_signals_below_threshold(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        transcript = self._usage_file(tmp_path / "transcript.jsonl", 500)
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                        "transcript_path": str(transcript)})
+        assert rc == 0
+        assert "getting heavy" not in err
+        assert not lg.handoff_nudged(root, "lead-1")
+
+    def test_token_nudge_still_fires_exactly_once(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1")
+        transcript = self._usage_file(tmp_path / "transcript.jsonl", 212000)
+        payload = {"session_id": "lead-1", "cwd": str(tmp_path), "transcript_path": str(transcript)}
+        assert self._run(tmp_path, payload)[0] == 2
+        rc, err = self._run(tmp_path, payload)
+        assert rc == 0
+        assert "getting heavy" not in err
+        events = self._ledger_events(root)
+        assert len([e for e in events if e["event"] == "handoff_nudged"]) == 1
 
     def test_nudges_once_when_over_threshold(self, tmp_path):
         root = tmp_path / ".relay-tasks"

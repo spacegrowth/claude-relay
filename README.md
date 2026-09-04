@@ -287,15 +287,19 @@ If you'd rather not thread stdin through, `--statusline` is optional: `relay sta
 "$CLAUDE_CODE_SESSION_ID"` (or with no argument at all, since `relay status` falls back to that same
 env var) works from a plain shell command with no JSON parsing.
 
-The LEAD view also carries a transcript-weight segment — an ambient early warning before the
-one-shot [handoff nudge](#handing-off-a-long-lived-lead) fires, and a persistent pointer to
-`/relay:handoff` after it does, so you're not relying on catching that single wake. It only appears
-via `--statusline` (that's the only invocation that carries `transcript_path`, confirmed present in
-the statusline JSON payload against the same docs), and only from 60% of `handoff_nudge_mb` upward:
+The LEAD view also carries a context-weight segment — an ambient early warning before the one-shot
+[handoff nudge](#handing-off-a-long-lived-lead) fires, and a persistent pointer to `/relay:handoff`
+after it does, so you're not relying on catching that single wake. It only appears via
+`--statusline` (that's the only invocation that carries `transcript_path`, confirmed present in the
+statusline JSON payload against the same docs). It's token-first, like the executor heaviness
+footnote: live context (from 60% of `context_nudge_tokens` upward) is the primary reading;
+transcript-MB (the secondary "session age" signal — it never shrinks, so a big number means several
+compactions in even when live context looks fine) rides alongside it once MB alone is past
+`handoff_nudge_mb`:
 
 ```
-🚦 busy: tk-parser,tk-render · ✅ tk-auth · 4.2MB
-🚦 busy: tk-parser · 5.2MB → /relay:handoff
+🚦 busy: tk-parser,tk-render · ✅ tk-auth · 84k ctx
+🚦 busy: tk-parser · 84k ctx · 5.2MB → /relay:handoff
 ```
 
 Honest limit: `relay status` reads stored state + report-file existence only — no liveness refresh.
@@ -449,9 +453,12 @@ terminal-notifier's click still runs `relay focus <lead>`.
 
 Wakes are scoped to executors the lead owns — multiple leads on different projects don't cross-wake.
 
-Separately, relay nudges a lead **once** (ever, per session) when its transcript file grows past
-`handoff_nudge_mb` (default 5MB) — a proxy for session weight. The suggested flow: write a handoff
-md, then `/relay:handoff <md>`.
+Separately, relay nudges a lead **once** (ever, per session) on two signals: primarily its live
+context (`context_nudge_tokens`, default 150k) — the cost/quality number that actually tracks
+compaction, mirroring the executor heaviness gate — and secondarily its transcript file size on
+disk (`handoff_nudge_mb`, default 5MB), which never shrinks so a big number alone still means
+several compactions in. Either crossing its threshold fires the nudge; the suggested flow is the
+same either way: write a handoff md, then `/relay:handoff <md>`.
 
 ### Handing off a long-lived lead
 
@@ -637,8 +644,8 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
-| `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) for the LEAD's own handoff nudge — a proxy for session weight, not context-window occupancy; calibrated on real sessions (a full working day ≈ 3MB, the heaviest marathon session ever ≈ 6MB). **Deprecated as the EXECUTOR heaviness signal** (`relay send`'s gate, `relay list`'s heavy footnote, the board) — see `context_nudge_tokens` below, which replaced it there; still read as the fallback threshold when an executor's transcript can't be parsed for real usage, and still drives the lead's own nudge above |
-| `context_nudge_tokens` | 150000 | The executor heaviness signal: an executor is "heavy" when its LAST request's live context (input + cache_read + cache_creation tokens — the real spend the next turn pays, not a transcript-size proxy) is at/above this many tokens. Read by `relay send`'s heaviness gate, `relay list`'s heavy footnote, and the board |
+| `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) — the secondary "session age" (compaction-count) signal for **both** leads and executors: MB on disk never shrinks, so a big number alone means several compactions in even when live context currently looks fine. Fires the lead's handoff nudge/statusline segment alongside tokens, and is the executor fallback reading (`relay send`'s gate, `relay list`'s heavy footnote) only when a transcript can't be parsed for real usage at all |
+| `context_nudge_tokens` | 150000 | The cost/context signal for **both** leads and executors: heavy when the LAST request's live context (input + cache_read + cache_creation tokens — the real spend the next turn pays, not a transcript-size proxy) is at/above this many tokens. Primary trigger for the lead's own handoff nudge/statusline segment (mirroring the executor gate) and for `relay send`'s heaviness gate, `relay list`'s heavy footnote/CTX columns, and the board |
 | `cache_ttl_minutes` | 60 | Claude Code's prompt-cache TTL — how long an executor's last request stays cached free. Drives the warm/cold readout in `relay list`'s TOKENS column, the board, and `relay send`'s advisory line — see [Cache state](#executor-context-window-200k-vs-1m) |
 | `executor_default_context` | "1m" | Context window an executor launches with when nothing else decides it (no packet `CONTEXT:` line, no `[1m]` on `--model`, referenced reading under the heuristic). `"1m"` or `"200k"`. Shipped `1m`: the window is a **ceiling, not consumption** — you pay for tokens used, so a bounded packet costs the same either way, and 1M stops executors compacting early on real work. A packet can still pin `CONTEXT: 200k`; haiku (no 1M window) always runs 200K |
 | `auto_close` | true | Park finished executors automatically — see [Auto-close](#auto-close-finished-executors-park-themselves) |
