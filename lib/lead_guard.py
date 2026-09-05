@@ -62,10 +62,12 @@ LEAD_DEFAULTS = {
                                  # at/above this many tokens. This is the number that actually drives
                                  # cost/compaction; handoff_nudge_mb is the fallback reading only
                                  # when usage can't be read at all.
-    "cache_ttl_minutes": 60,     # Claude Code's prompt-cache TTL (1 hour by default) — how long the
-                                 # last request's prefix stays cached free. Configurable because a
-                                 # workspace running the 5-minute-TTL tier (usage overage) needs a
-                                 # different number; see lead_guard.cache_state.
+    "cache_ttl_minutes": 60,     # Claude Code's prompt-cache TTL for a main conversation (each executor
+                                 # is one): 1 hour when signed in with a Claude plan within its included
+                                 # usage; 5 minutes on an API key / cloud provider / usage credits unless
+                                 # promptCacheTtl (CLAUDE_CODE_PROMPT_CACHE_TTL) is set to 1h. Set this to
+                                 # match; see lead_guard.cache_state. Verified 2026-09-05 against the
+                                 # Claude Code prompt-caching doc + a transcript's ephemeral_1h writes.
     "executor_default_model": "sonnet",  # model an executor launches with when --model is omitted —
                                   # relay's own policy, never the human's personal `/model` default
                                   # (see "executor model policy" section below: incident where a
