@@ -89,6 +89,12 @@
   .steps6 .who.you { background: var(--accent); color: #fff; }
   .steps6 .who.lead { background: var(--line); color: var(--muted); }
   .steps6 code { color: var(--ink); }
+  .tools { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2.4vh 2.4vw; }
+  .tools h3 { font-family: var(--mono); font-size: clamp(11px, 1.05vw, 19px); letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin: 0 0 .8vh; font-weight: 500; }
+  .tools p { font-size: clamp(12px, 1.12vw, 20px); line-height: 1.45; max-width: none; margin: 0 0 .5vh; }
+  .tools p + p { margin-top: 0; }
+  .tools code { color: var(--ink); font-weight: 500; }
+  .tools pre { font-size: clamp(10px, .95vw, 17px); padding: 1vh 1vw; margin: .6vh 0 .8vh; }
   .report { font-family: var(--mono); font-size: clamp(12px, 1.15vw, 21px); line-height: 1.55; white-space: pre; }
   .report em { font-style: normal; color: var(--accent); }
   .spine { font-family: var(--mono); color: var(--accent); letter-spacing: .06em; font-size: clamp(14px, 1.4vw, 25px); }
@@ -370,39 +376,48 @@ without a cache        ≈ 5.2M</pre>
   <aside class="notes">The point of the slide is the color: blue is the human, gray is the lead. Four blue words in a whole cycle. Leave it up during questions.</aside>
 </section>
 <section class="slide">
-  <p class="eyebrow">skills</p>
+  <p class="eyebrow">the tools</p>
   <h1>Everything is <code>/relay:</code>something</h1>
-  <p class="muted" style="margin-bottom:2vh">The four you'll use every day:</p>
-  <div class="grid">
-    <div><code>mode</code>become the lead; arm the gate and the wake</div>
-    <div><code>spawn</code>new executor, seeded with a packet</div>
-    <div><code>send</code>follow-up into an executor you already have; <code>--upgrade</code> moves it a tier up, <code>--rotate</code> replaces it</div>
-    <div><code>diff</code>staged changes as a review page</div>
-  </div>
-  <hr class="rule">
-  <p class="small muted" style="max-width:none;line-height:1.9"><code>verify</code> report vs. index &nbsp;·&nbsp; <code>list</code> <code>board</code> every session &nbsp;·&nbsp; <code>check</code> poll for a report &nbsp;·&nbsp; <code>focus</code> jump to a tab &nbsp;·&nbsp; <code>auto</code> proceed-by-default &nbsp;·&nbsp; <code>close</code> <code>retire</code> <code>resume</code> <code>restart</code> lifecycle &nbsp;·&nbsp; <code>handoff</code> a fresh lead &nbsp;·&nbsp; <code>route</code> the gate's escape hatch &nbsp;·&nbsp; <code>stop</code> step down</p>
-  <p class="foot"><code>relay doctor</code> checks the installed CLI still behaves the way relay assumes. Run it after every Claude Code update.</p>
-  <aside class="notes">Point at the top row and move on. The second row is there so nobody asks "is there a way to…" during questions.</aside>
-</section>
-<section class="slide">
-  <p class="eyebrow">what's next</p>
-  <h1>Turning the rubric into data</h1>
-  <div class="cols cols-2">
-    <div>
-      <p><code>relay stats</code> joins every packet's model and effort to what happened to it: rounds before it landed, the verify verdict, tokens per packet.</p>
-      <pre class="step tabular" style="margin-top:2vh">MODEL   PACKETS  ROUNDS  % CLEAN  TOK/PKT
+  <div class="tools">
+    <div><h3>lead</h3>
+      <p><code>mode</code> become the lead: model check, edit gate, wake</p>
+      <p><code>auto</code> proceed-by-default inside an approved plan</p>
+      <p><code>handoff</code> hand this lead to a fresh one, with a note</p>
+      <p><code>route</code> the edit gate's escape hatch, reason ledgered</p>
+      <p><code>stop</code> step down</p>
+    </div>
+    <div><h3>delegate</h3>
+      <p><code>spawn</code> new executor tab, seeded with a packet</p>
+      <p><code>send</code> follow-up into one you have · <code>--upgrade</code> a tier up · <code>--rotate</code> replace · <code>--when-idle</code> queue</p>
+      <p><code>queue</code> see or cancel queued packets</p>
+      <p><code>lint</code> check a packet before sending</p>
+    </div>
+    <div><h3>watch</h3>
+      <p><code>list</code> every session: status, model, packet, CTX, tokens</p>
+      <p><code>board</code> the same as one page, with each packet's timeline</p>
+      <p><code>check</code> poll for a report · <code>focus</code> jump to a tab · <code>status</code> statusline one-liner</p>
+    </div>
+    <div><h3>review</h3>
+      <p><code>diff</code> staged changes as a review page</p>
+      <p><code>verify</code> report against the index: COUNTS-MATCH or not</p>
+      <p><code>report</code> print a report</p>
+    </div>
+    <div><h3>lifecycle</h3>
+      <p><code>close</code> park it now · <code>retire</code> park + successor seed · <code>keep</code> pin</p>
+      <p><code>resume</code> bring back a closed or crashed one, context intact · <code>restart</code> re-run the packet fresh</p>
+      <p><code>adopt</code> claim an orphan · <code>prune</code> clear old state</p>
+    </div>
+    <div><h3>learn</h3>
+      <p><code>stats</code> every packet's model → rounds, verdict, tokens; the rubric checked against data</p>
+      <pre class="tabular" style="margin-top:2vh">MODEL   PACKETS  ROUNDS  % CLEAN  TOK/PKT
 haiku   1        -       100%     353k
 opus    11       -       36%      8.3M
 sonnet  259      0.5     20%      10.1M</pre>
-    </div>
-    <div>
-      <p class="step">Rounds only started counting once relay could see a manual <code>git commit</code>: a <code>landed</code> event, recorded the moment a packet's claimed files are clean in the tree. Older packets show a dash.</p>
-      <p class="step">Then "did I pick the right model" stops being a feeling.</p>
+      <p><code>doctor</code> proves the installed CLI still behaves as relay assumes. Run it after every Claude Code update.</p>
     </div>
   </div>
-  <hr class="rule">
-  <p class="lead">Now the live run: arm, spawn a Haiku packet, watch the wake, verify, diff, commit.</p>
-  <aside class="notes">Demo script is in docs/deck/README.md. Ten minutes. Keep the packet tiny so the wake lands inside the talk.</aside>
+  <p class="foot">Now the live run: arm, spawn a Haiku packet, watch the wake, verify, diff, commit.</p>
+  <aside class="notes">Don't read this out. Point at the six groups, then at stats: that's the one that turns "did I pick the right model" from a feeling into a number. Then straight into the demo.</aside>
 </section>
 </div>
 

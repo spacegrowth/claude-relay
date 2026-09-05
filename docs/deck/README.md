@@ -1,6 +1,6 @@
 # Relay deck
 
-`relay-deck.html` — a 15-slide talk about the plugin. Single file, no build, opens from disk.
+`relay-deck.html` — a 14-slide talk about the plugin. Single file, no build, opens from disk.
 
 ## Presenting
 
@@ -18,7 +18,7 @@ next slide; `←` back; `Home` / `End`; `n` toggles speaker notes; `?` shows thi
 | 7 | 2 | choosing a model (effort is one line: leave it) |
 | 8–9 | 5 | caching in simple terms, the bill |
 | 10–11 | 4 | reuse/rotate/hand off, how executors close |
-| 12–15 | 4 | guardrails, six steps, skills, what's next |
+| 12–14 | 4 | guardrails, six steps, the tools (incl. stats) → demo |
 | demo | 10 | below |
 
 ## Demo script (10 min)
