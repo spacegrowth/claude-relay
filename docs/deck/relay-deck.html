@@ -33,6 +33,7 @@
   .cols { display: grid; gap: 3vw; align-items: start; }
   .cols-2 { grid-template-columns: 1fr 1fr; }
   .cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .cols > p + p { margin-top: 0; }
   .wide p, .wide li { max-width: 92ch; font-size: clamp(17px, 1.72vw, 33px); }
   .wide p + p { margin-top: 2.4vh; }
   .cmp { margin: 1vh 0 0; }
