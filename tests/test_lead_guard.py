@@ -3299,6 +3299,20 @@ class TestTranscriptUsage:
         expected = datetime.datetime.fromisoformat(ts2.replace("Z", "+00:00")).timestamp()
         assert u["last_ts"] == pytest.approx(expected)
 
+    def test_max_prompt_is_the_largest_single_request_over_the_session(self, tmp_path):
+        # m1's (deduped) prompt is 2+1000+500=1502; m2's is 3+1500+0=1503 — the larger of the two,
+        # not the sum (that's `prompt`) and not the last one specifically (that's `last_prompt`,
+        # which happens to coincide here since m2 is both largest and last).
+        u = lg.transcript_usage(self._write(tmp_path))
+        assert u["max_prompt"] == 3 + 1500 + 0
+        assert u["max_prompt"] == u["last_prompt"]  # coincidence of this fixture, not a rule
+
+    def test_max_prompt_zero_when_prompt_is_zero(self, tmp_path):
+        p = tmp_path / "empty.jsonl"
+        p.write_text("not json\nstill not json\n")
+        u = lg.transcript_usage(p)
+        assert u["max_prompt"] == 0
+
     def test_cache_hit_rate_over_whole_session(self, tmp_path):
         u = lg.transcript_usage(self._write(tmp_path))
         assert u["cache_hit_rate"] == pytest.approx(u["cache_read"] / u["prompt"])

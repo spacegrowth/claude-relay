@@ -6763,3 +6763,353 @@ class TestCmdStats:
     def test_no_packets_at_all_prints_placeholder_not_a_crash(self, relay, capsys):
         relay.cmd_stats(self._args())
         assert "(no packets recorded)" in capsys.readouterr().out
+
+
+def _result_event(model_id, window, key=None):
+    """A minimal stream-json `result` event carrying `modelUsage` the way a live `claude -p
+    --output-format stream-json` run does — enough for _probe_context_window to read
+    contextWindow from. `key` lets a test simulate a modelUsage key that disagrees with the init
+    model (a mismatch the check must catch)."""
+    return {"type": "result", "modelUsage": {(key or model_id): {"contextWindow": window,
+            "maxOutputTokens": 64000, "canonicalModel": model_id}}}
+
+
+class TestDoctorContextWindow:
+    """Doctor's "model aliases + context window" check LEARNS each tier's real window from the
+    live result event's `modelUsage.<model>.contextWindow` — it does NOT assert bare `sonnet`/
+    `opus` must be 200k, because on this account (verified live 2026-09-05) they already report
+    the same 1_000_000 window as their `[1m]` form. relay must not assume either way; instead it
+    caches every probed model's window into `tier_windows.json` for `relay list`/board to read."""
+
+    FIVE_TIER = {
+        "haiku": ("claude-haiku-4-5-20251001", 200_000, None),
+        "sonnet": ("claude-sonnet-5", 200_000, None),
+        "sonnet[1m]": ("claude-sonnet-5[1m]", 1_000_000, None),
+        "opus": ("claude-opus-5", 200_000, None),
+        "opus[1m]": ("claude-opus-5[1m]", 1_000_000, None),
+    }
+
+    def _mock_probe(self, by_model):
+        """by_model: {alias: (init_model_id, window, error)} -> a _probe_claude stand-in."""
+        def fake(prompt, extra_flags=(), cwd=None, skip_perms=False, model="haiku", timeout=180,
+                 want_result=False):
+            init_model, window, err = by_model[model]
+            if err:
+                return (None, "", err, None) if want_result else (None, "", err)
+            init = {"type": "system", "subtype": "init", "model": init_model}
+            result_event = _result_event(init_model, window) if window is not None else \
+                {"type": "result", "modelUsage": {}}
+            if want_result:
+                return init, "ok", "", result_event
+            return init, "ok", ""
+        return fake
+
+    def _set_ceiling(self, relay, ceiling):
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        relay.lead_guard.config_path(relay.STATE_ROOT).write_text(json.dumps({"executor_model_ceiling": ceiling}))
+
+    def test_pass_and_caches_every_probed_model_when_bare_is_narrower_than_1m(self, relay):
+        probe = self._mock_probe(self.FIVE_TIER)
+        with mock.patch.object(relay, "_probe_claude", side_effect=probe):
+            ok, detail, info = relay._check_model_aliases_and_context()
+        assert ok is True
+        assert info == []
+        assert "haiku 200k" in detail
+        assert "sonnet 200k/1M" in detail
+        assert "opus 200k/1M" in detail
+        cache = json.loads((relay.STATE_ROOT / "tier_windows.json").read_text())
+        assert cache["claude-haiku-4-5-20251001"]["window"] == 200_000
+        assert cache["claude-sonnet-5"] == {"window": 200_000, "alias": "sonnet", "probed_at": mock.ANY}
+        assert cache["claude-sonnet-5[1m]"]["window"] == 1_000_000
+        assert cache["claude-opus-5"]["window"] == 200_000
+        assert cache["claude-opus-5[1m]"]["window"] == 1_000_000
+
+    def test_pass_and_notes_when_bare_already_equals_1m_on_this_account(self, relay):
+        # the live finding this packet responds to: bare sonnet AND bare opus already report
+        # 1_000_000 on this account. That is a PASS, not a FAIL — relay reports it, not asserts
+        # bare must be 200k.
+        by_model = dict(self.FIVE_TIER)
+        by_model["sonnet"] = ("claude-sonnet-5", 1_000_000, None)
+        by_model["opus"] = ("claude-opus-5", 1_000_000, None)
+        probe = self._mock_probe(by_model)
+        with mock.patch.object(relay, "_probe_claude", side_effect=probe):
+            ok, detail, info = relay._check_model_aliases_and_context()
+        assert ok is True
+        assert "sonnet 1M (bare = [1m] on this account)" in detail
+        assert "opus 1M (bare = [1m] on this account)" in detail
+        assert any("[1m]" in line and "sonnet" in line and "no-op" in line for line in info)
+        assert any("[1m]" in line and "opus" in line and "no-op" in line for line in info)
+        cache = json.loads((relay.STATE_ROOT / "tier_windows.json").read_text())
+        assert cache["claude-sonnet-5"]["window"] == 1_000_000
+
+    def test_fail_when_a_1m_probe_does_not_report_1_000_000(self, relay):
+        by_model = dict(self.FIVE_TIER)
+        by_model["sonnet[1m]"] = ("claude-sonnet-5[1m]", 200_000, None)
+        probe = self._mock_probe(by_model)
+        with mock.patch.object(relay, "_probe_claude", side_effect=probe):
+            ok, detail, info = relay._check_model_aliases_and_context()
+        assert ok is False
+
+    def test_fail_when_bare_reports_more_than_its_1m_form(self, relay):
+        # nonsensical direction: the [1m] form must never be NARROWER than the bare alias.
+        by_model = dict(self.FIVE_TIER)
+        by_model["opus"] = ("claude-opus-5", 1_000_000, None)
+        by_model["opus[1m]"] = ("claude-opus-5[1m]", 500_000, None)
+        probe = self._mock_probe(by_model)
+        with mock.patch.object(relay, "_probe_claude", side_effect=probe):
+            ok, detail, info = relay._check_model_aliases_and_context()
+        assert ok is False
+
+    def test_fail_when_haiku_is_not_200k(self, relay):
+        by_model = dict(self.FIVE_TIER)
+        by_model["haiku"] = ("claude-haiku-4-5-20251001", 1_000_000, None)
+        probe = self._mock_probe(by_model)
+        with mock.patch.object(relay, "_probe_claude", side_effect=probe):
+            ok, detail, info = relay._check_model_aliases_and_context()
+        assert ok is False
+
+    def test_fail_when_contextwindow_field_absent_wording_unchanged(self, relay):
+        # older CLI / changed output shape: never silently pass; wording stays exactly as
+        # packet-001 specified it.
+        by_model = dict(self.FIVE_TIER)
+        by_model["sonnet"] = ("claude-sonnet-5", None, None)
+        probe = self._mock_probe(by_model)
+        with mock.patch.object(relay, "_probe_claude", side_effect=probe):
+            ok, detail, info = relay._check_model_aliases_and_context()
+        assert ok is False
+        assert detail == "no contextWindow in result.modelUsage — CLI too old or output shape changed"
+
+    def test_fail_when_no_init_event(self, relay):
+        by_model = dict(self.FIVE_TIER)
+        by_model["sonnet"] = (None, None, "timeout")
+        probe = self._mock_probe(by_model)
+        with mock.patch.object(relay, "_probe_claude", side_effect=probe):
+            ok, detail, info = relay._check_model_aliases_and_context()
+        assert ok is False
+        assert detail == "timeout"
+
+    def test_fail_when_modelusage_key_disagrees_with_init_model(self, relay):
+        def fake(prompt, extra_flags=(), cwd=None, skip_perms=False, model="haiku", timeout=180,
+                 want_result=False):
+            if model == "sonnet":
+                init = {"type": "system", "subtype": "init", "model": "claude-sonnet-5"}
+                return init, "ok", "", _result_event("claude-sonnet-5", 200_000, key="claude-opus-5")
+            init_model, window, _err = self.FIVE_TIER[model]
+            return {"type": "system", "subtype": "init", "model": init_model}, "ok", "", \
+                _result_event(init_model, window)
+        with mock.patch.object(relay, "_probe_claude", side_effect=fake):
+            ok, detail, info = relay._check_model_aliases_and_context()
+        assert ok is False
+        assert "claude-opus-5" in detail and "claude-sonnet-5" in detail
+
+    def test_skips_opus_probes_when_ceiling_is_below_opus(self, relay):
+        by_model = {k: v for k, v in self.FIVE_TIER.items() if not k.startswith("opus")}
+        probe = self._mock_probe(by_model)
+        self._set_ceiling(relay, "sonnet")
+        with mock.patch.object(relay, "_probe_claude", side_effect=probe):
+            ok, detail, info = relay._check_model_aliases_and_context()
+        assert ok is True
+        assert "opus" not in detail
+        cache = json.loads((relay.STATE_ROOT / "tier_windows.json").read_text())
+        assert "claude-opus-5" not in cache
+
+    def test_offline_and_quick_skip_the_check(self, relay, capsys):
+        with mock.patch.object(relay, "_probe_claude") as probe:
+            relay.cmd_doctor(SimpleNamespace(offline=True, quick=False, model=None, json=True))
+        probe.assert_not_called()
+        checks = json.loads(capsys.readouterr().out)
+        row = [c for c in checks if c["check"] == "model aliases + context window"][0]
+        assert row["status"] == "SKIP"
+
+
+class TestTranscriptUsageMaxPrompt:
+    """`transcript_usage`'s `max_prompt` — the largest single request's input+cache_read+
+    cache_creation over the session — the empirical lower bound on the window that was actually
+    in effect, PROVING a stamped context rather than trusting it."""
+
+    def _write(self, tmp_path, requests):
+        """requests: list of (input, cache_read, cache_creation) per assistant message, in order."""
+        d = tmp_path / "t.jsonl"
+        lines = []
+        for i, (inp, cr, cc) in enumerate(requests):
+            lines.append(json.dumps({"type": "assistant", "timestamp": f"2026-01-01T00:0{i}:00.000Z",
+                "message": {"id": f"m{i}", "model": "claude-sonnet-5", "usage": {
+                    "input_tokens": inp, "cache_read_input_tokens": cr,
+                    "cache_creation_input_tokens": cc, "output_tokens": 5}}}))
+        d.write_text("\n".join(lines) + "\n")
+        return d
+
+    def test_max_prompt_is_the_largest_single_request_not_the_sum(self, relay, tmp_path):
+        path = self._write(tmp_path, [(0, 1000, 0), (0, 5000, 0), (0, 2000, 0)])  # growing then shrinking
+        usage = relay.lead_guard.transcript_usage(str(path))
+        assert usage["max_prompt"] == 5000
+        assert usage["last_prompt"] == 2000          # last request, not the max
+        assert usage["prompt"] == 8000                # sum, unaffected by max_prompt
+
+    def test_max_prompt_on_monotonically_growing_session(self, relay, tmp_path):
+        path = self._write(tmp_path, [(0, 50_000, 0), (0, 120_000, 0), (0, 245_000, 0)])
+        usage = relay.lead_guard.transcript_usage(str(path))
+        assert usage["max_prompt"] == 245_000
+        assert usage["last_prompt"] == 245_000
+
+    def test_max_prompt_zero_on_no_usage(self, relay, tmp_path):
+        d = tmp_path / "empty.jsonl"; d.write_text("")
+        usage = relay.lead_guard.transcript_usage(str(d))
+        assert usage["max_prompt"] == 0
+
+
+class TestCtxWindowCell:
+    """lead_guard.ctx_window_cell — the "<live>/<window>" reading + the ✓ proof / ! contradiction
+    flag, shared by `relay list`'s CTX column and the board's context chip."""
+
+    def test_1m_stamp_proven_by_a_request_over_200k(self):
+        import lead_guard
+        usage = {"last_prompt": 264_000, "max_prompt": 264_000}
+        cell, bad = lead_guard.ctx_window_cell(usage, "1m")
+        assert cell == "264k/1M ✓"
+        assert bad is False
+
+    def test_1m_stamp_unproven_when_nothing_exceeded_200k(self):
+        import lead_guard
+        usage = {"last_prompt": 40_000, "max_prompt": 40_000}
+        cell, bad = lead_guard.ctx_window_cell(usage, "1m")
+        assert cell == "40k/1M"          # no ✓ — never proven this session
+        assert bad is False
+
+    def test_200k_stamp_normal_reading_no_flag(self):
+        import lead_guard
+        usage = {"last_prompt": 88_000, "max_prompt": 88_000}
+        cell, bad = lead_guard.ctx_window_cell(usage, "200k")
+        assert cell == "88k/200k"
+        assert bad is False
+
+    def test_200k_stamp_contradicted_by_a_request_over_200k(self):
+        import lead_guard
+        usage = {"last_prompt": 245_000, "max_prompt": 245_000}
+        cell, bad = lead_guard.ctx_window_cell(usage, "200k")
+        assert cell == "245k/200k !"
+        assert bad is True
+
+    def test_unknown_context_renders_live_number_alone(self):
+        import lead_guard
+        usage = {"last_prompt": 40_000, "max_prompt": 40_000}
+        cell, bad = lead_guard.ctx_window_cell(usage, None)
+        assert cell == "40k"
+        assert bad is False
+
+    def test_no_usage_renders_zero_live(self):
+        import lead_guard
+        cell, bad = lead_guard.ctx_window_cell(None, "1m")
+        assert cell == "0/1M"
+        assert bad is False
+
+    def test_real_window_overrides_a_conservative_200k_stamp_no_flag(self):
+        # tier_windows says the account's sonnet ALREADY resolves to 1M — a session stamped
+        # "200k" at launch (before doctor learned that) is conservative, not wrong: no "!".
+        import lead_guard
+        usage = {"last_prompt": 245_000, "max_prompt": 245_000}
+        tier_windows = {"claude-sonnet-5": {"window": 1_000_000, "alias": "sonnet"}}
+        cell, bad = lead_guard.ctx_window_cell(usage, "200k", "claude-sonnet-5", tier_windows)
+        assert cell == "245k/1M ✓"
+        assert bad is False
+
+    def test_real_window_still_contradicts_when_it_too_is_200k(self):
+        # tier_windows confirms sonnet really is 200k on this account — a 245k request DID
+        # contradict it, real window or not.
+        import lead_guard
+        usage = {"last_prompt": 245_000, "max_prompt": 245_000}
+        tier_windows = {"claude-sonnet-5": {"window": 200_000, "alias": "sonnet"}}
+        cell, bad = lead_guard.ctx_window_cell(usage, "200k", "claude-sonnet-5", tier_windows)
+        assert cell == "245k/200k !"
+        assert bad is True
+
+    def test_real_window_resolves_by_alias_too(self):
+        import lead_guard
+        usage = {"last_prompt": 40_000, "max_prompt": 40_000}
+        tier_windows = {"claude-sonnet-5[1m]": {"window": 1_000_000, "alias": "sonnet[1m]"}}
+        cell, bad = lead_guard.ctx_window_cell(usage, None, "sonnet[1m]", tier_windows)
+        assert cell == "40k/1M"
+        assert bad is False
+
+    def test_unknown_model_falls_back_to_stamp(self):
+        import lead_guard
+        usage = {"last_prompt": 88_000, "max_prompt": 88_000}
+        tier_windows = {"claude-sonnet-5": {"window": 1_000_000, "alias": "sonnet"}}
+        cell, bad = lead_guard.ctx_window_cell(usage, "200k", "claude-opus-5", tier_windows)
+        assert cell == "88k/200k"
+        assert bad is False
+
+
+class TestWindowFor:
+    """lead_guard.window_for — resolves an alias or a concrete model id to the REAL context
+    window `relay doctor` last probed for it, via `tier_windows.json`'s cache."""
+
+    def test_concrete_id_direct_match(self):
+        import lead_guard
+        tw = {"claude-sonnet-5[1m]": {"window": 1_000_000, "alias": "sonnet[1m]"}}
+        assert lead_guard.window_for("claude-sonnet-5[1m]", tw) == 1_000_000
+
+    def test_alias_match_with_and_without_1m_suffix(self):
+        import lead_guard
+        tw = {"claude-sonnet-5": {"window": 200_000, "alias": "sonnet"},
+              "claude-sonnet-5[1m]": {"window": 1_000_000, "alias": "sonnet[1m]"}}
+        assert lead_guard.window_for("sonnet", tw) == 200_000
+        assert lead_guard.window_for("sonnet[1m]", tw) == 1_000_000
+
+    def test_unknown_model_or_empty_cache_is_none(self):
+        import lead_guard
+        tw = {"claude-sonnet-5": {"window": 200_000, "alias": "sonnet"}}
+        assert lead_guard.window_for("claude-opus-5", tw) is None
+        assert lead_guard.window_for("sonnet", {}) is None
+        assert lead_guard.window_for(None, tw) is None
+
+    def test_load_save_round_trip(self, tmp_path):
+        import lead_guard
+        data = {"claude-haiku-4-5-20251001": {"window": 200_000, "alias": "haiku", "probed_at": 1.0}}
+        lead_guard.save_tier_windows(tmp_path, data)
+        assert lead_guard.load_tier_windows(tmp_path) == data
+
+    def test_load_missing_file_is_empty_dict(self, tmp_path):
+        import lead_guard
+        assert lead_guard.load_tier_windows(tmp_path / "nope") == {}
+
+
+class TestListCtxColumnWindowProof:
+    """`relay list`'s CTX cell as "<live>/<window>", including the ✓ proof and the ! contradiction
+    footnote — end to end through cmd_list, not just the lead_guard helper."""
+
+    def _exec(self, relay, sid, claude_session, context, packet=3):
+        relay.write_session(sid, {"session_id": sid, "current_packet": packet, "status": "reported",
+            "topic": "t", "worktree": "/w", "scope": "", "model": "sonnet[1m]" if context == "1m" else "sonnet",
+            "context": context, "claude_session": claude_session, "busy_since": relay.now(),
+            "updated": relay.now(), "owner_lead": None, "owner_project": None})
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        (relay.packets_dir(sid) / f"{packet:03d}-report.md").write_text("done")
+
+    def test_1m_session_proven_shows_check(self, relay, capsys, tmp_path, monkeypatch):
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-1m", 264_000)
+        self._exec(relay, "exec-1m", "cs-1m", "1m")
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        row = [l for l in out.splitlines() if l.startswith("exec-1m")][0]
+        assert "264k/1M" in row and "✓" in row
+
+    def test_200k_session_normal_no_flag(self, relay, capsys, tmp_path, monkeypatch):
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-200k", 88_000)
+        self._exec(relay, "exec-200k", "cs-200k", "200k")
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        row = [l for l in out.splitlines() if l.startswith("exec-200k")][0]
+        assert "88k/200k" in row
+        assert "✓" not in row and "!" not in row
+
+    def test_200k_session_contradicted_by_a_245k_request_flags_and_footnotes(self, relay, capsys,
+                                                                             tmp_path, monkeypatch):
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-bad", 245_000)
+        self._exec(relay, "exec-bad", "cs-bad", "200k")
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        row = [l for l in out.splitlines() if l.startswith("exec-bad")][0]
+        assert "245k/200k" in row and "!" in row
+        assert "⚠ exec-bad: ran a 245k request while stamped 200k" in out
+        assert "check `relay doctor`" in out

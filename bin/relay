@@ -2226,17 +2226,21 @@ def _print_auto_closed(acted):
 # of them silently; the unit suite mocks them all. `relay doctor` proves them against the INSTALLED
 # cli the way tests/test_e2e_mcp.py / test_e2e_agent.py do, plus the offline plumbing checks.
 
-def _probe_claude(prompt, extra_flags=(), cwd=None, skip_perms=False, model="haiku", timeout=180):
+def _probe_claude(prompt, extra_flags=(), cwd=None, skip_perms=False, model="haiku", timeout=180,
+                   want_result=False):
     """One headless `claude -p` with relay's own command builder. Returns (init_event|None,
-    result_text, error_text)."""
+    result_text, error_text) — or, with want_result=True, (init_event|None, result_text, error_text,
+    result_event|None), where result_event is the raw `result` stream-json event (carries
+    `modelUsage`, keyed by model id, with each model's `contextWindow` — the proof behind the
+    doctor context-window check)."""
     cmd = iterm_backend.build_claude_cmd(prompt, model=model, skip_perms=skip_perms,
                                          mcp_flags=list(extra_flags))
     cmd += " -p --output-format stream-json --verbose"
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd)
     except Exception as e:
-        return None, "", str(e)
-    init, result = None, ""
+        return (None, "", str(e), None) if want_result else (None, "", str(e))
+    init, result, result_event = None, "", None
     for line in r.stdout.splitlines():
         try:
             d = json.loads(line)
@@ -2246,7 +2250,11 @@ def _probe_claude(prompt, extra_flags=(), cwd=None, skip_perms=False, model="hai
             init = d
         if d.get("type") == "result":
             result = d.get("result") or ""
-    return init, result, (r.stderr[-400:] if r.returncode != 0 else "")
+            result_event = d
+    err = r.stderr[-400:] if r.returncode != 0 else ""
+    if want_result:
+        return init, result, err, result_event
+    return init, result, err
 
 
 def _cli_version():
@@ -2289,11 +2297,96 @@ def resolve_model_for_launch(model):
     return lead_guard.resolve_model(model, STATE_ROOT / "models.json", _cli_version(), _probe_model)
 
 
-def cmd_doctor(args):
-    checks = []  # (name, status, detail) status ∈ PASS/FAIL/SKIP
+def _fmt_context_window(n):
+    """1_000_000 -> "1M", 200_000 -> "200k" — the doctor detail text's units, not human_tokens'
+    generic 1-decimal rounding (which would print "1.0M")."""
+    if n is None:
+        return "?"
+    if n == 1_000_000:
+        return "1M"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n // 1_000}k"
+    return str(n)
 
-    def add(name, ok, detail="", skip=False):
-        checks.append((name, "SKIP" if skip else ("PASS" if ok else "FAIL"), detail))
+
+def _probe_context_window(model):
+    """(contextWindow|None, resolved_model_id|None, error|None) for one alias, proven from the
+    live `result` event's `modelUsage` (not the `[1m]` suffix — see THE PRIMITIVE). error is set
+    (and contextWindow None) whenever the field can't be trusted: no init event, no modelUsage,
+    no contextWindow key, or the modelUsage key naming a different model than init reported."""
+    init, _, err, result_event = _probe_claude("Reply: ok", model=model, want_result=True)
+    if not init:
+        return None, None, err or "no init event"
+    model_id = init.get("model")
+    mu = (result_event or {}).get("modelUsage") or {}
+    if not mu:
+        return None, model_id, "no contextWindow in result.modelUsage — CLI too old or output shape changed"
+    key = next(iter(mu))
+    entry = mu.get(key) or {}
+    if "contextWindow" not in entry:
+        return None, model_id, "no contextWindow in result.modelUsage — CLI too old or output shape changed"
+    if key != model_id:
+        return None, model_id, f"modelUsage key {key!r} != init model {model_id!r}"
+    return entry["contextWindow"], model_id, None
+
+
+def _check_model_aliases_and_context():
+    """(ok, detail, info_lines) for the doctor "model aliases + context window" check.
+
+    Bare `sonnet`/`opus` are NOT asserted to be 200k — on some accounts they already report the
+    same 1_000_000 window as their `[1m]` form (verified live on this machine 2026-09-05: the
+    `sonnet1m45MigrationComplete` rollout). relay LEARNS each tier's real window from the probe
+    instead of asserting a number the account can change. PASS iff every `[1m]` probe reports
+    1_000_000, `haiku` reports 200_000, and no bare alias reports MORE than its `[1m]` form (a
+    bare alias reporting a NARROWER window than [1m] would mean the suffix is doing something
+    backwards). Every successful probe is cached into `~/.relay-tasks/tier_windows.json` via
+    `lead_guard.save_tier_windows` (merged with whatever was already there) so `relay list`/board
+    can read the REAL window instead of the launch stamp. `opus`/`opus[1m]` are skipped (with no
+    effect on PASS/FAIL) when `executor_model_ceiling` is below opus."""
+    cfg = lead_guard.load_config(STATE_ROOT)
+    ceiling = cfg.get("executor_model_ceiling", "opus")
+    probe_opus = not lead_guard.model_exceeds_ceiling("opus", ceiling)
+    aliases = ["haiku", "sonnet", "sonnet[1m]"] + (["opus", "opus[1m]"] if probe_opus else [])
+    results = {}   # alias -> (window, model_id, error)
+    for alias in aliases:
+        results[alias] = _probe_context_window(alias)
+    for alias, (w, m, e) in results.items():
+        if e:
+            return False, e, []
+
+    tier_windows = lead_guard.load_tier_windows(STATE_ROOT)
+    now = time.time()
+    for alias, (w, m, _e) in results.items():
+        tier_windows[m] = {"window": w, "alias": alias, "probed_at": now}
+    lead_guard.save_tier_windows(STATE_ROOT, tier_windows)
+
+    hw, _, _ = results["haiku"]
+    ok = (hw == 200_000)
+    segments = [f"haiku {_fmt_context_window(hw)}"]
+    info_lines = []
+    for tier in ("sonnet", "opus"):
+        if tier not in results:
+            continue
+        bw, _, _ = results[tier]
+        w1m, _, _ = results[f"{tier}[1m]"]
+        ok = ok and w1m == 1_000_000 and bw <= w1m
+        if bw == w1m:
+            segments.append(f"{tier} {_fmt_context_window(w1m)} (bare = [1m] on this account)")
+            info_lines.append(f"ℹ the [1m] suffix changes nothing for {tier} on this account — "
+                               f"executor_default_context is a no-op there")
+        else:
+            segments.append(f"{tier} {_fmt_context_window(bw)}/{_fmt_context_window(w1m)}")
+    detail = " · ".join(segments)
+    return ok, detail, info_lines
+
+
+def cmd_doctor(args):
+    checks = []  # (name, status, detail, info_lines) status ∈ PASS/FAIL/SKIP
+
+    def add(name, ok, detail="", skip=False, info=()):
+        checks.append((name, "SKIP" if skip else ("PASS" if ok else "FAIL"), detail, list(info or ())))
 
     # ---- offline plumbing ----
     bin_path = shutil.which("claude") or iterm_backend.CLAUDE_BIN
@@ -2327,7 +2420,7 @@ def cmd_doctor(args):
     # ---- live probes ----
     if args.offline:
         for name in ("strict MCP → zero servers", "executor agent applies", "git commit denied under skip-perms",
-                     "model aliases (sonnet, sonnet[1m])"):
+                     "model aliases + context window"):
             add(name, False, "--offline", skip=True)
     else:
         model = args.model or "haiku"
@@ -2361,24 +2454,24 @@ def cmd_doctor(args):
             add("executor agent applies", False, "no agent file", skip=True)
             add("git commit denied under skip-perms", False, "no agent file", skip=True)
         if args.quick:
-            add("model aliases (sonnet, sonnet[1m])", False, "--quick", skip=True)
+            add("model aliases + context window", False, "--quick", skip=True)
         else:
-            i1, _, e1 = _probe_claude("Reply: ok", model="sonnet")
-            i2, _, e2 = _probe_claude("Reply: ok", model="sonnet[1m]")
-            m1 = (i1 or {}).get("model") or ""; m2 = (i2 or {}).get("model") or ""
-            add("model aliases (sonnet, sonnet[1m])", "sonnet" in m1 and m2.endswith("[1m]"),
-                f"sonnet→{m1 or e1 or '?'}  sonnet[1m]→{m2 or e2 or '?'}")
+            ok, detail, info_lines = _check_model_aliases_and_context()
+            add("model aliases + context window", ok, detail, info=info_lines)
 
     if args.json:
-        print(json.dumps([{"check": n, "status": st, "detail": d} for n, st, d in checks], indent=2))
+        print(json.dumps([{"check": n, "status": st, "detail": d, "info": info}
+                           for n, st, d, info in checks], indent=2))
     else:
-        for n, st, d in checks:
+        for n, st, d, info in checks:
             col = {"PASS": "green", "FAIL": "red", "SKIP": "dim"}[st]
             print(f"{c(st.ljust(4), col, 'bold')}  {n}" + (c(f"  — {d}", "dim") if d else ""))
-        fails = [n for n, st, _ in checks if st == "FAIL"]
+            for line in info:
+                print(c(f"      {line}", "dim"))
+        fails = [n for n, st, _, _ in checks if st == "FAIL"]
         print(c(f"\n{'✗ ' + str(len(fails)) + ' failing: ' + ', '.join(fails) if fails else '✓ relay doctor: all checks passed'}",
                 "red" if fails else "green"))
-    if any(st == "FAIL" for _, st, _ in checks):
+    if any(st == "FAIL" for _, st, _, _ in checks):
         sys.exit(1)
 
 
@@ -2414,6 +2507,7 @@ def board_data(include_all=True, lead_sid=None):
     cfg = lead_guard.load_config(STATE_ROOT)
     poll_seconds = cfg.get("poll_seconds", 1800)
     poll_interval = cfg.get("poll_interval", 5)
+    tier_windows = lead_guard.load_tier_windows(STATE_ROOT)
     leads = []
     for m in lead_guard.list_leads(STATE_ROOT):
         sid = m.get("session_id")
@@ -2473,8 +2567,10 @@ def board_data(include_all=True, lead_sid=None):
             rendered = f"{st} (auto)"
         cache = lead_guard.cache_state(usage, time.time(), ttl_minutes)
         hit_rate = usage.get("cache_hit_rate") if usage else None
+        ctx_cell, ctx_bad = lead_guard.ctx_window_cell(usage, r.get("context"), r.get("model"), tier_windows)
         execs.append({**r, "rendered_status": rendered, "launch": lead_guard.launch_cell(r),
                       "tokens": lead_guard.usage_cell(usage, cache), "usage": usage, "mb": _mb_cell_text(mb),
+                      "ctx_cell": ctx_cell, "ctx_contradiction": ctx_bad,
                       "hit_rate": round(hit_rate * 100) if hit_rate is not None else None,
                       "heavy": _is_heavy(usage, mb, token_threshold, mb_threshold), "queued": len(read_queue(sid)),
                       "pkt": str(cur).zfill(3) if cur is not None else "-", "packets": packets,
@@ -3140,7 +3236,10 @@ def _transcript_mb_for(claude_session):
 def _usage_for_session(s):
     """Token usage for an executor's conversation (lead_guard.transcript_usage), cached in its
     state dir as usage.json keyed by the transcript's (size, mtime) so `relay list` doesn't re-parse
-    a multi-MB file on every run. None when the transcript can't be located."""
+    a multi-MB file on every run. None when the transcript can't be located.
+    A cached usage dict written before `max_prompt` existed (an older relay version) is missing the
+    key entirely — the fingerprint alone can't tell that apart from "genuinely 0", so re-parse
+    whenever it's absent rather than trust a stale shape forever."""
     cs = s.get("claude_session")
     if not cs:
         return None
@@ -3153,7 +3252,7 @@ def _usage_for_session(s):
         cache = session_dir(s["session_id"]) / "usage.json"
         if cache.exists():
             d = json.loads(cache.read_text())
-            if d.get("key") == key and d.get("usage"):
+            if d.get("key") == key and d.get("usage") and "max_prompt" in d["usage"]:
                 return d["usage"]
         usage = lead_guard.transcript_usage(str(path))
         if usage:
@@ -3465,15 +3564,21 @@ def cmd_list(args):
     token_threshold = _heaviness_threshold_tokens()
     mb_threshold = _heaviness_threshold_mb()
     # TOKENS: real prompt/output spend per executor from its transcript (cached per size/mtime).
-    # CTX: the LIVE context (last request's live prompt) — what the heaviness gate actually reads,
-    # and the number that answers "would the next turn re-write its cache". LAUNCH: mcp/context/
-    # role, so "why does this executor lack a tool / compact early" is a glance.
+    # CTX: "<live>/<window>" — the LIVE context (last request's live prompt) against the window
+    # this session was launched with, so a glance answers both "how heavy" and "was the [1m] suffix
+    # real" — a ✓ when a request over 200k PROVES a 1m stamp, a ! when one contradicts a 200k stamp
+    # (see lead_guard.ctx_window_cell). LAUNCH: mcp/context/role, so "why does this executor lack a
+    # tool / compact early" is a glance.
     usage_by_sid = {s["session_id"]: _usage_for_session(s) for s in rows}
     ttl_minutes = lead_guard.load_config(STATE_ROOT).get("cache_ttl_minutes",
                   lead_guard.LEAD_DEFAULTS["cache_ttl_minutes"])
     cache_by_sid = {sid: lead_guard.cache_state(usage_by_sid[sid], time.time(), ttl_minutes) for sid in usage_by_sid}
-    ctx_by_sid = {sid: (lead_guard.human_tokens(usage_by_sid[sid].get("last_prompt"))
-                        if usage_by_sid[sid] else "-") for sid in usage_by_sid}
+    tier_windows = lead_guard.load_tier_windows(STATE_ROOT)
+    ctx_cell_by_sid = {s["session_id"]: lead_guard.ctx_window_cell(
+                           usage_by_sid[s["session_id"]], s.get("context"), s.get("model"), tier_windows)
+                       for s in rows}
+    ctx_by_sid = {sid: cell for sid, (cell, _) in ctx_cell_by_sid.items()}
+    ctx_contradiction_by_sid = {sid: bad for sid, (_, bad) in ctx_cell_by_sid.items()}
 
     # Calculate dynamic widths for EXECUTORS table with per-column caps.
     exec_cols = [
@@ -3486,9 +3591,9 @@ def cmd_list(args):
         ("MODEL", 8, [str(s.get("model") or "-") for s in rows]),
         ("PKT", 4, [str(s["current_packet"]).zfill(4) for s in rows]),
         # CTX: §6e e1 — the same context-weight visibility leads got in #3, so "how heavy is this
-        # exec" is a glance instead of archaeology. The REAL live context (last request's tokens),
+        # exec" is a glance instead of archaeology. "<live>/<window>" (+✓/! — see ctx_window_cell),
         # not the transcript-MB proxy the column used to show.
-        ("CTX", 6, [ctx_by_sid[s["session_id"]] for s in rows]),
+        ("CTX", 14, [ctx_by_sid[s["session_id"]] for s in rows]),
         ("TOKENS", 18, [lead_guard.usage_cell(usage_by_sid[s["session_id"]], cache_by_sid[s["session_id"]]) for s in rows]),
         ("LAUNCH", 16, [lead_guard.launch_cell(s) for s in rows]),
         ("REPORTED", 8, ["yes" if s["reported"] else "no" for s in rows]),
@@ -3521,9 +3626,18 @@ def cmd_list(args):
             rep_cell,
         ]
         print(" ".join(row_parts))
-    print(c("  CTX = live context (last request's tokens: input+cache_read+cache_create); "
+    print(c("  CTX = live/window (live: last request's tokens, input+cache_read+cache_create; "
+            "window from `relay doctor`'s probe when available, else the launch stamp — "
+            "✓ = a request over 200k PROVED a 1m window, "
+            "! = one CONTRADICTED the window); "
             "TOKENS = prompt/output billed so far ·cache warm/cold~rewrite; "
             "LAUNCH = mcp/context/role (A agent, G legacy GATES footer)", "dim"))
+    contradictions = [s for s in rows if ctx_contradiction_by_sid.get(s["session_id"])]
+    for s in contradictions:
+        sid = s["session_id"]
+        max_prompt = (usage_by_sid[sid] or {}).get("max_prompt") or 0
+        print(c(f"  ⚠ {sid}: ran a {lead_guard.human_tokens(max_prompt)} request while stamped 200k "
+                f"— the context stamp is wrong; check `relay doctor`", "red"))
 
     # heavy footnote (§6e e1's "warning-stamp" shape, ver?/stale-hooks style — say it in words, not
     # just a skimmable column) — NUDGE wording per §9: state the fact and the alternative, never

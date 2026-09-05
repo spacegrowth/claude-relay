@@ -234,9 +234,10 @@ def _chips(ex):
     out = []
     if ex.get("model"):
         out.append(f'<span class="chip">model<b>{_e(ex["model"])}</b></span>')
-    ctx = ex.get("context") or ("1m" if str(ex.get("model", "")).endswith("[1m]") else None)
-    if ctx:
-        out.append(f'<span class="chip">context<b>{_e(ctx)}</b></span>')
+    ctx_cell = ex.get("ctx_cell")
+    if ctx_cell and ctx_cell != "-":
+        cls = " bad" if ex.get("ctx_contradiction") else ""
+        out.append(f'<span class="chip{cls}">context<b>{_e(ctx_cell)}</b></span>')
     out.append(f'<span class="chip">mcp<b>{_e(_mcp_short(ex))}</b></span>')
     if ex.get("agent"):
         out.append('<span class="chip">role<b>agent</b></span>')

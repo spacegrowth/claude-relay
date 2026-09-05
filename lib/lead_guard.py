@@ -1732,11 +1732,15 @@ def _parse_ts(raw):
 
 def transcript_usage(path):
     """Aggregate usage for one transcript: {"requests", "prompt", "input", "cache_read",
-    "cache_create", "output", "models": {model: requests}, "last_prompt", "last_ts",
+    "cache_create", "output", "models": {model: requests}, "last_prompt", "last_ts", "max_prompt",
     "cache_hit_rate"} — or None when unreadable.
     `last_prompt` is the LAST request's input+cache_read+cache_create (the live context a rotate-
     vs-reuse call should actually weigh); `last_ts` is that request's timestamp as epoch seconds;
-    `cache_hit_rate` is cache_read / prompt over the WHOLE session (0.0-1.0, None when prompt == 0)."""
+    `max_prompt` is the LARGEST single request's input+cache_read+cache_create over the whole
+    session — the empirical lower bound on the context window that was actually in effect (a
+    request that size could not have succeeded on a smaller window), used to PROVE a session's
+    stamped context rather than trust it; `cache_hit_rate` is cache_read / prompt over the WHOLE
+    session (0.0-1.0, None when prompt == 0)."""
     try:
         by_id = {}
         order = []
@@ -1762,13 +1766,14 @@ def transcript_usage(path):
                 last_mid = mid
                 last_ts = _parse_ts(d.get("timestamp"))
         agg = {"requests": 0, "prompt": 0, "input": 0, "cache_read": 0, "cache_create": 0, "output": 0,
-               "models": {}, "last_prompt": 0, "last_ts": None, "cache_hit_rate": None}
+               "models": {}, "last_prompt": 0, "last_ts": None, "max_prompt": 0, "cache_hit_rate": None}
         for mid in order:
             u, model = by_id[mid]
             i = int(u.get("input_tokens") or 0); cr = int(u.get("cache_read_input_tokens") or 0)
             cc = int(u.get("cache_creation_input_tokens") or 0); o = int(u.get("output_tokens") or 0)
             agg["requests"] += 1; agg["input"] += i; agg["cache_read"] += cr; agg["cache_create"] += cc
             agg["output"] += o; agg["prompt"] += i + cr + cc
+            agg["max_prompt"] = max(agg["max_prompt"], i + cr + cc)
             if model:
                 agg["models"][model] = agg["models"].get(model, 0) + 1
         if last_mid is not None:
@@ -1809,6 +1814,95 @@ def human_tokens(n):
     if n >= 1_000:
         return f"{n / 1_000:.0f}k" if n >= 10_000 else f"{n / 1_000:.1f}k"
     return str(n)
+
+
+TIER_WINDOWS_FILE = "tier_windows.json"
+
+
+def load_tier_windows(state_root):
+    """{"<model id as modelUsage keys it>": {"window": N, "alias": "<alias probed>",
+    "probed_at": ts}, ...} — the cache `relay doctor` writes from its live probes (haiku, sonnet,
+    sonnet[1m], opus, opus[1m]). {} when the file doesn't exist yet or is unparsable — callers
+    fall back to the launch-time context stamp, they never assume a window."""
+    try:
+        return json.loads((Path(state_root) / TIER_WINDOWS_FILE).read_text())
+    except Exception:
+        return {}
+
+
+def save_tier_windows(state_root, tier_windows):
+    path = Path(state_root) / TIER_WINDOWS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(tier_windows, indent=2, sort_keys=True))
+
+
+def window_for(model, tier_windows):
+    """Resolve `model` — an alias ("sonnet", "sonnet[1m]") or a concrete model id the way
+    modelUsage keys it ("claude-sonnet-5", "claude-sonnet-5[1m]") — to the REAL context window
+    `relay doctor` last probed for it, via `tier_windows` (as `load_tier_windows` returns). None
+    when that exact model/alias hasn't been probed — callers must not guess in that case, they
+    fall back to the launch-time stamp instead. A concrete id matches a `tier_windows` key
+    directly; an alias matches an entry's `alias` field."""
+    if not model or not tier_windows:
+        return None
+    model = str(model)
+    entry = tier_windows.get(model)
+    if entry:
+        return entry.get("window")
+    for e in tier_windows.values():
+        if isinstance(e, dict) and e.get("alias") == model:
+            return e.get("window")
+    return None
+
+
+def _fmt_window(n):
+    """1_000_000 -> "1M", 200_000 -> "200k" — same units as `human_tokens` but without its
+    1-decimal rounding (which would print "1.0M"), and with a generic fallback for any other
+    window value a future probe might learn."""
+    if n == 1_000_000:
+        return "1M"
+    if n == 200_000:
+        return "200k"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n // 1_000}k"
+    return str(n)
+
+
+def ctx_window_cell(usage, ctx, model=None, tier_windows=None):
+    """(cell_text, contradiction) for the "live/window" CTX reading `relay list`/the board render.
+    cell_text is "<live>/<window>" — "264k/1M" or "88k/200k". The window compared against is the
+    REAL one `relay doctor` last probed for `model` (via `window_for(model, tier_windows)`) when
+    known; otherwise it falls back to the session's launch-time `ctx` stamp ("1m" -> 1_000_000,
+    "200k" -> 200_000, anything else/None -> unknown, cell is the live number alone with no slash).
+    A `✓` is appended when `max_prompt` (the largest single request's input+cache_read+
+    cache_create over the session — transcript_usage's empirical lower bound on the window that
+    was actually in effect) exceeds 200_000 on a session whose real-or-stamped window is
+    1_000_000: a request that size could only have succeeded on the 1M window, so the window is
+    PROVEN, not merely trusted. `contradiction` is True (and the cell reads "!" instead of "✓")
+    ONLY when max_prompt exceeds the real-or-stamped window itself — never merely because the
+    stamp says "200k": when `tier_windows` says the REAL window is 1M, a 200k stamp is read as
+    conservative, not wrong, and the cell renders "<live>/1M" with no flag at all."""
+    live = human_tokens((usage or {}).get("last_prompt") or 0)
+    max_prompt = (usage or {}).get("max_prompt") or 0
+    real = window_for(model, tier_windows) if model and tier_windows else None
+    if real is not None:
+        window = real
+    elif ctx == "1m":
+        window = 1_000_000
+    elif ctx == "200k":
+        window = 200_000
+    else:
+        window = None
+    if window is None:
+        return live, False
+    cell = f"{live}/{_fmt_window(window)}"
+    if max_prompt > window:
+        return cell + " !", True
+    if window == 1_000_000 and max_prompt > 200_000:
+        return cell + " ✓", False
+    return cell, False
 
 
 def usage_cell(usage, cache=None):

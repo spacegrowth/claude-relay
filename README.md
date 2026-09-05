@@ -692,6 +692,31 @@ that ran heavy is widened by `relay retire` + respawn — the
 successor seed says `declare CONTEXT: 1m` when that applies. `haiku[1m]` is refused; a
 packet/heuristic asking for 1M on haiku degrades to 200K with a note.
 
+**How relay proves it.** Everything above decides which window an executor is *launched* with — a
+`context: 1m/200k` field relay writes and then trusts. Nothing before this stamped it against
+reality. Three things now do:
+- `relay doctor`'s "model aliases + context window" check reads the actual `contextWindow` off a
+  live probe's `result.modelUsage` for `haiku`, `sonnet`, `sonnet[1m]`, `opus`, and `opus[1m]`
+  (skipping the opus pair when `executor_model_ceiling` is below opus). It PASSes iff every
+  `[1m]` probe reports 1_000_000, `haiku` reports 200_000, and no bare alias reports *more* than
+  its `[1m]` form — it does **not** assert bare `sonnet`/`opus` must be 200_000, because some
+  accounts already resolve them to 1_000_000 (verified live on this machine 2026-09-05, driven by
+  an account-level `sonnet1m45MigrationComplete` rollout). relay **learns** each model's real
+  window from the probe instead of asserting a number the account can change, and caches every
+  probed model into `~/.relay-tasks/tier_windows.json`. When a bare tier already equals its
+  `[1m]` form, doctor adds an ℹ line noting the suffix is a no-op for that tier on this account.
+- `relay list`'s CTX column renders `<live>/<window>`, reading the REAL window from
+  `tier_windows.json` when doctor has probed that session's model, falling back to the launch-time
+  stamp otherwise — so a session launched `200k` before doctor learned the account's true window
+  renders `<live>/1M` with no contradiction once the cache catches up. It appends `✓` the moment a
+  session's own traffic makes a 1M window self-evident: a single request whose input+cache_read+
+  cache_creation exceeds 200K could not have succeeded on a 200K window. A session whose
+  real-or-stamped window is contradicted by such a request renders `!` instead, with a footnote —
+  the footnote says to check `relay doctor`. The board's context chip shows the same string and flag.
+- `tests/test_e2e_context.py` pins the live numbers against the real CLI (`sonnet[1m]`/`opus[1m]` →
+  1_000_000, `haiku` → 200_000, bare `sonnet`/`opus` learned rather than asserted), the same way
+  `test_e2e_agent.py` pins the executor agent.
+
 **Cache state.** Separate from the window size, Claude Code caches an executor's last request's
 prefix for `cache_ttl_minutes` (default 60, matching the CLI's own 1-hour prompt-cache TTL) — inside
 that window the next turn's send is nearly free; past it, the cache has expired and the next turn
@@ -739,10 +764,17 @@ spawn ceiling still applies.
 
 - **First, `relay doctor`.** It proves the installed Claude Code still behaves the way relay's launch
   line assumes — `--strict-mcp-config` loads zero servers, the executor agent applies without
-  replacing the harness prompt, `git commit` is denied under skip-permissions, `sonnet`/`sonnet[1m]`
-  resolve — plus the plumbing (binary, agent file, hooks, state dir, config, configured MCP servers).
-  A few small haiku calls; `--offline` for plumbing only, `--quick` to skip the slow probes. Run it
-  after every Claude Code update and before a relay release.
+  replacing the harness prompt, `git commit` is denied under skip-permissions, and each model tier
+  reports the real window it should — plus the plumbing (binary, agent file, hooks, state dir,
+  config, configured MCP servers). The model-aliases check reads the **real `contextWindow`** off
+  the live `result` event's `modelUsage` for `haiku`, `sonnet`, `sonnet[1m]`, `opus`, `opus[1m]`
+  (not the `[1m]` suffix string — a CLI could resolve the suffix to an id and still hand back a
+  200K window, and this check would catch that); it PASSes when every `[1m]` probe reports
+  1_000_000, `haiku` reports 200_000, and no bare alias reports more than its `[1m]` form — it does
+  **not** require bare `sonnet`/`opus` to be 200_000, since an account can already default them to
+  1M, and FAILs — never silently passes — when a CLI is too old to carry `contextWindow` at all. A
+  few small calls (up to five); `--offline` for plumbing only, `--quick` to skip the slow probes.
+  Run it after every Claude Code update and before a relay release.
 
 - **`/relay:check --all`** tells you the real state (busy/reported/stalled/dead) — trust it over how
   a tab looks. `stalled` means go look at that tab.
