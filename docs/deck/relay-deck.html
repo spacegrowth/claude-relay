@@ -249,7 +249,7 @@ bin/relay
   <h1>Effort is how long it thinks before each action. It doesn't make a model smarter.</h1>
   <div class="cols cols-2">
     <div>
-      <p>A Sonnet at <code>max</code> effort is a Sonnet that takes longer. Effort is a quality lever on top of the right model: turn it up (<code>xhigh</code>) only for an Opus executor whose whole job is finding root causes.</p>
+      <p>A Sonnet at <code>max</code> effort is a Sonnet that takes longer. Claude Code already runs at <code>xhigh</code>, so unset and <code>xhigh</code> are the same thing. The only step up is <code>max</code>: take it for an Opus executor whose whole job is finding root causes, and nowhere else.</p>
       <p class="step">Don't turn it down to save money. Here's why:</p>
     </div>
     <div class="bars step">
@@ -259,7 +259,7 @@ bin/relay
     </div>
   </div>
   <p class="foot">Set it with an <code>EFFORT:</code> line or <code>--effort</code>. It's fixed for the life of the session, and sessions get reused. Leaving it unset is the right default.</p>
-  <aside class="notes">The bar is the argument. Output, thinking included, is under one percent of what the session cost. The lever people actually want is the model tier.</aside>
+  <aside class="notes">The bar is the argument. Output, thinking included, is under one percent of the tokens and about a seventh of the money (output bills at ~5× input). Still not the lever. The lever people actually want is the model tier.</aside>
 </section>
 <section class="slide">
   <p class="eyebrow">caching, in simple terms</p>

@@ -708,7 +708,8 @@ spawn (flag wins); unset leaves the CLI's own default. Like the model, it's fixe
 `relay resume|restart --effort` changes it, `send --rotate` carries it to the successor, and a
 follow-up packet declaring a different `EFFORT:` gets an ℹ note instead of a silent ignore.
 Pairing guidance: effort is a quality lever on top of the right model, not a cost lever. Leave it
-unset; raise to `xhigh` only for an opus executor whose whole territory is unknown-root-cause work
+unset (the CLI default is already `xhigh`); raise to `max` only for an opus executor whose whole
+territory is unknown-root-cause work
 (it's per-process, and executors are reused across packets). Don't turn it down to save money —
 thinking tokens are a minority of an executor's spend, and a weaker tier thinking longer doesn't
 gain the judgment it lacks; the cost lever is haiku. Shown in `relay list`'s LAUNCH

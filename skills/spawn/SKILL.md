@@ -26,8 +26,8 @@ plausible result, never by file count:**
   ambiguity you can't spec away in the packet. **Downgrade signal**: your acceptance criteria could
   be checked by a script.
 - **Effort is a quality lever on top of the right model, never a cost lever** (packet `EFFORT:`
-  line or `--effort`). Leave it unset. Raise it (`xhigh`) only when you've already chosen opus for
-  unknown-root-cause work AND the executor's whole territory is that kind of work — it's fixed per
+  line or `--effort`). Leave it unset (Claude Code's default is already `xhigh`). Raise it to `max` only when you've
+  already chosen opus for unknown-root-cause work AND the executor's whole territory is that kind of work — it's fixed per
   process and executors are reused, so you're setting it for every packet the session will get.
   Don't use `low`/`medium` to save money: thinking tokens are a minority of an executor's spend
   (reading files dominates), and a weaker tier thinking longer doesn't gain the judgment it lacks —
