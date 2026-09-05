@@ -241,25 +241,8 @@ bin/relay
   </div>
   <hr class="rule">
   <p class="step"><strong>If you guessed low, you'll know:</strong> two fix-list rounds and it still hasn't landed. That's the signal to respawn on a stronger model and mark the old session superseded. The reverse signal is the first question again: if the acceptance could be a script, you're overpaying.</p>
-  <p class="foot">Haiku isn't a worse worker. It's a worker that needs the packet bounded, the way the packet slide showed. Pass the tier name (<code>haiku</code> / <code>sonnet</code> / <code>opus</code>); relay resolves the version.</p>
+  <p class="foot">Pass the tier name (<code>haiku</code> / <code>sonnet</code> / <code>opus</code>); relay resolves it through this machine's CLI. Effort: leave it alone. Claude Code already runs at <code>xhigh</code>, and a longer-thinking Sonnet is still a Sonnet — the tier is the lever, not the dial.</p>
   <aside class="notes">Check the cheap case first, then the expensive one; Sonnet is what is left. The "two rounds" rule is the only feedback most people will actually use.</aside>
-</section>
-<section class="slide">
-  <p class="eyebrow">effort</p>
-  <h1>Effort is how long it thinks before each action. It doesn't make a model smarter.</h1>
-  <div class="cols cols-2">
-    <div>
-      <p>A Sonnet at <code>max</code> effort is a Sonnet that takes longer. Claude Code already runs at <code>xhigh</code>, so unset and <code>xhigh</code> are the same thing. The only step up is <code>max</code>: take it for an Opus executor whose whole job is finding root causes, and nowhere else.</p>
-      <p class="step">Don't turn it down to save money. Here's why:</p>
-    </div>
-    <div class="bars step">
-      <span>prompt</span><i style="width:100%"></i>
-      <span>output</span><i style="width:.6%;min-width:3px"></i>
-      <span></span><span class="muted small">one real executor session: 5.1M prompt tokens, 29k output. Thinking lives inside that 29k.</span>
-    </div>
-  </div>
-  <p class="foot">Set it with an <code>EFFORT:</code> line or <code>--effort</code>. It's fixed for the life of the session, and sessions get reused. Leaving it unset is the right default.</p>
-  <aside class="notes">The bar is the argument. Output, thinking included, is under one percent of the tokens and about a seventh of the money (output bills at ~5× input). Still not the lever. The lever people actually want is the model tier.</aside>
 </section>
 <section class="slide">
   <p class="eyebrow">caching, in simple terms</p>
