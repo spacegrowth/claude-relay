@@ -118,7 +118,7 @@
     <div class="row head"><div class="hd"></div><div class="hd">subagents &amp; agent teams</div><div class="hd on">relay executor</div></div>
     <div class="row step"><div class="k">model, effort</div><p class="old">Inherit the lead's unless you name one.</p><p class="new">Chosen per packet, by the lead.</p></div>
     <div class="row step"><div class="k">the cache</div><p class="old">In-process teammates hold it 5 minutes.</p><p class="new">Full sessions. Reuse one while it's warm.</p></div>
-    <div class="row step"><div class="k">mcp servers</div><p class="old">The project's, loaded into every turn.</p><p class="new">None by default. Opt in per packet.</p></div>
+    <div class="row step"><div class="k">mcp servers</div><p class="old">The project's, by default.</p><p class="new">None by default. Opt in per packet.</p></div>
     <div class="row step"><div class="k">permissions</div><p class="old">The lead's. Can't differ per agent at spawn.</p><p class="new">Commit denied at launch, every executor.</p></div>
     <div class="row step"><div class="k">you get back</div><p class="old">Prose you have to trust.</p><p class="new">A report checked against the git index.</p></div>
     <div class="row step"><div class="k">the lead</div><p class="old">Fixed for the session's lifetime.</p><p class="new">Hands off to a fresh one when it gets heavy.</p></div>
@@ -156,9 +156,9 @@
   </div>
   <p>You ask the lead for an executor. It writes the packet and opens the tab, titled by topic. Close the tab and the executor is gone. Its staged work isn't.</p>
   <pre class="step" style="margin-top:3vh">LEADS
-PROJECT          SESSION   AUTO  LIVE  MB
-claude-relay     cdad2e57  AUTO  live  4.5
-chart-migration  400e2a7b  -     live  0.4
+PROJECT          SESSION   AUTO  LIVE  CTX   MB
+claude-relay     cdad2e57  AUTO  live  321k  4.5
+chart-migration  400e2a7b  -     live  12k   0.4
 
 EXECUTORS
 SESSION            STATUS     TOPIC       MODEL     PKT  CTX   TOKENS
@@ -196,7 +196,7 @@ Don't touch hooks/.
 REPORT: write your full report to
   …/ctx-gate-205156/packets/002-report.md
 then end your turn with exactly:
-  ✅ [relay] — staged + report written — idle</span></pre>
+  ✅ [relay] — staged + report written — diff: … — idle, awaiting the lead's review.</span></pre>
     <div>
       <p><strong>This is what bounded means.</strong> Exact files, a finish line a command can check, what not to touch, and what to do when stuck: stop and report, never ask in the tab.</p>
       <p class="step"><strong>Acceptance is commands, not adjectives.</strong> If you can't write the check, you haven't finished thinking.</p>
@@ -252,7 +252,7 @@ bin/relay
   </div>
   <hr class="rule">
   <p class="step"><strong>Picked too weak?</strong> Third packet into the same session, relay puts a banner on your screen. Say "upgrade" and it moves one tier up. <strong>Too strong?</strong> The lead's terminal says "haiku can do this" at spawn.</p>
-  <p class="foot">Pass the tier name (<code>haiku</code> / <code>sonnet</code> / <code>opus</code>); relay resolves it through this machine's CLI. Effort: leave it alone. Claude Code already runs at <code>xhigh</code>, and a longer-thinking Sonnet is still a Sonnet — the tier is the lever, not the dial.</p>
+  <p class="foot">Pass the tier name (<code>haiku</code> / <code>sonnet</code> / <code>opus</code>); relay resolves it through this machine's CLI. Effort: leave it alone. Relay pins executors to <code>high</code>, the CLI default, whatever your own <code>/effort</code> is set to. A longer-thinking Sonnet is still a Sonnet — the tier is the lever, not the dial.</p>
   <aside class="notes">Check the cheap case first, then the expensive one; Sonnet is what is left. The "two rounds" rule is the only feedback most people will actually use.</aside>
 </section>
 <section class="slide">
