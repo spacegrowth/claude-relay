@@ -278,7 +278,8 @@ bin/relay
       <p class="step"><strong>Size is a tax.</strong> 10% of 260k is 26k tokens, every single turn, just to remember. A rotation costs one cold start, roughly 200k tokens' worth. Past 150k that pays for itself inside a single packet, so that's where relay draws the line — on the 1M window it's pure economics; on a 200k window it's also where auto-compaction would rewrite the history for you.</p>
       <p class="step"><strong>Tier is multiples, not percents.</strong> Haiku work costs Haiku. Nothing else on this slide moves the bill as much.</p>
     </div>
-    <pre class="step tabular">one real executor session
+    <pre class="step tabular">one real executor session — 63 requests,
+largest single request 124k tokens
 
 sent to the model     5,087,364
   from the cache      4,963,695   ×0.1
