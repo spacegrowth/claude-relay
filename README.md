@@ -171,6 +171,8 @@ And the three nouns:
                                             its conversation with the wider set, then delivers
              [--rotate]                    heavy session? retire it + spawn a seeded successor
                                             (1M window when the tier has one) with this packet first
+             [--upgrade]                   same, but ONE TIER UP (haiku→sonnet→opus): the answer to
+                                            the round-3 nudge when the current tier isn't landing it
              [--when-idle]                 busy target? queue it; delivers when it next goes idle
 relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --when-idle
 /relay:check [<session_id> | --all]        busy / reported / stalled / dead
@@ -716,12 +718,14 @@ gain the judgment it lacks; the cost lever is haiku. Shown in `relay list`'s LAU
 column as a fourth segment when set (`none/1m/A/low`).
 
 **Round-count nudge.** `relay send` prints an ℹ note once the outgoing packet is the 3rd (or later)
-sent to that session: `this is packet 3 into a <tier> session — if the last two were fixes for the
-same work and it still isn't done, stop sending fixes: spawn a stronger model on the packet and
-close this one with --supersede`. It doesn't try to detect whether the last two rounds were actually
-the same work — that's the lead's call — it just names the count so the "you picked too weak"
-signal isn't silently missed on a session that's just accumulating packets. Advisory only; never
-blocks the send.
+sent to that session — `this is packet 3 into a <tier> session — if the last two were fixes for the
+same work and it still isn't done, stop sending fixes: relay send <sid> <packet> --upgrade moves it
+one tier up with a seeded successor` — and posts the same sentence as a desktop banner (same
+`notify_on_wake` / `RELAY_NO_NOTIFY` switches as the wake), because the ℹ line lives in the lead's
+collapsed tool output and the human otherwise never sees it. It doesn't try to detect whether the
+last two rounds were actually the same work — that's the lead's call. Advisory only; never blocks
+the send. `--upgrade` is `--rotate` one tier up: retire, seeded successor, this packet first; the
+spawn ceiling still applies.
 
 ### Executor MCP servers
 

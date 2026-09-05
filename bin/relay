@@ -553,6 +553,36 @@ def packet_missing_preconditions(body):
     return PRECONDITIONS_HEADING_RE.search(body) is None
 
 
+def desktop_nudge(message, lead_sid=None, subtitle="model check"):
+    """Desktop banner for the round-3 nudge (the one that fires mid-work, when nobody is looking
+    at the terminal; the spawn-time shape hints stay terminal-only — the lead is already proposing
+    the split to the human at that moment).
+    The ℹ lines print inside the lead's Bash tool output, which Claude Code collapses — the human
+    never sees them unless the lead relays them. This puts the same sentence on screen. Same
+    kill-switches as the wake banner (notify_on_wake config, RELAY_NO_NOTIFY env); terminal-notifier
+    when present (click → `relay focus <lead>`, coalesced per lead), else macOS's built-in banner.
+    Best-effort, never raises."""
+    try:
+        if os.environ.get("RELAY_NO_NOTIFY"):
+            return
+        if not lead_guard.load_config(STATE_ROOT).get("notify_on_wake", True):
+            return
+        title = "relay · model check"
+        tn = lead_guard.find_terminal_notifier()
+        if tn:
+            args = [tn, "-title", title, "-subtitle", subtitle, "-message", message[:200], "-sound", "Glass"]
+            if lead_sid:
+                args += ["-group", f"relay-nudge-{lead_sid}", "-execute", f"'{RELAY_BIN}' focus {lead_sid}"]
+            subprocess.run(args, capture_output=True, timeout=5)
+        else:
+            def q(t):
+                return (t or "").replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.run(["osascript", "-e", f'display notification "{q(message[:180])}" '
+                            f'with title "{q(title)}" subtitle "{q(subtitle)}"'], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
 def print_lint(body, cwd=None, model=None, skip=("no-preconditions",)):
     """Print lead_guard.lint_packet findings for an outgoing packet (spawn/send). Advisory; the
     Preconditions nag is skipped here by default because warn_missing_preconditions already prints
@@ -1500,21 +1530,35 @@ def cmd_resume(args):
     print(f"resumed '{sid}' (tab '{label}', pid {pid}) — reopened conversation with full context")
 
 
-def _rotate_and_send(args, s, mb=None):
+def _rotate_and_send(args, s, mb=None, upgrade=False):
     """retire `s` → spawn its successor (seeded, same territory, 1M window when the tier has one) with
-    args.packet as packet 001. Prints the new session id; ledgers `rotated`."""
+    args.packet as packet 001. Prints the new session id; ledgers `rotated`.
+    `upgrade=True` (send --upgrade): the successor runs ONE TIER UP (haiku→sonnet→opus→fable, tier
+    alias, resolved through the CLI at spawn like any alias) — the one-flag answer to the round-3
+    nudge ("two fix rounds and it still isn't done → stronger model"). The spawn ceiling
+    (executor_model_ceiling) still applies, so an upgrade past it refuses the same way a spawn would."""
     sid = args.session_id
     n = 2
     while read_session(f"{sid}-r{n}"):
         n += 1
     new_sid = f"{sid}-r{n}"
     model = s.get("model") or lead_guard.load_config(STATE_ROOT).get("executor_default_model", "sonnet")
+    from_tier = None
+    if upgrade:
+        from_tier = lead_guard.model_tier(model)
+        if from_tier is None:
+            sys.exit(f"--upgrade: can't tell the tier of '{model}' — respawn by hand with --model")
+        idx = lead_guard.TIER_ORDER.index(from_tier)
+        if idx + 1 >= len(lead_guard.TIER_ORDER):
+            sys.exit(f"--upgrade: '{sid}' already runs {from_tier}, the top tier — nothing above it")
+        model = lead_guard.TIER_ORDER[idx + 1]
     widened = False
     if not lead_guard.model_has_1m(model) and lead_guard.model_supports_1m(model):
         model, widened = lead_guard.model_with_context(model, "1m"), True
     mcp = s.get("mcp")
     mcp_arg = lead_guard.mcp_spec_label(mcp) if mcp is not None else None
-    print(f"rotating '{sid}'" + (f" ({mb:.1f}MB transcript)" if mb else "") + f" → retire + spawn '{new_sid}' on {model}"
+    print((f"upgrading '{sid}' {from_tier} → {lead_guard.model_tier(model)}" if upgrade else f"rotating '{sid}'")
+          + (f" ({mb:.1f}MB transcript)" if mb and not upgrade else "") + f" → retire + spawn '{new_sid}' on {model}"
           + (" (widened to the 1M window)" if widened else ""))
     cmd_retire(SimpleNamespace(session_id=sid, force=False, keep_tab=False))
     cmd_spawn(SimpleNamespace(worktree=s["worktree"], topic=s.get("topic") or sid, packet=args.packet, model=model,
@@ -1522,8 +1566,8 @@ def _rotate_and_send(args, s, mb=None):
                               lead=s.get("owner_lead"), seed=sid, mcp=mcp_arg, keep=bool(s.get("keep")),
                               effort=s.get("effort"), model_override=None))
     append_ledger("rotated", session_id=sid, successor=new_sid, model=model, widened=widened,
-                  mb=round(mb, 1) if mb else None)
-    print(f"rotated: '{sid}' retired, '{new_sid}' spawned with this packet (seed inherited)")
+                  mb=round(mb, 1) if mb else None, upgrade=bool(upgrade), from_tier=from_tier)
+    print(f"{'upgraded' if upgrade else 'rotated'}: '{sid}' retired, '{new_sid}' spawned with this packet (seed inherited)")
 
 
 def cmd_send(args):
@@ -1595,6 +1639,8 @@ def cmd_send(args):
     # spawn a fresh executor over the same territory (same worktree/topic/scope/model/MCP, widened to
     # the 1M window when the tier has one), with this packet as its first. Works on a non-heavy
     # session too (a deliberate rotation), it just isn't suggested there.
+    if getattr(args, "upgrade", False):
+        return _rotate_and_send(args, s, mb, upgrade=True)
     if getattr(args, "rotate", False):
         return _rotate_and_send(args, s, mb)
     if _is_heavy(usage, mb, token_threshold, mb_threshold):
@@ -1645,9 +1691,11 @@ def cmd_send(args):
     print_lint(body, cwd=s.get("worktree"), model=s.get("model"))
     if n >= 3:
         tier = lead_guard.model_tier(s.get("model")) or s.get("model") or "?"
-        print(c(f"  ℹ this is packet {n} into a {tier} session — if the last two were fixes for the "
-                f"same work and it still isn't done, stop sending fixes: spawn a stronger model on the "
-                f"packet and close this one with --supersede", "dim"))
+        note = (f"this is packet {n} into a {tier} session — if the last two were fixes for the "
+                f"same work and it still isn't done, stop sending fixes: `relay send {args.session_id} "
+                f"<packet> --upgrade` moves it one tier up with a seeded successor")
+        print(c(f"  ℹ {note}", "dim"))
+        desktop_nudge(note, lead_sid=s.get("owner_lead"), subtitle=f"packet {n} on {tier}")
     want_effort = lead_guard.packet_effort_spec(body)
     if want_effort and want_effort != s.get("effort"):
         print(c(f"  ℹ packet declares EFFORT: {want_effort} but this session runs "
@@ -4786,6 +4834,9 @@ def main():
                     help="required to send into a session whose transcript is past the heaviness "
                          "threshold (§6e e2) — the reason is ledgered (model_ceiling_override's "
                          "sibling)")
+    sd.add_argument("--upgrade", action="store_true",
+                    help="retire this session and spawn a seeded successor ONE TIER UP (haiku→sonnet→opus) "
+                         "with this packet first — the one-flag answer to the round-3 nudge")
     sd.add_argument("--rotate", action="store_true",
                     help="retire this session and spawn a seeded successor over the same territory "
                          "(1M window when the tier has one) with this packet as its first — the one-flag "

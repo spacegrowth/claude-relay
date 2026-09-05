@@ -2401,7 +2401,46 @@ class TestSend:
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
         out = capsys.readouterr().out
         assert "ℹ this is packet 3 into a sonnet session" in out
-        assert "close this one with --supersede" in out
+        assert "--upgrade" in out
+
+    def test_round_nudge_also_posts_a_desktop_banner(self, relay, tmp_path, capsys, monkeypatch):
+        # The ℹ line lives in collapsed tool output; the banner is what the human actually sees.
+        self._mk(relay, status="reported", pid=os.getpid(), claude_session="cs-x", report=True)
+        s = relay.read_session("e1"); s["model"] = "sonnet"; s["owner_lead"] = "lead-1"
+        relay.write_session("e1", s)
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))  # 002
+        (relay.packets_dir("e1") / "002-report.md").write_text("done")
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        calls = []
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay.lead_guard, "find_terminal_notifier", return_value="/fake/tn"), \
+             mock.patch.object(relay.subprocess, "run", side_effect=lambda a, **k: calls.append(a)):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        banners = [a for a in calls if a and a[0] == "/fake/tn"]
+        assert banners, "no desktop banner posted for the round-3 nudge"
+        a = banners[-1]
+        assert "this is packet 3 into a sonnet session" in a[a.index("-message") + 1]
+        assert a[a.index("-group") + 1] == "relay-nudge-lead-1"
+        assert "focus lead-1" in a[a.index("-execute") + 1]
+
+    def test_round_nudge_banner_respects_no_notify(self, relay, tmp_path, monkeypatch):
+        self._mk(relay, status="reported", pid=os.getpid(), claude_session="cs-x", report=True)
+        s = relay.read_session("e1"); s["model"] = "sonnet"; relay.write_session("e1", s)
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))  # 002
+        (relay.packets_dir("e1") / "002-report.md").write_text("done")
+        monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
+        calls = []
+        with mock.patch.object(relay.iterm, "send", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay.lead_guard, "find_terminal_notifier", return_value="/fake/tn"), \
+             mock.patch.object(relay.subprocess, "run", side_effect=lambda a, **k: calls.append(a)):
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        assert not [a for a in calls if a and a[0] == "/fake/tn"]
 
     def test_send_records_landed_for_current_packet_before_next_packet_sent(self, relay, tmp_path):
         # Ledger event ORDER matters here: packet 001's `landed` must be appended before packet
@@ -6301,6 +6340,52 @@ class TestSendRotate:
         packet = (relay.packets_dir(f"{sid}-r2") / "001-packet.md").read_text()
         assert "do more in src/a.py" in packet and "Successor seed" in packet
         assert any(json.loads(l).get("event") == "rotated" for l in relay.LEDGER.read_text().splitlines())
+
+    def _seed_for_upgrade(self, relay, tmp_path, model):
+        sid = "up1"
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": str(tmp_path), "topic": "parser", "scope": "p",
+            "tab_label": "x", "model": model, "mcp": None, "context": "1m", "agent": "relay-executor",
+            "pid": None, "claude_session": "cs-u", "status": "reported", "current_packet": 1, "owner_lead": "lead-1",
+            "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("first")
+        (relay.packets_dir(sid) / "001-report.md").write_text("Done.\nStatus: partial\nRisk flags: none\nUNVERIFIED: none\nChanged: x")
+        nxt = tmp_path / "n.md"; nxt.write_text("# next\n\n## Preconditions\n- ok\n\nfix it properly in src/a.py")
+        return sid, nxt
+
+    def _run_upgrade(self, relay, sid, nxt):
+        cap = {}
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: cap.update(kw)), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=False), \
+             mock.patch.object(relay.iterm, "close", return_value=True), \
+             mock.patch.object(relay, "_kill_and_wait"), mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_send(SimpleNamespace(session_id=sid, packet=str(nxt), upgrade=True))
+        return cap
+
+    def test_upgrade_spawns_seeded_successor_one_tier_up(self, relay, tmp_path):
+        sid, nxt = self._seed_for_upgrade(relay, tmp_path, "sonnet[1m]")
+        cap = self._run_upgrade(relay, sid, nxt)
+        assert relay.read_session(sid)["status"] == "superseded"
+        new = relay.read_session(f"{sid}-r2")
+        assert new and relay.lead_guard.model_tier(new["model"]) == "opus" and new["owner_lead"] == "lead-1"
+        assert relay.lead_guard.model_tier(cap["model"]) == "opus"
+        assert "Successor seed" in (relay.packets_dir(f"{sid}-r2") / "001-packet.md").read_text()
+        ev = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
+        rot = [e for e in ev if e.get("event") == "rotated"][-1]
+        assert rot["upgrade"] is True and rot["from_tier"] == "sonnet"
+
+    def test_upgrade_from_haiku_lands_on_sonnet(self, relay, tmp_path):
+        sid, nxt = self._seed_for_upgrade(relay, tmp_path, "haiku")
+        cap = self._run_upgrade(relay, sid, nxt)
+        assert relay.lead_guard.model_tier(cap["model"]) == "sonnet"
+
+    def test_upgrade_at_top_tier_refuses(self, relay, tmp_path):
+        sid, nxt = self._seed_for_upgrade(relay, tmp_path, "fable")
+        with pytest.raises(SystemExit) as ei:
+            self._run_upgrade(relay, sid, nxt)
+        assert "top tier" in str(ei.value)
+        assert relay.read_session(sid)["status"] == "reported"  # nothing retired
 
     def test_heavy_gate_mentions_rotate(self, relay, tmp_path):
         sid = "heavy2"
