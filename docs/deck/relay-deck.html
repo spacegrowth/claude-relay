@@ -251,7 +251,7 @@ bin/relay
   <div class="cols cols-3">
     <p><strong>No memory.</strong> Every reply, the whole conversation so far is sent to the API again, and billed again.</p>
     <p class="step"><strong>The cache remembers the start.</strong> Anything the API has already seen costs a tenth to send again. Anything new costs double to store, once.</p>
-    <p class="step"><strong>It stays warm while you keep talking.</strong> Every turn resets a 60-minute clock. Go quiet for an hour and the whole thing is stored again, at double.</p>
+    <p class="step"><strong>It stays warm while you keep talking.</strong> Every turn resets a 60-minute clock (on a subscription; 5 minutes on a raw API key). Go quiet for an hour and the whole thing is stored again, at double.</p>
   </div>
   <div class="step" style="margin:3.5vh 0 0">
     <p class="small muted" style="margin-bottom:.8vh">what's in the cache: everything sent so far, in this order</p>
