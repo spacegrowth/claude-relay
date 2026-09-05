@@ -275,7 +275,7 @@ bin/relay
   <div class="cols cols-2">
     <div>
       <p><strong>Warm reuse.</strong> The next packet into a session you already have pays 10% on everything it has read. A fresh spawn stores all of it again.</p>
-      <p class="step"><strong>Size is a tax.</strong> 10% of 260k is 26k tokens, every single turn, just to remember. A rotation costs one cold start, roughly 200k tokens' worth. Past 150k that pays for itself inside a single packet, so that's where relay draws the line.</p>
+      <p class="step"><strong>Size is a tax.</strong> 10% of 260k is 26k tokens, every single turn, just to remember. A rotation costs one cold start, roughly 200k tokens' worth. Past 150k that pays for itself inside a single packet, so that's where relay draws the line — on the 1M window it's pure economics; on a 200k window it's also where auto-compaction would rewrite the history for you.</p>
       <p class="step"><strong>Tier is multiples, not percents.</strong> Haiku work costs Haiku. Nothing else on this slide moves the bill as much.</p>
     </div>
     <pre class="step tabular">one real executor session
