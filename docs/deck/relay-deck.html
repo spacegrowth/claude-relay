@@ -253,17 +253,17 @@ bin/relay
     <p class="step"><strong>It stays warm while you keep talking.</strong> Every turn resets a 60-minute clock. Go quiet for an hour and the whole thing is stored again, at double.</p>
   </div>
   <div class="step" style="margin:3.5vh 0 0">
-    <p class="small muted" style="margin-bottom:.8vh">what gets re-sent every turn, in this order</p>
-    <div style="display:flex;gap:2px;font-family:var(--mono);font-size:1.05vw;line-height:1.35">
-      <div style="flex:3;border:1px solid var(--line);padding:1vh .8vw">system prompt<br><span class="muted">Claude Code + executor role + CLAUDE.md</span></div>
-      <div style="flex:1.4;border:1px solid var(--line);padding:1vh .8vw">tool<br>definitions</div>
-      <div style="flex:1.6;border:1px solid var(--line);padding:1vh .8vw">the packet</div>
-      <div style="flex:3.2;border:1px solid var(--line);padding:1vh .8vw">every file it read<br><span class="muted">tool results are part of the conversation</span></div>
-      <div style="flex:2;border:1px solid var(--line);padding:1vh .8vw">command output</div>
-      <div style="flex:1.6;border:1px solid var(--line);padding:1vh .8vw">its own replies</div>
-      <div style="flex:1.4;border:1px solid var(--accent);color:var(--accent);padding:1vh .8vw">this turn<br><span style="opacity:.8">not held yet</span></div>
+    <p class="small muted" style="margin-bottom:.8vh">what's in the cache: everything sent so far, in this order</p>
+    <div style="display:flex;gap:2px;font-family:var(--mono);font-size:1.1vw;line-height:1.35">
+      <div style="flex:2.2;border:1px solid var(--line);padding:1.1vh .8vw">system prompt</div>
+      <div style="flex:1.4;border:1px solid var(--line);padding:1.1vh .8vw">tool list</div>
+      <div style="flex:1.4;border:1px solid var(--line);padding:1.1vh .8vw">the packet</div>
+      <div style="flex:2.4;border:1px solid var(--line);padding:1.1vh .8vw">every file it read</div>
+      <div style="flex:2.2;border:1px solid var(--line);padding:1.1vh .8vw">every command's output</div>
+      <div style="flex:1.6;border:1px solid var(--line);padding:1.1vh .8vw">its own replies</div>
+      <div style="flex:1.2;border:1px solid var(--accent);color:var(--accent);padding:1.1vh .8vw">this turn</div>
     </div>
-    <p class="small muted" style="margin-top:.8vh">A file read on turn 3 is re-sent on every turn after: at 10%, but forever. Two catches: it only matches from the start, and it's per model.</p>
+    <p class="small muted" style="margin-top:.8vh">A file read on turn 3 is re-sent on every turn after. It only matches from the start, and it's per model.</p>
   </div>
   <p class="foot">Which is why relay's first answer to a new packet is <code>send</code> into a warm executor, not <code>spawn</code>.</p>
   <aside class="notes">Beat one is the whole idea: no memory, so everything is re-sent. Point at "every file it read" on the strip. The two catches at the bottom are why relay never swaps a session's model and why the system prompt is frozen.</aside>
