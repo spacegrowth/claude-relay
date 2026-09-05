@@ -1992,7 +1992,7 @@ def lint_packet(body, cwd=None, known_servers=None, model=None, reading_bytes=No
     if tier not in ("opus", "fable") and any(w in low for w in OPUS_SHAPE_WORDS) \
             and REPRO_RE.search(text) is None:
         out.append(("info", "shape-opus", "packet carries a question the lead couldn't answer — "
-                    "opus-shaped; effort xhigh is the pairing (rubric: 'unknown-root-cause… "
+                    "opus-shaped; effort max if correctness beats cost (rubric: 'unknown-root-cause… "
                     "wrong-but-plausible would survive review')"))
     return out
 
