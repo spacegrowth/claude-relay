@@ -716,12 +716,12 @@ gain the judgment it lacks; the cost lever is haiku. Shown in `relay list`'s LAU
 column as a fourth segment when set (`none/1m/A/low`).
 
 **Round-count nudge.** `relay send` prints an ℹ note once the outgoing packet is the 3rd (or later)
-sent to that session: `round 3 into this session on <tier> — if the last two were fix-lists on the
-same work, the spawn rubric says respawn stronger and --supersede`. It doesn't try to detect
-whether the last two rounds were actually the same work — that's the lead's call — it just names the
-round count so the spawn skill's upgrade signal (two fix-list rounds haven't landed it → respawn
-stronger + `--supersede`) isn't silently missed on a session that's just accumulating packets.
-Advisory only; never blocks the send.
+sent to that session: `this is packet 3 into a <tier> session — if the last two were fixes for the
+same work and it still isn't done, stop sending fixes: spawn a stronger model on the packet and
+close this one with --supersede`. It doesn't try to detect whether the last two rounds were actually
+the same work — that's the lead's call — it just names the count so the "you picked too weak"
+signal isn't silently missed on a session that's just accumulating packets. Advisory only; never
+blocks the send.
 
 ### Executor MCP servers
 

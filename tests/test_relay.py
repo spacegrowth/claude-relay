@@ -2393,15 +2393,15 @@ class TestSend:
              mock.patch.object(relay.iterm, "is_alive", return_value=True):
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
         out = capsys.readouterr().out
-        assert "round" not in out  # 2nd packet into the session — too early
+        assert "this is packet" not in out  # 2nd packet into the session — too early
 
         (relay.packets_dir("e1") / "002-report.md").write_text("done")
         with mock.patch.object(relay.iterm, "send", return_value=True), \
              mock.patch.object(relay.iterm, "is_alive", return_value=True):
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
         out = capsys.readouterr().out
-        assert "ℹ round 3 into this session on sonnet" in out
-        assert "respawn stronger and --supersede" in out
+        assert "ℹ this is packet 3 into a sonnet session" in out
+        assert "close this one with --supersede" in out
 
     def test_send_records_landed_for_current_packet_before_next_packet_sent(self, relay, tmp_path):
         # Ledger event ORDER matters here: packet 001's `landed` must be appended before packet

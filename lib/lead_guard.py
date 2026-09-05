@@ -1987,13 +1987,13 @@ def lint_packet(body, cwd=None, known_servers=None, model=None, reading_bytes=No
     has_file_list = bool(FILES_LIST_RE.search(text)) or len(BACKTICK_PATH_RE.findall(text)) >= 2
     if tier != "haiku" and has_acceptance_cmd and has_file_list \
             and not any(w in low for w in HAIKU_DISQUALIFY_WORDS):
-        out.append(("info", "shape-haiku", "packet is fully specified and script-checkable — "
-                    "haiku-shaped (rubric: 'mechanical, fully-specified, verifiable-by-command')"))
+        out.append(("info", "shape-haiku", "this packet names its files and has a command that checks "
+                    "it's done — haiku can do this; you picked something bigger"))
     if tier not in ("opus", "fable") and any(w in low for w in OPUS_SHAPE_WORDS) \
             and REPRO_RE.search(text) is None:
-        out.append(("info", "shape-opus", "packet carries a question the lead couldn't answer — "
-                    "opus-shaped; effort max if correctness beats cost (rubric: 'unknown-root-cause… "
-                    "wrong-but-plausible would survive review')"))
+        out.append(("info", "shape-opus", "this packet asks the executor to figure something out "
+                    "(investigate / root cause / why) and gives no repro — a wrong answer would look "
+                    "right; consider opus"))
     return out
 
 
