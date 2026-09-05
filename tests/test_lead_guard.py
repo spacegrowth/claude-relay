@@ -3224,6 +3224,13 @@ class TestPacketLint:
     def test_shape_haiku_fires_on_fully_specified_packet(self):
         assert "shape-haiku" in self.codes(self.HAIKU_SHAPED)
 
+    def test_shape_haiku_fires_on_plain_acceptance_line_not_just_heading(self):
+        # real packets write "ACCEPTANCE:" as a plain line, not a markdown heading
+        body = ("Rename `fetch_bars` to `fetch_ohlc` everywhere.\n\n"
+                "REPO: ~/x — files: `src/a.py`, `tests/test_a.py`\n"
+                "ACCEPTANCE:\n```\npython3 -m pytest -q tests/test_a.py\n```\n")
+        assert "shape-haiku" in self.codes(body)
+
     def test_shape_haiku_silent_without_file_list_or_acceptance_command(self):
         assert "shape-haiku" not in self.codes(self.GOOD)  # one bare path, no acceptance command
 

@@ -1908,7 +1908,7 @@ ASK_RE = re.compile(r"\b(ask|check with|confirm with|clarify with) (the )?(user|
 OPUS_SHAPE_WORDS = ("investigate", "figure out", "root cause", "unknown", "diagnose", "why does")
 HAIKU_DISQUALIFY_WORDS = ("investigate", "figure out", "root cause", "why", "unclear", "diagnose")
 ACCEPTANCE_CMD_RE = re.compile(
-    r"^#{1,6}[ \t]*acceptance\b.*?(?:```|^\s*(?:pytest|npm|make|python3 -m|go test)\b)",
+    r"^(?:#{1,6}[ \t]*)?acceptance\b.*?(?:```|^\s*(?:pytest|npm|make|python3 -m|go test)\b)",
     re.IGNORECASE | re.MULTILINE | re.DOTALL)
 FILES_LIST_RE = re.compile(r"^\s*files\s*:", re.IGNORECASE | re.MULTILINE)
 BACKTICK_PATH_RE = re.compile(r"`[^`\n]*[/.][^`\n]*`")
