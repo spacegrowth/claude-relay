@@ -85,6 +85,10 @@
   .steps6 { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1.2vw; }
   .steps6 div { border-top: 2px solid var(--ink); padding-top: 1.4vh; font-size: clamp(12px, 1.15vw, 21px); line-height: 1.45; }
   .steps6 code { display: block; background: none; padding: 0; color: var(--accent); margin-bottom: .6vh; }
+  .steps6 .who { display: inline-block; font-family: var(--mono); font-size: clamp(10px, .95vw, 17px); letter-spacing: .08em; text-transform: uppercase; padding: .15em .5em; border-radius: 3px; margin-bottom: .8vh; }
+  .steps6 .who.you { background: var(--accent); color: #fff; }
+  .steps6 .who.lead { background: var(--line); color: var(--muted); }
+  .steps6 code { color: var(--ink); }
   .report { font-family: var(--mono); font-size: clamp(12px, 1.15vw, 21px); line-height: 1.55; white-space: pre; }
   .report em { font-style: normal; color: var(--accent); }
   .spine { font-family: var(--mono); color: var(--accent); letter-spacing: .06em; font-size: clamp(14px, 1.4vw, 25px); }
@@ -353,17 +357,17 @@ without a cache        ≈ 5.2M</pre>
 </section>
 <section class="slide">
   <p class="eyebrow">using it</p>
-  <h1>Six steps</h1>
+  <h1>Six steps — four are yours, and they're all one word.</h1>
   <div class="steps6">
-    <div class="step"><code>/relay:mode</code>Arm the lead. Model check, edit gate on, wake on.</div>
-    <div class="step"><code>write a packet</code>Goal on the first line, files, acceptance commands, boundaries.</div>
-    <div class="step"><code>/relay:spawn</code>Worktree, topic, packet, <code>--model sonnet</code>. Or <code>/relay:send</code> into one you have.</div>
-    <div class="step"><code>wait</code>The wake announces the report. <code>/relay:check</code> if you're impatient.</div>
-    <div class="step"><code>/relay:diff</code> <code>/relay:verify</code>Read the diff. Check the claims.</div>
-    <div class="step"><code>git commit</code>You, not the executor. Then relay parks it.</div>
+    <div class="step"><span class="who you">you</span><code>/relay:mode</code>Arm the lead. It checks its model, turns the edit gate and the wake on.</div>
+    <div class="step"><span class="who you">you</span><code>describe the work</code>Or point at a brief. That's the last long thing you type.</div>
+    <div class="step"><span class="who lead">lead</span><code>packets + split</code>Writes the packet files, proposes who builds what. <span class="who you">you</span> say <strong>go</strong>.</div>
+    <div class="step"><span class="who lead">lead</span><code>spawn · wait</code>Opens the executor tabs. The wake announces each report; a banner if you're away.</div>
+    <div class="step"><span class="who lead">lead</span><code>diff · verify</code>Reads the staged diff, checks the report's claims, tells you what it found.</div>
+    <div class="step"><span class="who you">you</span><code>commit</code>One word. The lead commits under your name; relay parks the executor.</div>
   </div>
-  <p class="foot">The first spawn of a session always asks for your go, even in auto. Deciding how work splits is yours.</p>
-  <aside class="notes">Leave this slide up during questions.</aside>
+  <p class="foot">The first spawn of a session always waits for your go, even in auto. Deciding how work splits is yours; typing the commands isn't.</p>
+  <aside class="notes">The point of the slide is the color: blue is the human, gray is the lead. Four blue words in a whole cycle. Leave it up during questions.</aside>
 </section>
 <section class="slide">
   <p class="eyebrow">skills</p>
