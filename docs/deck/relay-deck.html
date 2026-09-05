@@ -240,7 +240,7 @@ bin/relay
     <div><p class="light">Everything else.</p><p class="muted step"><strong>Sonnet.</strong> Bounded features, bugs with a repro, refactors inside one module. Most packets land here.</p></div>
   </div>
   <hr class="rule">
-  <p class="step"><strong>If you guessed low, you'll know:</strong> two fix-list rounds and it still hasn't landed. That's the signal to respawn on a stronger model and mark the old session superseded. The reverse signal is the first question again: if the acceptance could be a script, you're overpaying.</p>
+  <p class="step"><strong>How you find out you picked wrong.</strong> Too weak: you've sent two rounds of fixes and it still isn't done. Stop sending fixes — spawn a stronger model on the same packet and close the old one. Too strong: if a script could have checked the result, Haiku would have done it for a fraction of the price.</p>
   <p class="foot">Pass the tier name (<code>haiku</code> / <code>sonnet</code> / <code>opus</code>); relay resolves it through this machine's CLI. Effort: leave it alone. Claude Code already runs at <code>xhigh</code>, and a longer-thinking Sonnet is still a Sonnet — the tier is the lever, not the dial.</p>
   <aside class="notes">Check the cheap case first, then the expensive one; Sonnet is what is left. The "two rounds" rule is the only feedback most people will actually use.</aside>
 </section>
