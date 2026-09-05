@@ -100,7 +100,6 @@
   <p class="foot spine">Delegate. Review. Commit.</p>
   <aside class="notes">Point at the headline and let the picture land: this is a row of terminal tabs, not agents in a box. The three verbs at the bottom are the whole talk. Come back to them in the demo.</aside>
 </section>
-
 <section class="slide">
   <p class="eyebrow">the obvious question</p>
   <h1>The difference isn't parallelism. It's who pays, and who signs.</h1>
@@ -117,7 +116,6 @@
   <p class="foot">Teams win when the agents should argue with each other. Everywhere else the tier is yours to pick, packet by packet, and nothing lands without your commit.</p>
   <aside class="notes">Concede the overlap immediately: teams also get their own context, their own panes, and direct messaging. The difference is that relay treats the executor as untrusted: it cannot commit, its report is machine-checked against the index, and you approve the plan. Facts for Q&A: agent teams need CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1; teammate model falls through to the lead's; effort is always the lead's; permission modes can't be set per teammate at spawn; a named subagent becomes a teammate without confirmation; one team per session; the lead can't be handed off. Relay handles the last one with /relay:handoff.</aside>
 </section>
-
 <section class="slide">
   <p class="eyebrow">how it works</p>
   <h1>The best model makes the decisions. Cheaper ones do the typing.</h1>
@@ -135,7 +133,6 @@
   <p class="foot">Executors can't commit (denied at launch). Leads can't make large inline edits (a hook blocks it). The asymmetry is the design.</p>
   <aside class="notes">The headline is the thesis; the diagram is the proof. Start with the plan, not the arrows: splitting the work into bounded pieces is the lead's judgment and relay never does it for you. That's the callback on the six-steps slide. Then walk the arrows in order. Stress that the wake originates in the lead's session, from a hook: there is no arrow from the executor to the lead except the report file.</aside>
 </section>
-
 <section class="slide">
   <p class="eyebrow">tabs</p>
   <h1>Every executor is a tab you can look at.</h1>
@@ -159,7 +156,6 @@ relay-stats-205203 busy 12m   relay-stats sonnet-5  001  210k  8.3M/45k ·warm</
   <p class="step small muted" style="margin-top:1vh;max-width:none">Ask "what's running": leads by project, executors by session, each with status, model, packet number, live context, tokens spent, and whether the cache is still warm.</p>
   <aside class="notes">People ask "where does it run" first. Answer it before the mechanics. These are real rows. Nobody types relay commands; you talk to the lead and it runs them.</aside>
 </section>
-
 <section class="slide">
   <p class="eyebrow">the contract, outbound</p>
   <h1>A packet</h1>
@@ -198,7 +194,6 @@ then end your turn with exactly:
   </div>
   <aside class="notes">A real packet, trimmed. The "cold reader" test is the one habit that makes delegation work.</aside>
 </section>
-
 <section class="slide">
   <p class="eyebrow">the contract, inbound</p>
   <h1>A report</h1>
@@ -236,7 +231,82 @@ bin/relay
   <p class="foot">Executors never commit. You do, with your name on it.</p>
   <aside class="notes">This is the real report for the packet on the previous slide, trimmed. Pair them: the packet asked for a number in the report; the report has 1171. The "pre-existing flake" line is what honest looks like; a report that hides that is the one to worry about.</aside>
 </section>
+<section class="slide">
+  <p class="eyebrow">choosing a model</p>
+  <h1>Who gets the packet?</h1>
+  <div class="cols cols-3">
+    <div><p class="light">A script could check it's done.</p><p class="muted step"><strong>Haiku.</strong> Rename sweeps, boilerplate from a shown template, config plumbing. The packet must be tight. If it needs a "why" explained, it isn't Haiku work.</p></div>
+    <div><p class="light">A plausible wrong answer could slip past you.</p><p class="muted step"><strong>Opus.</strong> Unknown root causes, cross-cutting changes, core logic. Pay for judgment where a review wouldn't catch a wrong answer.</p></div>
+    <div><p class="light">Everything else.</p><p class="muted step"><strong>Sonnet.</strong> Bounded features, bugs with a repro, refactors inside one module. Most packets land here.</p></div>
+  </div>
+  <hr class="rule">
+  <p class="step"><strong>If you guessed low, you'll know:</strong> two fix-list rounds and it still hasn't landed. That's the signal to respawn on a stronger model and mark the old session superseded. The reverse signal is the first question again: if the acceptance could be a script, you're overpaying.</p>
+  <p class="foot">Haiku isn't a worse worker. It's a worker that needs the packet bounded, the way the packet slide showed. Pass the tier name (<code>haiku</code> / <code>sonnet</code> / <code>opus</code>); relay resolves the version.</p>
+  <aside class="notes">Check the cheap case first, then the expensive one; Sonnet is what is left. The "two rounds" rule is the only feedback most people will actually use.</aside>
+</section>
+<section class="slide">
+  <p class="eyebrow">effort</p>
+  <h1>Effort is how long it thinks before each action. It doesn't make a model smarter.</h1>
+  <div class="cols cols-2">
+    <div>
+      <p>A Sonnet at <code>max</code> effort is a Sonnet that takes longer. Effort is a quality lever on top of the right model: turn it up (<code>xhigh</code>) only for an Opus executor whose whole job is finding root causes.</p>
+      <p class="step">Don't turn it down to save money. Here's why:</p>
+    </div>
+    <div class="bars step">
+      <span>prompt</span><i style="width:100%"></i>
+      <span>output</span><i style="width:.6%;min-width:3px"></i>
+      <span></span><span class="muted small">one real executor session: 5.1M prompt tokens, 29k output. Thinking lives inside that 29k.</span>
+    </div>
+  </div>
+  <p class="foot">Set it with an <code>EFFORT:</code> line or <code>--effort</code>. It's fixed for the life of the session, and sessions get reused. Leaving it unset is the right default.</p>
+  <aside class="notes">The bar is the argument. Output, thinking included, is under one percent of what the session cost. The lever people actually want is the model tier.</aside>
+</section>
+<section class="slide">
+  <p class="eyebrow">caching, in simple terms</p>
+  <h1>The model forgets everything between turns. The cache is what makes that affordable.</h1>
+  <div class="cols cols-3">
+    <p><strong>No memory.</strong> Every reply, the whole conversation so far is sent to the API again, and billed again.</p>
+    <p class="step"><strong>The cache remembers the start.</strong> Anything the API has already seen costs a tenth to send again. Anything new costs double to store, once.</p>
+    <p class="step"><strong>It stays warm while you keep talking.</strong> Every turn resets a 60-minute clock. Go quiet for an hour and the whole thing is stored again, at double.</p>
+  </div>
+  <div class="step" style="margin:3.5vh 0 0">
+    <p class="small muted" style="margin-bottom:.8vh">what gets re-sent every turn, in this order</p>
+    <div style="display:flex;gap:2px;font-family:var(--mono);font-size:1.05vw;line-height:1.35">
+      <div style="flex:3;border:1px solid var(--line);padding:1vh .8vw">system prompt<br><span class="muted">Claude Code + executor role + CLAUDE.md</span></div>
+      <div style="flex:1.4;border:1px solid var(--line);padding:1vh .8vw">tool<br>definitions</div>
+      <div style="flex:1.6;border:1px solid var(--line);padding:1vh .8vw">the packet</div>
+      <div style="flex:3.2;border:1px solid var(--line);padding:1vh .8vw">every file it read<br><span class="muted">tool results are part of the conversation</span></div>
+      <div style="flex:2;border:1px solid var(--line);padding:1vh .8vw">command output</div>
+      <div style="flex:1.6;border:1px solid var(--line);padding:1vh .8vw">its own replies</div>
+      <div style="flex:1.4;border:1px solid var(--accent);color:var(--accent);padding:1vh .8vw">this turn<br><span style="opacity:.8">not held yet</span></div>
+    </div>
+    <p class="small muted" style="margin-top:.8vh">A file read on turn 3 is re-sent on every turn after: at 10%, but forever. Two catches: it only matches from the start, and it's per model.</p>
+  </div>
+  <p class="foot">Which is why relay's first answer to a new packet is <code>send</code> into a warm executor, not <code>spawn</code>.</p>
+  <aside class="notes">Beat one is the whole idea: no memory, so everything is re-sent. Point at "every file it read" on the strip. The two catches at the bottom are why relay never swaps a session's model and why the system prompt is frozen.</aside>
+</section>
+<section class="slide">
+  <p class="eyebrow">the bill</p>
+  <h1>Why a warm executor is cheap, and a huge one isn't</h1>
+  <div class="cols cols-2">
+    <div>
+      <p><strong>Warm reuse.</strong> The next packet into a session you already have pays 10% on everything it has read. A fresh spawn stores all of it again.</p>
+      <p class="step"><strong>Size is a tax.</strong> 10% of 260k is 26k tokens, every single turn, just to remember. That's why relay says rotate at 150k.</p>
+      <p class="step"><strong>Tier is multiples, not percents.</strong> Haiku work costs Haiku. Nothing else on this slide moves the bill as much.</p>
+    </div>
+    <pre class="step tabular">one real executor session
 
+sent to the model     5,087,364
+  from the cache      4,963,695   ×0.1
+  stored fresh          123,543   ×2
+output                   29,242   ×5
+
+billed like            ≈ 0.9M input tokens
+without a cache        ≈ 5.2M</pre>
+  </div>
+  <p class="foot">What moves the bill, biggest first: which tier, how much it reads per turn, warm reuse over cold spawns. Effort barely registers.</p>
+  <aside class="notes">Real numbers from one Sonnet executor. Most of the bill is cache reads, so warm reuse is the lever and context size is the tax. ×2 is the 1-hour cache write, which is what Claude Code uses; output is 5× input on every tier.</aside>
+</section>
 <section class="slide">
   <p class="eyebrow">reuse, rotate, hand off</p>
   <h1>Keep using a session while it's cheap. Replace it when it isn't.</h1>
@@ -263,106 +333,6 @@ bin/relay
   <p class="foot">The first session the 150k gate ever caught was the executor that built it. Why reuse is cheap and size is a tax: caching, a few slides on.</p>
   <aside class="notes">Same idea at two speeds. Executors churn in an afternoon; a lead lasts days. Rotate = retire plus a seeded successor, one step, the lead does it. Handoff = a note plus a fresh lead, and it's the one thing agent teams can't do at all. The 321k / 4.5 MB pair is real: the lead building this deck. MB said "getting close"; tokens said "twice past the line". That's why the nudge went token-first in 0.3.49.</aside>
 </section>
-
-<section class="slide">
-  <p class="eyebrow">the design</p>
-  <h1>Why it's built this way</h1>
-  <div class="chain step">
-    <p>A bounded packet has a finish line a command can check <span class="to">→</span> review catches a wrong answer <span class="to">→</span> judgment isn't needed inside the task</p>
-    <p class="so">so a cheap model does it. You pay Haiku for Haiku work.</p>
-  </div>
-  <div class="chain step">
-    <p>The model forgets every turn <span class="to">→</span> everything is re-sent <span class="to">→</span> the cache makes that 10% <span class="to">→</span> a warm session is cheap, a huge one is a tax</p>
-    <p class="so">so send into the executor you have. Rotate it at 150k.</p>
-  </div>
-  <div class="chain step">
-    <p>The executor can't commit <span class="to">→</span> its report is checked against the index <span class="to">→</span> you read the diff</p>
-    <p class="so">so you sign. Every time.</p>
-  </div>
-  <p class="foot">The next few slides are these three lines, slowly.</p>
-  <aside class="notes">This is the map. Read each chain left to right and land on the "so". Everything from here to the guardrails slide is one of these three chains in detail; when a slide feels like a rule, point back at which chain it closes.</aside>
-</section>
-
-<section class="slide">
-  <p class="eyebrow">choosing a model</p>
-  <h1>Who gets the packet?</h1>
-  <div class="cols cols-3">
-    <div><p class="light">A script could check it's done.</p><p class="muted step"><strong>Haiku.</strong> Rename sweeps, boilerplate from a shown template, config plumbing. The packet must be tight. If it needs a "why" explained, it isn't Haiku work.</p></div>
-    <div><p class="light">A plausible wrong answer could slip past you.</p><p class="muted step"><strong>Opus.</strong> Unknown root causes, cross-cutting changes, core logic. Pay for judgment where a review wouldn't catch a wrong answer.</p></div>
-    <div><p class="light">Everything else.</p><p class="muted step"><strong>Sonnet.</strong> Bounded features, bugs with a repro, refactors inside one module. Most packets land here.</p></div>
-  </div>
-  <hr class="rule">
-  <p class="step"><strong>If you guessed low, you'll know:</strong> two fix-list rounds and it still hasn't landed. That's the signal to respawn on a stronger model and mark the old session superseded. The reverse signal is the first question again: if the acceptance could be a script, you're overpaying.</p>
-  <p class="foot">Haiku isn't a worse worker. It's a worker that needs the packet bounded, the way the packet slide showed. Pass the tier name (<code>haiku</code> / <code>sonnet</code> / <code>opus</code>); relay resolves the version.</p>
-  <aside class="notes">Check the cheap case first, then the expensive one; Sonnet is what is left. The "two rounds" rule is the only feedback most people will actually use.</aside>
-</section>
-
-<section class="slide">
-  <p class="eyebrow">effort</p>
-  <h1>Effort is how long it thinks before each action. It doesn't make a model smarter.</h1>
-  <div class="cols cols-2">
-    <div>
-      <p>A Sonnet at <code>max</code> effort is a Sonnet that takes longer. Effort is a quality lever on top of the right model: turn it up (<code>xhigh</code>) only for an Opus executor whose whole job is finding root causes.</p>
-      <p class="step">Don't turn it down to save money. Here's why:</p>
-    </div>
-    <div class="bars step">
-      <span>prompt</span><i style="width:100%"></i>
-      <span>output</span><i style="width:.6%;min-width:3px"></i>
-      <span></span><span class="muted small">one real executor session: 5.1M prompt tokens, 29k output. Thinking lives inside that 29k.</span>
-    </div>
-  </div>
-  <p class="foot">Set it with an <code>EFFORT:</code> line or <code>--effort</code>. It's fixed for the life of the session, and sessions get reused. Leaving it unset is the right default.</p>
-  <aside class="notes">The bar is the argument. Output, thinking included, is under one percent of what the session cost. The lever people actually want is the model tier.</aside>
-</section>
-
-<section class="slide">
-  <p class="eyebrow">caching, in simple terms</p>
-  <h1>The model forgets everything between turns. The cache is what makes that affordable.</h1>
-  <div class="cols cols-3">
-    <p><strong>No memory.</strong> Every reply, the whole conversation so far is sent to the API again, and billed again.</p>
-    <p class="step"><strong>The cache remembers the start.</strong> Anything the API has already seen costs a tenth to send again. Anything new costs double to store, once.</p>
-    <p class="step"><strong>It stays warm while you keep talking.</strong> Every turn resets a 60-minute clock. Go quiet for an hour and the whole thing is stored again, at double.</p>
-  </div>
-  <div class="step" style="margin:3.5vh 0 0">
-    <p class="small muted" style="margin-bottom:.8vh">what gets re-sent every turn, in this order</p>
-    <div style="display:flex;gap:2px;font-family:var(--mono);font-size:1.05vw;line-height:1.35">
-      <div style="flex:3;border:1px solid var(--line);padding:1vh .8vw">system prompt<br><span class="muted">Claude Code + executor role + CLAUDE.md</span></div>
-      <div style="flex:1.4;border:1px solid var(--line);padding:1vh .8vw">tool<br>definitions</div>
-      <div style="flex:1.6;border:1px solid var(--line);padding:1vh .8vw">the packet</div>
-      <div style="flex:3.2;border:1px solid var(--line);padding:1vh .8vw">every file it read<br><span class="muted">tool results are part of the conversation</span></div>
-      <div style="flex:2;border:1px solid var(--line);padding:1vh .8vw">command output</div>
-      <div style="flex:1.6;border:1px solid var(--line);padding:1vh .8vw">its own replies</div>
-      <div style="flex:1.4;border:1px solid var(--accent);color:var(--accent);padding:1vh .8vw">this turn<br><span style="opacity:.8">not held yet</span></div>
-    </div>
-    <p class="small muted" style="margin-top:.8vh">A file read on turn 3 is re-sent on every turn after: at 10%, but forever. Two catches: it only matches from the start, and it's per model.</p>
-  </div>
-  <p class="foot">Which is why relay's first answer to a new packet is <code>send</code> into a warm executor, not <code>spawn</code>.</p>
-  <aside class="notes">Beat one is the whole idea: no memory, so everything is re-sent. Point at "every file it read" on the strip. The two catches at the bottom are why relay never swaps a session's model and why the system prompt is frozen.</aside>
-</section>
-
-<section class="slide">
-  <p class="eyebrow">the bill</p>
-  <h1>Why a warm executor is cheap, and a huge one isn't</h1>
-  <div class="cols cols-2">
-    <div>
-      <p><strong>Warm reuse.</strong> The next packet into a session you already have pays 10% on everything it has read. A fresh spawn stores all of it again.</p>
-      <p class="step"><strong>Size is a tax.</strong> 10% of 260k is 26k tokens, every single turn, just to remember. That's why relay says rotate at 150k.</p>
-      <p class="step"><strong>Tier is multiples, not percents.</strong> Haiku work costs Haiku. Nothing else on this slide moves the bill as much.</p>
-    </div>
-    <pre class="step tabular">one real executor session
-
-sent to the model     5,087,364
-  from the cache      4,963,695   ×0.1
-  stored fresh          123,543   ×2
-output                   29,242   ×5
-
-billed like            ≈ 0.9M input tokens
-without a cache        ≈ 5.2M</pre>
-  </div>
-  <p class="foot">What moves the bill, biggest first: which tier, how much it reads per turn, warm reuse over cold spawns. Effort barely registers.</p>
-  <aside class="notes">Real numbers from one Sonnet executor. Most of the bill is cache reads, so warm reuse is the lever and context size is the tax. ×2 is the 1-hour cache write, which is what Claude Code uses; output is 5× input on every tier.</aside>
-</section>
-
 <section class="slide">
   <p class="eyebrow">lifecycle</p>
   <h1>When executors close, and how</h1>
@@ -376,7 +346,6 @@ without a cache        ≈ 5.2M</pre>
   <p class="foot">Nothing is auto-closed until the lead has actually seen its report. Busy, stalled, queued and pinned sessions are never touched.</p>
   <aside class="notes">The question behind this slide is "will I lose work?" No: staged changes live in the worktree, reports live on disk, and the conversation is resumable.</aside>
 </section>
-
 <section class="slide">
   <p class="eyebrow">guardrails</p>
   <h1>Three things relay refuses to let happen</h1>
@@ -397,7 +366,6 @@ without a cache        ≈ 5.2M</pre>
   <p class="foot">The last two are attestations the tool can't check. It refuses without them, and a false one is a false statement in the ledger. While building this deck, every commit stopped at the gate because the packets touched <code>lib/lead_guard.py</code>. That's the gate working.</p>
   <aside class="notes">Frame it as the three fears: it'll do the work itself, it'll act while I'm out, it'll commit junk. Each column is the answer to one fear. Don't read the five conditions aloud; say "five, and two of them are the lead's own word".</aside>
 </section>
-
 <section class="slide">
   <p class="eyebrow">using it</p>
   <h1>Six steps</h1>
@@ -412,7 +380,6 @@ without a cache        ≈ 5.2M</pre>
   <p class="foot">The first spawn of a session always asks for your go, even in auto. Deciding how work splits is yours.</p>
   <aside class="notes">Leave this slide up during questions.</aside>
 </section>
-
 <section class="slide">
   <p class="eyebrow">skills</p>
   <h1>Everything is <code>/relay:</code>something</h1>
@@ -428,7 +395,6 @@ without a cache        ≈ 5.2M</pre>
   <p class="foot"><code>relay doctor</code> checks the installed CLI still behaves the way relay assumes. Run it after every Claude Code update.</p>
   <aside class="notes">Point at the top row and move on. The second row is there so nobody asks "is there a way to…" during questions.</aside>
 </section>
-
 <section class="slide">
   <p class="eyebrow">what's next</p>
   <h1>Turning the rubric into data</h1>
