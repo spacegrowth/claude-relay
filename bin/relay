@@ -1646,9 +1646,10 @@ def cmd_send(args):
     if _is_heavy(usage, mb, token_threshold, mb_threshold):
         if not getattr(args, "heavy_override", None):
             if usage is not None:
-                reading = (f"its live context is {lead_guard.human_tokens(usage.get('last_prompt') or 0)} "
-                           f"tokens, past the {lead_guard.human_tokens(token_threshold)} nudge (long-context "
-                           f"pricing starts at 200k)")
+                ctx = usage.get('last_prompt') or 0
+                reading = (f"its live context is {lead_guard.human_tokens(ctx)} tokens, past the "
+                           f"{lead_guard.human_tokens(token_threshold)} nudge — every turn re-sends all of it "
+                           f"(~{lead_guard.human_tokens(ctx // 10)} tokens' worth at the cached rate, just to remember)")
             else:
                 reading = f"its transcript is {mb:.1f}MB, past the {mb_threshold:g}MB threshold"
             sys.exit(f"session '{args.session_id}' is heavy — {reading}. That's not a verdict on its work — "
