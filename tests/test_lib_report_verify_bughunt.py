@@ -102,8 +102,6 @@ class TestTldrContractEdges:
 
 # ── claimed files: the false-accusation class the module says is its expensive error ───────────
 class TestClaimExtraction:
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-1: _CLAIM_RE's ASCII-only character class "
-                                           "truncates a non-ASCII path into an accusable prefix")
     def test_a_non_ascii_filename_is_not_falsely_accused(self):
         """plausible_claims' docstring (lib/report_verify.py:162-165): accusing an executor of not
         staging a path that isn't one 'would be a false MISMATCH — the expensive error here, since
@@ -115,8 +113,6 @@ class TestClaimExtraction:
         assert mismatched_paths(res) == []
         assert res["verdict"] == rv.COUNTS_MATCH
 
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-2: a 'What changed' bullet's same-line claims "
-                                           "are dropped — the section body starts at the NEXT line")
     def test_a_claim_on_the_what_changed_bullet_itself_is_checked(self):
         """what_changed_section's docstring: 'Runs from the heading/bullet naming it to the next
         heading' — a bullet is an accepted opener, so a report that names its changed file on that
@@ -127,9 +123,6 @@ class TestClaimExtraction:
         res = rv.verify(text, reality(staged=["src/other.py"], repo_entries={"src"}))
         assert "src/app.py" in mismatched_paths(res)
 
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-3: a bulleted 'What changed' section has no "
-                                           "terminator, so it swallows the rest of the report and "
-                                           "accuses files that were merely read")
     def test_a_bulleted_section_does_not_swallow_the_rest_of_the_report(self):
         """The same docstring pair: the scoped path is 'trustworthy enough to accuse on', and
         plausible_claims exists so 'a false accusation costs more trust than a missed catch'.
@@ -182,6 +175,32 @@ class TestClaimExtraction:
         assert "index-empty" in codes
         assert any("`git diff --cached` is EMPTY" in f["text"] for f in res["findings"])
 
+    def test_a_bullet_opener_s_nested_sub_bullets_are_the_section_body(self):
+        """what_changed_section: a bullet opener's terminator must fire only on a bullet at the
+        opener's own indent or shallower — never on a deeper, nested sub-bullet, which is the
+        section's own body. Before the fix, the first indented sub-bullet ("  - lib/a.py")
+        matched the same 0-3-space terminator regex as a sibling and ended the section
+        immediately, so BOTH nested paths were silently dropped from what was checked."""
+        text = ("- What changed:\n  - lib/a.py\n  - lib/b.py\n"
+                "- What I verified: ran tests\n")
+        section = rv.what_changed_section(text)
+        assert section is not None
+        paths, scoped = rv.claimed_paths(text)
+        assert scoped
+        assert "lib/a.py" in paths
+        assert "lib/b.py" in paths
+
+    def test_a_sibling_bullet_still_terminates_a_bulleted_section(self):
+        """The companion contract to the nested case above: a bullet at the SAME indent as the
+        opener (a true sibling, e.g. the next top-level '- What I verified:' bullet) must still
+        end the section — only a deeper, nested bullet is section body."""
+        text = ("- What changed:\n  - lib/a.py\n"
+                "- What I verified: lib/should_not_be_claimed.py\n")
+        paths, scoped = rv.claimed_paths(text)
+        assert scoped
+        assert "lib/a.py" in paths
+        assert "lib/should_not_be_claimed.py" not in paths
+
 
 # ── false positives observed LIVE, from `relay verify` runs on 2026-09-05 ─────────────────────
 # The report bodies below are the real sentences those runs accused, kept verbatim.
@@ -190,9 +209,6 @@ REPO_ENTRIES = {"bin", "lib", "hooks", "tests", "skills", "docs", "agents", "scr
 
 
 class TestLiveFalsePositives:
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-10: a dotted Python identifier with a short "
-                                           "attribute name reads as a bare filename, so prose "
-                                           "like `r.get(\"model\")` becomes a claimed file")
     def test_dotted_identifiers_in_prose_are_not_claims(self):
         """The bare-filename branch exists with an explicit stated defence
         (lib/report_verify.py:151-152): it 'caps the extension at 6 chars so a dotted Python
@@ -213,9 +229,6 @@ class TestLiveFalsePositives:
         res = rv.verify(text, reality(staged=["bin/relay"], repo_entries=REPO_ENTRIES))
         assert mismatched_paths(res) == []
 
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-10: a bare filename is accused on its "
-                                           "extension alone, with nothing checking it could be a "
-                                           "repo file at all")
     def test_a_bare_filename_that_is_not_in_the_repo_is_not_claimed(self):
         """plausible_claims promises to keep only 'ones that could really be repo files'
         (lib/report_verify.py:160-171), and a false accusation is named there as 'the expensive

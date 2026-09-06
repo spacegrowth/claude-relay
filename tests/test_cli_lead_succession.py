@@ -577,9 +577,6 @@ class TestClosePredecessor:
         run_main(relay, "close-predecessor")
         assert "Cmd-W it if it lingers" in capsys.readouterr().out
 
-    @pytest.mark.xfail(strict=True, reason="BUG-cli-3: close-predecessor addresses the outgoing "
-                                           "lead's tab through the CALLER's ambient backend, not "
-                                           "the predecessor's own — Defect A all over again")
     def test_it_addresses_the_predecessors_own_backend(self, relay, terms, monkeypatch):
         """`_lead_tab_target`'s docstring states the invariant for every lead-tab operation: the
         backend and handle come "from the marker rather than from the caller's ambient state", and
@@ -763,9 +760,6 @@ class TestWhoami:
         run_main(relay, "whoami", "e1")
         assert "lead       : -  (unowned)" in capsys.readouterr().out
 
-    @pytest.mark.xfail(strict=True, reason="BUG-cli-5: whoami's token is not routed through "
-                                           "resolve_sid, so a lead's project name (and a unique "
-                                           "sid prefix) fail where README says they work")
     def test_a_lead_project_name_resolves(self, relay, terms, capsys):
         """README, right under the command table (which lists `relay whoami [<token>]`):
         "Anywhere a command above takes a session id, you can pass the executor's name …, a lead's

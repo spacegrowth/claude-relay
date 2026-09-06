@@ -577,6 +577,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_escalation` | true | Arm every spawned executor with the second-layer one-shot push (see [Auto-wake and notifications](#auto-wake-and-notifications)) |
 | `autonomous_mode` | false | Posture a newly-armed lead holds. false = wait for you on every approval beat (safe default). true = new leads start in autonomous mode. `/relay:auto on\|off` flips it mid-session either way (see [Autonomous mode](#autonomous-mode)) |
 | `stall_threshold_seconds` | 2700 | How long an executor can be `busy` with no report before `stalled` — kept independent of `poll_seconds` so the two don't flip at the same instant |
+| `usage_limit_pattern` | built-in | Regex (case-insensitive, matched against the START of an executor's last assistant message) that marks it `paused (limit)` in `relay list`/`check` instead of an ordinary `stalled`. The built-in wording is a reasonable guess, not confirmed against a real Claude Code usage-limit message — override this only if the CLI's actual wording differs |
 
 `poll_seconds` must stay under the `Stop` hook's `timeout` in `hooks/hooks.json` (currently 1900s) — the harness kills the hook's background poller at that timeout regardless of `poll_seconds`, so raising one without the other silently breaks auto-wake (see [async-rewake-findings.md](docs/async-rewake-findings.md#addendum-silent-auto-wake-death-2026-07-10)).
 

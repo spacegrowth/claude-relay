@@ -151,9 +151,17 @@ def is_none_value(value):
 # The bare-filename branch caps the extension at 6 chars so a dotted Python identifier
 # (`diff_render.parse_report_mentions`) doesn't read as a file. Both this and the word-pair case
 # below were found by running this tool on its own report — ordinary technical prose produces them.
+# The path branch's segment class is unicode-aware (BUG-lib-1: an ASCII-only class truncated
+# `tests/tëst_data.py` into the accusable prefix `tests/t`) but still excludes: whitespace and
+# path/prose punctuation (`/:,;()[]` backtick/quote — unchanged from before), PLUS `~` (so
+# `~/.relay-tasks/...` can't be swept in as one unbroken match starting at the tilde — the
+# existing `(?<![\w/.-])` lookbehind alone no longer blocked that once `~` became a legal segment
+# character) and `*` (so a glob like `lib/*.py` isn't read as a literal path — AMBIGUOUS-lib-4's
+# decidable half). The trailing `(?![\w-])` refuses a candidate cut off mid-word.
 _CLAIM_RE = re.compile(
-    r'(?<![\w/.-])((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z][A-Za-z0-9]{0,5})'
-    r'(?::\d+(?:-\d+)?)?')
+    r'(?<![\w/.-])((?:[^\s/:,;()\[\]`"\'~*]+/)+[^\s/:,;()\[\]`"\'~*]+|'
+    r'[A-Za-z0-9_.-]+\.[A-Za-z][A-Za-z0-9]{0,5})'
+    r'(?::\d+(?:-\d+)?)?(?![\w-])')
 _HAS_EXTENSION_RE = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,5}$")
 
 
@@ -168,11 +176,19 @@ def plausible_claims(paths, repo_entries=(), staged=()):
     is already staged (in which case it is confirmed, not accused).
 
     With no `repo_entries` (worktree gone) this keeps only extension-bearing paths — deliberately
-    the weaker, non-accusing direction."""
+    the weaker, non-accusing direction.
+
+    A BARE name (no "/") must be a real top-level repo entry to survive — otherwise a technical
+    term that merely happens to carry a file-shaped extension (`tier_windows.json`, mentioned in
+    prose but never a repo file) becomes an accusable claim on extension alone (BUG-lib-10b)."""
     kept = []
     for p in paths:
-        first = p.split("/")[0]
-        if p in staged or _HAS_EXTENSION_RE.search(p) or (first in repo_entries and "/" in p):
+        if p in staged:                 # confirmed, not accused
+            kept.append(p)
+        elif "/" in p:
+            if _HAS_EXTENSION_RE.search(p) or p.split("/")[0] in repo_entries:
+                kept.append(p)
+        elif p in repo_entries:         # a BARE filename must be a real top-level repo entry
             kept.append(p)
     return kept
 
@@ -187,8 +203,22 @@ _HEADING_RE = re.compile(r"^\s*#{1,6}\s")
 _BOLD_HEADING_RE = re.compile(r"^\s*\*\*([^*/`]+)\*\*\s*:?\s*$")
 
 
-def _ends_section(raw):
-    return bool(_HEADING_RE.match(raw) or _BOLD_HEADING_RE.match(raw))
+_BULLET_RE = re.compile(r"^\s{0,3}[-*]\s")
+# Depth-aware terminator match: captures the indent so a bulleted section can tell a SIBLING
+# bullet (same indent as the opener, or shallower — ends the section) from a nested sub-bullet
+# (deeper than the opener — that's the section's own body, e.g. "- What changed:\n  - a.py\n  -
+# b.py"). Unlike `_BULLET_RE` above (capped at 0-3 spaces, used only to recognise a bulleted
+# OPENER), this has no indent cap: a sub-bullet's indent can be anything deeper than the opener's.
+_ANY_BULLET_RE = re.compile(r"^(\s*)[-*]\s")
+
+
+def _ends_section(raw, bulleted=False, opener_indent=0):
+    if _HEADING_RE.match(raw) or _BOLD_HEADING_RE.match(raw):
+        return True
+    if not bulleted:
+        return False
+    m = _ANY_BULLET_RE.match(raw)
+    return bool(m) and len(m.group(1)) <= opener_indent
 
 
 def what_changed_section(text):
@@ -201,15 +231,33 @@ def what_changed_section(text):
     could not scope the claims. Best-effort parsing must degrade to LOUD, never to agreement."""
     lines = text.splitlines()
     start = None
+    bulleted = False
+    opener_indent = 0
+    body = []
     for i, raw in enumerate(lines):
-        if _WHAT_CHANGED_RE.match(_demark(raw)):
+        demarked = _demark(raw)
+        m = _WHAT_CHANGED_RE.match(demarked)
+        if m:
+            # BUG-lib-2: a bullet/heading opener can carry the FIRST claim on its own line
+            # ("- What changed: src/app.py:2 — appended a line."). The body used to start on the
+            # NEXT line, discarding whatever the opener itself said — include the opener's
+            # remainder (after the section name and its punctuation) as the first body line.
+            rest = demarked[m.end():].lstrip(" :—-")
+            if rest:
+                body.append(rest)
+            # BUG-lib-3: a bullet-opened section has no heading to end it, so it used to run to
+            # EOF and swallow later bullets ("What I verified", a plain aside) as if they were
+            # more "What changed" content. A bullet opener ends its section at the next SIBLING
+            # bullet (same indent as the opener, or shallower) — never at a deeper, nested
+            # sub-bullet, which is the section's own body ("- What changed:\n  - a.py\n  - b.py").
+            bulleted = bool(_BULLET_RE.match(raw))
+            opener_indent = (len(raw) - len(raw.lstrip(" "))) if bulleted else 0
             start = i + 1
             break
     if start is None:
         return None
-    body = []
     for raw in lines[start:]:
-        if _ends_section(raw):
+        if _ends_section(raw, bulleted=bulleted, opener_indent=opener_indent):
             break
         body.append(raw)
     return "\n".join(body) if "\n".join(body).strip() else None

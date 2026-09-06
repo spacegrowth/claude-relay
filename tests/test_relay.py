@@ -6138,10 +6138,14 @@ class TestAutoCloseSweep:
         s = relay.read_session("e1")
         assert s["status"] == "superseded" and (relay.STATE_ROOT / "e1" / relay.SEED_FILENAME).exists()
 
-    def test_list_renders_closed_auto_and_pin(self, relay, tmp_path, capsys):
+    def test_list_renders_closed_auto_and_pin(self, relay, tmp_path, capsys, monkeypatch):
         wt = self._repo(tmp_path)
         self._exec(relay, wt)
         self._exec(relay, wt, sid="pinned", keep=True)
+        # BUG-cli-2 (fixed): the sweep only acts for an armed-lead caller now, scoped to that
+        # lead's own executors — both sessions here are owned by "lead-1" (the default `_exec`
+        # owner, armed via write_marker), so list must run as that lead to see its own auto-close.
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-1")
         with mock.patch.object(relay, "_kill_and_wait"), \
              mock.patch.object(relay.iterm, "close", return_value=True), \
              mock.patch.object(relay.iterm, "is_alive", return_value=False), \

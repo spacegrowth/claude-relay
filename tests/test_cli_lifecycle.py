@@ -162,6 +162,13 @@ class FakeTerm:
         if kw.get("iterm_id_file"):
             Path(kw["iterm_id_file"]).parent.mkdir(parents=True, exist_ok=True)
             Path(kw["iterm_id_file"]).write_text("w0t0p0:STUB")
+        # A tab this spawn() just opened IS alive — decouples "was the PRE-relaunch session's old
+        # tab still around" (what resume/restart's live-copy guard probes, and what a test sets up
+        # before calling) from "_ensure_tab_label's post-spawn is_alive check on the NEW tab", which
+        # shares this same flag. Without this, a test that sets `terms.alive = False` to model a
+        # genuinely-dead session (BUG-cli-4) makes the retry-3-times-with-a-real-sleep label
+        # verification inside _ensure_tab_label spuriously fire on every successful relaunch.
+        self.alive = True
         return {"ok": True, "session_id": "w0t0p0:STUB"}
 
     def send(self, label, prompt, handle=None, pid=None):
@@ -359,6 +366,13 @@ class TestRestart:
     brand-new `claude` conversation. It does NOT carry over the prior conversation … If the session
     still looks alive, relay refuses unless you pass `--force`"."""
 
+    @pytest.fixture(autouse=True)
+    def _tab_is_gone(self, terms):
+        """BUG-cli-4's fix consults the tab whenever there's no pid (every "dead"/pid-None fixture
+        below), mirroring the lead-side guard's own default (see TestResumeLead._lead_tab_is_gone).
+        Tests that want the tab to still be alive flip this back explicitly."""
+        terms.alive = False
+
     def test_restart_mints_a_fresh_conversation_id(self, relay, terms, tmp_path):
         make_session(relay, "e1", status="dead", claude_session="cs-old")
         run_main(relay, "restart", "e1")
@@ -446,6 +460,13 @@ class TestResumeExecutor:
     """resume SKILL.md: "opens a fresh iTerm tab running `claude --resume <the executor's Claude
     session id>` … so the executor comes back with its **entire conversation/context**"."""
 
+    @pytest.fixture(autouse=True)
+    def _tab_is_gone(self, terms):
+        """BUG-cli-4's fix consults the tab whenever there's no pid (every "dead"/pid-None fixture
+        below), mirroring the lead-side guard's own default (see TestResumeLead._lead_tab_is_gone).
+        The one test that wants the tab to still be alive flips this back explicitly."""
+        terms.alive = False
+
     def test_resume_reopens_the_same_conversation(self, relay, terms, monkeypatch):
         make_session(relay, "e1", status="dead")
         monkeypatch.setattr(relay, "_launch_survived", lambda pid, **kw: True)
@@ -530,9 +551,6 @@ class TestResumeExecutor:
         run_main(relay, "resume", "e1")
         assert relay.read_session("e1")["owner_lead"] == "lead-new"
 
-    @pytest.mark.xfail(strict=True, reason="BUG-cli-4: resume's second-live-copy guard is pid-only, "
-                                           "so a session whose PID was never captured resumes into "
-                                           "a second live copy of one conversation")
     def test_resume_refuses_when_only_the_tab_says_it_is_alive(self, relay, terms):
         """cmd_resume_lead states the invariant this guard exists for — "two live copies of one
         conversation stomp on each other" — and implements it as "a pid recorded by a previous
@@ -814,11 +832,15 @@ class TestAutoCloseSweep:
         assert names.index("landed") < names.index("auto_closed")
 
     def test_the_sweep_never_raises_on_a_broken_session(self, relay, terms, tmp_path):
-        """auto_close_sweep: "Deterministic, best-effort, never raises"."""
+        """auto_close_sweep: "Deterministic, best-effort, never raises". BUG-cli-1 fixed:
+        read_session now reads a corrupt session.json as None (same convention as read_queue's
+        own corrupt-file handling) instead of raising, so the per-sid `if not s: continue` guard
+        absorbs it silently — no exception ever reaches the inner except, hence no
+        `auto_close_error` ledger entry for this shape of corruption."""
         d = relay.session_dir("broken"); d.mkdir(parents=True, exist_ok=True)
         (d / "session.json").write_text("{ not json")
         assert relay.auto_close_sweep("test", sids=["broken"]) == []
-        assert ledger_events(relay, "auto_close_error")
+        assert not ledger_events(relay, "auto_close_error")
 
     def test_lead_scoped_sweep_ignores_another_leads_executor(self, relay, terms, tmp_path):
         self._finished(relay, tmp_path, sid="e1", lead="lead-A")
@@ -826,8 +848,6 @@ class TestAutoCloseSweep:
         assert relay.auto_close_sweep("test", sids=["e1"], lead_sid="lead-B") == []
         assert relay.read_session("e1")["status"] == "reported"
 
-    @pytest.mark.xfail(strict=True, reason="BUG-cli-2: `relay check --all` / `relay list` sweep "
-                                           "unscoped, so one lead parks ANOTHER lead's executor")
     def test_check_all_does_not_park_another_leads_executor(self, relay, terms, tmp_path,
                                                             monkeypatch):
         """README "Auto-close": "The sweep runs on `relay check`, `relay list`, and every lead

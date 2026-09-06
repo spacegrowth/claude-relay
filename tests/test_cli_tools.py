@@ -382,9 +382,6 @@ class TestLint:
                    "## Preconditions\n- ok\n")
         assert "[mcp-mentioned-not-declared]" in capsys.readouterr().out
 
-    @pytest.mark.xfail(strict=True, reason="BUG-cli-6: the `mcp-unparsable` lint finding can "
-                                           "never fire — normalize_mcp_spec turns any non-empty "
-                                           "value into an allowlist instead of None")
     def test_an_unparsable_mcp_line_is_warned_about(self, relay, terms, tmp_path, capsys):
         """lint_packet declares the finding and its message names the contract:
         `"MCP: line present but its value isn't none/inherit/a,b"` (lib/lead_guard.py, the
@@ -643,9 +640,6 @@ class TestStats:
         run_main(relay, "stats")
         assert "(no packets recorded)" in capsys.readouterr().out
 
-    @pytest.mark.xfail(strict=True, reason="BUG-cli-5: `stats --lead` is not routed through "
-                                           "resolve_sid, so a lead's project name silently scopes "
-                                           "to nothing instead of to that lead")
     def test_lead_scoping_accepts_a_project_name(self, relay, terms, capsys):
         """README, right under the command table (which lists `relay stats [--lead SID]`):
         "Anywhere a command above takes a session id, you can pass the executor's name …, a lead's
@@ -985,9 +979,6 @@ class TestCorruptSessionJson:
         ("list",), ("check", "--all"), ("prune", "--dry-run"), ("stats", "--json"),
         ("board", "--json"), ("whoami", "some-unknown-uuid"),
     ], ids=["list", "check-all", "prune", "stats", "board", "whoami"])
-    @pytest.mark.xfail(strict=True, reason="BUG-cli-1: one unparsable session.json raises "
-                                           "JSONDecodeError out of read_session and takes down "
-                                           "every multi-session command")
     def test_one_broken_session_does_not_take_the_command_down(self, relay, terms, argv):
         make_session(relay, "good")
         corrupt_session(relay)
@@ -998,10 +989,11 @@ class TestCorruptSessionJson:
 
     def test_an_empty_session_json_is_the_same_hazard(self, relay, terms):
         """A half-written file (the O_TRUNC window of a non-atomic write) reads as "" — the same
-        JSONDecodeError, from the same line."""
+        shape of corruption as a hand-edited session.json. BUG-cli-1 fixed: read_session now
+        treats this the same way read_queue treats a corrupt queue.json — unreadable reads as
+        "no such session" (None), never a raised JSONDecodeError."""
         corrupt_session(relay, "half-written", text="")
-        with pytest.raises(json.JSONDecodeError):
-            relay.read_session("half-written")
+        assert relay.read_session("half-written") is None
 
     def test_a_corrupt_queue_file_really_does_read_as_empty(self, relay, terms):
         """The contract read_queue DOES honour — quoted above — for contrast with session.json."""

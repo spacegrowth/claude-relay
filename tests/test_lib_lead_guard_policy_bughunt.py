@@ -352,10 +352,6 @@ class TestPacketLint:
         assert "mcp-unknown-server" not in codes(
             "## Preconditions\nMCP: linear\n" + LONG, known_servers={"linear"})
 
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-7: the 'mcp-unparsable' lint rule is "
-                                           "unreachable — normalize_mcp_spec is total, so "
-                                           "packet_mcp_spec never returns None when an MCP: line "
-                                           "is present")
     def test_an_unparsable_mcp_value_is_reported_as_unparsable(self):
         """The rule's own message is the contract (lib/lead_guard.py:1937-1939): 'MCP: line
         present but its value isn't none/inherit/a,b'. Today such a value is silently read as a

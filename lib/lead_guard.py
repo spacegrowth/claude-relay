@@ -2225,7 +2225,16 @@ def lint_packet(body, cwd=None, known_servers=None, model=None, reading_bytes=No
     # MCP
     mcp_line = PACKET_MCP_RE.search(text)
     mcp_spec = packet_mcp_spec(text)
-    if mcp_line and mcp_spec is None:
+    # BUG-cli-6/BUG-lib-7: normalize_mcp_spec is total (any non-empty string that isn't a keyword
+    # falls through to a comma-split allowlist), so `mcp_spec is None` never actually happens when
+    # `mcp_line` is present — this finding could never fire. Linter-local fix: re-check the RAW
+    # value's comma-parts against the plausible-server-name shape directly, rather than relying on
+    # normalize_mcp_spec's (unchanged) resolution to signal failure. `mcp_spec is None` is kept
+    # alongside it — harmless today, and correct again if normalize_mcp_spec's totality is ever
+    # narrowed later.
+    if mcp_line and (mcp_spec is None or any(
+            not re.fullmatch(r"[A-Za-z0-9_.-]+", part.strip())
+            for part in mcp_line.group(1).split(",") if part.strip())):
         out.append(("warn", "mcp-unparsable", f"MCP: line present but its value isn't none/inherit/a,b: "
                     f"'{mcp_line.group(1)}'"))
     if mcp_spec is None:
