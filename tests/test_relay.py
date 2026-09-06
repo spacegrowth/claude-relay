@@ -7314,3 +7314,52 @@ class TestListCtxColumnWindowProof:
         assert "245k/200k" in row and "!" in row
         assert "⚠ exec-bad: ran a 245k request while stamped 200k" in out
         assert "check `relay doctor`" in out
+
+
+class TestSuccessorName:
+    """`relay send --rotate/--upgrade` successor naming: `<base>-r<N>` with the base stripped of any
+    existing `-r<N>` suffix (so a rotated session rotates to -r3, never -r2-r2), or an explicit
+    `--name` validated like `spawn --name`."""
+    def _exists(self, relay, sid):
+        relay.write_session(sid, {"session_id": sid, "status": "superseded"})
+
+    def test_fresh_name_gets_r2(self, relay):
+        assert relay.successor_name("foo") == "foo-r2"
+
+    def test_already_rotated_name_increments_instead_of_stacking(self, relay):
+        self._exists(relay, "foo-r2")
+        assert relay.successor_name("foo-r2") == "foo-r3"
+        self._exists(relay, "foo-r3")
+        assert relay.successor_name("foo-r3") == "foo-r4"
+
+    def test_skips_taken_numbers(self, relay):
+        self._exists(relay, "foo-r2"); self._exists(relay, "foo-r3")
+        assert relay.successor_name("foo") == "foo-r4"
+
+    def test_explicit_name_wins(self, relay):
+        assert relay.successor_name("foo-r2", "relay-fix") == "relay-fix"
+
+    def test_explicit_name_collision_refuses(self, relay):
+        self._exists(relay, "relay-fix")
+        with pytest.raises(SystemExit) as ei:
+            relay.successor_name("foo", "relay-fix")
+        assert "already exists" in str(ei.value)
+
+    def test_rotate_passes_name_through(self, relay, tmp_path):
+        sid = "heavy2"
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "worktree": str(tmp_path), "topic": "t", "scope": "s",
+            "tab_label": "x", "model": "sonnet", "mcp": None, "context": "1m", "agent": "relay-executor",
+            "pid": None, "claude_session": "cs-h2", "status": "reported", "current_packet": 1, "owner_lead": "lead-1",
+            "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+        (relay.packets_dir(sid) / "001-packet.md").write_text("first")
+        (relay.packets_dir(sid) / "001-report.md").write_text("Done.\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: x")
+        nxt = tmp_path / "n.md"; nxt.write_text("# next\n\n## Preconditions\n- ok\n\ndo more in src/a.py please")
+        with mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: None), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=False), \
+             mock.patch.object(relay.iterm, "close", return_value=True), \
+             mock.patch.object(relay, "_kill_and_wait"), mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123):
+            relay.cmd_send(SimpleNamespace(session_id=sid, packet=str(nxt), rotate=True, name="relay-fix"))
+        assert relay.read_session("relay-fix") and relay.read_session("relay-fix")["topic"] == "t"
+        assert relay.read_session(sid)["status"] == "superseded"

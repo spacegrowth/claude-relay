@@ -1556,6 +1556,22 @@ def cmd_resume(args):
     print(f"resumed '{sid}' (tab '{label}', pid {pid}) — reopened conversation with full context")
 
 
+def successor_name(sid, explicit=None):
+    """The relay name a rotated/upgraded session's successor gets. `explicit` (send --name) wins,
+    validated exactly like spawn --name (refused when a session of that name already exists).
+    Otherwise `<base>-r<N>`: the base is `sid` with any existing `-r<N>` suffix stripped, and N is
+    the next free number — so `foo` → `foo-r2`, `foo-r2` → `foo-r3`, never `foo-r2-r2`."""
+    if explicit:
+        if read_session(explicit):
+            sys.exit(f"--name '{explicit}': a session of that name already exists — pick another")
+        return explicit
+    base = re.sub(r"-r\d+$", "", sid) or sid
+    n = 2
+    while read_session(f"{base}-r{n}"):
+        n += 1
+    return f"{base}-r{n}"
+
+
 def _rotate_and_send(args, s, mb=None, upgrade=False):
     """retire `s` → spawn its successor (seeded, same territory, 1M window when the tier has one) with
     args.packet as packet 001. Prints the new session id; ledgers `rotated`.
@@ -1564,10 +1580,7 @@ def _rotate_and_send(args, s, mb=None, upgrade=False):
     nudge ("two fix rounds and it still isn't done → stronger model"). The spawn ceiling
     (executor_model_ceiling) still applies, so an upgrade past it refuses the same way a spawn would."""
     sid = args.session_id
-    n = 2
-    while read_session(f"{sid}-r{n}"):
-        n += 1
-    new_sid = f"{sid}-r{n}"
+    new_sid = successor_name(sid, getattr(args, "name", None))
     model = s.get("model") or lead_guard.load_config(STATE_ROOT).get("executor_default_model", "sonnet")
     from_tier = None
     if upgrade:
@@ -1594,6 +1607,7 @@ def _rotate_and_send(args, s, mb=None, upgrade=False):
     append_ledger("rotated", session_id=sid, successor=new_sid, model=model, widened=widened,
                   mb=round(mb, 1) if mb else None, upgrade=bool(upgrade), from_tier=from_tier)
     print(f"{'upgraded' if upgrade else 'rotated'}: '{sid}' retired, '{new_sid}' spawned with this packet (seed inherited)")
+    print(f"successor: {new_sid}")
 
 
 def cmd_send(args):
@@ -5024,6 +5038,9 @@ def main():
                     help="retire this session and spawn a seeded successor over the same territory "
                          "(1M window when the tier has one) with this packet as its first — the one-flag "
                          "answer to the heaviness gate")
+    sd.add_argument("--name", metavar="NAME",
+                    help="with --rotate/--upgrade: the successor's relay name (default: the retired "
+                         "session's base name with the next free -r<N> suffix)")
     sd.add_argument("--when-idle", dest="when_idle", action="store_true",
                     help="if the session is busy/stalled, QUEUE this packet instead of refusing; "
                          "it is delivered automatically the next time the session goes idle "
