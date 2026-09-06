@@ -45,6 +45,14 @@ def load_relay_module(state_root):
     # Never probe the REAL claude CLI for a model alias (lead_guard "model alias resolution").
     mod._probe_model = lambda alias: (None, "disabled in tests")
     mod._cli_version = lambda: "test"
+    # read_pid/read_iterm_id/read_iterm_id_at poll a file for up to 5s by default — test-side only,
+    # shrink the DEFAULT to 0.5s (an explicit timeout from any caller is untouched); see
+    # tests/test_relay.py::load_relay_module for the full rationale.
+    _orig_read_pid, _orig_read_iterm_id, _orig_read_iterm_id_at = (
+        mod.read_pid, mod.read_iterm_id, mod.read_iterm_id_at)
+    mod.read_pid = lambda session_id, timeout=0.5: _orig_read_pid(session_id, timeout)
+    mod.read_iterm_id = lambda session_id, timeout=0.5: _orig_read_iterm_id(session_id, timeout)
+    mod.read_iterm_id_at = lambda path, timeout=0.5: _orig_read_iterm_id_at(path, timeout)
     return mod
 
 
@@ -672,9 +680,18 @@ class TestDoctor:
             out = "" if argv and argv[0] == "git" else "1.2.3 (Claude Code)"
             return subprocess.CompletedProcess(argv, 0, out, "")
         monkeypatch.setattr(relay.subprocess, "run", fake_run)
-        state = {"probe": lambda prompt, extra=(), **kw: ({"mcp_servers": [], "tools": ["Bash"],
-                                                           "model": "claude-sonnet-5"},
-                                                          "GATES=YES\nHARNESS=YES", "")}
+
+        def default_probe(prompt, extra=(), **kw):
+            """3-tuple by default; with want_result=True (the model-aliases + context-window
+            check's shape, bin/relay `_probe_claude`) a 4th element carrying a synthesized
+            `result.modelUsage` — haiku narrow (200k), everything else full (1M)."""
+            init = {"mcp_servers": [], "tools": ["Bash"], "model": "claude-sonnet-5"}
+            res, err = "GATES=YES\nHARNESS=YES", ""
+            if not kw.get("want_result"):
+                return init, res, err
+            cw = 200_000 if kw.get("model") == "haiku" else 1_000_000
+            return init, res, err, {"modelUsage": {init["model"]: {"contextWindow": cw}}}
+        state = {"probe": default_probe}
         monkeypatch.setattr(relay, "_probe_claude",
                             lambda prompt, extra_flags=(), **kw: state["probe"](prompt, extra_flags,
                                                                                **kw))
@@ -686,7 +703,7 @@ class TestDoctor:
         checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)}
         assert checks["strict MCP → zero servers"]["status"] == "SKIP"
         assert checks["executor agent applies"]["status"] == "SKIP"
-        assert checks["model aliases (sonnet, sonnet[1m])"]["status"] == "SKIP"
+        assert checks["model aliases + context window"]["status"] == "SKIP"
         assert checks["state root writable"]["status"] == "PASS"
         assert checks["config loads"]["status"] == "PASS"
 
@@ -753,31 +770,43 @@ class TestDoctor:
         run_main(relay, "doctor", "--quick", "--json")
         checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)}
         assert checks["git commit denied under skip-perms"]["status"] == "SKIP"
-        assert checks["model aliases (sonnet, sonnet[1m])"]["status"] == "SKIP"
+        assert checks["model aliases + context window"]["status"] == "SKIP"
 
     def test_the_model_alias_check_wants_a_1m_flavour_back(self, relay, terms, probes, capsys):
+        """README "Executor context window": the check "PASSes iff every `[1m]` probe reports
+        1_000_000, `haiku` reports 200_000, and no bare alias reports *more* than its `[1m]`
+        form" — proven off `result.modelUsage.contextWindow`, not the model id string."""
         seen = []
 
         def probe(prompt, extra=(), **kw):
             seen.append(kw.get("model"))
-            model = "claude-sonnet-5[1m]" if kw.get("model") == "sonnet[1m]" else "claude-sonnet-5"
-            return {"mcp_servers": [], "tools": ["Bash"], "model": model}, "GATES=YES\nHARNESS=YES", ""
+            init = {"mcp_servers": [], "tools": ["Bash"], "model": "claude-sonnet-5"}
+            res, err = "GATES=YES\nHARNESS=YES", ""
+            if not kw.get("want_result"):
+                return init, res, err
+            cw = 200_000 if kw.get("model") == "haiku" else 1_000_000
+            return init, res, err, {"modelUsage": {"claude-sonnet-5": {"contextWindow": cw}}}
         probes.state["probe"] = probe
         run_main(relay, "doctor", "--json")
         checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)}
-        assert checks["model aliases (sonnet, sonnet[1m])"]["status"] == "PASS"
+        assert checks["model aliases + context window"]["status"] == "PASS"
         assert "sonnet[1m]" in seen
 
     def test_the_model_alias_check_fails_when_1m_does_not_take(self, relay, terms, probes, capsys):
-        """README Config: "`[1m]` always rides a full id" — a CLI that drops the suffix silently
-        downgrades every 1M executor, which is exactly what this check exists to catch."""
-        probes.state["probe"] = lambda p, extra=(), **kw: (
-            {"mcp_servers": [], "tools": ["Bash"], "model": "claude-sonnet-5"},
-            "GATES=YES\nHARNESS=YES", "")
+        """README "Executor context window": the check exists to catch a CLI where "the `[1m]`
+        suffix" silently "changes nothing" — every alias, including the `[1m]` ones, reports the
+        narrow 200k window here, so `sonnet[1m]`'s probe never reaches the required 1_000_000."""
+        def probe(prompt, extra=(), **kw):
+            init = {"mcp_servers": [], "tools": ["Bash"], "model": "claude-sonnet-5"}
+            res, err = "GATES=YES\nHARNESS=YES", ""
+            if not kw.get("want_result"):
+                return init, res, err
+            return init, res, err, {"modelUsage": {"claude-sonnet-5": {"contextWindow": 200_000}}}
+        probes.state["probe"] = probe
         with pytest.raises(SystemExit):
             run_main(relay, "doctor", "--json")
         checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)}
-        assert checks["model aliases (sonnet, sonnet[1m])"]["status"] == "FAIL"
+        assert checks["model aliases + context window"]["status"] == "FAIL"
 
     def test_the_model_alias_cache_is_reported(self, relay, terms, probes, capsys):
         """README Config: the alias resolution is "cached per CLI version in

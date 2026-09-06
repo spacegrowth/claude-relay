@@ -46,6 +46,14 @@ def load_relay_module(state_root):
     # Never probe the REAL claude CLI for a model alias (lead_guard "model alias resolution").
     mod._probe_model = lambda alias: (None, "disabled in tests")
     mod._cli_version = lambda: "test"
+    # read_pid/read_iterm_id/read_iterm_id_at poll a file for up to 5s by default — test-side only,
+    # shrink the DEFAULT to 0.5s (an explicit timeout from any caller is untouched); see
+    # tests/test_relay.py::load_relay_module for the full rationale.
+    _orig_read_pid, _orig_read_iterm_id, _orig_read_iterm_id_at = (
+        mod.read_pid, mod.read_iterm_id, mod.read_iterm_id_at)
+    mod.read_pid = lambda session_id, timeout=0.5: _orig_read_pid(session_id, timeout)
+    mod.read_iterm_id = lambda session_id, timeout=0.5: _orig_read_iterm_id(session_id, timeout)
+    mod.read_iterm_id_at = lambda path, timeout=0.5: _orig_read_iterm_id_at(path, timeout)
     return mod
 
 
@@ -504,10 +512,12 @@ class TestSpawnEffort:
         run_main(relay, "spawn", str(tmp_path), "t", pkt, "--name", "e1")
         assert relay.read_session("e1")["effort"] == "high"
 
-    def test_unset_stays_unset(self, relay, terms, tmp_path):
+    def test_unset_resolves_to_the_config_default(self, relay, terms, tmp_path):
+        """README "Executor effort": "Executors run at `executor_default_effort` (`high`, the CLI
+        default) ... It is always explicit: a new executor's `effort` is never unset"."""
         run_main(relay, "spawn", str(tmp_path), "t", write_packet(tmp_path), "--name", "e1")
-        assert relay.read_session("e1")["effort"] is None
-        assert terms.spawns[0]["effort"] is None
+        assert relay.read_session("e1")["effort"] == "high"
+        assert terms.spawns[0]["effort"] == "high"
 
     def test_invalid_flag_value_is_refused_with_the_valid_list(self, relay, terms, tmp_path):
         with pytest.raises(SystemExit) as e:
@@ -516,12 +526,13 @@ class TestSpawnEffort:
         assert "valid: low, medium, high, xhigh, max" in str(e.value)
         assert terms.spawns == []
 
-    def test_unparsable_packet_effort_line_degrades_to_unset(self, relay, terms, tmp_path):
+    def test_unparsable_packet_effort_line_degrades_to_the_config_default(self, relay, terms, tmp_path):
         """lead_guard.normalize_effort_spec returns None for an unknown level; lint warns
-        (`effort-unparsable`) but the spawn proceeds on the CLI default."""
+        (`effort-unparsable`) but the spawn proceeds on `executor_default_effort` ("high") — README
+        "Executor effort": "a new executor's `effort` is never unset"."""
         pkt = write_packet(tmp_path, body="GOAL — do it.\n\nEFFORT: turbo\n\n## Preconditions\n- ok\n")
         run_main(relay, "spawn", str(tmp_path), "t", pkt, "--name", "e1")
-        assert relay.read_session("e1")["effort"] is None
+        assert relay.read_session("e1")["effort"] == "high"
 
 
 # ── spawn: seed ─────────────────────────────────────────────────────────────────────────────────

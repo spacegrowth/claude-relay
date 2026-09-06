@@ -45,6 +45,14 @@ def load_relay_module(state_root):
     # Never probe the REAL claude CLI for a model alias (lead_guard "model alias resolution").
     mod._probe_model = lambda alias: (None, "disabled in tests")
     mod._cli_version = lambda: "test"
+    # read_pid/read_iterm_id/read_iterm_id_at poll a file for up to 5s by default — test-side only,
+    # shrink the DEFAULT to 0.5s (an explicit timeout from any caller is untouched); see
+    # tests/test_relay.py::load_relay_module for the full rationale.
+    _orig_read_pid, _orig_read_iterm_id, _orig_read_iterm_id_at = (
+        mod.read_pid, mod.read_iterm_id, mod.read_iterm_id_at)
+    mod.read_pid = lambda session_id, timeout=0.5: _orig_read_pid(session_id, timeout)
+    mod.read_iterm_id = lambda session_id, timeout=0.5: _orig_read_iterm_id(session_id, timeout)
+    mod.read_iterm_id_at = lambda path, timeout=0.5: _orig_read_iterm_id_at(path, timeout)
     return mod
 
 

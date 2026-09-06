@@ -37,6 +37,16 @@ def load_relay_module(state_root):
     # test patches _probe_model itself.
     mod._probe_model = lambda alias: (None, "disabled in tests")
     mod._cli_version = lambda: "test"
+    # read_pid/read_iterm_id/read_iterm_id_at poll a file for up to 5s by default; ~35
+    # TestSpawn*/TestExecutor*/TestSend* tests here never write that file and would eat the full
+    # 5s each. Test-side only: shrink the DEFAULT to 0.5s — any caller (product code or a test)
+    # that passes an explicit timeout is untouched, so a test asserting the real timeout path
+    # still gets whatever timeout it passes.
+    _orig_read_pid, _orig_read_iterm_id, _orig_read_iterm_id_at = (
+        mod.read_pid, mod.read_iterm_id, mod.read_iterm_id_at)
+    mod.read_pid = lambda session_id, timeout=0.5: _orig_read_pid(session_id, timeout)
+    mod.read_iterm_id = lambda session_id, timeout=0.5: _orig_read_iterm_id(session_id, timeout)
+    mod.read_iterm_id_at = lambda path, timeout=0.5: _orig_read_iterm_id_at(path, timeout)
     return mod
 
 

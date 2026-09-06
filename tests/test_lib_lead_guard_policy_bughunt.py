@@ -514,11 +514,13 @@ class TestTranscriptUsage:
         assert lg.heavy_reading_text(None, None) == "unknown"
 
     def test_launch_cell_reads_mcp_context_and_role(self):
-        """launch_cell: "'none/200k/A' (A = agent-roled, G = legacy full-GATES packets; '?' for
-        records that predate the field)"."""
-        assert lg.launch_cell({}) == "?/?/?"
-        assert lg.launch_cell({"mcp": "none", "context": "200k", "agent": True}) == "none/200k/A"
-        assert lg.launch_cell({"mcp": ["a"], "model": "sonnet[1m]", "agent": False}) == "a/1m/G"
+        """launch_cell: "'none/1m/A/high' (A = agent-roled, G = legacy full-GATES packets; '?' for
+        records that predate a field)" — README "Executor effort", last sentence: "Shown in
+        `relay list`'s LAUNCH column as an always-present fourth segment (`none/1m/A/high`)" — so
+        a bare record with no fields at all renders all four segments as '?'."""
+        assert lg.launch_cell({}) == "?/?/?/?"
+        assert lg.launch_cell({"mcp": "none", "context": "200k", "agent": True}) == "none/200k/A/?"
+        assert lg.launch_cell({"mcp": ["a"], "model": "sonnet[1m]", "agent": False}) == "a/1m/G/?"
         assert lg.launch_cell({"mcp": "none", "context": "1m", "agent": True,
                                "effort": "high"}) == "none/1m/A/high"
 
