@@ -3339,9 +3339,9 @@ class TestTranscriptUsage:
         assert lg.human_tokens(999) == "999" and lg.human_tokens(1234) == "1.2k"
         assert lg.human_tokens(34567) == "35k" and lg.human_tokens(1_234_567) == "1.2M"
         assert lg.usage_cell({"prompt": 1_234_567, "output": 34_567}) == "1.2M/35k" and lg.usage_cell(None) == "-"
-        assert lg.launch_cell({"mcp": "none", "context": "200k", "agent": "relay-executor"}) == "none/200k/A"
-        assert lg.launch_cell({"mcp": ["linear"], "context": "1m", "agent": None}) == "linear/1m/G"
-        assert lg.launch_cell({"model": "sonnet[1m]"}) == "?/1m/?"
+        assert lg.launch_cell({"mcp": "none", "context": "200k", "agent": "relay-executor"}) == "none/200k/A/?"
+        assert lg.launch_cell({"mcp": ["linear"], "context": "1m", "agent": None}) == "linear/1m/G/?"
+        assert lg.launch_cell({"model": "sonnet[1m]"}) == "?/1m/?/?"
 
     def test_usage_cell_renders_warm_cold_and_unknown_cache_states(self):
         u = {"prompt": 1_234_567, "output": 34_567}
@@ -3381,8 +3381,16 @@ class TestExecutorEffort:
         assert lg.normalize_effort_spec("Max") == "max" and lg.normalize_effort_spec("bogus") is None
 
     def test_launch_cell_includes_effort(self):
+        # The 4th (effort) segment is now ALWAYS present — "?" only for a record that predates
+        # a pinned effort, never omitted.
         assert lg.launch_cell({"mcp": "none", "context": "1m", "agent": "x", "effort": "low"}) == "none/1m/A/low"
-        assert lg.launch_cell({"mcp": "none", "context": "1m", "agent": "x"}) == "none/1m/A"
+        assert lg.launch_cell({"mcp": "none", "context": "1m", "agent": "x"}) == "none/1m/A/?"
+
+    def test_resolve_executor_effort_default(self):
+        assert lg.resolve_executor_effort_default({}) == "high"                     # built-in default
+        assert lg.resolve_executor_effort_default({"executor_default_effort": "xhigh"}) == "xhigh"
+        with pytest.raises(ValueError, match="valid:"):
+            lg.resolve_executor_effort_default({"executor_default_effort": "turbo"})
 
     def test_lint_flags_unparsable_effort(self):
         codes = [c for _, c, _ in lg.lint_packet("# T\n\n## Preconditions\n- ok\n\nDo the thing in src/a.py, stage for review, acceptance criteria included.\nEFFORT: turbo\n")]

@@ -25,13 +25,14 @@ plausible result, never by file count:**
 - **Upgrade signals**: two fix-list rounds haven't landed it (respawn stronger + `--supersede`);
   ambiguity you can't spec away in the packet. **Downgrade signal**: your acceptance criteria could
   be checked by a script.
-- **Effort is a quality lever on top of the right model, never a cost lever** (packet `EFFORT:`
-  line or `--effort`). Leave it unset (Claude Code's default is already `xhigh`). Raise it to `max` only when you've
-  already chosen opus for unknown-root-cause work AND the executor's whole territory is that kind of work — it's fixed per
-  process and executors are reused, so you're setting it for every packet the session will get.
-  Don't use `low`/`medium` to save money: thinking tokens are a minority of an executor's spend
-  (reading files dominates), and a weaker tier thinking longer doesn't gain the judgment it lacks —
-  haiku is the cost lever.
+- **Effort is a quality lever on top of the right model, never a cost lever.** Executors run at
+  relay's own `executor_default_effort` (`high`, the CLI default) regardless of your personal
+  `effortLevel` — leave it alone by default. Raise a single executor with `EFFORT:` / `--effort`:
+  `xhigh` for an opus executor whose whole territory is unknown-root-cause work, `max` only when
+  correctness beats cost (it's fixed per process and executors are reused, so you're setting it for
+  every packet the session will get). Never lower it to save money: thinking is a minority of an
+  executor's spend (reading files dominates), and a weaker tier thinking longer doesn't gain the
+  judgment it lacks — haiku is the cost lever.
 - **Version hygiene**: pass the TIER alias (`haiku`/`sonnet`/`opus`) and let relay resolve the
   concrete id through this machine's CLI — never type version ids (`…-4-6`) from memory; a stale id
   silently pins an old model. `relay doctor` shows what each alias resolves to here.

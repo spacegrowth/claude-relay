@@ -91,7 +91,7 @@ class TestCmdBoard:
             d = json.loads(capsys.readouterr().out)
             assert [m["session_id"] for m in d["leads"]] == ["lead-1"] and d["leads"][0]["liveness"] == "live"
             ex = {e["session_id"]: e for e in d["executors"]}
-            assert ex["e1"]["launch"] == "none/200k/A" and ex["e1"]["packets"][0]["tldr"]["outcome"] == "Done the thing."
+            assert ex["e1"]["launch"] == "none/200k/A/?" and ex["e1"]["packets"][0]["tldr"]["outcome"] == "Done the thing."
             assert ex["e1"]["packets"][0]["report_body"]["text"].startswith("Done the thing.")
             assert ex["orph"]["orphan"] is True and any("no longer armed" in w["text"] for w in d["warnings"])
             out = tmp_path / "b.html"

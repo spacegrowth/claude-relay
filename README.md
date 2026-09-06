@@ -161,8 +161,10 @@ And the three nouns:
              [--mcp [SPEC]] [--keep]       MCP servers (default none; packet `MCP:` line usually
                                             decides); --keep pins it against auto-close
              [--effort LEVEL]              thinking effort (low|medium|high|xhigh|max), or an
-                                            `EFFORT:` line in the packet; unset = the CLI default;
-                                            fixed per process (resume/restart --effort changes it)
+                                            `EFFORT:` line in the packet; unset = relay's own
+                                            executor_default_effort (the CLI default, "high") —
+                                            never your personal effortLevel; fixed per process
+                                            (resume/restart --effort changes it)
                                             context window: `--model sonnet[1m]`, or the packet's
                                             `CONTEXT: 1m` line, or relay picks 1m when the packet's
                                             referenced reading is big; default 200K
@@ -642,6 +644,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_skip_permissions` | false | Spawn executors with `--dangerously-skip-permissions` (false = prompt before edits/commands; true = hands-off but requires careful review before landing) |
 | `executor_default_model` | "sonnet" | Model an executor launches with when `--model` is omitted — relay's own policy, never the CLI's personal `/model` default. An alias (`sonnet`/`opus`/`haiku`/`fable`, optionally `[1m]`) is **resolved through this machine's Claude Code at spawn** and the executor is launched with the concrete id (`claude-sonnet-5[1m]`), so the same alias can't mean different models on different machines and `[1m]` always rides a full id; cached per CLI version in `~/.relay-tasks/models.json`, shown in `relay doctor`. A full id is passed through untouched; an unrecognised model is refused before any tab opens |
 | `executor_model_ceiling` | "opus" | Spawn refuses a requested executor model above this tier unless `--model-override "<reason>"` is passed (recorded in the ledger) |
+| `executor_default_effort` | "high" | Thinking effort an executor launches with when neither `--effort` nor a packet `EFFORT:` line pins one — relay's own policy (the CLI default), never your personal `effortLevel` from `~/.claude/settings.json`. Validated against `--effort`'s own levels (`low`\|`medium`\|`high`\|`xhigh`\|`max`); an invalid value is refused at spawn |
 | `terminal_app` | "auto" | "iterm" \| "terminal" \| "auto" (auto-detect via `$TERM_PROGRAM`; iTerm default) |
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
@@ -730,17 +733,18 @@ of a bloated one.
 ### Executor effort
 
 Effort is the second half of the model dial: which model (the rubric in `/relay:spawn`) and how
-hard it thinks. Declare it in the packet (`EFFORT: low` … `EFFORT: max`) or pass `--effort` at
-spawn (flag wins); unset leaves the CLI's own default. Like the model, it's fixed per process —
-`relay resume|restart --effort` changes it, `send --rotate` carries it to the successor, and a
-follow-up packet declaring a different `EFFORT:` gets an ℹ note instead of a silent ignore.
-Pairing guidance: effort is a quality lever on top of the right model, not a cost lever. Leave it
-unset (the CLI default is already `xhigh`); raise to `max` only for an opus executor whose whole
-territory is unknown-root-cause work
-(it's per-process, and executors are reused across packets). Don't turn it down to save money —
-thinking tokens are a minority of an executor's spend, and a weaker tier thinking longer doesn't
-gain the judgment it lacks; the cost lever is haiku. Shown in `relay list`'s LAUNCH
-column as a fourth segment when set (`none/1m/A/low`).
+hard it thinks. Executors run at `executor_default_effort` (`high`, the CLI default) regardless of
+your personal `effortLevel` — declaring `EFFORT: low` … `EFFORT: max` in the packet, or passing
+`--effort` at spawn (flag wins), only raises or lowers a *single* executor above that policy. It is
+always explicit: a new executor's `effort` is never unset, and a legacy session recorded before
+this policy existed gets the config default stamped in on its next resume/restart, printed once.
+Like the model, it's fixed per process — `relay resume|restart --effort` changes it, `send --rotate`
+carries it to the successor, and a follow-up packet declaring a different `EFFORT:` gets an ℹ note
+instead of a silent ignore. Pairing guidance: effort is a quality lever on top of the right model,
+not a cost lever. Raise a single executor with `EFFORT:` / `--effort`: `xhigh` for an opus executor
+whose whole territory is unknown-root-cause work, `max` only when correctness beats cost. Never
+lower it to save money — thinking is a minority of an executor's spend; the tier is the lever.
+Shown in `relay list`'s LAUNCH column as an always-present fourth segment (`none/1m/A/high`).
 
 **Round-count nudge.** `relay send` prints an ℹ note once the outgoing packet is the 3rd (or later)
 sent to that session — `this is packet 3 into a <tier> session — if the last two were fixes for the

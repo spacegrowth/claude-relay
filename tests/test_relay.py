@@ -505,9 +505,13 @@ class TestSpawnExecutorEscalation:
         assert hook["command"].endswith(" s1")  # relay NAME passed as argv — see lead_guard
         assert "asyncRewake" not in hook  # plain synchronous push (§9.4) — nothing to host async
 
-    def test_kill_switch_omits_settings_file(self, relay, tmp_path):
+    def test_kill_switch_omits_hooks_but_keeps_effort_level(self, relay, tmp_path):
+        # executor_default_effort ships non-empty ("high"), so the settings file itself is now
+        # always written (to carry effortLevel) even with the escalation kill-switch off — it just
+        # carries no hooks.
         cap = self._run(relay, tmp_path, cfg={"executor_escalation": False})
-        assert cap.get("settings_file") is None
+        content = json.loads(Path(cap["settings_file"]).read_text())
+        assert "hooks" not in content and content == {"effortLevel": "high"}
 
     def test_build_claude_cmd_includes_settings_flag(self, relay, tmp_path):
         # End-to-end through the real (unmocked) build_claude_cmd: --settings actually lands in the
@@ -6305,11 +6309,11 @@ class TestListTokensAndLaunch:
              mock.patch.object(relay, "session_pid_alive", return_value=True):
             relay.cmd_list(SimpleNamespace(json=False, lead=None, all=True, closed=False))
             out = capsys.readouterr().out
-            assert "1.0k/200" in out and "none/200k/A" in out and "TOKENS" in out and "LAUNCH" in out
+            assert "1.0k/200" in out and "none/200k/A/?" in out and "TOKENS" in out and "LAUNCH" in out
             assert (relay.session_dir("u1") / "usage.json").exists()            # cached
             relay.cmd_list(SimpleNamespace(json=True, lead=None, all=True, closed=False))
             row = json.loads(capsys.readouterr().out)["executors"][0]
-            assert row["usage"]["prompt"] == 1000 and row["launch"] == "none/200k/A"
+            assert row["usage"]["prompt"] == 1000 and row["launch"] == "none/200k/A/?"
 
 
 class TestSendRotate:
@@ -6452,12 +6456,35 @@ class TestExecutorEffortWiring:
         assert self._spawn(relay, tmp_path, "# T\nEFFORT: low\ndo it")["effort"] == "low"
         assert relay.read_session("ef1")["effort"] == "low"
         assert self._spawn(relay, tmp_path, "# T\nEFFORT: low\ndo it", effort="xhigh", name="ef2")["effort"] == "xhigh"
-        assert self._spawn(relay, tmp_path, name="ef3")["effort"] is None      # unset → CLI default
+        # unset flag/line → relay's own executor_default_effort policy (the CLI default, "high"),
+        # NEVER unset/None — that's the whole point of this packet: an executor's effort is always
+        # explicit, so it can never silently inherit the human's personal effortLevel.
+        assert self._spawn(relay, tmp_path, name="ef3")["effort"] == "high"
+        assert relay.read_session("ef3")["effort"] == "high"
 
     def test_invalid_flag_refused(self, relay, tmp_path):
         with pytest.raises(SystemExit) as ei:
             self._spawn(relay, tmp_path, effort="turbo", name="ef4")
         assert "valid:" in str(ei.value)
+
+    def test_config_default_used_when_unset(self, relay, tmp_path):
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps({"executor_default_effort": "xhigh"}))
+        cap = self._spawn(relay, tmp_path, name="ef-cfg")
+        assert cap["effort"] == "xhigh"
+        assert relay.read_session("ef-cfg")["effort"] == "xhigh"
+
+    def test_invalid_config_default_refused(self, relay, tmp_path):
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps({"executor_default_effort": "turbo"}))
+        with pytest.raises(SystemExit) as ei:
+            self._spawn(relay, tmp_path, name="ef-bad-cfg")
+        assert "executor_default_effort" in str(ei.value) and "turbo" in str(ei.value)
+
+    def test_settings_file_carries_effort_level(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path, name="ef-settings")
+        d = json.loads(Path(cap["settings_file"]).read_text())
+        assert d["effortLevel"] == "high"
 
     def test_build_claude_cmd_carries_effort(self, relay):
         cmd = relay.iterm.build_claude_cmd("x", model="sonnet", session_uuid="u", effort="low")
@@ -6488,6 +6515,22 @@ class TestExecutorEffortWiring:
             relay.cmd_resume(SimpleNamespace(session_id="ef6", force=False, mcp=None, effort="high"))
         assert cap["effort"] == "high" and relay.read_session("ef6")["effort"] == "high"
 
+    def test_relaunch_stamps_legacy_none_effort_with_config_default(self, relay, tmp_path, capsys):
+        # A session recorded before executor_default_effort existed (effort: None) must get the
+        # config default stamped into session.json at relaunch time, and the stamping must be
+        # printed — never a silent fallthrough to the CLI's/human's own default.
+        self._spawn(relay, tmp_path, name="ef7")
+        s = relay.read_session("ef7"); s["effort"] = None; relay.write_session("ef7", s)
+        cap = {}
+        bk = SimpleNamespace(spawn=lambda **kw: cap.update(kw))
+        with mock.patch.object(relay, "term_backend", return_value=bk), mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=126), mock.patch.object(relay, "read_iterm_id", return_value=None), \
+             mock.patch.object(relay, "_ensure_tab_label"):
+            relay._relaunch("ef7", relay.read_session("ef7"), "go", resume_id="cs")
+        assert cap["effort"] == "high"
+        assert relay.read_session("ef7")["effort"] == "high"
+        assert "stamping executor_default_effort" in capsys.readouterr().out
+
 
 class TestExecutorFallbackModel:
     """executor_fallback_model config rides the per-executor --settings file (the flag is
@@ -6513,13 +6556,19 @@ class TestExecutorFallbackModel:
         cap = self._spawn(relay, tmp_path, {"executor_escalation": False,
                                             "executor_fallback_model": ["claude-opus-4-8", "claude-sonnet-4-6"]}, name="fb2")
         d = json.loads(Path(cap["settings_file"]).read_text())
-        assert d == {"fallbackModel": ["claude-opus-4-8", "claude-sonnet-4-6"]}
+        # No hooks (escalation off), but fallbackModel AND the always-on effortLevel both ride —
+        # the settings file carries whatever's configured, never just one key at a time.
+        assert d == {"fallbackModel": ["claude-opus-4-8", "claude-sonnet-4-6"], "effortLevel": "high"}
 
-    def test_unset_means_no_key_and_kill_switch_still_omits_file(self, relay, tmp_path):
+    def test_unset_means_no_key_and_kill_switch_still_writes_effort_only_file(self, relay, tmp_path):
         cap = self._spawn(relay, tmp_path, {}, name="fb3")
         assert "fallbackModel" not in json.loads(Path(cap["settings_file"]).read_text())
+        # executor_default_effort ships non-empty ("high"), so the settings file is now always
+        # written (to carry effortLevel) even with the escalation kill-switch off and no fallback —
+        # it just carries effortLevel alone, no hooks.
         cap = self._spawn(relay, tmp_path, {"executor_escalation": False}, name="fb4")
-        assert cap.get("settings_file") is None
+        d = json.loads(Path(cap["settings_file"]).read_text())
+        assert d == {"effortLevel": "high"}
 
 
 class TestCmdStats:
@@ -6920,6 +6969,48 @@ class TestDoctorContextWindow:
         checks = json.loads(capsys.readouterr().out)
         row = [c for c in checks if c["check"] == "model aliases + context window"][0]
         assert row["status"] == "SKIP"
+
+
+class TestDoctorExecutorEffortPinned:
+    """`relay doctor`'s plumbing check: executor_default_effort is a valid level, and the human's
+    OWN ~/.claude/settings.json effortLevel is named right alongside it — the leak this check
+    exists to surface (found 2026-09-05: this machine's personal effortLevel is "medium", silently
+    inherited by every unpinned executor before executor_default_effort existed)."""
+
+    def _checks(self, relay, capsys, home_settings=None, expect_fail=False):
+        with mock.patch.object(relay, "_probe_claude"), \
+             mock.patch.object(Path, "home", return_value=relay.STATE_ROOT.parent / "fakehome"):
+            fake_home = relay.STATE_ROOT.parent / "fakehome" / ".claude"
+            fake_home.mkdir(parents=True, exist_ok=True)
+            if home_settings is not None:
+                (fake_home / "settings.json").write_text(json.dumps(home_settings))
+            args = SimpleNamespace(offline=True, quick=False, model=None, json=True)
+            if expect_fail:
+                # cmd_doctor sys.exit(1)s once any check FAILs — same as `relay doctor` at a real
+                # terminal — so the JSON is still printed first; just expect the exit.
+                with pytest.raises(SystemExit):
+                    relay.cmd_doctor(args)
+            else:
+                relay.cmd_doctor(args)
+        return json.loads(capsys.readouterr().out)
+
+    def test_reports_config_default_and_human_effort_side_by_side(self, relay, capsys):
+        checks = self._checks(relay, capsys, home_settings={"effortLevel": "medium"})
+        row = [c for c in checks if c["check"] == "executor effort pinned"][0]
+        assert row["status"] == "PASS"
+        assert "high (config)" in row["detail"] and "medium (~/.claude/settings.json)" in row["detail"]
+
+    def test_no_human_settings_file_reads_unset(self, relay, capsys):
+        checks = self._checks(relay, capsys, home_settings=None)
+        row = [c for c in checks if c["check"] == "executor effort pinned"][0]
+        assert row["status"] == "PASS" and "your session: unset" in row["detail"]
+
+    def test_invalid_config_default_fails_the_check(self, relay, capsys):
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps({"executor_default_effort": "turbo"}))
+        checks = self._checks(relay, capsys, expect_fail=True)
+        row = [c for c in checks if c["check"] == "executor effort pinned"][0]
+        assert row["status"] == "FAIL"
 
 
 class TestTranscriptUsageMaxPrompt:

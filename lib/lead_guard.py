@@ -73,6 +73,16 @@ LEAD_DEFAULTS = {
                                   # (see "executor model policy" section below: incident where a
                                   # null-model executor silently ran a full day on the user's
                                   # top-tier default)
+    "executor_default_effort": "high",  # thinking-effort an executor launches with when neither
+                                  # --effort nor a packet EFFORT: line pins one — relay's OWN policy
+                                  # (the CLI default), never the human's personal `effortLevel` from
+                                  # ~/.claude/settings.json. Closes the same class of leak
+                                  # executor_default_model closed for the model (LIVE INCIDENT
+                                  # below): found 2026-09-05 — a machine with effortLevel "medium" in
+                                  # its personal settings silently ran every unpinned executor at
+                                  # medium, while the docs claimed "unset = the CLI default (high)".
+                                  # Validated against EFFORT_LEVELS at spawn, same as an --effort
+                                  # flag; an invalid value is refused there, not silently ignored.
     "executor_model_ceiling": "opus",    # spawn refuses a requested executor model ABOVE this tier
                                   # without --model-override "<reason>" (see "executor model policy")
     "stall_threshold_seconds": 2700,  # bin/relay's STALL_THRESHOLD_SECONDS override (wake-watch
@@ -1946,22 +1956,23 @@ def heavy_reading_text(usage, mb):
 
 
 def launch_cell(s):
-    """Compact 'what was this executor launched with': mcp/context/role, e.g. 'none/200k/A'
-    (A = agent-roled, G = legacy full-GATES packets; '?' for records that predate the field)."""
+    """Compact 'what was this executor launched with': mcp/context/role/effort, e.g. 'none/1m/A/high'
+    (A = agent-roled, G = legacy full-GATES packets; '?' for records that predate a field — every
+    executor spawned since executor_default_effort shipped has a real 4th segment, never '?')."""
     mcp = mcp_spec_label(s.get("mcp")) if s.get("mcp") is not None else "?"
     ctx = s.get("context") or ("1m" if model_has_1m(s.get("model")) else "?")
     role = "A" if s.get("agent") else ("G" if "agent" in s else "?")
-    cell = f"{mcp}/{ctx}/{role}"
-    if s.get("effort"):
-        cell += f"/{s['effort']}"
-    return cell
+    return f"{mcp}/{ctx}/{role}/{s.get('effort') or '?'}"
 
 
 # ---- executor effort ---------------------------------------------------------------------------
 # Effort is the second half of the model dial: WHICH model (the rubric) and HOW HARD it thinks.
 # Per-process like the model — set at launch via `claude --effort`, verified live 2026-08-21 (an
-# unknown value is warned-and-ignored by the CLI, never fatal). Relay passes it only when asked
-# (packet `EFFORT:` line or `--effort` flag); unspecified executors keep the CLI's own default.
+# unknown value is warned-and-ignored by the CLI, never fatal). Precedence: `--effort` flag >
+# packet `EFFORT:` line > executor_default_effort (LEAD_DEFAULTS above) — ALWAYS explicit now,
+# never the CLI's own default and never an unspecified executor's silent inheritance of the
+# human's personal `effortLevel` (see resolve_executor_effort_default and the LIVE INCIDENT it
+# closes, 2026-09-05, the same class of leak executor_default_model closed for the model).
 # Pairing guidance lives in the spawn skill: mechanical/script-checkable → low/medium; the
 # workhorse default; unknown-root-cause / core-logic → xhigh (max when correctness beats cost).
 
@@ -1983,6 +1994,20 @@ def packet_effort_spec(body):
         return None
     m = EFFORT_RE.search(body)
     return normalize_effort_spec(m.group(1)) if m else None
+
+
+def resolve_executor_effort_default(cfg):
+    """The effort level to stamp on an executor when neither `--effort` nor a packet `EFFORT:`
+    line pins one — `executor_default_effort` from `cfg` (relay's own policy; the CLI default is
+    `high`), validated against EFFORT_LEVELS exactly like an `--effort` flag value. Raises
+    ValueError on an invalid config value: a bad config must fail LOUDLY at spawn, never fall
+    through silently to whatever the CLI (or the human's personal ~/.claude/settings.json
+    effortLevel) would have picked instead."""
+    v = cfg.get("executor_default_effort", "high")
+    if v not in EFFORT_LEVELS:
+        raise ValueError(f"config executor_default_effort '{v}' is invalid — valid: "
+                          f"{', '.join(EFFORT_LEVELS)}")
+    return v
 
 
 # ---- packet lint -------------------------------------------------------------------------------
@@ -2335,13 +2360,19 @@ def build_escalation_settings(plugin_root, exec_name, timeout=30):
 
 
 def write_escalation_settings(state_root, plugin_root, exec_name, timeout=30, include_hooks=True,
-                              fallback=None):
+                              fallback=None, effort=None):
     """Write this executor's own `--settings` file into its state dir. PER-EXECUTOR (not shared),
     because the file carries that executor's relay name as a hook argument — see
     build_escalation_settings for why the hook can't derive it. Regenerated on each call so it
     always points at the CURRENTLY live plugin_root/version. Returns the path (str), or None on any
     failure — a write failure must fall back to spawning WITHOUT escalation armed rather than
-    failing the whole spawn."""
+    failing the whole spawn.
+
+    `effort`, when given, is also stamped into the file as `{"effortLevel": effort}` — belt and
+    braces alongside the `--effort` CLI flag (executor effort policy above): Claude Code's
+    settings-precedence rule (managed > `--settings` file > project local > project > user) means
+    this per-launch file's effortLevel wins over the human's own ~/.claude/settings.json even on a
+    relaunch path that might drop the flag."""
     try:
         d = Path(state_root) / str(exec_name)
         d.mkdir(parents=True, exist_ok=True)
@@ -2349,6 +2380,8 @@ def write_escalation_settings(state_root, plugin_root, exec_name, timeout=30, in
         content = build_escalation_settings(plugin_root, exec_name, timeout=timeout) if include_hooks else {}
         if fallback:
             content["fallbackModel"] = fallback
+        if effort:
+            content["effortLevel"] = effort
         p.write_text(json.dumps(content, indent=2))
         return str(p)
     except Exception:

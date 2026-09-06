@@ -129,10 +129,15 @@ LAUNCH_GRACE_SECONDS = 3.0
 EXECUTOR_ESCALATION_TIMEOUT_SECONDS = 30
 
 
-def _maybe_escalation_settings_file(exec_name):
-    """The `--settings` file to launch an executor with (arms hooks/executor_escalation.py), or
-    None if the config kill-switch is off or the settings file couldn't be written — a write
-    failure must degrade to spawning WITHOUT escalation armed, never block the spawn itself.
+def _maybe_escalation_settings_file(exec_name, effort=None):
+    """The `--settings` file to launch an executor with (arms hooks/executor_escalation.py, carries
+    executor_fallback_model, and — belt and braces alongside `--effort` on the command line —
+    stamps `effortLevel` so the pinned effort holds even on a relaunch path that might drop the
+    flag), or None if there's nothing at all to write (kill-switch off, no fallback, no effort) or
+    the settings file couldn't be written — a write failure must degrade to spawning WITHOUT
+    escalation armed, never block the spawn itself. `effort` is passed by every caller now (spawn's
+    effort resolution is always explicit), so in practice this returns None only on a write
+    failure or when escalation/fallback/effort are ALL absent (e.g. a test that omits `effort`).
 
     `exec_name` (the RELAY name) is baked into the hook command: the hook can't derive its own
     identity from Claude Code's payload, which carries the Claude session id while relay files
@@ -140,11 +145,11 @@ def _maybe_escalation_settings_file(exec_name):
     cfg = lead_guard.load_config(STATE_ROOT)
     esc = bool(cfg.get("executor_escalation", True))
     fallback = cfg.get("executor_fallback_model")
-    if not esc and not fallback:
+    if not esc and not fallback and not effort:
         return None
     return lead_guard.write_escalation_settings(STATE_ROOT, _plugin_root(), exec_name,
                                                 timeout=EXECUTOR_ESCALATION_TIMEOUT_SECONDS,
-                                                include_hooks=esc, fallback=fallback)
+                                                include_hooks=esc, fallback=fallback, effort=effort)
 
 TEMPLATE_FOOTER = """
 
@@ -1055,8 +1060,12 @@ def cmd_spawn(args):
         print(f"  MCP: {lead_guard.mcp_spec_label(mcp_spec)} (from {mcp_src})")
     print_lint(authored_body, cwd=worktree, model=resolved_model)
 
-    # Effort (lead_guard "executor effort"): --effort flag > packet EFFORT: line > unset (the CLI's
-    # own default). Invalid flag values are refused here; the CLI would only warn-and-ignore.
+    # Effort (lead_guard "executor effort"): --effort flag > packet EFFORT: line >
+    # executor_default_effort (relay's own policy — the CLI default — never the human's personal
+    # `effortLevel` from ~/.claude/settings.json; see LEAD_DEFAULTS). ALWAYS explicit now:
+    # session.json["effort"] is never None for a new executor. Invalid flag values are refused
+    # here; the CLI would only warn-and-ignore. An invalid config default is refused too, not a
+    # silent fallthrough.
     effort = None
     if getattr(args, "effort", None) is not None:
         effort = lead_guard.normalize_effort_spec(args.effort)
@@ -1064,8 +1073,12 @@ def cmd_spawn(args):
             sys.exit(f"spawn: --effort '{args.effort}' — valid: {', '.join(lead_guard.EFFORT_LEVELS)}")
     else:
         effort = lead_guard.packet_effort_spec(authored_body)
-    if effort:
-        print(f"  effort: {effort}")
+    if not effort:
+        try:
+            effort = lead_guard.resolve_executor_effort_default(cfg)
+        except ValueError as e:
+            sys.exit(f"spawn: {e}")
+    print(f"  effort: {effort}")
 
     auto_trust(worktree)
     label = f"[Exec] {session_id}"  # role-prefixed: exec tabs and lead tabs are told apart at a glance
@@ -1117,7 +1130,7 @@ def cmd_spawn(args):
 
     # Arm the executor-side wake escalation (wake-watch design §4): a plain `claude` launch gets NO
     # hooks, so this executor only gets the escalation Stop hook if we pass it explicitly here.
-    settings_file = _maybe_escalation_settings_file(session_id)
+    settings_file = _maybe_escalation_settings_file(session_id, effort=effort)
 
     def launch_attempt():
         """One full launch: open the tab, then read back the two INDEPENDENT signals that say it
@@ -1259,7 +1272,17 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     s["mcp"] = mcp_spec
     # The role rides the inline agent and is NOT restored by --resume → re-pass it, like --settings.
     agent_flags = lead_guard.executor_agent_flags(_plugin_root()) if s.get("agent") else []
+    # Effort is re-passed on every relaunch, same as today — but a LEGACY session recorded before
+    # executor_default_effort existed (effort: None) gets stamped with the config default here,
+    # once, rather than relaunching a second time with no effort pinned at all.
     effort = lead_guard.normalize_effort_spec(s.get("effort"))
+    if not effort:
+        try:
+            effort = lead_guard.resolve_executor_effort_default(cfg)
+        except ValueError as e:
+            sys.exit(f"relaunch: {e}")
+        s["effort"] = effort
+        print(f"  effort: legacy session had no pinned effort — stamping executor_default_effort ({effort})")
     bk.spawn(
         cwd=s["worktree"],
         prompt=prompt,
@@ -1271,9 +1294,12 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
         session_uuid=session_uuid,
         resume_id=resume_id,
         tab_color=tab_color,
-        settings_file=_maybe_escalation_settings_file(session_id),  # re-arm escalation on the fresh tab too —
-                                                          # a resumed/restarted executor must not
-                                                          # silently lose wake coverage
+        settings_file=_maybe_escalation_settings_file(session_id, effort=effort),  # re-arm
+                                                          # escalation on the fresh tab too — a
+                                                          # resumed/restarted executor must not
+                                                          # silently lose wake coverage, and the
+                                                          # pinned effort must ride the settings
+                                                          # file too (belt and braces)
         mcp_flags=mcp_flags,
         agent_flags=agent_flags,
         effort=effort,
@@ -2411,6 +2437,21 @@ def cmd_doctor(args):
     cfg = lead_guard.load_config(STATE_ROOT)
     add("config loads", True, f"auto_close={cfg.get('auto_close')} escalation={cfg.get('executor_escalation')} "
         f"default_model={cfg.get('executor_default_model')} ceiling={cfg.get('executor_model_ceiling')}")
+    # executor effort pinned: relay's own executor_default_effort policy must be a valid level, and
+    # the human's OWN personal effortLevel (~/.claude/settings.json) is surfaced right alongside it
+    # so a mismatch — the exact leak this check exists for (2026-09-05) — is visible at a glance
+    # instead of silently inherited by every unpinned executor.
+    try:
+        exec_effort = lead_guard.resolve_executor_effort_default(cfg)
+        human_settings_path = Path.home() / ".claude" / "settings.json"
+        human_effort = None
+        if human_settings_path.exists():
+            human_effort = json.loads(human_settings_path.read_text()).get("effortLevel")
+        add("executor effort pinned", True,
+            f"executors: {exec_effort} (config) · your session: {human_effort or 'unset'} "
+            f"(~/.claude/settings.json)")
+    except Exception as e:
+        add("executor effort pinned", False, str(e))
     known = lead_guard.known_mcp_servers(cwd=os.getcwd())
     add("configured MCP servers (allowlist-able)", True, ", ".join(sorted(known)) or "(none — only `MCP: inherit` can add servers)")
     mc = lead_guard.load_model_cache(STATE_ROOT / "models.json").get(_cli_version()) or {}
