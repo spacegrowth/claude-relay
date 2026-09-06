@@ -216,7 +216,17 @@ def main():
     try:
         import lead_guard as lg
         sid = payload.get("session_id")
-        if not sid or not lg.is_lead(STATE_ROOT, sid):
+        # The `or` below is the id-changed-on-resume fallback (memory: relay-lead-id-changes-on-
+        # resume.md): ONLY reached when sid would otherwise conclude "not a lead" — migrates a
+        # marker found for this tab under a different id, so is_lead(sid) is then true for the rest
+        # of this hook. Guarded on `payload.get("cwd")` (fix-list 002): a shared tab is NOT proof of
+        # the same project — a fresh, unrelated session that merely reuses an old lead's tab must
+        # never inherit it, and a payload with no cwd can't prove same-project either way, so it
+        # doesn't even attempt the lookup. No other change to this sign-off-gated hook.
+        if not sid or not (lg.is_lead(STATE_ROOT, sid)
+                            or (payload.get("cwd") and lg.migrate_lead(STATE_ROOT, lg.find_lead_by_tab(
+                                STATE_ROOT, iterm_session=os.environ.get("TERM_SESSION_ID"),
+                                cwd=payload.get("cwd")), sid))):
             sys.exit(0)  # not a lead session → silent, zero impact
         # Heartbeat: every lead turn refreshes last_active (and re-stamps plugin_version/
         # stop_hook_timeout from THIS hook's own plugin root) so `relay list` reflects real liveness

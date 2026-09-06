@@ -810,6 +810,17 @@ spawn ceiling still applies.
   it). If you've already re-stamped and need a check that survives it: on the next idle turn with a
   busy executor, look at that lead's `poll.lock` — JSON `{pid, pid_started, ts}` means current hooks; a bare integer
   means stale.
+- **If your 🚦 segment disappears after a resume**, relay's own `$CLAUDE_CODE_SESSION_ID` most likely
+  changed underneath the same tab (observed live: a background-job resume reported a different id
+  than the one the lead armed under). A resume that comes back under a NEW id can't be revived by
+  the ordinary same-id path, so relay's SessionStart/Stop hooks fall back to looking for a lead
+  marker that claims the SAME tab AND the same project directory, and migrate it forward
+  automatically — gate, wake, auto posture and the statusline segment all move with it, and
+  `relay list` marks the row `↪ migrated from <old id>` so the jump stays visible. This should be
+  silent and automatic; if the segment is
+  *still* gone after your next turn, migrate by hand: `/relay:mode` re-arms this session as a fresh
+  lead, `relay adopt <sid> --force` for each executor the old lead owned, then `relay close --self
+  <old-session-id>` to retire the orphaned marker.
 - **A stale row in the LEADS table with an old LAST ACTIVE** is a dead lead (tab closed/crashed
   without `/relay:stop`) — `relay prune` clears it once it's older than `--days`; a lead you're
   actively using is never pruned.

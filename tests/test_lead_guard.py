@@ -2841,6 +2841,388 @@ class TestSessionStartRearmHook:
         assert p.returncode == 0
 
 
+class TestSessionStartRearmMigration:
+    """hooks/sessionstart_lead_rearm.py's fallback for THE INCIDENT (memory:
+    relay-lead-id-changes-on-resume.md): a resume whose session id has NO marker at all (not even a
+    tombstone) is migrated forward from whatever lead marker still claims the current tab, instead
+    of coming back silently unarmed."""
+
+    def _run(self, home, payload, term_session_id):
+        import subprocess
+        env = {**os.environ, "HOME": str(home), "RELAY_NO_NOTIFY": "1"}
+        if term_session_id is None:
+            env.pop("TERM_SESSION_ID", None)
+        else:
+            env["TERM_SESSION_ID"] = term_session_id
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "sessionstart_lead_rearm.py")],
+            input=json.dumps(payload), capture_output=True, text=True, env=env)
+        return p.returncode, p.stdout, p.stderr
+
+    def test_unknown_id_with_tab_match_migrates_and_announces(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "old-sid", project="webapp", iterm_session="w1t2p0:TAB-X",
+                        cwd=str(tmp_path))
+        rc, out, err = self._run(tmp_path, {"session_id": "new-sid", "source": "resume",
+                                            "cwd": str(tmp_path)}, "w1t2p0:TAB-X")
+        assert rc == 0
+        assert lg.is_lead(root, "new-sid") is True
+        assert lg.read_marker(root, "new-sid")["migrated_from"] == "old-sid"
+        assert lg.is_lead(root, "old-sid") is False  # tombstoned, not deleted
+        assert lg.read_marker(root, "old-sid")["project"] == "webapp"
+        # loud on stdout (model-visible), same channel the ordinary revive uses, plus the id-change note
+        assert "restored" in out.lower()
+        assert "old-sid"[:8] in out and "new-sid"[:8] in out
+        assert err.strip() == ""
+
+    def test_different_cwd_is_a_noop_no_migration_no_ledger(self, tmp_path):
+        """Fix-list 002 (the gap): a tab match ALONE is not proof of identity — a fresh, unrelated
+        session that merely reuses an old lead's tab, but for a DIFFERENT project directory, must
+        never inherit it."""
+        root = tmp_path / ".relay-tasks"
+        other_project = tmp_path / "other-project"; other_project.mkdir()
+        lg.write_marker(root, "old-sid", project="webapp", iterm_session="w1t2p0:TAB-X",
+                        cwd=str(other_project))
+        rc, out, err = self._run(tmp_path, {"session_id": "new-sid", "source": "resume",
+                                            "cwd": str(tmp_path)}, "w1t2p0:TAB-X")
+        assert rc == 0
+        assert lg.is_lead(root, "new-sid") is False
+        assert lg.read_marker(root, "new-sid") == {}
+        assert lg.is_lead(root, "old-sid") is True   # untouched — never tombstoned
+        assert not (root / "sessions.jsonl").exists()   # no lead_migrated, no ambiguous, nothing
+        assert err.strip() == ""
+
+    def test_symlinked_same_cwd_still_migrates(self, tmp_path):
+        """Same project reached via a different (symlinked) path must still count as the same
+        cwd — os.path.realpath resolves both sides before comparing."""
+        root = tmp_path / ".relay-tasks"
+        real_project = tmp_path / "real-project"; real_project.mkdir()
+        link = tmp_path / "link-to-project"
+        link.symlink_to(real_project)
+        lg.write_marker(root, "old-sid", project="webapp", iterm_session="w1t2p0:TAB-X",
+                        cwd=str(real_project))
+        rc, out, err = self._run(tmp_path, {"session_id": "new-sid", "source": "resume",
+                                            "cwd": str(link)}, "w1t2p0:TAB-X")
+        assert rc == 0
+        assert lg.is_lead(root, "new-sid") is True
+        assert lg.read_marker(root, "new-sid")["migrated_from"] == "old-sid"
+
+    def test_unknown_id_with_no_tab_match_is_exactly_todays_noop(self, tmp_path):
+        """No marker anywhere claims this tab — behaves EXACTLY like before this feature existed:
+        silent, unarmed, no crash."""
+        root = tmp_path / ".relay-tasks"
+        rc, out, err = self._run(tmp_path, {"session_id": "new-sid", "source": "resume"}, "w1t2p0:NOBODY")
+        assert rc == 0
+        assert lg.is_lead(root, "new-sid") is False
+        assert lg.read_marker(root, "new-sid") == {}
+        assert err.strip() == ""
+
+    def test_no_term_session_id_env_is_a_noop(self, tmp_path):
+        """A hook process with no TERM_SESSION_ID at all (e.g. Terminal.app, or the var just isn't
+        set) must degrade to the ordinary no-marker no-op, never raise."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "old-sid", project="webapp", iterm_session="w1t2p0:TAB-X")
+        rc, out, err = self._run(tmp_path, {"session_id": "new-sid", "source": "resume"}, None)
+        assert rc == 0
+        assert lg.is_lead(root, "new-sid") is False
+
+    def test_known_tombstoned_id_still_uses_the_ordinary_revive_path(self, tmp_path):
+        """A KNOWN id (its own tombstone exists) must take the plain revive_lead path, never the
+        tab-migration fallback — no behavior change for the case this hook already handled."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", project="proj", iterm_session="w1t2p0:TAB-X")
+        lg.tombstone_lead(root, "lead-1")
+        rc, out, err = self._run(tmp_path, {"session_id": "lead-1", "source": "resume"}, "w1t2p0:TAB-X")
+        assert rc == 0
+        assert lg.is_lead(root, "lead-1") is True
+        assert "migrated_from" not in lg.read_marker(root, "lead-1")
+        assert "session id changed" not in out
+
+
+class TestStopHookMigration:
+    """hooks/stop_lead_watch.py's minimal one-call fallback in the "not a lead" branch: same
+    tab-match migration, reached only when is_lead(sid) is already false."""
+
+    def _run(self, home, payload, term_session_id):
+        import subprocess
+        env = {**os.environ, "HOME": str(home), "RELAY_NO_NOTIFY": "1"}
+        if term_session_id is None:
+            env.pop("TERM_SESSION_ID", None)
+        else:
+            env["TERM_SESSION_ID"] = term_session_id
+        p = subprocess.run(
+            ["python3", str(REPO_ROOT / "hooks" / "stop_lead_watch.py")],
+            input=json.dumps(payload), capture_output=True, text=True, env=env)
+        return p.returncode, p.stderr
+
+    def test_unknown_id_with_tab_match_migrates_then_proceeds_as_lead(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "old-sid", project="webapp", iterm_session="w1t2p0:TAB-X",
+                        cwd=str(tmp_path))
+        ed = root / "exec-1"; (ed / "packets").mkdir(parents=True)
+        (ed / "session.json").write_text(json.dumps(
+            {"session_id": "exec-1", "current_packet": 1, "status": "reported", "owner_lead": "old-sid"}))
+        (ed / "packets" / "001-report.md").write_text("done")
+        rc, err = self._run(tmp_path, {"session_id": "new-sid", "cwd": str(tmp_path)}, "w1t2p0:TAB-X")
+        # migrated → now IS a lead → the ordinary auto-wake path runs and finds exec-1's report
+        # (its owner_lead was rewritten to new-sid by the migration)
+        assert rc == 2
+        assert "exec-1" in err
+        assert lg.read_marker(root, "new-sid")["migrated_from"] == "old-sid"
+
+    def test_different_cwd_is_a_noop_no_migration_no_ledger(self, tmp_path):
+        """Fix-list 002 (the gap): a lead in tab X exits (tombstoned, keeps iterm_session=X); a
+        brand-new, unrelated Claude session started later in that SAME tab for a DIFFERENT project
+        must not inherit it on its first Stop, even though the tab id matches exactly."""
+        root = tmp_path / ".relay-tasks"
+        other_project = tmp_path / "other-project"; other_project.mkdir()
+        lg.write_marker(root, "old-sid", project="webapp", iterm_session="w1t2p0:TAB-X",
+                        cwd=str(other_project))
+        lg.tombstone_lead(root, "old-sid")
+        rc, err = self._run(tmp_path, {"session_id": "new-sid", "cwd": str(tmp_path)}, "w1t2p0:TAB-X")
+        assert rc == 0 and err == ""
+        assert lg.is_lead(root, "new-sid") is False
+        assert lg.read_marker(root, "new-sid") == {}
+        assert lg.read_marker(root, "old-sid")["ended"] is True   # still tombstoned, untouched
+        assert "migrated_to" not in lg.read_marker(root, "old-sid")
+        assert not (root / "sessions.jsonl").exists()   # no lead_migrated, no ambiguous, nothing
+
+    def test_symlinked_same_cwd_still_migrates(self, tmp_path):
+        """Same project reached via a different (symlinked) path must still count as the same
+        cwd — os.path.realpath resolves both sides before comparing."""
+        root = tmp_path / ".relay-tasks"
+        real_project = tmp_path / "real-project"; real_project.mkdir()
+        link = tmp_path / "link-to-project"
+        link.symlink_to(real_project)
+        lg.write_marker(root, "old-sid", project="webapp", iterm_session="w1t2p0:TAB-X",
+                        cwd=str(real_project))
+        rc, err = self._run(tmp_path, {"session_id": "new-sid", "cwd": str(link)}, "w1t2p0:TAB-X")
+        assert rc == 0
+        assert lg.is_lead(root, "new-sid") is True
+        assert lg.read_marker(root, "new-sid")["migrated_from"] == "old-sid"
+
+    def test_no_tab_match_stays_the_ordinary_silent_noop(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        rc, err = self._run(tmp_path, {"session_id": "new-sid", "cwd": str(tmp_path)}, "w1t2p0:NOBODY")
+        assert rc == 0 and err == ""
+
+    def test_a_known_lead_never_pays_for_the_tab_lookup(self, tmp_path, monkeypatch):
+        """No behavior change when the id is known: is_lead short-circuits the `or`, so
+        find_lead_by_tab must never even be called for an ordinary already-armed lead."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", project="webapp")
+        calls = []
+        # Can't monkeypatch the subprocess's imported module directly; instead prove it via
+        # behavior: an ambiguous/ledger-producing tab situation must NOT leave a ledger trace for
+        # an already-armed lead's ordinary Stop.
+        lg.write_marker(root, "lead-2", iterm_session="dup")
+        lg.write_marker(root, "lead-3", iterm_session="dup")
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path)}, "dup")
+        assert rc == 0
+        events_path = root / "sessions.jsonl"
+        if events_path.exists():
+            events = [json.loads(l) for l in events_path.read_text().splitlines()]
+            assert not any(e["event"] == "lead_migrate_ambiguous" for e in events)
+
+
+class TestFindLeadByTab:
+    """lead_guard.find_lead_by_tab — the pure lookup half of surviving a session-id change (memory:
+    relay-lead-id-changes-on-resume.md): given the CURRENT tab's identity, which (if any) lead
+    marker still claims it. Never writes a marker; only the ambiguous branch ever touches disk
+    (the ledger), and even that is opt-out via log_ambiguous=False."""
+
+    def test_no_input_returns_none_untouched(self, root):
+        assert lg.find_lead_by_tab(root) is None
+        assert not (root / "sessions.jsonl").exists()
+
+    def test_exact_iterm_session_match(self, root):
+        lg.write_marker(root, "old-sid", project="proj", iterm_session="w1t2p0:X")
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:X") == "old-sid"
+
+    def test_no_match_returns_none(self, root):
+        lg.write_marker(root, "old-sid", project="proj", iterm_session="w1t2p0:X")
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:DIFFERENT") is None
+
+    def test_marker_with_no_iterm_session_never_matches(self, root):
+        lg.write_marker(root, "old-sid", project="proj")  # iterm_session defaults to None
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:X") is None
+
+    # ---- fix-list 002: tab match alone is not proof of identity — cwd must also agree ----------
+
+    def test_cwd_omitted_matches_on_tab_alone(self, root):
+        """Backward compatible: no `cwd` given → the old tab-only behavior, unchanged."""
+        lg.write_marker(root, "old-sid", project="proj", iterm_session="w1t2p0:X", cwd="/anything")
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:X") == "old-sid"
+
+    def test_cwd_given_and_matches(self, root):
+        lg.write_marker(root, "old-sid", project="proj", iterm_session="w1t2p0:X", cwd="/repo/a")
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:X", cwd="/repo/a") == "old-sid"
+
+    def test_cwd_given_and_differs_no_match(self, root):
+        """The gap this closes: an unrelated session in the same tab, different project — a tab
+        match ALONE must never be enough."""
+        lg.write_marker(root, "old-sid", project="proj", iterm_session="w1t2p0:X", cwd="/repo/a")
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:X", cwd="/repo/b") is None
+
+    def test_cwd_given_but_marker_has_none_no_match(self, root):
+        """A candidate with no recorded cwd can't prove same-project either way — must not match
+        once `cwd` is given, per the packet's explicit rule."""
+        lg.write_marker(root, "old-sid", project="proj", iterm_session="w1t2p0:X")  # no cwd
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:X", cwd="/repo/a") is None
+
+    def test_cwd_matches_through_a_symlink(self, root, tmp_path):
+        real = tmp_path / "real-project"; real.mkdir()
+        link = tmp_path / "link"; link.symlink_to(real)
+        lg.write_marker(root, "old-sid", project="proj", iterm_session="w1t2p0:X", cwd=str(real))
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:X", cwd=str(link)) == "old-sid"
+
+    def test_ambiguous_two_matches_returns_none_and_ledgers_once(self, root):
+        lg.write_marker(root, "old-a", project="a", iterm_session="w1t2p0:X")
+        lg.write_marker(root, "old-b", project="b", iterm_session="w1t2p0:X")
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:X") is None
+        events = [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+        ambiguous = [e for e in events if e["event"] == "lead_migrate_ambiguous"]
+        assert len(ambiguous) == 1
+        assert set(ambiguous[0]["candidates"]) == {"old-a", "old-b"}
+
+    def test_ambiguous_can_be_silenced_for_read_only_callers(self, root):
+        """The statusline path must stay side-effect free — log_ambiguous=False skips even this
+        best-effort ledger write."""
+        lg.write_marker(root, "old-a", project="a", iterm_session="w1t2p0:X")
+        lg.write_marker(root, "old-b", project="b", iterm_session="w1t2p0:X")
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:X", log_ambiguous=False) is None
+        assert not (root / "sessions.jsonl").exists()
+
+    def test_already_migrated_marker_is_excluded(self, root):
+        """The double-hop case: old→mid already migrated (old is stamped migrated_to). A later
+        lookup for the SAME tab must land on `mid`, not resurrect the superseded `old`."""
+        lg.write_marker(root, "old-sid", project="proj", iterm_session="w1t2p0:X")
+        assert lg.migrate_lead(root, "old-sid", "mid-sid") is True
+        assert lg.find_lead_by_tab(root, iterm_session="w1t2p0:X") == "mid-sid"
+
+    def test_tty_resolution_path(self, root, monkeypatch):
+        """Fixture per the packet: a marker recording iterm_session X, and a faked tty_by_id that
+        resolves X to a live tty — find_lead_by_tab(tty=...) must go through THAT resolution, not
+        exact string match against the tty path."""
+        lg.write_marker(root, "old-sid", project="proj", iterm_session="X")
+        monkeypatch.setattr(lg, "_tty_by_id", lambda iterm_id: "/dev/ttys005" if iterm_id == "X" else None)
+        assert lg.find_lead_by_tab(root, tty="/dev/ttys005") == "old-sid"
+        assert lg.find_lead_by_tab(root, tty="/dev/ttys999") is None
+
+    def test_tty_by_id_failure_degrades_to_no_match(self, root, monkeypatch):
+        lg.write_marker(root, "old-sid", project="proj", iterm_session="X")
+        monkeypatch.setattr(lg, "_tty_by_id", lambda iterm_id: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert lg.find_lead_by_tab(root, tty="/dev/ttys005") is None
+
+
+class TestMigrateLead:
+    """lead_guard.migrate_lead — moves a lead's identity from old_sid to new_sid when a resume comes
+    back under a different session id than the one its marker lives under (memory:
+    relay-lead-id-changes-on-resume.md)."""
+
+    def _armed(self, root, sid="old-sid", **extra):
+        lg.write_marker(root, sid, model="opus", iterm_session="w1t2p0:X", project="proj",
+                        cwd="/tmp/x", tab_label="[Lead] proj", color=[1, 2, 3],
+                        autonomous=True, autonomous_source="command")
+        if extra:
+            lg.update_marker(root, sid, **extra)
+        return lg.read_marker(root, sid)
+
+    def test_no_old_marker_is_a_noop(self, root):
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is False
+        assert lg.read_marker(root, "new-sid") == {}
+
+    def test_same_id_is_a_noop(self, root):
+        self._armed(root)
+        assert lg.migrate_lead(root, "old-sid", "old-sid") is False
+
+    def test_moves_marker_and_tags_provenance(self, root):
+        before = self._armed(root)
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True
+        new = lg.read_marker(root, "new-sid")
+        assert new["migrated_from"] == "old-sid"
+        assert new["session_id"] == "new-sid"
+        assert "migrated_at" in new
+        for k in ("project", "cwd", "iterm_session", "tab_label", "color", "model"):
+            assert new.get(k) == before.get(k), f"{k} was lost in migration"
+
+    def test_carries_autonomous_posture(self, root):
+        self._armed(root)
+        lg.migrate_lead(root, "old-sid", "new-sid")
+        on, source = lg.autonomous_state(lg.read_marker(root, "new-sid"))
+        assert on is True and source == "command"
+
+    def test_carries_surfaced_reports_handoff_nudge_and_grace(self, root):
+        self._armed(root)
+        lg.mark_surfaced(root, "old-sid", ["exec-1:1"])
+        lg.mark_handoff_nudged(root, "old-sid")
+        lg.set_grace(root, "old-sid", 120)
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True
+        assert lg.load_surfaced(root, "new-sid") == {"exec-1:1"}
+        assert lg.handoff_nudged(root, "new-sid") is True
+        assert lg.in_grace(root, "new-sid") is True
+
+    def test_rewrites_owner_lead_on_owned_executors_only(self, root):
+        self._armed(root)
+        (root / "exec-mine").mkdir(parents=True)
+        (root / "exec-mine" / "session.json").write_text(json.dumps(
+            {"session_id": "exec-mine", "owner_lead": "old-sid", "status": "busy"}))
+        (root / "exec-other").mkdir(parents=True)
+        (root / "exec-other" / "session.json").write_text(json.dumps(
+            {"session_id": "exec-other", "owner_lead": "some-other-lead", "status": "busy"}))
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True
+        assert json.loads((root / "exec-mine" / "session.json").read_text())["owner_lead"] == "new-sid"
+        assert json.loads((root / "exec-other" / "session.json").read_text())["owner_lead"] == "some-other-lead"
+
+    def test_tombstones_old_and_stamps_migrated_to(self, root):
+        self._armed(root)
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True
+        old = lg.read_marker(root, "old-sid")
+        assert old["ended"] is True
+        assert old["migrated_to"] == "new-sid"
+        assert lg.is_lead(root, "old-sid") is False
+
+    def test_new_id_starts_armed_not_tombstoned(self, root):
+        self._armed(root)
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True
+        assert lg.is_lead(root, "new-sid") is True
+
+    def test_ledgers_exactly_one_lead_migrated_event(self, root):
+        self._armed(root)
+        (root / "exec-mine").mkdir(parents=True)
+        (root / "exec-mine" / "session.json").write_text(json.dumps(
+            {"session_id": "exec-mine", "owner_lead": "old-sid", "status": "busy"}))
+        lg.migrate_lead(root, "old-sid", "new-sid")
+        events = [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+        migrated = [e for e in events if e["event"] == "lead_migrated"]
+        assert len(migrated) == 1
+        assert migrated[0]["old"] == "old-sid" and migrated[0]["new"] == "new-sid"
+        assert migrated[0]["executors"] == ["exec-mine"]
+
+    def test_idempotent_second_call_is_a_silent_noop(self, root):
+        self._armed(root)
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True
+        marker_before = lg.read_marker(root, "new-sid")
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True   # no-op, not a failure
+        assert lg.read_marker(root, "new-sid") == marker_before
+        events = [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+        assert len([e for e in events if e["event"] == "lead_migrated"]) == 1  # never doubled
+
+    def test_refuses_to_clobber_a_real_independent_marker(self, root):
+        """new_sid already has ITS OWN marker (a genuinely different, independently-armed lead) —
+        must not be overwritten just because some other old_sid also exists."""
+        self._armed(root, sid="old-sid")
+        self._armed(root, sid="new-sid")
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is False
+        assert lg.read_marker(root, "new-sid").get("migrated_from") is None
+
+    def test_never_raises_on_a_corrupt_executor_session_json(self, root):
+        self._armed(root)
+        (root / "exec-bad").mkdir(parents=True)
+        (root / "exec-bad" / "session.json").write_text("not json")
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True
+
+
 class TestHooksAreExecutable:
     """Every hook registered in hooks.json is invoked by the harness as a BARE PATH, so it must
     carry the executable bit. A hook created without +x fails silently at runtime — and unit tests

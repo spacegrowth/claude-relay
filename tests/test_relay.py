@@ -1149,6 +1149,24 @@ class TestCmdList:
         assert data["executors"][0]["owner_lead"] == "lead-1"
         assert data["executors"][0]["owner_project"] == "alpha"
 
+    def test_migrated_lead_shows_a_footnote(self, relay, capsys):
+        """id-changed-on-resume audit trail (memory: relay-lead-id-changes-on-resume.md): a lead row
+        whose marker carries `migrated_from` says so once, so the id jump stays visible rather than
+        looking like a brand-new lead that happens to share the old one's project/tab."""
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-sid", project="webapp",
+                                      iterm_session="w1t2p0:X")
+        assert relay.lead_guard.migrate_lead(relay.STATE_ROOT, "old-sid", "new-sid") is True
+        relay.cmd_list(self._args())
+        out = capsys.readouterr().out
+        assert "↪" in out and "migrated from" in out
+        assert "old-sid"[:8] in out
+
+    def test_no_footnote_without_a_migration(self, relay, capsys):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        relay.cmd_list(self._args())
+        out = capsys.readouterr().out
+        assert "↪" not in out
+
     def test_json_respects_lead_scoping(self, relay, capsys):
         self._exec(relay, "mine", owner_lead="lead-1")
         self._exec(relay, "theirs", owner_lead="lead-2")
@@ -5095,6 +5113,88 @@ class TestStatus:
         files_after = sorted(p.relative_to(lead_dir) for p in lead_dir.rglob("*") if p.is_file())
         assert session_before == session_after
         assert files_before == files_after
+
+
+class TestStatusMigrationFallback:
+    """`relay status`'s id-changed-on-resume fallback (memory: relay-lead-id-changes-on-resume.md):
+    when the incoming session id is neither a known lead nor a known executor, but a lead marker
+    for the CURRENT tab exists under a different id, render THAT lead's segment — strictly
+    read-only, per cmd_status's own "NO writes anywhere in this path" docstring contract."""
+
+    FAKE_CWD = "/fake/project"   # need not exist on disk — os.path.realpath just normalizes it,
+                                 # identically on both sides of the comparison
+
+    def _args(self, session_id=None, statusline=False):
+        return SimpleNamespace(session_id=session_id, statusline=statusline)
+
+    def test_renders_the_matched_leads_segment(self, relay, capsys, monkeypatch):
+        monkeypatch.setenv("TERM_SESSION_ID", "w1t2p0:TAB-X")
+        monkeypatch.setattr(relay.os, "getcwd", lambda: self.FAKE_CWD)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-sid", project="webapp",
+                                      iterm_session="w1t2p0:TAB-X", cwd=self.FAKE_CWD,
+                                      stop_hook_timeout=1800)
+        relay.cmd_status(self._args(session_id="new-sid"))
+        out = capsys.readouterr().out
+        assert "webapp" in out and "🚦" in out
+
+    def test_no_tab_match_prints_nothing(self, relay, capsys, monkeypatch):
+        monkeypatch.setenv("TERM_SESSION_ID", "w1t2p0:NOBODY")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-sid", project="webapp",
+                                      iterm_session="w1t2p0:TAB-X", cwd=self.FAKE_CWD)
+        relay.cmd_status(self._args(session_id="new-sid"))
+        assert capsys.readouterr().out == ""
+
+    def test_different_cwd_prints_nothing(self, relay, capsys, monkeypatch):
+        """Fix-list 002: a tab match ALONE is not proof of identity — a marker whose recorded cwd
+        differs from this CLI's own cwd must not render, even though the tab id matches exactly."""
+        monkeypatch.setenv("TERM_SESSION_ID", "w1t2p0:TAB-X")
+        monkeypatch.setattr(relay.os, "getcwd", lambda: self.FAKE_CWD)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-sid", project="webapp",
+                                      iterm_session="w1t2p0:TAB-X", cwd="/fake/OTHER-project")
+        relay.cmd_status(self._args(session_id="new-sid"))
+        assert capsys.readouterr().out == ""
+
+    def test_never_writes_anything(self, relay, capsys, monkeypatch):
+        """The acceptance bar: statusline renders the matched lead without writing anything —
+        assert no file mtime changes anywhere under STATE_ROOT."""
+        monkeypatch.setenv("TERM_SESSION_ID", "w1t2p0:TAB-X")
+        monkeypatch.setattr(relay.os, "getcwd", lambda: self.FAKE_CWD)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-sid", project="webapp",
+                                      iterm_session="w1t2p0:TAB-X", cwd=self.FAKE_CWD,
+                                      stop_hook_timeout=1800)
+        before = {p: p.stat().st_mtime_ns for p in relay.STATE_ROOT.rglob("*") if p.is_file()}
+        relay.cmd_status(self._args(session_id="new-sid"))
+        out = capsys.readouterr().out
+        assert "webapp" in out   # the segment actually rendered, this isn't a vacuous pass
+        after = {p: p.stat().st_mtime_ns for p in relay.STATE_ROOT.rglob("*") if p.is_file()}
+        assert before == after
+        assert not (relay.STATE_ROOT / "sessions.jsonl").exists()   # not even a ledger write
+
+    def test_ambiguous_tab_match_stays_silent_and_writes_nothing(self, relay, capsys, monkeypatch):
+        """Two lead markers claim the same tab AND the same cwd — even the (best-effort, opt-out)
+        ambiguity ledger write must NOT happen from this strictly-read-only surface."""
+        monkeypatch.setenv("TERM_SESSION_ID", "dup")
+        monkeypatch.setattr(relay.os, "getcwd", lambda: self.FAKE_CWD)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-a", project="a", iterm_session="dup",
+                                      cwd=self.FAKE_CWD)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-b", project="b", iterm_session="dup",
+                                      cwd=self.FAKE_CWD)
+        relay.cmd_status(self._args(session_id="new-sid"))
+        assert capsys.readouterr().out == ""
+        assert not (relay.STATE_ROOT / "sessions.jsonl").exists()
+
+    def test_a_known_id_never_reaches_the_fallback(self, relay, capsys, monkeypatch):
+        """No behavior change when the id is known — an ordinary lead's own status render must not
+        even attempt the tab lookup (proven the same way as elsewhere: no ledger trace even under a
+        tab setup that WOULD be ambiguous if it were consulted)."""
+        monkeypatch.setenv("TERM_SESSION_ID", "dup")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp",
+                                      iterm_session="dup", stop_hook_timeout=1800)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-b", project="b", iterm_session="dup")
+        relay.cmd_status(self._args(session_id="lead-1"))
+        out = capsys.readouterr().out
+        assert "webapp" in out
+        assert not (relay.STATE_ROOT / "sessions.jsonl").exists()
 
 
 class TestWeightSegmentTokenFirst:

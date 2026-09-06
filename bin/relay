@@ -3143,6 +3143,23 @@ def cmd_status(args):
             print(_executor_status_line(s))
             return
 
+    # id-changed-on-resume fallback (memory: relay-lead-id-changes-on-resume.md): no marker for
+    # this id, and it's not a known executor either — before going blank, check whether a lead
+    # marker for THIS tab AND this project directory exists under a different id (fix-list 002: a
+    # shared tab alone isn't proof — this CLI's own cwd is always available, unlike a hook payload
+    # that might omit one, so it's always passed), and render THAT lead's own segment. This path
+    # stays exactly as read-only as the rest of the function: find_lead_by_tab never writes a
+    # marker, and log_ambiguous=False means it won't even append the (rare) ambiguity ledger event
+    # here — no migration happens from --statusline, ever, per this docstring's own contract.
+    tab_sid = lead_guard.find_lead_by_tab(STATE_ROOT, iterm_session=os.environ.get("TERM_SESSION_ID"),
+                                          cwd=os.getcwd(), log_ambiguous=False)
+    if tab_sid:
+        tab_marker = lead_guard.read_marker(STATE_ROOT, tab_sid)
+        if tab_marker:
+            line = _lead_status_line(tab_sid, tab_marker, transcript_path)
+            if line:
+                print(line)
+
 
 def _lead_age_cell(m):
     """LAST ACTIVE cell for a lead row, prefixed with ⏸ when the lead is PAUSED (tombstoned: its
@@ -3517,6 +3534,16 @@ def cmd_list(args):
         if any(lead_guard.is_tombstoned(m) for m in leads):
             print(c("  ⏸ paused: this lead's session exited but is resumable — its name and state "
                     "are held, and resuming re-arms it automatically.", "dim"))
+        # Audit trail for the id-changed-on-resume migration (memory: relay-lead-id-changes-on-
+        # resume.md): a lead row with `migrated_from` came back under a DIFFERENT session id than
+        # the one it originally armed under — say so once, so the jump is visible rather than
+        # looking like a brand-new lead that happens to share the old one's tab/project.
+        migrated_leads = [m for m in leads if m.get("migrated_from")]
+        if migrated_leads:
+            names = ", ".join(
+                f"{m.get('project') or (m.get('session_id') or '?')[:8]} "
+                f"(↪ migrated from {m['migrated_from'][:8]})" for m in migrated_leads)
+            print(c(f"  ↪ {names}", "dim"))
         # Footnote only when something needs action — a stale (or unknown) wake hook is exactly the
         # silent condition that used to cost a forensic investigation to find.
         # Autonomy must never be quiet: if any lead is proceeding without asking, say so in words

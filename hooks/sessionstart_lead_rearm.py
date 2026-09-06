@@ -86,8 +86,29 @@ def main():
             # Lossless: revive_lead only drops the tombstone flags and refreshes last_active, so the
             # project name, cwd, iterm_session, colour and predecessor all come back untouched — a
             # resumed lead is indistinguishable from one that never exited.
-            if lg.revive_lead(STATE_ROOT, sid):
+            revived = lg.revive_lead(STATE_ROOT, sid)
+            id_change_suffix = ""
+            if revived:
                 lg.append_ledger(STATE_ROOT, "lead_rearmed", session_id=sid, source=source)
+            elif not lg.read_marker(STATE_ROOT, sid) and payload.get("cwd"):
+                # relay has NO marker for this id at all — not even a tombstone. THE INCIDENT (memory:
+                # relay-lead-id-changes-on-resume.md): this resume's own $CLAUDE_CODE_SESSION_ID came
+                # back different from the one its lead armed under, while the iTerm TAB is unchanged.
+                # Look for whichever lead marker still claims THIS tab (same identity lead-start itself
+                # records — os.environ["TERM_SESSION_ID"], compared by exact string equality, no
+                # subprocess needed) AND the same project directory (fix-list 002: a shared tab alone
+                # isn't proof — a brand-new unrelated session started later in that tab must not
+                # inherit an old lead; a payload with no cwd can't prove same-project either way, so
+                # the `and payload.get("cwd")` above skips the lookup entirely) and migrate it forward
+                # rather than leaving it silently orphaned.
+                old_sid = lg.find_lead_by_tab(STATE_ROOT, iterm_session=os.environ.get("TERM_SESSION_ID"),
+                                              cwd=payload.get("cwd"))
+                if old_sid and lg.migrate_lead(STATE_ROOT, old_sid, sid):
+                    revived = True
+                    lg.append_ledger(STATE_ROOT, "lead_rearmed", session_id=sid, source=source,
+                                     migrated_from=old_sid)
+                    id_change_suffix = f" (session id changed: {old_sid[:8]} → {sid[:8]})"
+            if revived:
                 marker = lg.read_marker(STATE_ROOT, sid)
                 # Loudness is the point: the original defect was that unarming happened in silence.
                 # This MUST be stdout — a SessionStart hook's stdout is surfaced as session context;
@@ -95,7 +116,8 @@ def main():
                 # wrote to stderr, the re-arm worked perfectly and reported itself to no one.)
                 sys.stdout.write(
                     f"🚦 [relay] — lead mode restored for this resumed session "
-                    f"(project '{marker.get('project') or '?'}'). Gate and auto-wake are active again.\n"
+                    f"(project '{marker.get('project') or '?'}'). Gate and auto-wake are active "
+                    f"again.{id_change_suffix}\n"
                 )
                 # ...but stdout only reaches the MODEL (it becomes session context). Nothing a
                 # SessionStart hook writes lands on the user's screen. So also fire the desktop

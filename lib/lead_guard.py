@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -744,6 +745,178 @@ def revive_lead(state_root, session_id):
         m.pop("ended_at", None)
         m["last_active"] = now()
         marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
+        return True
+    except Exception:
+        return False
+
+
+# ---- migration: lead re-arming survives a session-id change --------------------------------------
+# THE INCIDENT (memory: relay-lead-id-changes-on-resume.md): a resumed lead's OWN
+# $CLAUDE_CODE_SESSION_ID can change out from under it (observed live: a background-job resume
+# reported a different id than the one the lead armed under) while its iTerm TAB is unchanged.
+# revive_lead is keyed on the session id matching exactly, so a resume that comes back under a
+# NEW id finds no marker/tombstone at all and silently does nothing — gate, wake, auto posture and
+# the 🚦 statusline segment all go dark, with no error anywhere, because every hook's own
+# `is_lead`/`read_marker` check is correctly reporting "no marker for this id" (it's just the wrong
+# question — the id changed, the LEAD didn't). find_lead_by_tab + migrate_lead below answer the
+# right question instead: "is there a lead marker for the tab this process is actually running in?"
+
+def _tty_by_id(iterm_session_id):
+    """/dev/ttysNNN for an iTerm session id ($TERM_SESSION_ID, "w#t#p#:UUID"), or None — a thin,
+    mockable indirection over scripts/iterm.tty_by_id (lazily imported: lead_guard stays free of a
+    hard terminal-backend dependency, matching every other function in this file). Tests monkeypatch
+    THIS function directly rather than reaching into iterm's AppleScript/subprocess plumbing. Any
+    failure (module missing, AppleScript failure, no live match) degrades to None. Never raises."""
+    try:
+        scripts_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import iterm as _iterm
+        return _iterm.tty_by_id(iterm_session_id)
+    except Exception:
+        return None
+
+
+def find_lead_by_tab(state_root, iterm_session=None, tty=None, cwd=None, log_ambiguous=True):
+    """PURE lookup (reads lead markers only; never writes a marker, never migrates): the ONE lead
+    marker whose recorded `iterm_session` identifies the CURRENT tab.
+
+    Two ways to identify "current": `iterm_session` matches a candidate's stamped iterm_session by
+    exact string equality — the fast, common path, since it's the very value write_marker recorded
+    at arm time and what a hook/CLI process inherits via $TERM_SESSION_ID with no subprocess call at
+    all. `tty` instead resolves EACH candidate's stamped iterm_session to a live tty path
+    (_tty_by_id) and compares that against `tty` — for a caller that only knows the tty, not the
+    iTerm session id. Give exactly one of the two; with neither, returns None untouched.
+
+    Fix-list 002 (the gap: a tab match ALONE is not proof of identity — a tombstoned lead's
+    `iterm_session` stays recorded forever, so a brand-new, wholly unrelated session started later
+    in that same physical tab would otherwise "inherit" it). When `cwd` is given, a candidate must
+    ALSO satisfy `os.path.realpath(candidate["cwd"]) == os.path.realpath(cwd)` — a candidate with no
+    recorded cwd never matches once `cwd` is given, since it can't prove same-project either way.
+    Callers that can't establish a cwd (or a hook whose payload carries none) should pass `cwd=None`
+    AND independently refuse to migrate at all — this function has no way to distinguish "caller
+    doesn't have a cwd" from "caller doesn't care", so that refusal is the caller's job (both
+    hooks below guard their whole migrate attempt on the payload actually carrying a cwd).
+
+    A marker already carrying `migrated_to` is excluded — it has already been superseded by a later
+    migration, so matching it again would hand back a lead identity that has already moved on (the
+    double-hop case: tab X migrates old→mid, then later mid→new — `new`'s lookup must land on `mid`,
+    not resurrect the already-migrated-away `old`).
+
+    Returns the matched marker's session_id, or None when nothing matches. Two or more MATCH is
+    ambiguous: rather than guess which one is "the" lead, this returns None and (when
+    `log_ambiguous`, the default) appends a `lead_migrate_ambiguous` ledger event naming every
+    candidate — so the collision is visible for forensics instead of silently picking one. A caller
+    that must stay strictly side-effect-free (e.g. the statusline path) passes `log_ambiguous=False`
+    to skip even that ledger write. Never raises."""
+    if not iterm_session and not tty:
+        return None
+    try:
+        cwd_real = os.path.realpath(cwd) if cwd else None
+        matches = []
+        for m in list_leads(state_root):
+            sid = m.get("session_id")
+            cand = m.get("iterm_session")
+            if not sid or not cand or m.get("migrated_to"):
+                continue
+            if iterm_session is not None:
+                hit = cand == iterm_session
+            else:
+                hit = _tty_by_id(cand) == tty
+            if not hit:
+                continue
+            if cwd_real is not None:
+                m_cwd = m.get("cwd")
+                if not m_cwd or os.path.realpath(m_cwd) != cwd_real:
+                    continue
+            matches.append(sid)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1 and log_ambiguous:
+            append_ledger(state_root, "lead_migrate_ambiguous", candidates=matches,
+                          iterm_session=iterm_session, tty=tty)
+        return None
+    except Exception:
+        return None
+
+
+def migrate_lead(state_root, old_sid, new_sid):
+    """Migrate a lead's identity from old_sid to new_sid — the fix for THE INCIDENT above: a resumed
+    lead came back under a different session id than the one its marker lives under.
+
+    Writes a NEW marker.json at new_sid: a copy of old_sid's marker (so project/cwd/iterm_session/
+    color/predecessor/autonomous posture all carry over untouched — a migrated lead is
+    indistinguishable from one that never changed id) with `session_id` corrected, `migrated_from`/
+    `migrated_at` stamped, and any tombstone flags dropped (a migration IS a revive: the new id
+    starts armed). Also moves the auxiliary per-lead files that would otherwise strand a resumed
+    lead's memory of its own state: surfaced_reports.json (don't re-announce reports it already
+    saw), handoff_nudged (don't re-nudge a handoff it already got), grace_until (don't drop an
+    in-progress /relay:route window).
+
+    Rewrites `owner_lead` on every executor's session.json that pointed at old_sid, so their
+    wake/adopt paths keep targeting the lead that's actually still there. Tombstones old_sid
+    (kept for audit, not deleted — mirrors a resumable SessionEnd, NOT `close --self`, which fully
+    deletes; see this task's report for why the packet's own wording pointed at the wrong function)
+    and stamps it `migrated_to: new_sid` so find_lead_by_tab won't match it again on a later hop.
+    Appends ONE `lead_migrated` ledger event naming every re-parented executor.
+
+    Idempotent: if new_sid already has a marker stamped `migrated_from == old_sid`, this is a silent
+    no-op (returns True — the migration already happened, nothing left to do). Returns False (does
+    nothing) when there's no old marker to migrate, old_sid == new_sid, or new_sid already carries a
+    DIFFERENT marker of its own (refuses to clobber a real, independently-armed lead). Never raises
+    into a caller — every caller here is a hook."""
+    try:
+        if not old_sid or not new_sid or old_sid == new_sid:
+            return False
+        old_marker = read_marker(state_root, old_sid)
+        if not old_marker:
+            return False
+        new_marker = read_marker(state_root, new_sid)
+        if new_marker:
+            return new_marker.get("migrated_from") == old_sid  # already migrated → no-op; else refuse
+
+        migrated = dict(old_marker)
+        migrated["session_id"] = new_sid
+        migrated["migrated_from"] = old_sid
+        migrated["migrated_at"] = now()
+        migrated["last_active"] = now()
+        migrated.pop("ended", None)
+        migrated.pop("ended_at", None)
+        new_dir = lead_dir(state_root, new_sid)
+        new_dir.mkdir(parents=True, exist_ok=True)
+        marker_path(state_root, new_sid).write_text(json.dumps(migrated, indent=2))
+
+        old_dir = lead_dir(state_root, old_sid)
+        for name in ("surfaced_reports.json", "handoff_nudged", "grace_until"):
+            src = old_dir / name
+            if src.exists():
+                try:
+                    shutil.move(str(src), str(new_dir / name))
+                except Exception:
+                    pass  # best-effort — losing a nudge/surfaced flag is a soft regression, not fatal
+
+        moved_execs = []
+        root = Path(state_root)
+        if root.exists():
+            for d in root.iterdir():
+                sj = d / "session.json"
+                if not sj.exists():
+                    continue
+                try:
+                    s = json.loads(sj.read_text())
+                except Exception:
+                    continue
+                if s.get("owner_lead") != old_sid:
+                    continue
+                s["owner_lead"] = new_sid
+                s["updated"] = now()
+                sj.write_text(json.dumps(s, indent=2))
+                moved_execs.append(s.get("session_id") or d.name)
+
+        tombstone_lead(state_root, old_sid)
+        update_marker(state_root, old_sid, migrated_to=new_sid)
+
+        append_ledger(state_root, "lead_migrated", old=old_sid, new=new_sid, executors=moved_execs)
         return True
     except Exception:
         return False
