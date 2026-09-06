@@ -189,9 +189,6 @@ class TestMarkerState:
         lg.marker_path(sr, sid).write_text(raw[:len(raw) // 2])   # a half-written marker
         assert lg.read_marker(sr, sid) == {}
 
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-8: is_lead reports True for an unreadable "
-                                           "marker — read_marker swallows the error into {}, so "
-                                           "'any error → not lead' never fires")
     @pytest.mark.parametrize("content", ["{ truncated", "", "[1, 2]", "null"])
     def test_an_unreadable_marker_is_not_a_lead(self, sr, content):
         """is_lead: 'Marker absent (or any error) → not lead → the hooks fast-exit-allow, which
@@ -229,14 +226,20 @@ class TestMarkerState:
         assert [m["session_id"] for m in lg.list_leads(sr)] == ["gone"]
 
     def test_one_malformed_marker_never_blanks_the_list(self, sr):
-        """list_leads: 'a single bad marker must never blank the whole list'."""
+        """list_leads: 'a single bad marker must never blank the whole list' — strengthened by
+        D2 (BUG-lib-8's mitigation): a marker that can't be read as a real dict now shows up as
+        its own distinct BROKEN row instead of silently vanishing."""
         armed(sr, "good")
         (sr / "lead" / "bad").mkdir(parents=True)
         (sr / "lead" / "bad" / "marker.json").write_text("{ truncated")
         (sr / "lead" / "listy").mkdir(parents=True)
         (sr / "lead" / "listy" / "marker.json").write_text("[1, 2]")   # valid JSON, wrong shape
         lg.config_path(sr).write_text("{}")                            # not a marker dir
-        assert [m["session_id"] for m in lg.list_leads(sr)] == ["good"]
+        leads = lg.list_leads(sr)
+        assert {m["session_id"] for m in leads} == {"good", "bad", "listy"}
+        broken = {m["session_id"]: m for m in leads if m.get("broken")}
+        assert set(broken) == {"bad", "listy"}
+        assert all(m == {"session_id": sid, "broken": True} for sid, m in broken.items())
 
     def test_list_leads_sorts_oldest_first_and_tolerates_a_missing_started(self, sr):
         armed(sr, "b", started="2026-01-02T00:00:00")
@@ -268,11 +271,24 @@ class TestMarkerState:
     def test_marker_writers_never_raise_when_the_marker_is_read_only(self, sr):
         """touch_lead/update_marker/tombstone_lead/revive_lead all promise 'nothing here ever
         raises (the Stop hook's fail-open contract must hold even if the heartbeat can't be
-        written)'."""
+        written)'.
+
+        BUG-lib-8's atomic-write fix makes write_marker/touch_lead write via a sibling tmp file +
+        os.replace, so blocking THEIR write needs the containing DIRECTORY read-only (a replace
+        only needs write permission on the directory, not the target file's own mode — chmod'ing
+        just the marker file no longer stops it). update_marker/tombstone_lead/revive_lead still
+        write straight onto the marker in place, so chmod'ing the marker file itself still blocks
+        those, same as before."""
         sid = armed(sr)
+        lead_dir_path = lg.lead_dir(sr, sid)
+        lead_dir_path.chmod(0o555)
+        try:
+            lg.touch_lead(sr, sid)   # must not raise — the marker is simply left untouched
+        finally:
+            lead_dir_path.chmod(0o755)
+
         lg.marker_path(sr, sid).chmod(0o444)
         try:
-            lg.touch_lead(sr, sid)
             assert lg.update_marker(sr, sid, x=1) is False
             assert lg.tombstone_lead(sr, sid) is False
         finally:

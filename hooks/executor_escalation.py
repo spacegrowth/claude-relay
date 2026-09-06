@@ -184,6 +184,21 @@ def main():
 
         decision = lg.escalation_decision(STATE_ROOT, sid, n, owner_lead)
 
+        # 11b (lead-found, 2026-09-05 22:01): before giving up, look for the SINGLE currently-armed
+        # lead whose project matches this executor's own owner_project — the net under any way an
+        # owner can go missing WITHOUT a handoff to re-parent it (11a: cmd_handoff now re-parents
+        # proactively, so this is the remaining gap — a crash, a manual close). Never guesses
+        # between two same-project leads; ambiguous or no match falls through unchanged.
+        if decision in ("unowned", "owner-missing"):
+            exec_s = lg.read_session_json(STATE_ROOT, sid) or {}
+            fallback = lg.find_lead_by_project(STATE_ROOT, exec_s.get("owner_project"))
+            if fallback:
+                lg.append_ledger(STATE_ROOT, "owner_fallback", session_id=sid, packet=n,
+                                 old_owner=owner_lead, new_owner=fallback,
+                                 project=exec_s.get("owner_project"))
+                owner_lead = fallback
+                decision = lg.escalation_decision(STATE_ROOT, sid, n, owner_lead)
+
         if decision == "resolved":
             # The lead's own fast-path already surfaced this — the dedup working, not a dead hook.
             lg.append_ledger(STATE_ROOT, "escalation_resolved", session_id=sid, packet=n,
@@ -200,6 +215,15 @@ def main():
 
         # decision == "send"
         ok = _push_to_lead(owner_lead, sid, n)
+        # 8b (lead-found): ALSO attempt a desktop banner alongside the text injection above — typed
+        # text alone is easy to miss if the lead's tab isn't in view. Deduped against the lead's OWN
+        # Stop-hook wake via the shared claim stamp (lead_guard.claim_notification): whichever of
+        # the two producers gets here first for this "<executor>:<packet>" key fires the banner, the
+        # other stays quiet. When THIS is the one that fires, `_notify_human` reads the lead's own
+        # marker for its iterm_session, so it uses the SAME iTerm-OSC tier a wake would rather than
+        # landing on terminal-notifier for lack of one.
+        if lg.claim_notification(STATE_ROOT, owner_lead, f"{sid}:{n}"):
+            _notify_human(lg, cfg, sid, n, owner_lead, "review it")
         # A successful `nudge-lead` proves the TEXT was typed, not that the lead consumed it (a busy
         # lead's tab swallows it — §13). Mark unconfirmed so a later Stop can re-arm while the
         # report is still unsurfaced, instead of burning the one shot exactly when it's needed most.

@@ -41,66 +41,26 @@ PLUGIN_ROOT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
 
 def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_session=None,
             subtitle=None):
-    """Desktop notification, three tiers, first one that applies wins:
+    """Desktop notification for a lead wake — resolves the title (project name) and default
+    subtitle (which executor reported) from THIS call site's own vocabulary, then hands off to
+    `lead_guard.notify_banner` for the actual three-tier chain (iTerm OSC → terminal-notifier →
+    osascript — see that function's docstring). Lead-found gap (fixed): that chain used to be
+    copy-pasted here AND skipped entirely by bin/relay's own `desktop_nudge`, which went straight
+    to terminal-notifier; both now call the ONE shared implementation.
 
-    1. iTerm native (OSC 777, written straight to the lead's own tty) — zero external deps, and
-       clicking it focuses the POSTING session natively (confirmed live — see
-       docs/async-rewake-findings.md). Used whenever the lead's marker recorded an iterm_session
-       AND iterm.tty_by_id can still resolve it to a live tty; RETURNs regardless of whether the
-       write itself succeeds (notify_via_tty is best-effort/never-raises — that's the point of a
-       tier system, not something to retry with a fallback).
-    2. terminal-notifier — still valuable even with tier 1 available: `-group` coalesces repeated
-       pings per lead (replace rather than stack), and `-execute` runs `relay focus <lead>` so it
-       works even if the lead's tty is gone (session moved, iTerm restarted).
-    3. osascript's built-in `display notification` — same info, NOT clickable, no coalescing.
-
-    Title names the project, subtitle/body names the executor. Configurable via notify_on_wake;
-    failures swallowed throughout."""
+    Title names the project, subtitle/body names the executor. Configurable via notify_on_wake
+    (checked HERE, before resolving title/subtitle at all — notify_banner itself only checks the
+    RELAY_NO_NOTIFY kill-switch, since not every caller ties itself to notify_on_wake the same
+    way)."""
     if not cfg.get("notify_on_wake", True):
         return
-    if os.environ.get("RELAY_NO_NOTIFY"):
-        return  # kill-switch: the test suite sets this so its subprocess hook runs don't fire REAL
-                #             desktop banners (neither notifier path has a dry-run). Also usable in CI.
     import lead_guard as lg
     title = f"relay · {project}" if project else "relay — review needed"
     # `subtitle` lets non-report callers (e.g. the SessionStart re-arm) say what actually happened;
     # without it the default below would mislabel every notification as "review needed".
     if subtitle is None:
         subtitle = f"{executor} reported" if executor else "review needed"
-    # Tier 1 is skipped when notify_via='terminal-notifier'. iTerm posts the OSC notification under a
-    # "Session …" title it controls — no escape parameter overrides or suppresses it — so a lead who
-    # wants a clean banner title opts out of this tier and takes terminal-notifier/osascript below
-    # (which set -title/-subtitle explicitly). Trade-off: the OSC tier's NATIVE click→posting-session
-    # is lost, but terminal-notifier's -execute still clicks through to `relay focus <lead>`.
-    if iterm_session and cfg.get("notify_via", "auto") != "terminal-notifier":
-        try:
-            import iterm
-            tty = iterm.tty_by_id(iterm_session)
-            if tty:
-                iterm.notify_via_tty(tty, title, subtitle + " — " + message[:180])
-                return
-        except Exception:
-            pass  # fall through to tier 2 — tty_by_id shells out to osascript, which can misbehave
-    tn = lg.find_terminal_notifier()  # PATH-robust — a bare `which` fails in the hook's minimal PATH
-    try:
-        if tn:
-            args = [tn, "-title", title, "-subtitle", subtitle, "-message", message[:200], "-sound", "Glass"]
-            if lead_sid:
-                args += ["-group", f"relay-{lead_sid}",
-                         "-execute", f"'{RELAY_BIN}' focus {lead_sid}"]  # click → jump to the lead tab
-            subprocess.run(args, capture_output=True, timeout=5)
-        else:
-            # FALLBACK: no terminal-notifier → macOS's built-in banner via osascript. Same
-            # information (project in the title, executor in the message) but degraded: NOT
-            # clickable (no way to jump to the lead's tab) and no per-lead coalescing — those two
-            # are terminal-notifier-only. The on-screen 🚦 wake is unaffected either way.
-            def q(s):
-                return (s or "").replace("\\", "\\\\").replace('"', '\\"')
-            script = (f'display notification "{q(subtitle + " — " + message[:180])}" '
-                      f'with title "{q(title)}" sound name "Glass"')
-            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
-    except Exception:
-        pass
+    lg.notify_banner(cfg, title, subtitle, message, lead_sid=lead_sid, iterm_session=iterm_session)
 
 
 def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg, kind="sync",
@@ -118,8 +78,16 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg, kind="syn
     marker = lg.read_marker(STATE_ROOT, sid)
     project = marker.get("project")
     executor = surfaced_keys[0].split(":")[0] if surfaced_keys else None  # first executor that reported
-    _notify(cfg, notify_msg, project=project, executor=executor, lead_sid=sid,
-            iterm_session=marker.get("iterm_session"))
+    # 8b (lead-found): dedupe the DESKTOP BANNER only — never the stdout/model-facing announce
+    # above, which always fires regardless — against the executor's OWN escalation push notifying
+    # for the SAME report (a genuine race: this wake's own pending→surfaced promotion, just above,
+    # hasn't landed yet when the escalation hook's decision tree reads it). Claim every key in this
+    # batch (so each report is independently deduped even when several land in one announce); skip
+    # the banner only when EVERY key here was already claimed by someone else.
+    claims = [lg.claim_notification(STATE_ROOT, sid, key) for key in surfaced_keys]
+    if not surfaced_keys or any(claims):
+        _notify(cfg, notify_msg, project=project, executor=executor, lead_sid=sid,
+                iterm_session=marker.get("iterm_session"))
     # Emoji-forward banner: the model echoes this into its announcement, so 🚦 is a visible,
     # consistent "you have a relay update" marker in the lead's on-screen text.
     #
@@ -208,6 +176,12 @@ def _notify_summary(lines):
 
 
 def main():
+    # THE INCIDENT (2026-09-05 22:18:50) — see sessionstart_lead_rearm.py's main() for the full
+    # account: a headless `claude -p` relay itself launches inherits the LEAD's own tab env, and
+    # every one of this plugin's hooks must return immediately on relay's own RELAY_HEADLESS=1
+    # marker, before even reading the payload.
+    if os.environ.get("RELAY_HEADLESS") == "1":
+        sys.exit(0)
     try:
         payload = json.load(sys.stdin)
     except Exception:
@@ -222,11 +196,14 @@ def main():
         # of this hook. Guarded on `payload.get("cwd")` (fix-list 002): a shared tab is NOT proof of
         # the same project — a fresh, unrelated session that merely reuses an old lead's tab must
         # never inherit it, and a payload with no cwd can't prove same-project either way, so it
-        # doesn't even attempt the lookup. No other change to this sign-off-gated hook.
+        # doesn't even attempt the lookup. `safe_migrate_by_tab` additionally refuses when the
+        # matched old marker still looks like a LIVE lead (THE INCIDENT, see main()'s top) — this
+        # exact unconditional migrate-on-tab-match was the other path into that incident.
         if not sid or not (lg.is_lead(STATE_ROOT, sid)
-                            or (payload.get("cwd") and lg.migrate_lead(STATE_ROOT, lg.find_lead_by_tab(
-                                STATE_ROOT, iterm_session=os.environ.get("TERM_SESSION_ID"),
-                                cwd=payload.get("cwd")), sid))):
+                            or (payload.get("cwd") and lg.safe_migrate_by_tab(
+                                STATE_ROOT, os.environ.get("TERM_SESSION_ID"), payload.get("cwd"),
+                                sid, lg.load_config(STATE_ROOT).get(
+                                    "poll_seconds", lg.LEAD_DEFAULTS["poll_seconds"])))):
             sys.exit(0)  # not a lead session → silent, zero impact
         # Heartbeat: every lead turn refreshes last_active (and re-stamps plugin_version/
         # stop_hook_timeout from THIS hook's own plugin root) so `relay list` reflects real liveness

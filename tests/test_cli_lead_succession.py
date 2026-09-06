@@ -503,6 +503,37 @@ class TestHandoff:
         assert relay.lead_guard.is_lead(relay.STATE_ROOT, "lead-old")
         assert [m["session_id"] for m in relay.lead_guard.list_leads(relay.STATE_ROOT)] == ["lead-old"]
 
+    def test_a_busy_executor_is_reparented_to_the_successor(self, relay, terms, tmp_path, outgoing):
+        """11a (lead-found, 2026-09-05 22:01): waiting for the successor's first send/resume
+        (adopt-on-claim) left a window where a report landing BEFORE that first claim woke nobody
+        — its escalation push still targeted the stepped-down predecessor. Re-parenting now happens
+        proactively, at handoff time, before the predecessor is even stepped down."""
+        make_session(relay, "e1", owner_lead="lead-old", owner_project="webapp", status="busy")
+        run_main(relay, "handoff", self._doc(tmp_path))
+        sid = self._successor(relay)
+        s = relay.read_session("e1")
+        assert s["owner_lead"] == sid
+        assert s["owner_project"] == "webapp"
+        rec = ledger_events(relay, "adopted")
+        assert len(rec) == 1
+        assert rec[0]["session_id"] == "e1"
+        assert rec[0]["from_lead"] == "lead-old" and rec[0]["to_lead"] == sid
+
+    def test_a_closed_executor_is_not_reparented(self, relay, terms, tmp_path, outgoing):
+        """Only NON-terminal executors are worth re-parenting — a closed/superseded one has no
+        further report or wake to worry about."""
+        make_session(relay, "e1", owner_lead="lead-old", status="closed")
+        run_main(relay, "handoff", self._doc(tmp_path))
+        assert relay.read_session("e1")["owner_lead"] == "lead-old"
+        assert ledger_events(relay, "adopted") == []
+
+    def test_an_executor_owned_by_a_different_lead_is_untouched(self, relay, terms, tmp_path,
+                                                                 outgoing):
+        make_session(relay, "e-other", owner_lead="some-other-lead", status="busy")
+        run_main(relay, "handoff", self._doc(tmp_path))
+        assert relay.read_session("e-other")["owner_lead"] == "some-other-lead"
+        assert ledger_events(relay, "adopted") == []
+
 
 # ── close-predecessor ───────────────────────────────────────────────────────────────────────────
 

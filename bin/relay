@@ -577,26 +577,23 @@ def desktop_nudge(message, lead_sid=None, subtitle="model check"):
     the split to the human at that moment).
     The ℹ lines print inside the lead's Bash tool output, which Claude Code collapses — the human
     never sees them unless the lead relays them. This puts the same sentence on screen. Same
-    kill-switches as the wake banner (notify_on_wake config, RELAY_NO_NOTIFY env); terminal-notifier
-    when present (click → `relay focus <lead>`, coalesced per lead), else macOS's built-in banner.
-    Best-effort, never raises."""
+    kill-switches as the wake banner (notify_on_wake config, RELAY_NO_NOTIFY env), and — lead-found
+    gap (fixed) — the SAME three-tier chain the Stop hook's wake banner uses (iTerm OSC →
+    terminal-notifier → osascript, `lead_guard.notify_banner`): this used to skip straight to
+    terminal-notifier, so a lead's tab-native OSC banner never fired for a nudge, only for a wake.
+    A distinct `relay-nudge-<sid>` group keeps a nudge from replacing/being replaced by a wake
+    banner for the same lead in Notification Center. Best-effort, never raises."""
     try:
         if os.environ.get("RELAY_NO_NOTIFY"):
             return
-        if not lead_guard.load_config(STATE_ROOT).get("notify_on_wake", True):
+        cfg = lead_guard.load_config(STATE_ROOT)
+        if not cfg.get("notify_on_wake", True):
             return
         title = "relay · model check"
-        tn = lead_guard.find_terminal_notifier()
-        if tn:
-            args = [tn, "-title", title, "-subtitle", subtitle, "-message", message[:200], "-sound", "Glass"]
-            if lead_sid:
-                args += ["-group", f"relay-nudge-{lead_sid}", "-execute", f"'{RELAY_BIN}' focus {lead_sid}"]
-            subprocess.run(args, capture_output=True, timeout=5)
-        else:
-            def q(t):
-                return (t or "").replace("\\", "\\\\").replace('"', '\\"')
-            subprocess.run(["osascript", "-e", f'display notification "{q(message[:180])}" '
-                            f'with title "{q(title)}" subtitle "{q(subtitle)}"'], capture_output=True, timeout=5)
+        marker = lead_guard.read_marker(STATE_ROOT, lead_sid) if lead_sid else {}
+        lead_guard.notify_banner(cfg, title, subtitle, message, lead_sid=lead_sid,
+                                 iterm_session=marker.get("iterm_session"),
+                                 group=f"relay-nudge-{lead_sid}" if lead_sid else None)
     except Exception:
         pass
 
@@ -1398,6 +1395,29 @@ def _maybe_adopt(session_id, s, force=False, quiet=False):
               f"— its report will wake THEM, not you. Take it with: relay adopt {session_id} --force",
               file=sys.stderr)
     return s
+
+
+def _reparent_executors(old_owner, new_owner, new_owner_project):
+    """Re-parent every non-terminal executor owned by `old_owner` to `new_owner`, proactively —
+    the handoff-time half of the executor-ownership fix (lead-found, 2026-09-05 22:01): waiting for
+    the successor's first send/resume (adopt-on-claim, `_maybe_adopt` above) left a window where a
+    report that lands BEFORE that first claim wakes nobody — its escalation push still targets the
+    now-stepped-down predecessor, and the successor's own Stop-hook fast path doesn't yet own it
+    either. Ledgers `adopted` per session, same event shape `_maybe_adopt` already uses (so the two
+    adoption paths are indistinguishable in the ledger except by whichever fields differ). Returns
+    the list of re-parented session ids."""
+    moved = []
+    for sid in all_session_ids():
+        s = read_session(sid)
+        if not s or s.get("owner_lead") != old_owner or s.get("status") in ("closed", "superseded"):
+            continue
+        s["owner_lead"] = new_owner
+        s["owner_project"] = new_owner_project
+        s["updated"] = now()
+        write_session(sid, s)
+        append_ledger("adopted", session_id=sid, from_lead=old_owner, to_lead=new_owner, forced=False)
+        moved.append(sid)
+    return moved
 
 
 def cmd_restart(args):
@@ -2351,6 +2371,21 @@ def _print_auto_closed(acted):
 # of them silently; the unit suite mocks them all. `relay doctor` proves them against the INSTALLED
 # cli the way tests/test_e2e_mcp.py / test_e2e_agent.py do, plus the offline plumbing checks.
 
+def _headless_env():
+    """Env for every headless `claude -p` relay itself launches (`_probe_claude` — doctor's checks
+    and the context-window probe; `_probe_model` — spawn's model-cache seed): unset the tab-
+    identifying vars ($TERM_SESSION_ID/$ITERM_SESSION_ID) a SessionStart/Stop hook uses to find a
+    live lead by tab+cwd, and set RELAY_HEADLESS=1 so all three lead-arming hooks (sessionstart,
+    stop, sessionend) return immediately. THE INCIDENT (2026-09-05 22:18:50): a probe launched from
+    the LEAD's own shell inherits its env, so its own SessionStart hook matched the live lead's
+    tab+cwd and migrated the marker onto the throwaway probe, tombstoning the real lead mid-turn."""
+    env = dict(os.environ)
+    env.pop("TERM_SESSION_ID", None)
+    env.pop("ITERM_SESSION_ID", None)
+    env["RELAY_HEADLESS"] = "1"
+    return env
+
+
 def _probe_claude(prompt, extra_flags=(), cwd=None, skip_perms=False, model="haiku", timeout=180,
                    want_result=False):
     """One headless `claude -p` with relay's own command builder. Returns (init_event|None,
@@ -2362,7 +2397,8 @@ def _probe_claude(prompt, extra_flags=(), cwd=None, skip_perms=False, model="hai
                                          mcp_flags=list(extra_flags))
     cmd += " -p --output-format stream-json --verbose"
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                           env=_headless_env())
     except Exception as e:
         return (None, "", str(e), None) if want_result else (None, "", str(e))
     init, result, result_event = None, "", None
@@ -2396,7 +2432,8 @@ def _probe_model(alias):
     cmd = iterm_backend.build_claude_cmd("Reply: ok", model=alias)
     cmd += " -p --output-format stream-json --verbose --max-turns 1"
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120,
+                           env=_headless_env())
     except Exception as e:
         return None, str(e)
     init_model, err = None, None
@@ -3367,7 +3404,11 @@ def _lead_liveness(m, now_ts=None):
 
 
 _LIVENESS_CELL = {"live": ("live", ("green",)), "unreachable": ("unreachable", ("red", "bold")),
-                  "ghost": ("ghost", ("dim", "red"))}
+                  "ghost": ("ghost", ("dim", "red")),
+                  # D2 (BUG-lib-8/BUG-hooks-1's mitigation): a marker `list_leads` could not read at
+                  # all — distinct from "ghost" (a marker it CAN read, just stale): this one carries
+                  # no cwd/project/tab identity to even attempt an is_alive probe against.
+                  "broken": ("broken", ("red", "bold"))}
 
 
 def _lead_liveness_cell(m):
@@ -3437,34 +3478,30 @@ def _usage_for_session(s):
 # no anchor, matched an executor's own prose that merely DISCUSSES usage limits mid-sentence (this
 # repo's own executors do) and wrongly showed them as paused. A real limit hit is the CLI's own
 # terse message, always the first thing it says — never something buried mid-paragraph.
-_USAGE_LIMIT_PATTERN_DEFAULT = (r"^(?:you'?ve hit your (?:session|usage) limit"
-                                r"|(?:claude )?usage limit reached)")
-_USAGE_LIMIT_RE = re.compile(_USAGE_LIMIT_PATTERN_DEFAULT, re.IGNORECASE)
+#
+# The built-in default pattern lives in lead_guard.LEAD_DEFAULTS["usage_limit_pattern"] (single
+# source of truth, overridable the same way as every other config key) — item 13: this used to be a
+# module-level string here, read straight off the config FILE via lead_guard.config_path, because
+# the packet that introduced it forbade touching lib/lead_guard.py. That restriction is gone; see
+# _usage_limit_pattern below.
+_USAGE_LIMIT_RE = re.compile(lead_guard.LEAD_DEFAULTS["usage_limit_pattern"], re.IGNORECASE)
 _RESET_TIME_RE = re.compile(r"(?:resets?|try again)\s*(?:at\s*)?(\d{1,2}(?::\d{2})?\s*[ap]\.?m\b)",
                             re.IGNORECASE)
 
 
 def _usage_limit_pattern():
-    """The compiled usage-limit regex: the built-in default above, or a user override from config
-    key `usage_limit_pattern` (a plain regex string, matched case-insensitively same as the
-    default). Read directly via `lead_guard.config_path` rather than through
-    `lead_guard.load_config` — that loader only merges keys already declared in LEAD_DEFAULTS
-    (lib/lead_guard.py), and this packet is scoped to bin/relay only (never touch
-    lib/lead_guard.py here), so this reads the one extra key straight off the SAME config file/path
-    relay's config already resolves, rather than adding a LEAD_DEFAULTS entry. A missing file, unset
-    key, or a value that doesn't compile as a regex all fall back to the built-in — this must never
-    raise or silently disable pause detection."""
+    """The compiled usage-limit regex: the built-in default
+    (`lead_guard.LEAD_DEFAULTS["usage_limit_pattern"]`), or a user override from config key
+    `usage_limit_pattern` (a plain regex string, matched case-insensitively same as the default) —
+    read through `lead_guard.load_config` exactly like every other config key now. A value that
+    doesn't compile as a regex falls back to the built-in — this must never raise or silently
+    disable pause detection."""
+    pattern = lead_guard.load_config(STATE_ROOT).get(
+        "usage_limit_pattern", lead_guard.LEAD_DEFAULTS["usage_limit_pattern"])
     try:
-        p = lead_guard.config_path(STATE_ROOT)
-        if p.exists():
-            user = json.loads(p.read_text())
-            if isinstance(user, dict):
-                pattern = user.get("usage_limit_pattern")
-                if isinstance(pattern, str) and pattern.strip():
-                    return re.compile(pattern, re.IGNORECASE)
+        return re.compile(pattern, re.IGNORECASE)
     except Exception:
-        pass
-    return _USAGE_LIMIT_RE
+        return _USAGE_LIMIT_RE
 
 
 _LAST_ASSISTANT_TAIL_BYTES = 256 * 1024
@@ -3527,7 +3564,7 @@ def _usage_limit_pause_text(claude_session):
     (busy too long, no report). Clears itself the moment a fresh assistant turn (post-reset)
     becomes the new last message, since `_last_assistant_text` always reads the current tail.
 
-    Matches only at the START of the stripped text (see `_USAGE_LIMIT_PATTERN_DEFAULT`) — an
+    Matches only at the START of the stripped text (see `_usage_limit_pattern`) — an
     executor whose last message merely DISCUSSES usage limits mid-sentence must never pause.
     NOTE: the real-world wording Claude Code emits for this message is still UNVERIFIED (no
     contract/fixture/prior art found for it) — this pattern is a reasonable choice, not a
@@ -3683,7 +3720,10 @@ def cmd_list(args):
         _WAKE_CELL = {"ok": ("ok", ("green",)), "stale": ("STALE", ("red", "bold")),
                       "unknown": ("ver?", ("dim",)), "stuck": ("stuck", ("red", "bold"))}
         # One liveness verdict per lead, computed up front — see the LIVE column comment below.
-        liveness_by_sid = {m.get("session_id"): _lead_liveness(m) for m in leads}
+        # A broken marker (D2) short-circuits to "broken": it carries no tab/cwd identity to run
+        # the is_alive probe against, and it isn't a real "how stale is this lead" question.
+        liveness_by_sid = {m.get("session_id"): ("broken" if m.get("broken") else _lead_liveness(m))
+                           for m in leads}
         # One usage reading per lead, computed up front (same memoize-once rationale as liveness
         # above) — feeds the CTX column and is cached on disk itself (_usage_for_session's
         # usage.json), but still worth reading once rather than twice (width calc + row render).
@@ -3788,6 +3828,12 @@ def cmd_list(args):
             print(c(f"  ⚠ LIVE=ghost: {names} — tab gone, stamp stale — this lead is dead and never "
                     f"stepped down. `relay close --self <session-id>` clears it (or `relay prune`).",
                     "dim"))
+        # D2 (BUG-lib-8/BUG-hooks-1's mitigation): one line per broken marker, named by its own sid
+        # (not aggregated like the footnotes above — there is no project/anything else to show).
+        for m in leads:
+            if m.get("broken"):
+                print(c(f"  ⚠ {m.get('session_id')}: lead marker unreadable — re-run /relay:mode "
+                        f"to re-arm", "red"))
         if any(st == "stuck" for st in wake_states.values()):
             print(c("  ⚠ WAKE=stuck: a dead watcher's lock is blocking wakes for this lead — it "
                     "will self-heal on the lead's next turn (the lock is now auto-broken), and any "
@@ -4652,8 +4698,9 @@ def cmd_handoff(args):
     aftercare block (with the pinned UUID twice) directly into the seed prompt — the typed launch
     command truncated mid-string on a real run, corrupting the shell. build_pointer_message's
     fragility rule (short pointer, content lives in a file) applies here too now. Inherited
-    executors re-parent automatically on the successor's first send/resume (adopt-on-claim) —
-    nothing to wire here."""
+    executors are re-parented to the successor HERE, proactively (`_reparent_executors`, lead-found
+    2026-09-05 22:01) — waiting for the successor's first send/resume (adopt-on-claim,
+    `_maybe_adopt`) left a window where a report landing first woke nobody."""
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if not caller or not lead_guard.is_lead(STATE_ROOT, caller):
         sys.exit("handoff: caller isn't an armed lead — run /relay:mode first")
@@ -4767,6 +4814,11 @@ def cmd_handoff(args):
                             predecessor=predecessor, started=successor_started,
                             backend=iterm.NAME,
                             autonomous=False, autonomous_source="config")
+
+    # 11a (lead-found, 2026-09-05 22:01): re-parent every inherited executor NOW, before the caller
+    # is stepped down — see _reparent_executors' docstring for the race this closes (a report that
+    # lands before the successor's first send/resume used to wake nobody).
+    _reparent_executors(caller, successor_sid, project)
 
     # Step the caller down — the FINAL act, only after the spawn call has returned successfully.
     lead_guard.clear_lead(STATE_ROOT, caller)

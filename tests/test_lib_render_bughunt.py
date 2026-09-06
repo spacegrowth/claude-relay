@@ -32,9 +32,6 @@ def diff_for(path, old_lines, new_lines):
 
 # ── diff parsing: what the review page is allowed to lose (nothing) ────────────────────────────
 class TestUnifiedDiffFidelity:
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-4: an in-hunk content line starting with "
-                                           "'--- '/'+++ ' is parsed as a file header, so the "
-                                           "change is dropped from the page and from the stats")
     def test_a_deleted_line_that_looks_like_a_file_header_is_still_rendered(self):
         """README: `relay diff` renders the staged diff 'so you review diffs in one click'; and
         parse_unified_diff promises per-file `additions`/`deletions`. Deleting a line that starts
@@ -48,8 +45,6 @@ class TestUnifiedDiffFidelity:
         assert ("del", 2, None, "-- sql comment") in f["hunks"][0]["lines"]
         assert "sql comment" in dr.render_stdlib_html(text, {"session_id": "s", "packet": 1})
 
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-4: same root cause on the '+++ ' side — an "
-                                           "added line beginning '++ ' is swallowed as a header")
     def test_an_added_line_that_looks_like_a_file_header_is_still_counted(self):
         """The `+++ ` mirror of the same rule: `---`/`+++` only ever appear in a file HEADER,
         before the first `@@`, so a `+++ ` line inside a hunk is content."""
@@ -245,9 +240,6 @@ def board(**over):
 
 
 class TestBoardEscaping:
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-5: _chips interpolates hit_rate and queued "
-                                           "into the page without html.escape, unlike every "
-                                           "other field")
     def test_every_chip_value_is_escaped(self):
         """board_render is documented 'Pure: render(data) -> html' and routes every other value
         through `_e` (html.escape). Two chips do not, so a non-int value reaches the page raw."""
@@ -368,9 +360,6 @@ class TestBoardShape:
         assert "background:rgb(12,34,56)" in html
 
     @pytest.mark.parametrize("color", ["red", ["a", "b", "c"], [None, None, None]])
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-6: _lead_dot's guard checks len(color)==3 but "
-                                           "not its contents, so a non-numeric 3-element colour "
-                                           "raises ValueError and the whole board fails to render")
     def test_a_colour_that_is_not_three_numbers_falls_back_to_the_dim_dot(self, color):
         """`_lead_dot` already carries a fallback for an unusable colour ('background:var(--dim)'),
         and the board is the always-visible overview: lead_guard.list_leads pins the same rule for

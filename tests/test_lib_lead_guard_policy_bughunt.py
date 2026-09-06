@@ -200,9 +200,6 @@ class TestContextWindow:
         assert lg.packet_reading_bytes("", cwd=tmp_path) == 0
         assert lg.packet_reading_bytes(None) == 0
 
-    @pytest.mark.xfail(strict=True, reason="BUG-lib-9: Path(raw).expanduser() is evaluated "
-                                           "OUTSIDE the per-candidate try, so an unknown `~user` "
-                                           "path raises RuntimeError out of packet_reading_bytes")
     def test_a_path_that_cannot_be_expanded_is_skipped_not_fatal(self, tmp_path):
         """packet_reading_bytes: 'paths that exist … Missing paths count nothing', and its inner
         try/except exists precisely to absorb a candidate it cannot resolve. An unknown `~user`

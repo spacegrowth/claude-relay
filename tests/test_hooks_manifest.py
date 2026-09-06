@@ -48,11 +48,18 @@ def every_entry():
 
 
 def command_paths():
-    """The script path each manifest entry points at, plugin-root placeholder resolved."""
+    """The REAL script path each manifest entry points at: plugin-root placeholder resolved, THEN
+    shell-unquoted via shlex — the same two steps the real shell performs launching the hook (env
+    expansion, then word-splitting/quote-removal). BUG-hooks-2's fix double-quotes the placeholder
+    (`"${CLAUDE_PLUGIN_ROOT}"/hooks/...`) — double quotes still permit `/bin/sh` to expand the
+    variable, unlike single quotes, which suppress expansion entirely and make the hook look for a
+    script literally named `${CLAUDE_PLUGIN_ROOT}` — so a naive string substitution alone would
+    leave literal quote characters in the "path" every other test in this file treats as a real
+    filesystem path."""
     out = []
     for event, _matcher, entry in every_entry():
-        cmd = entry["command"]
-        out.append((event, cmd.replace(PLUGIN_ROOT_VAR, str(H.REPO_ROOT))))
+        cmd = entry["command"].replace(PLUGIN_ROOT_VAR, str(H.REPO_ROOT))
+        out.append((event, shlex.split(cmd)[0]))
     return out
 
 
@@ -78,9 +85,14 @@ class TestManifestShape:
         assert set(HOOKS) == {"PreToolUse", "Stop", "SessionStart", "SessionEnd"}
 
     def test_every_command_is_rooted_at_the_plugin_root_placeholder(self):
-        """A relative or absolute path would break on any install that isn't the author's."""
+        """A relative or absolute path would break on any install that isn't the author's.
+        BUG-hooks-2's fix double-quotes the placeholder (`"${CLAUDE_PLUGIN_ROOT}"/...`) so a plugin
+        root containing a space still word-splits to one argv element — still rooted at the same
+        placeholder, just wrapped in double quotes, which (unlike single quotes) still let
+        `/bin/sh` expand the variable."""
+        quoted_root = '"%s"' % PLUGIN_ROOT_VAR
         for _event, _m, entry in every_entry():
-            assert entry["command"].startswith(PLUGIN_ROOT_VAR), entry["command"]
+            assert entry["command"].startswith(quoted_root), entry["command"]
 
     def test_no_hook_is_registered_twice(self):
         paths = [p for _e, p in command_paths()]
@@ -318,15 +330,7 @@ class TestManifestDescriptionIsTrue:
         assert run.returncode == 0, hook
         assert run.stdout == "" and run.stderr == "", hook
 
-    @pytest.mark.parametrize("hook", [
-        pytest.param(
-            os.path.basename(p),
-            marks=(pytest.mark.xfail(
-                strict=True,
-                reason="BUG-hooks-3: the SessionEnd hook ledgers EVERY session on the machine, "
-                       "creating ~/.relay-tasks for projects that have never used relay")
-                   if os.path.basename(p) == "sessionend_lead_cleanup.py" else ()))
-        for _e, p in command_paths()])
+    @pytest.mark.parametrize("hook", [os.path.basename(p) for _e, p in command_paths()])
     def test_no_hook_creates_state_for_a_stranger(self, hook, tmp_path):
         """CONTRACT — hooks/hooks.json's own description: "Silent on non-lead and executor
         sessions (EACH HOOK FAST-EXITS WHEN THE LEAD MARKER IS ABSENT)". README.md:320-322 says the
@@ -335,40 +339,25 @@ class TestManifestDescriptionIsTrue:
         else (non-lead sessions, executor sessions, EVERY OTHER PROJECT ON THE MACHINE) it
         fast-exits and allows."
 
-        ACTUAL — hooks/sessionend_lead_cleanup.py:45-48 logs BEFORE any marker check:
-
-            # Always log to ledger for observability
-            if sid:
-                was_lead = lg.is_lead(STATE_ROOT, sid)
-                lg.append_ledger(STATE_ROOT, "session_end", session_id=sid, reason=reason, ...)
-
-        and append_ledger:744-757 does `root.mkdir(parents=True, exist_ok=True)`. So ending ANY
-        Claude Code session in ANY project — one that has never armed a lead, on a machine where
-        relay was merely installed — creates `~/.relay-tasks/` and appends a `session_end` record
-        to `sessions.jsonl`, forever, unbounded. The other four manifest hooks all fast-exit
-        correctly; this is the only one that does not.
-
-        AMBIGUITY, stated honestly: the write is DELIBERATE — the same file's docstring (L12-13)
-        says "Every SessionEnd is logged to the ledger with its reason for future incident
-        attribution", added after the 2026-07-10 unarming incident. So this is a genuine conflict
-        between two in-repo contracts, resolved here in favour of the README + manifest per the
-        bug-hunt oracle order (README/docs > module docstrings).
-
-        PROPOSED FIX — keep the attribution but honour the zero-impact promise by not CREATING the
-        state root from this path: log only when `~/.relay-tasks` already exists (relay has been
-        used on this machine), e.g. guard the block with
-        `if sid and os.path.isdir(STATE_ROOT):`. A machine that has run relay keeps full incident
-        attribution; a machine that has not is genuinely untouched. (The alternative fix is to
-        correct the manifest description and README instead — a doc change, not a code one.)"""
+        BUG-hooks-3 (fixed): `hooks/sessionend_lead_cleanup.py` used to log to the ledger BEFORE
+        any marker check, and `append_ledger`'s `root.mkdir(parents=True, exist_ok=True)` created
+        `~/.relay-tasks` on the way — so ending ANY Claude Code session, in ANY project, on a
+        machine where relay was merely installed, created state forever, unbounded. D3 (the
+        decision made): log only when `~/.relay-tasks` already exists (relay has been used on this
+        machine) — `if sid and os.path.isdir(STATE_ROOT):`. A machine that has run relay keeps full
+        incident attribution for a stranger session (see the sibling test below); a machine that
+        has NOT run relay is now genuinely untouched, which is what this test proves."""
         H.run_hook(hook, self._stranger_payload(tmp_path), tmp_path)
         assert not H.state_root(tmp_path).exists(), \
             "%s created state for a session that is not a lead" % hook
 
-    def test_the_stranger_state_that_is_created_is_only_the_ledger(self):
-        """Bounding BUG-hooks-3: whatever it writes, it must not ARM anything. No marker, no lead
-        dir — the damage is confined to an unwanted ledger line."""
+    def test_a_stranger_on_a_machine_that_already_uses_relay_still_only_ledgers(self):
+        """D3's OTHER half: once `~/.relay-tasks` already exists (this machine has used relay
+        before), a stranger session's SessionEnd still keeps full incident attribution — it must
+        not ARM anything. No marker, no lead dir — the write is confined to one ledger line."""
         import tempfile
         home = tempfile.mkdtemp()
+        H.state_root(home).mkdir(parents=True)   # relay has been used on this machine before
         H.run_hook("sessionend_lead_cleanup.py",
                    {"session_id": "a-stranger", "reason": "exit"}, home)
         root = H.state_root(home)
@@ -389,33 +378,35 @@ class TestManifestDescriptionIsTrue:
 
 class TestManifestCommandQuoting:
 
-    @pytest.mark.xfail(strict=True, reason="BUG-hooks-2: hook commands interpolate "
-                                           "${CLAUDE_PLUGIN_ROOT} unquoted, so an install path "
-                                           "containing a space silently disables every hook")
     def test_manifest_commands_survive_a_plugin_root_with_a_space(self):
         """CONTRACT — the manifest's own `description` promises the gate "blocks large inline
         Edit/Write/MultiEdit" and that the Stop hook "wakes the idle lead"; both are unconditional.
         lib/lead_guard.py's own shell-command builder quotes for exactly this reason
         (hooks/stop_lead_watch.py:90: `"-execute", f"'{RELAY_BIN}' focus {lead_sid}"`).
 
-        ACTUAL — hooks/hooks.json:11 et al. spell the command as
+        ACTUAL (as originally found) — hooks/hooks.json:11 et al. spelled the command as
         `${CLAUDE_PLUGIN_ROOT}/hooks/pretool_route_guard.py` with no quoting. A plugin installed
         under a path containing a space (`--plugin-dir "~/My Plugins/claude-relay"`) word-splits
         into an argv whose first element does not exist, so the hook never runs. Nothing reports
         it: a hook that fails to launch is indistinguishable from a hook that fast-exited, which
         is precisely the silent-failure class this manifest suite exists to catch.
 
-        PROPOSED FIX — quote the placeholder in every entry:
-            "command": "'${CLAUDE_PLUGIN_ROOT}'/hooks/pretool_route_guard.py"
-        and the same in lead_guard.build_escalation_settings:2233 (see the sibling test below)."""
+        FIX — DOUBLE-quote the placeholder in every entry:
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/pretool_route_guard.py"
+        Single quotes were tried first and are WRONG: `/bin/sh` never expands a variable inside
+        single quotes, so `'${CLAUDE_PLUGIN_ROOT}'/hooks/x.py` looks for a script literally named
+        `${CLAUDE_PLUGIN_ROOT}` and fails every hook, every time (lead-found live: "No such file or
+        directory"). Double quotes still let the shell expand the variable while surviving a space
+        in the resolved path. This test can't tell the two forms apart (it never actually invokes
+        `/bin/sh`, only shlex — see the module docstring) which is exactly why the single-quoted
+        form shipped and broke every hook before it was caught by manual proof, not by this
+        suite."""
         spaced = "/Users/someone/My Plugins/claude-relay"
         for _event, _m, entry in every_entry():
             resolved = entry["command"].replace(PLUGIN_ROOT_VAR, spaced)
             argv = shlex.split(resolved)
             assert len(argv) == 1, "%r word-splits into %r" % (resolved, argv)
 
-    @pytest.mark.xfail(strict=True, reason="BUG-hooks-2: build_escalation_settings has the same "
-                                           "unquoted-path defect as the manifest")
     def test_the_escalation_settings_command_survives_a_plugin_root_with_a_space(self):
         """Same defect, second location: lead_guard.build_escalation_settings:2233 builds
         `f"{hook_path} {exec_name}"`. With a spaced plugin root the executor's Stop hook never

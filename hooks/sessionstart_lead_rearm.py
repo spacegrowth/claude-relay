@@ -62,6 +62,14 @@ def _notify_rearm(lg, sid, marker):
 
 
 def main():
+    # THE INCIDENT (2026-09-05 22:18:50): a headless `claude -p` relay itself launches (a model-
+    # alias probe, `relay doctor`, spawn's model-cache seed) runs from the LEAD's own shell and
+    # inherits its $TERM_SESSION_ID/cwd — its own SessionStart hook then matched the live lead's
+    # tab and migrated the marker onto the throwaway probe, tombstoning the real lead. Relay stamps
+    # RELAY_HEADLESS=1 on every such launch (bin/relay's `_headless_env`); every one of this
+    # plugin's hooks returns immediately on it, before even reading the payload.
+    if os.environ.get("RELAY_HEADLESS") == "1":
+        sys.exit(0)
     try:
         payload = json.load(sys.stdin)
     except Exception:
@@ -100,10 +108,15 @@ def main():
                 # isn't proof — a brand-new unrelated session started later in that tab must not
                 # inherit an old lead; a payload with no cwd can't prove same-project either way, so
                 # the `and payload.get("cwd")` above skips the lookup entirely) and migrate it forward
-                # rather than leaving it silently orphaned.
-                old_sid = lg.find_lead_by_tab(STATE_ROOT, iterm_session=os.environ.get("TERM_SESSION_ID"),
-                                              cwd=payload.get("cwd"))
-                if old_sid and lg.migrate_lead(STATE_ROOT, old_sid, sid):
+                # rather than leaving it silently orphaned. `safe_migrate_by_tab` refuses when that
+                # old marker still looks like a LIVE lead (lead_guard.lead_still_live) — THE
+                # INCIDENT above (2026-09-05 22:18:50) is this exact lookup matching a still-running
+                # lead's tab from one of relay's own headless probes, not a genuine resume.
+                poll_seconds = lg.load_config(STATE_ROOT).get(
+                    "poll_seconds", lg.LEAD_DEFAULTS["poll_seconds"])
+                old_sid = lg.safe_migrate_by_tab(STATE_ROOT, os.environ.get("TERM_SESSION_ID"),
+                                                 payload.get("cwd"), sid, poll_seconds)
+                if old_sid:
                     revived = True
                     lg.append_ledger(STATE_ROOT, "lead_rearmed", session_id=sid, source=source,
                                      migrated_from=old_sid)

@@ -5,13 +5,13 @@
       {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
-          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretool_route_guard.py"}
+          {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/pretool_route_guard.py"}
         ]
       },
       {
         "matcher": "Bash",
         "hooks": [
-          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretool_bash_gate.py"}
+          {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/pretool_bash_gate.py"}
         ]
       }
     ],
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop_lead_watch.py",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/stop_lead_watch.py",
             "asyncRewake": true,
             "timeout": 1900,
             "rewakeMessage": "🚦 [relay] — review needed: an executor finished or you committed work while idle. Open your reply with the marker '🚦 [relay] — review needed:', surface the details below to the user, and wait for their direction — do not auto-review or auto-commit:",
@@ -33,14 +33,14 @@
       {
         "matcher": "*",
         "hooks": [
-          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart_lead_rearm.py"}
+          {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/sessionstart_lead_rearm.py"}
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/sessionend_lead_cleanup.py"}
+          {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/sessionend_lead_cleanup.py"}
         ]
       }
     ]

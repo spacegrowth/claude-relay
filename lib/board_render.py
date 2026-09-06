@@ -244,7 +244,7 @@ def _chips(ex):
     if ex.get("tokens") and ex.get("tokens") != "-":
         out.append(f'<span class="chip">tokens<b>{_e(ex["tokens"])}</b></span>')
     if ex.get("hit_rate") is not None:
-        out.append(f'<span class="chip">cache hit<b>{ex["hit_rate"]}%</b></span>')
+        out.append(f'<span class="chip">cache hit<b>{_e(ex["hit_rate"])}%</b></span>')
     if ex.get("mb") and ex.get("mb") != "-":
         out.append(f'<span class="chip">size<b>{_e(ex["mb"])} MB</b></span>')
     if ex.get("heavy"):
@@ -252,7 +252,7 @@ def _chips(ex):
     if ex.get("keep"):
         out.append('<span class="chip pin">\U0001F4CC pinned</span>')
     if ex.get("queued"):
-        out.append(f'<span class="chip flag">\U0001F4E5 {ex["queued"]} queued</span>')
+        out.append(f'<span class="chip flag">\U0001F4E5 {_e(ex["queued"])} queued</span>')
     if ex.get("auto_closed"):
         out.append(f'<span class="chip">auto: {_e(ex["auto_closed"])}</span>')
     if ex.get("unannounced"):
@@ -349,10 +349,17 @@ def _exec_panel(ex, relay_bin, lead_name, show=False):
 
 
 def _lead_dot(m):
+    # BUG-lib-6: the old guard checked len(color) == 3 but not that its elements are actually
+    # numbers — {"color": "red"} has length 3 too, so int("r") raised ValueError and took the
+    # WHOLE board page down for every lead and executor, from one hand-edited/half-written marker
+    # field. A single bad marker must never blank the whole page (the same rule list_leads already
+    # follows for the LEADS table) — try the real conversion, fall back on ANY failure.
     color = m.get("color")
-    if color and len(color) == 3:
-        return f'<span class="cdot" style="background:rgb({int(color[0])},{int(color[1])},{int(color[2])})"></span>'
-    return '<span class="cdot" style="background:var(--dim)"></span>'
+    try:
+        r, g, b = (int(v) for v in color)
+        return f'<span class="cdot" style="background:rgb({r},{g},{b})"></span>'
+    except Exception:
+        return '<span class="cdot" style="background:var(--dim)"></span>'
 
 
 def render(data):

@@ -54,7 +54,10 @@ stdout/chat).
           "nothing to report."
       Changed: <one-line what-changed summary>
 Then include the full detail:
-- What changed (file:line for each substantive change).
+- What changed (file:line for each substantive change). Name ONLY files you actually changed here
+  — never name a path you left untouched, even to say so explicitly (e.g. "X is untouched"); the
+  verifier reads every path in this section as a claim, with no way to tell a real change from a
+  negated mention. Say what you did NOT touch somewhere else in the report instead.
 - What you verified, and with which command/result.
 - Acceptance-criteria outcomes, if the packet listed any.
 - Anything you could NOT verify — name it explicitly as UNVERIFIED (same claims as the TL;DR's

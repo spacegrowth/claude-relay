@@ -533,8 +533,6 @@ class TestRouteGuardOddInputs:
 
 class TestRouteGuardCorruptMarker:
 
-    @pytest.mark.xfail(strict=True, reason="BUG-hooks-1: an unparseable lead marker makes is_lead "
-                                           "return True, so the gate DENIES instead of failing open")
     @pytest.mark.parametrize("drv", [H.run_hook], ids=["subprocess"])
     def test_corrupt_marker_fails_open(self, drv, tmp_path):
         """CONTRACT — hooks/pretool_route_guard.py:8-9: "HARD RULE: any error, missing file,

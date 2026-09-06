@@ -6928,6 +6928,121 @@ class TestCmdStats:
         assert "(no packets recorded)" in capsys.readouterr().out
 
 
+class TestHeadlessProbeEnv:
+    """`_headless_env` — THE INCIDENT (2026-09-05 22:18:50, ledger `lead_migrated
+    old=4dff0f10... new=4a75a4a9...` then `session_end 4a75a4a9... reason=other was_lead=true`): a
+    headless `claude -p` probe launched from the lead's own shell inherited its
+    $TERM_SESSION_ID/cwd, so its own SessionStart hook matched the live lead's tab and migrated the
+    marker onto the throwaway probe, tombstoning the real lead mid-turn. Every headless launch
+    (`_probe_claude` — doctor, the context-window probe; `_probe_model` — spawn's model-cache seed)
+    must run with the tab-identifying vars unset and RELAY_HEADLESS=1, so every one of this
+    plugin's hooks it fires returns immediately instead."""
+
+    def test_headless_env_strips_tab_vars_and_sets_the_marker(self, relay, monkeypatch):
+        monkeypatch.setenv("TERM_SESSION_ID", "w1t2p0:TAB-X")
+        monkeypatch.setenv("ITERM_SESSION_ID", "w1t2p0:TAB-X")
+        env = relay._headless_env()
+        assert "TERM_SESSION_ID" not in env
+        assert "ITERM_SESSION_ID" not in env
+        assert env["RELAY_HEADLESS"] == "1"
+        assert env.get("PATH") == os.environ.get("PATH")  # the ambient env, not a stripped one
+
+    def _spy_run(self, relay, captured):
+        def fake_run(cmd, **kw):
+            captured.update(kw)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return mock.patch.object(relay.subprocess, "run", side_effect=fake_run)
+
+    def test_probe_claude_launches_with_the_headless_env(self, relay, monkeypatch):
+        monkeypatch.setenv("TERM_SESSION_ID", "w1t2p0:TAB-X")
+        captured = {}
+        with self._spy_run(relay, captured):
+            relay._probe_claude("Reply: ok")
+        assert "TERM_SESSION_ID" not in captured["env"]
+        assert captured["env"]["RELAY_HEADLESS"] == "1"
+
+    def test_probe_model_launches_with_the_headless_env(self, tmp_path, monkeypatch):
+        """Uses a FRESH module load rather than the shared `relay` fixture: that fixture stubs
+        `_probe_model` to a no-subprocess fake for every other test in this file (`load_relay_module`
+        L35-38 — "tests must never [probe the real claude CLI] unless a test patches _probe_model
+        itself"), so testing the REAL function here needs its own unstubbed instance."""
+        path = str(REPO_ROOT / "bin" / "relay")
+        loader = importlib.machinery.SourceFileLoader("relay_cli_headless_probe_test", path)
+        spec = importlib.util.spec_from_file_location("relay_cli_headless_probe_test", path,
+                                                       loader=loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        mod.STATE_ROOT = tmp_path / ".relay-tasks"
+        monkeypatch.setenv("TERM_SESSION_ID", "w1t2p0:TAB-X")
+        captured = {}
+        with self._spy_run(mod, captured):
+            mod._probe_model("sonnet")
+        assert "TERM_SESSION_ID" not in captured["env"]
+        assert captured["env"]["RELAY_HEADLESS"] == "1"
+
+
+class TestDesktopNudgeUsesTheSharedNotifyChain:
+    """Lead-found gap (fixed): `desktop_nudge` (the round-3-packet nudge) used to skip straight to
+    terminal-notifier, disagreeing with the Stop hook's documented three-tier chain (README "Auto-
+    wake and notifications"). Both now call `lead_guard.notify_banner` — one test per transport,
+    only the actual OS-facing calls (subprocess.run, iterm.notify_via_tty) mocked, so this proves
+    `desktop_nudge` really drives the shared chain rather than just calling SOMETHING."""
+
+    def _armed(self, relay, iterm_session=None):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp",
+                                       iterm_session=iterm_session)
+
+    def test_iterm_tty_tier_used_when_the_lead_has_one(self, relay, monkeypatch):
+        """THE bug, made concrete: previously desktop_nudge never even attempted this tier."""
+        self._armed(relay, iterm_session="w1t1p0:X")
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        tty_calls, sub_calls = [], []
+        monkeypatch.setattr(relay.iterm_backend, "tty_by_id", lambda sid: "/dev/ttys004")
+        monkeypatch.setattr(relay.iterm_backend, "notify_via_tty",
+                            lambda path, title, body: tty_calls.append((path, title, body)) or True)
+        monkeypatch.setattr(relay.lead_guard.subprocess, "run",
+                            lambda *a, **k: sub_calls.append(a))
+        relay.desktop_nudge("packet 3 on sonnet", lead_sid="lead-1", subtitle="packet 3 on sonnet")
+        assert len(tty_calls) == 1
+        assert tty_calls[0][0] == "/dev/ttys004"
+        assert "model check" in tty_calls[0][1]
+        assert sub_calls == []   # terminal-notifier/osascript never reached — tier 1 won
+
+    def test_terminal_notifier_tier_used_when_no_tty_resolves(self, relay, monkeypatch):
+        self._armed(relay, iterm_session=None)
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        sub_calls = []
+        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier",
+                            lambda: "/x/terminal-notifier")
+        monkeypatch.setattr(relay.lead_guard.subprocess, "run",
+                            lambda cmd, **k: sub_calls.append(cmd))
+        relay.desktop_nudge("packet 3 on sonnet", lead_sid="lead-1")
+        assert sub_calls and sub_calls[0][0] == "/x/terminal-notifier"
+        assert "-group" in sub_calls[0] and "relay-nudge-lead-1" in sub_calls[0]
+        assert "-execute" in sub_calls[0]   # click → `relay focus lead-1` wired
+
+    def test_osascript_tier_used_when_terminal_notifier_is_missing(self, relay, monkeypatch):
+        self._armed(relay, iterm_session=None)
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        sub_calls = []
+        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: None)
+        monkeypatch.setattr(relay.lead_guard.subprocess, "run",
+                            lambda cmd, **k: sub_calls.append(cmd))
+        relay.desktop_nudge("packet 3 on sonnet", lead_sid="lead-1")
+        assert sub_calls and sub_calls[0][0] == "osascript"
+        assert "display notification" in " ".join(sub_calls[0])
+
+    def test_relay_no_notify_still_silences_desktop_nudge(self, relay, monkeypatch):
+        self._armed(relay, iterm_session="w1t1p0:X")
+        monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
+        calls = []
+        monkeypatch.setattr(relay.iterm_backend, "notify_via_tty",
+                            lambda *a, **k: calls.append(a))
+        monkeypatch.setattr(relay.lead_guard.subprocess, "run", lambda *a, **k: calls.append(a))
+        relay.desktop_nudge("packet 3 on sonnet", lead_sid="lead-1")
+        assert calls == []
+
+
 def _result_event(model_id, window, key=None):
     """A minimal stream-json `result` event carrying `modelUsage` the way a live `claude -p
     --output-format stream-json` run does — enough for _probe_context_window to read

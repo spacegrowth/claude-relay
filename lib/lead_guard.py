@@ -18,6 +18,7 @@ Design notes:
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -146,6 +147,20 @@ LEAD_DEFAULTS = {
                                   # block). Default True because logging has no user-visible effect —
                                   # same "safe to default on" reasoning as auto_wake. Flip off to
                                   # silence the ledger without a release.
+    "usage_limit_pattern": (      # bin/relay's `relay list`/`check` pause detection (lead-found gap
+                                  # (d), packet 0a153c7): a regex, matched case-insensitively against
+                                  # the START of an executor's last assistant text, that marks it
+                                  # `paused (limit)` instead of an ordinary `stalled`. This IS the
+                                  # built-in default string bin/relay falls back to on a missing/
+                                  # unparsable override — landed here (rather than left as a direct
+                                  # config-file read) once this packet no longer forbids touching
+                                  # this file; see bin/relay's `_usage_limit_pattern`. The real-world
+                                  # wording Claude Code emits for this message is UNVERIFIED — no
+                                  # contract/fixture/prior art was found for it — so this is a
+                                  # reasonable guess, not a confirmed one; override it here if the
+                                  # CLI's actual wording differs.
+                                  r"^(?:you'?ve hit your (?:session|usage) limit"
+                                  r"|(?:claude )?usage limit reached)"),
 }
 
 # Distinguishable, colorblind-tolerant tab colors — brightened so they remain visible when dimmed
@@ -229,6 +244,62 @@ def find_terminal_notifier():
         if os.access(cand, os.X_OK):
             return cand
     return None
+
+
+def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=None, group=None):
+    """The three-tier desktop notification chain EVERY relay banner should use — extracted from
+    hooks/stop_lead_watch.py's original `_notify` (lead-found gap: bin/relay's own `desktop_nudge`,
+    the round-3-packet nudge, skipped straight to terminal-notifier, disagreeing with the
+    documented chain — README "Auto-wake and notifications" — for no reason beyond having been
+    written separately). Both now call this ONE function, so a lead's tab-native OSC banner (zero
+    deps, native click-to-focus) fires for every relay notification, not only Stop-hook wakes.
+
+    1. iTerm native (OSC 777, written straight to the lead's own tty) — zero external deps, and
+       clicking it focuses the POSTING session natively. Used whenever `iterm_session` is given AND
+       `iterm.tty_by_id` can still resolve it to a live tty; returns regardless of whether the write
+       itself succeeds (best-effort/never-raises — the point of a tier system, not a retry).
+    2. terminal-notifier — `-group` coalesces repeated pings of the SAME kind (replace rather than
+       stack); `-execute` runs `relay focus <lead>` so it works even if the lead's tty is gone.
+       `group` defaults to `relay-<lead_sid>`; a caller notifying for a DIFFERENT reason than "an
+       executor reported" (e.g. the round-3 nudge) passes its own group so the two banner kinds
+       don't replace each other in Notification Center.
+    3. osascript's built-in `display notification` — same info, NOT clickable, no coalescing.
+
+    Honours `notify_on_wake` (the CALLER checks this — both call sites do, before building
+    title/subtitle/message at all) is NOT re-checked here; RELAY_NO_NOTIFY IS checked here
+    directly, so every caller gets the kill-switch for free. Failures swallowed throughout; never
+    raises."""
+    if os.environ.get("RELAY_NO_NOTIFY"):
+        return  # kill-switch: the test suite sets this so a hook/CLI run never fires a REAL
+                #             desktop banner (neither notifier path has a dry-run). Also usable in CI.
+    if iterm_session and (cfg or {}).get("notify_via", "auto") != "terminal-notifier":
+        try:
+            import iterm
+            tty = iterm.tty_by_id(iterm_session)
+            if tty:
+                iterm.notify_via_tty(tty, title, subtitle + " — " + message[:180])
+                return
+        except Exception:
+            pass  # fall through to tier 2 — tty_by_id shells out to osascript, which can misbehave
+    tn = find_terminal_notifier()  # PATH-robust — a bare `which` fails in a hook's minimal PATH
+    try:
+        if tn:
+            args = [tn, "-title", title, "-subtitle", subtitle, "-message", message[:200], "-sound", "Glass"]
+            if lead_sid:
+                relay_bin = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "relay")
+                args += ["-group", group or f"relay-{lead_sid}",
+                         "-execute", f"'{relay_bin}' focus {lead_sid}"]  # click → jump to the lead tab
+            subprocess.run(args, capture_output=True, timeout=5)
+        else:
+            # FALLBACK: no terminal-notifier → macOS's built-in banner via osascript. Same
+            # information but degraded: NOT clickable and no per-lead coalescing.
+            def q(s):
+                return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+            script = (f'display notification "{q(subtitle + " — " + message[:180])}" '
+                      f'with title "{q(title)}" sound name "Glass"')
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+    except Exception:
+        pass
 
 
 # ---- path helpers -----------------------------------------------------------------------------
@@ -457,9 +528,24 @@ def is_lead(state_root, session_id):
     try:
         if not marker_path(state_root, session_id).exists():
             return False
-        return not is_tombstoned(read_marker(state_root, session_id))
+        marker = read_marker(state_root, session_id)
+        if not marker:
+            return False   # present but unreadable/empty → "any error" → not armed (fail open)
+        return not is_tombstoned(marker)
     except Exception:
         return False
+
+
+def _atomic_write_json(path, obj):
+    """Write `obj` as indented JSON to `path` via a sibling tmp file + os.replace, never a
+    straight in-place `write_text` — the reachable path behind BUG-lib-8/BUG-hooks-1: a crash, a
+    full disk, or a kill mid-write left a truncated/corrupt marker, which pre-fix `is_lead` read as
+    an ARMED lead (every other reader treated the same file as absent). Same shape as bin/relay's
+    own `auto_trust`'s ~/.claude.json writer."""
+    path = Path(path)
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2))
+    os.replace(tmp, path)
 
 
 def write_marker(state_root, session_id, model=None, iterm_session=None, project=None, cwd=None,
@@ -468,7 +554,7 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
                  autonomous_source="config"):
     d = lead_dir(state_root, session_id)
     d.mkdir(parents=True, exist_ok=True)
-    marker_path(state_root, session_id).write_text(json.dumps({
+    _atomic_write_json(marker_path(state_root, session_id), {
         "session_id": session_id,
         "project": project,          # human-readable project name (defaults to cwd basename at call site)
         "cwd": cwd,                  # where a restored lead should reopen
@@ -504,13 +590,20 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
         # tell the human which it is rather than just the boolean.
         "autonomous": bool(autonomous),
         "autonomous_source": autonomous_source,
-    }, indent=2))
+    })
 
 
 def read_marker(state_root, session_id):
+    """The marker dict, or `{}` when absent, unreadable, OR valid JSON that isn't a dict (a bare
+    array/string/number/null — BUG-lib-8's repro covers this shape too: every caller downstream
+    treats the marker as a dict, so a non-dict parse is "any error" just as much as a JSON
+    exception is). Never raises."""
     try:
         p = marker_path(state_root, session_id)
-        return json.loads(p.read_text()) if p.exists() else {}
+        if not p.exists():
+            return {}
+        m = json.loads(p.read_text())
+        return m if isinstance(m, dict) else {}
     except Exception:
         return {}
 
@@ -612,7 +705,7 @@ def touch_lead(state_root, session_id, plugin_root=None):
             timeout = _read_stop_hook_timeout(plugin_root)
             if timeout is not None and timeout != m.get("stop_hook_timeout"):
                 m["stop_hook_timeout"] = timeout
-        marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
+        _atomic_write_json(marker_path(state_root, session_id), m)
     except Exception:
         pass
 
@@ -635,9 +728,15 @@ def update_marker(state_root, session_id, **fields):
 
 def list_leads(state_root):
     """Every lead marker under <state_root>/lead/*/marker.json, oldest-first by `started`. Each
-    item is the marker dict exactly as stored. Fully defensive: config.json and any non-marker
-    entry are skipped, an unreadable/malformed marker is skipped, and no input ever raises — this
-    is the always-visible LEADS surface, so a single bad marker must never blank the whole list."""
+    item is normally the marker dict exactly as stored. Fully defensive: config.json and any
+    non-marker entry are skipped, and no input ever raises.
+
+    D2 (BUG-lib-8/BUG-hooks-1's mitigation): a marker that EXISTS but can't be read as a real dict
+    (JSON error, or valid JSON that isn't a non-empty object — the same "any error" `is_lead` now
+    fails open on) used to be silently dropped here — invisible on the one surface (`relay list`)
+    that exists to show lead state. It is now a DISTINCT broken row instead:
+    `{"session_id": <dir name>, "broken": True}` — this is the always-visible LEADS surface, so a
+    bad marker must never just vanish, only ever show up as something a human can act on."""
     out = []
     try:
         lead_root = Path(state_root) / "lead"
@@ -651,13 +750,16 @@ def list_leads(state_root):
                 continue
             try:
                 m = json.loads(mp.read_text())
-                if isinstance(m, dict):
-                    out.append(m)
             except Exception:
-                continue  # a malformed marker is skipped, never fatal
+                m = None
+            if isinstance(m, dict) and m:
+                out.append(m)
+            else:
+                out.append({"session_id": d.name, "broken": True})
     except Exception:
         return out
-    # Sort oldest-first; a marker missing `started` sorts as "" (first) rather than crashing.
+    # Sort oldest-first; a marker missing `started` sorts as "" (first) rather than crashing — a
+    # broken row (no `started` at all) sorts alongside any other marker missing the field.
     out.sort(key=lambda m: m.get("started") or "")
     return out
 
@@ -715,18 +817,35 @@ def is_tombstoned(marker):
         return False
 
 
-def tombstone_lead(state_root, session_id, now_ts=None):
+def tombstone_lead(state_root, session_id, reason=None, now_ts=None):
     """Mark a lead ended-but-resumable instead of deleting it. Retains every other field so
-    revive_lead() is lossless. Returns True if a marker was actually tombstoned (no marker, or an
-    already-tombstoned one, returns False so callers can stay quiet). Never raises."""
+    revive_lead() is lossless.
+
+    THE INCIDENT (lead-found, 2026-09-05 20:16): a LIVE lead's marker was tombstoned during a
+    `/reload-plugins` churn with `ended: true`, no reason recorded, and NO ledger event — gate,
+    wake and auto posture all went dark unannounced until the lead noticed by accident. The missing
+    ledger event is fixed HERE rather than left to each caller to remember: every successful
+    tombstone appends its OWN `lead_tombstoned` ledger event (session_id, reason), and `reason` (a
+    short caller-supplied label — SessionEnd's own reason string, or "migrated" for migrate_lead's
+    call) is stored as `ended_reason` on the marker for the same forensic visibility. Deciding
+    WHETHER a missing/unknown SessionEnd reason should even reach this function is the CALLER's
+    policy (see hooks/sessionend_lead_cleanup.py's own reason dispatch, which never calls this
+    without one of its two recognized pause reasons) — this function stays the general-purpose
+    tombstone primitive migrate_lead and others also rely on, so it does not itself refuse a call
+    with no reason; it just no longer loses the fact that one wasn't given.
+
+    Returns True if a marker was actually tombstoned (no marker, or an already-tombstoned one,
+    returns False so callers can stay quiet). Never raises."""
     try:
         m = read_marker(state_root, session_id)
         if not m or is_tombstoned(m):
             return False
         m["ended"] = True
+        m["ended_reason"] = reason
         m["ended_at"] = now() if now_ts is None else time.strftime(
             "%Y-%m-%dT%H:%M:%S", time.localtime(now_ts))
         marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
+        append_ledger(state_root, "lead_tombstoned", session_id=session_id, reason=reason)
         return True
     except Exception:
         return False
@@ -743,6 +862,7 @@ def revive_lead(state_root, session_id):
             return False
         m.pop("ended", None)
         m.pop("ended_at", None)
+        m.pop("ended_reason", None)
         m["last_active"] = now()
         marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
         return True
@@ -773,6 +893,124 @@ def _tty_by_id(iterm_session_id):
             sys.path.insert(0, scripts_dir)
         import iterm as _iterm
         return _iterm.tty_by_id(iterm_session_id)
+    except Exception:
+        return None
+
+
+def _own_ancestor_pids():
+    """The set of pids in THIS process's own ancestry: its own pid, `os.getppid()`, and every
+    pid above that walked via `ps -o ppid=` up to (but not including) pid 1 or a repeat/lookup
+    failure. Exists so `_tab_has_live_claude` can tell "the very process whose SessionStart hook
+    is asking" (and whichever of ITS OWN ancestors happens to be the `claude` binary) apart from a
+    genuinely different `claude` process that merely shares the tab's tty. Best-effort: any `ps`
+    failure just truncates the chain where it stands rather than raising — a short chain only
+    makes the live-check MORE conservative (more pids read as "foreign"), never less safe."""
+    pid = os.getpid()
+    chain = {pid}
+    for _ in range(64):  # a hard cap — real ancestry chains are a handful of pids deep
+        try:
+            r = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                                capture_output=True, text=True, timeout=5)
+        except Exception:
+            break
+        if r.returncode != 0:
+            break
+        out = (r.stdout or "").strip()
+        if not out:
+            break
+        try:
+            ppid = int(out)
+        except ValueError:
+            break
+        if ppid <= 1 or ppid in chain:
+            break
+        chain.add(ppid)
+        pid = ppid
+    return chain
+
+
+def _tab_has_live_claude(iterm_session_id):
+    """True when the tab identified by `iterm_session_id` ($TERM_SESSION_ID) still has a `claude`
+    process attached to its tty THAT IS NOT this calling process's own ancestor — a thin, mockable
+    indirection over scripts/iterm.pids_on_tty, mirroring `_tty_by_id` above (tests monkeypatch
+    this function directly for `lead_still_live`/`safe_migrate_by_tab` coverage, and exercise it
+    directly with `ps` mocked for the ancestry-exclusion behavior itself).
+
+    Without the ancestry check this returned True for ANY `claude` on the tty, including the very
+    process whose SessionStart hook is asking — so a genuine same-tab `claude --resume` (the
+    0.3.50 "lead rearm survives a session-id change" feature) always saw itself on the tty and
+    `lead_still_live` refused its own legitimate migration, every time, in real life (the unit
+    tests only passed because this helper degrades to False in the sandboxed test environment,
+    where `ps`/AppleScript don't resolve at all). Excluding this process's own ancestry fixes that:
+    in a genuine resume the old lead process has already exited, so the only `claude` left on the
+    tty is an ancestor of the resumed process itself — not foreign, so not live. In THE INCIDENT
+    this guards against (see `lead_still_live`), the original lead is a SEPARATE, still-running
+    process, not an ancestor of the probe checking it — so it still reads as foreign and live.
+
+    Any failure (module missing, AppleScript failure, no live match, no session id at all)
+    degrades to False. Never raises. See `lead_still_live`'s docstring for what this guards
+    against."""
+    if not iterm_session_id:
+        return False
+    try:
+        tty = _tty_by_id(iterm_session_id)
+        if not tty:
+            return False
+        scripts_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import iterm as _iterm
+        own = _own_ancestor_pids()
+        foreign = [p for p in _iterm.pids_on_tty(tty) if p not in own]
+        return bool(foreign)
+    except Exception:
+        return False
+
+
+def lead_still_live(marker, poll_seconds):
+    """True when `marker` (a `find_lead_by_tab` migrate CANDIDATE's own, OLD marker) looks like a
+    real, currently-running lead rather than one whose process has actually exited — the guard
+    behind THE INCIDENT (2026-09-05 22:18:50, ledger `lead_migrated old=4dff0f10... new=4a75a4a9...`
+    then `session_end 4a75a4a9... reason=other was_lead=true`): `cmd_spawn`'s model-alias probe (a
+    headless `claude -p` relay itself launches) ran from the LEAD's own shell, inheriting its
+    $TERM_SESSION_ID and cwd — while the real lead was still mid-turn, blocked on that very
+    subprocess. Its SessionStart hook matched the live lead's tab+cwd and migrated the marker onto
+    the throwaway probe, tombstoning the real, still-running lead.
+
+    Deliberately narrower than the `last_active`-freshness check the fix note first reached for:
+    a marker's `last_active` is re-stamped on EVERY lead turn (including its very last one before a
+    genuine exit), so "still fresh" is true of almost any recently-used lead whether or not its
+    process has actually exited — checking it here would block the ordinary, legitimate
+    id-changed-on-resume migration this same code path exists to perform (0.3.50's own
+    `TestSessionStartRearmMigration`), not just the incident. `_tab_has_live_claude` instead asks
+    the one question that actually distinguishes them: is a `claude` process STILL attached to the
+    old marker's tab right now? In the incident, yes (the original lead is mid-turn). In a genuine
+    resume, the old process has already exited, so only the NEW session's own (not-yet-migrated)
+    process is there — nothing pre-existing to protect. See the report for why the `poll_seconds`
+    half of the originally-proposed guard was dropped rather than implemented as literally spec'd.
+
+    Never raises; any error here means "can't prove it's safe" → returns True (don't migrate)."""
+    try:
+        return _tab_has_live_claude((marker or {}).get("iterm_session"))
+    except Exception:
+        return True
+
+
+def safe_migrate_by_tab(state_root, iterm_session, cwd, new_sid, poll_seconds):
+    """`find_lead_by_tab` + `migrate_lead`, guarded by `lead_still_live` — THE ONE path both hooks
+    that migrate-by-tab (SessionStart's id-changed-on-resume revive; Stop's is_lead fallback) call,
+    so the incident guard lives in exactly one place. Ledgers `lead_migrate_refused_live` (never
+    `migrate_lead`, so a refused attempt is distinguishable from "no candidate at all") when a
+    candidate is found but looks still-live. Returns the OLD session id on a successful migration,
+    else None. Never raises."""
+    try:
+        old_sid = find_lead_by_tab(state_root, iterm_session=iterm_session, cwd=cwd)
+        if not old_sid:
+            return None
+        if lead_still_live(read_marker(state_root, old_sid), poll_seconds):
+            append_ledger(state_root, "lead_migrate_refused_live", session_id=new_sid, old_sid=old_sid)
+            return None
+        return old_sid if migrate_lead(state_root, old_sid, new_sid) else None
     except Exception:
         return None
 
@@ -840,6 +1078,26 @@ def find_lead_by_tab(state_root, iterm_session=None, tty=None, cwd=None, log_amb
         return None
 
 
+def find_lead_by_project(state_root, project):
+    """The single CURRENTLY-ARMED lead whose marker's project matches `project` exactly, or None —
+    zero matches, or more than one (ambiguous — never guessed, same rule find_lead_by_tab already
+    follows), both return None.
+
+    The fallback owner for hooks/executor_escalation.py's push (lead-found, 2026-09-05 22:01): an
+    executor's recorded `owner_lead` can go missing with no handoff to re-parent it (a crash, a
+    manual close) — a human who simply re-spawns a fresh lead for the SAME project should still be
+    reachable by that executor's report, without this ever guessing between two same-project leads.
+    Never raises."""
+    if not project:
+        return None
+    try:
+        matches = [m.get("session_id") for m in list_leads(state_root)
+                  if not m.get("broken") and m.get("project") == project and not is_tombstoned(m)]
+        return matches[0] if len(matches) == 1 else None
+    except Exception:
+        return None
+
+
 def migrate_lead(state_root, old_sid, new_sid):
     """Migrate a lead's identity from old_sid to new_sid — the fix for THE INCIDENT above: a resumed
     lead came back under a different session id than the one its marker lives under.
@@ -882,6 +1140,7 @@ def migrate_lead(state_root, old_sid, new_sid):
         migrated["last_active"] = now()
         migrated.pop("ended", None)
         migrated.pop("ended_at", None)
+        migrated.pop("ended_reason", None)
         new_dir = lead_dir(state_root, new_sid)
         new_dir.mkdir(parents=True, exist_ok=True)
         marker_path(state_root, new_sid).write_text(json.dumps(migrated, indent=2))
@@ -913,7 +1172,7 @@ def migrate_lead(state_root, old_sid, new_sid):
                 sj.write_text(json.dumps(s, indent=2))
                 moved_execs.append(s.get("session_id") or d.name)
 
-        tombstone_lead(state_root, old_sid)
+        tombstone_lead(state_root, old_sid, reason="migrated")
         update_marker(state_root, old_sid, migrated_to=new_sid)
 
         append_ledger(state_root, "lead_migrated", old=old_sid, new=new_sid, executors=moved_execs)
@@ -993,6 +1252,56 @@ def mark_surfaced(state_root, lead_sid, keys):
     except Exception:
         pass
     drop_pending(state_root, lead_sid, keys)  # proven by another channel → stop retrying it
+
+
+# ---- 8b: ONE desktop banner per (executor, packet) (lead-found duplicate-banner incident) -------
+# THE INCIDENT: a user saw BOTH an iTerm banner and a terminal-notifier banner for the SAME
+# executor report. Two producers can legitimately fire for the same report: the lead's own
+# Stop-hook wake (stop_lead_watch.py's _notify, via _announce_and_wake) and the executor's own
+# escalation push (executor_escalation.py, which also now attempts a banner alongside its
+# `nudge-lead` text injection — see that hook). Both key off the SAME "has this lead already seen
+# this report" question, but ask it at different times: the wake's OWN promotion from pending to
+# surfaced (mark_pending → promote_pending, proven-delivery only) lags behind the banner it just
+# fired, so an escalation push racing in that exact window sees "not yet surfaced" and fires too.
+#
+# `claim_notification` is the fix: a tiny stamp file, `notified.json`, under the LEAD's own state
+# dir (never the executor's — the lead is the one entity both producers already agree on and can
+# both reach by owner_lead), keyed by "<executor>:<packet>". Whichever producer asks FIRST gets
+# True (fire the banner); every later ask for the same key gets False (stay quiet). Distinct from
+# surfaced_reports.json on purpose: that one means "proven delivered", stamped only later and by
+# fewer paths; this one means "a banner was already ATTEMPTED for this", stamped immediately by
+# whichever producer gets there first, which is exactly the timing this race needs.
+
+def _notified_path(state_root, lead_sid):
+    return lead_dir(state_root, lead_sid) / "notified.json"
+
+
+def claim_notification(state_root, lead_sid, key, now_ts=None):
+    """Claim the ONE desktop-banner slot for `key` ("<executor>:<packet>") under `lead_sid`'s state
+    dir. Returns True the FIRST time `key` is claimed anywhere (the caller should fire the banner),
+    False on every later call for the same key (already claimed by the other producer — skip the
+    banner; nothing else about that producer's own work is affected). Best-effort and FAILS TOWARD
+    True: a broken/unreadable stamp file must never silently swallow a legitimate notification —
+    the cost of an occasional duplicate banner is far smaller than a missed one."""
+    try:
+        p = _notified_path(state_root, lead_sid)
+        data = {}
+        if p.exists():
+            try:
+                loaded = json.loads(p.read_text())
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:
+                data = {}
+        if key in data:
+            return False
+        data[key] = now() if now_ts is None else now_ts
+        d = lead_dir(state_root, lead_sid)
+        d.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(p, data)
+        return True
+    except Exception:
+        return True
 
 
 # ---- #22: announced-but-unproven wakes (§13's lost-wake bug) -----------------------------------
@@ -1847,9 +2156,18 @@ def packet_reading_bytes(body, cwd=None):
     total, seen = 0, set()
     for m in _PATH_RE.finditer(body or ""):
         raw = m.group(1)
-        cands = [Path(raw).expanduser()]
+        # BUG-lib-9: Path(raw).expanduser() RAISES (RuntimeError) for "~nosuchuser/..." — CPython
+        # pathlib can't resolve a home dir for an unknown user. That candidate must go through the
+        # SAME try/except every candidate below already has, not get built ahead of it — a packet
+        # merely MENTIONING another user's home path (~ops/deploy.sh, a path copied from another
+        # machine) must never crash the spawn.
+        cands = []
         if cwd and not raw.startswith(("/", "~")):
-            cands.insert(0, Path(cwd) / raw)
+            cands.append(Path(cwd) / raw)
+        try:
+            cands.append(Path(raw).expanduser())
+        except Exception:
+            pass
         for c in cands:
             try:
                 rp = c.resolve()
@@ -2531,7 +2849,7 @@ def build_escalation_settings(plugin_root, exec_name, timeout=30):
                     "hooks": [
                         {
                             "type": "command",
-                            "command": f"{hook_path} {exec_name}",
+                            "command": "%s %s" % (shlex.quote(hook_path), shlex.quote(exec_name)),
                             "timeout": timeout,
                         }
                     ]

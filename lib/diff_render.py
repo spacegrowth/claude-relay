@@ -87,11 +87,15 @@ def parse_unified_diff(diff_text):
             cur["is_deleted"] = True
         elif raw.startswith("Binary files ") and raw.endswith("differ"):
             cur["is_binary"] = True
-        elif raw.startswith("--- "):
+        # BUG-lib-4: "--- "/"+++ " are file headers only BEFORE the first hunk. Inside a hunk body
+        # they are ordinary content (a deleted/added line that happens to start with "-- "/"++ "),
+        # e.g. a deleted SQL comment or a "-- " signature separator — matching them unconditionally
+        # silently drops that line and mislabels the file card as a rename.
+        elif hunk is None and raw.startswith("--- "):
             p = raw[4:]
             if p not in ("/dev/null",):
                 cur["old_path"] = p[2:] if p.startswith(("a/", "b/")) else p
-        elif raw.startswith("+++ "):
+        elif hunk is None and raw.startswith("+++ "):
             p = raw[4:]
             if p not in ("/dev/null",):
                 cur["new_path"] = p[2:] if p.startswith(("a/", "b/")) else p

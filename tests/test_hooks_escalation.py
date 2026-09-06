@@ -204,6 +204,85 @@ class TestEscalationDecisionTree:
         assert escalation_ledger(tmp_path) == {}
 
 
+class TestOwnerFallback:
+    """11b (lead-found, 2026-09-05 22:01): when the recorded owner_lead has gone missing with no
+    handoff to re-parent it (a crash, a manual close — 11a's proactive re-parenting is the net
+    UNDER this, not a replacement for it), fall back to the SINGLE currently-armed lead whose
+    project matches this executor's own owner_project, rather than giving up straight to
+    "owner-missing". Never guesses between two same-project candidates."""
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_finds_the_fallback_and_resolves_through_the_real_hook_subprocess(self, drv, tmp_path):
+        """Driven through the REAL hook subprocess end to end: the fallback lookup itself needs no
+        interception (it's pure state), and pre-surfacing the report under the fallback keeps this
+        on the "resolved" branch — no `nudge-lead` subprocess ever attempted, so this needs none of
+        TestEscalationSendPath's in-process interception."""
+        H.make_executor(tmp_path, owner_lead="dead-lead", owner_project="webapp")
+        H.arm_lead(tmp_path, "lead-new", project="webapp")
+        lg.mark_surfaced(H.state_root(tmp_path), "lead-new", ["exec-1:1"])
+        run = drv(ESCALATE, {"session_id": "x"}, tmp_path, argv=("exec-1",))
+        assert run.returncode == 0
+        fallback_rec = [r for r in H.ledger(tmp_path) if r["event"] == "owner_fallback"]
+        assert len(fallback_rec) == 1
+        assert fallback_rec[0]["old_owner"] == "dead-lead"
+        assert fallback_rec[0]["new_owner"] == "lead-new"
+        assert fallback_rec[0]["project"] == "webapp"
+        resolved_rec = [r for r in H.ledger(tmp_path) if r["event"] == "escalation_resolved"]
+        assert resolved_rec and resolved_rec[0]["owner_lead"] == "lead-new"
+        assert escalation_ledger(tmp_path)["1"]["status"] == "resolved"
+
+    def test_pushes_to_the_fallback_lead_not_the_dead_owner(self, tmp_path, monkeypatch):
+        """The "send" branch, in-process with `nudge-lead` intercepted (same technique
+        TestEscalationSendPath uses) — the push must reach the FALLBACK's tab, never the dead
+        owner's."""
+        H.make_executor(tmp_path, owner_lead="dead-lead", owner_project="webapp")
+        H.arm_lead(tmp_path, "lead-new", project="webapp")
+        mod = load_escalation_module()
+        real_run = mod.subprocess.run
+        calls = []
+        monkeypatch.setattr(mod, "STATE_ROOT", str(H.state_root(tmp_path)))
+        monkeypatch.setattr("sys.argv", [ESCALATE, "exec-1"])
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
+
+        def fake_run(cmd, **kw):
+            if len(cmd) > 1 and cmd[1] == "nudge-lead":
+                calls.append(list(cmd))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return real_run(cmd, **kw)
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "x"})))
+        with pytest.raises(SystemExit):
+            mod.main()
+        assert len(calls) == 1
+        assert calls[0][1:3] == ["nudge-lead", "lead-new"]
+        rec = [r for r in H.ledger(tmp_path) if r["event"] == "owner_fallback"]
+        assert rec and rec[0]["new_owner"] == "lead-new"
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_two_same_project_leads_are_never_guessed_between(self, drv, tmp_path):
+        H.make_executor(tmp_path, owner_lead="dead-lead", owner_project="webapp")
+        H.arm_lead(tmp_path, "lead-a", project="webapp")
+        H.arm_lead(tmp_path, "lead-b", project="webapp")
+        run = drv(ESCALATE, {"session_id": "x"}, tmp_path, argv=("exec-1",))
+        assert run.returncode == 0
+        assert H.ledger(tmp_path) == [] or not any(
+            r["event"] == "owner_fallback" for r in H.ledger(tmp_path))
+        assert escalation_ledger(tmp_path)["1"]["status"] == "notified"
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_no_owner_project_recorded_is_not_a_fallback_candidate(self, drv, tmp_path):
+        """An executor spawned before owner_project was tracked (or genuinely unowned) must not
+        somehow match every lead with no project — find_lead_by_project(None) is a hard no."""
+        H.make_executor(tmp_path, owner_lead="dead-lead")   # no owner_project at all
+        H.arm_lead(tmp_path, "lead-new", project="webapp")
+        run = drv(ESCALATE, {"session_id": "x"}, tmp_path, argv=("exec-1",))
+        assert run.returncode == 0
+        assert not any(r["event"] == "owner_fallback" for r in H.ledger(tmp_path))
+        assert escalation_ledger(tmp_path)["1"]["status"] == "notified"
+
+
 class TestEscalationOncePerPacketGate:
     """_already_handled:123-138 — "The once-per-packet gate, now delivery-aware (#22)"."""
 
@@ -437,3 +516,92 @@ class TestEscalationSendPath:
         with pytest.raises(SystemExit):
             mod.main()
         assert not any(c[1] == "_deliver-queued" for c in seen)
+
+
+class TestDuplicateBannerDedup:
+    """8b (lead-found): a user saw BOTH an iTerm banner and a terminal-notifier banner for the
+    SAME executor report. Two producers can decide to notify for the same report — the lead's own
+    Stop-hook wake (hooks/stop_lead_watch.py) and this hook's own escalation push — because this
+    wake's own pending→surfaced promotion (proven-delivery only) lags behind the banner it just
+    fired, so an escalation push racing in that exact window still sees "not yet surfaced" and
+    fires too. `lead_guard.claim_notification` is the fix: a shared per-lead stamp file
+    (notified.json) that whichever producer asks FIRST claims; the other stays quiet. Proven here
+    both orders, through the wake's REAL hook subprocess; the escalation side is driven in-process
+    (same technique as TestEscalationSendPath above) so its `nudge-lead`/notifier subprocess calls
+    can be intercepted without ever reaching a real tab or a real desktop banner."""
+
+    def _escalate(self, tmp_path, monkeypatch):
+        """Runs executor_escalation.py's main() in-process: `relay whoami --json` reaches the real
+        CLI against this tmp HOME (same identity contract TestEscalationSendPath exercises);
+        `nudge-lead` and any terminal-notifier/osascript call are intercepted and recorded instead
+        of reaching a real tab or a real desktop banner. Returns the list of intercepted calls."""
+        mod = load_escalation_module()
+        root = H.state_root(tmp_path)
+        real_run = mod.subprocess.run
+        calls = []
+        monkeypatch.setattr(mod, "STATE_ROOT", str(root))
+        monkeypatch.setattr("sys.argv", [ESCALATE, "exec-1"])
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        monkeypatch.setattr(lg, "find_terminal_notifier", lambda: "/x/terminal-notifier")
+
+        def fake_run(cmd, **kw):
+            if len(cmd) > 1 and cmd[1] == "nudge-lead":
+                calls.append(list(cmd))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if cmd and (str(cmd[0]).endswith("terminal-notifier") or cmd[0] == "osascript"):
+                calls.append(list(cmd))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return real_run(cmd, **kw)
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "x"})))
+        with pytest.raises(SystemExit):
+            mod.main()
+        return calls
+
+    def _notifier_calls(self, calls):
+        """Matches EITHER shape this test collects: raw stub-log lines (strings, from the real
+        wake subprocess's stub PATH) or intercepted argv lists (from the in-process escalation
+        run) — either way, a call whose command names terminal-notifier or osascript."""
+        out = []
+        for c in calls:
+            if not c:
+                continue
+            first = c[0] if isinstance(c, (list, tuple)) else c
+            if "terminal-notifier" in str(first) or str(first).strip() == "osascript" \
+                    or (isinstance(c, str) and "osascript" in c):
+                out.append(c)
+        return out
+
+    def _wake(self, tmp_path):
+        H.write_config(tmp_path, auto_close=False)
+        return H.run_hook("stop_lead_watch.py", H.stop_payload(tmp_path, sid="lead-1"), tmp_path,
+                          no_notify=False)
+
+    def test_wake_first_then_escalation_stays_quiet(self, tmp_path, monkeypatch):
+        H.arm_lead(tmp_path, "lead-1", project="webapp")
+        H.make_executor(tmp_path, "exec-1", owner_lead="lead-1", status="reported")
+
+        wake_run = self._wake(tmp_path)
+        assert wake_run.returncode == H.WAKE
+        assert len(self._notifier_calls(H.stub_calls(tmp_path / "stub-calls.log"))) == 1
+
+        esc_calls = self._escalate(tmp_path, monkeypatch)
+        assert self._notifier_calls(esc_calls) == [], \
+            "the wake already claimed this report — the escalation push must stay quiet"
+        assert any(c[1] == "nudge-lead" for c in esc_calls), \
+            "the dedupe is banner-only — the text push itself still happens"
+
+    def test_escalation_first_then_wake_stays_quiet(self, tmp_path, monkeypatch):
+        H.arm_lead(tmp_path, "lead-1", project="webapp")
+        H.make_executor(tmp_path, "exec-1", owner_lead="lead-1", status="reported")
+
+        esc_calls = self._escalate(tmp_path, monkeypatch)
+        assert len(self._notifier_calls(esc_calls)) == 1
+
+        wake_run = self._wake(tmp_path)
+        assert wake_run.returncode == H.WAKE   # still announces on stdout/stderr — only the
+                                                # DESKTOP banner is deduped, not the wake itself
+        assert self._notifier_calls(H.stub_calls(tmp_path / "stub-calls.log")) == [], \
+            "the escalation push already claimed this report — the wake's banner must stay quiet"

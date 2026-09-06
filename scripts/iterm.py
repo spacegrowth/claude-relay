@@ -251,20 +251,23 @@ def title_by_id(iterm_id):
     return (r.stdout or "").strip() or None
 
 
-def pid_on_tty(tty_path, binary_suffix=CLAUDE_BIN):
-    """The pid of the process named `binary_suffix` (default "claude") attached to `tty_path`
-    (a "/dev/ttysNNN" from tty_by_id), or None. Used to SIGTERM a predecessor lead's claude process
-    before closing its tab — iTerm pops a 'confirm close running process' dialog otherwise, which
-    blocks osascript indefinitely (see close()'s docstring)."""
+def pids_on_tty(tty_path, binary_suffix=CLAUDE_BIN):
+    """ALL pids of processes named `binary_suffix` (default "claude") attached to `tty_path`
+    (a "/dev/ttysNNN" from tty_by_id), in `ps` listing order — [] if there are none, the tty
+    doesn't resolve, or the `ps` call itself fails. Unlike `pid_on_tty` (which answers "is there
+    ANY match"), callers that need to tell one matching process apart from another — e.g.
+    lead_guard._tab_has_live_claude excluding the calling process's own ancestry from "is a
+    DIFFERENT claude live on this tab's tty" — need the full list, not just the first hit."""
     if not tty_path:
-        return None
+        return []
     tty_name = tty_path.removeprefix("/dev/")
     try:
         r = subprocess.run(["ps", "-axo", "pid=,tty=,comm="], capture_output=True, text=True, timeout=5)
     except Exception:
-        return None
+        return []
     if r.returncode != 0:
-        return None
+        return []
+    out = []
     for line in r.stdout.splitlines():
         parts = line.split(None, 2)
         if len(parts) != 3:
@@ -272,10 +275,20 @@ def pid_on_tty(tty_path, binary_suffix=CLAUDE_BIN):
         pid_s, tty, comm = parts
         if tty == tty_name and comm.endswith(binary_suffix):
             try:
-                return int(pid_s)
+                out.append(int(pid_s))
             except ValueError:
                 continue
-    return None
+    return out
+
+
+def pid_on_tty(tty_path, binary_suffix=CLAUDE_BIN):
+    """The pid of the FIRST process named `binary_suffix` (default "claude") attached to `tty_path`
+    (a "/dev/ttysNNN" from tty_by_id), or None. Used to SIGTERM a predecessor lead's claude process
+    before closing its tab — iTerm pops a 'confirm close running process' dialog otherwise, which
+    blocks osascript indefinitely (see close()'s docstring). Contract unchanged from before
+    `pids_on_tty` existed: still one pid or None, same first-match-wins order."""
+    pids = pids_on_tty(tty_path, binary_suffix)
+    return pids[0] if pids else None
 
 
 def _create_target_block(lead_handle=None, layout="tab"):

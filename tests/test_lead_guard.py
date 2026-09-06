@@ -339,11 +339,15 @@ class TestListLeads:
         self._marker(root, "a", "2026-07-07T10:00:00")
         assert [m["session_id"] for m in lg.list_leads(root)] == ["a"]
 
-    def test_malformed_marker_is_skipped_not_fatal(self, root):
-        d = lg.lead_dir(root, "broken"); d.mkdir(parents=True, exist_ok=True)
+    def test_malformed_marker_is_a_broken_row_not_fatal(self, root):
+        """D2 (BUG-lib-8's mitigation): a malformed marker must never crash the list OR silently
+        vanish — it shows up as its own distinct `{"session_id": ..., "broken": True}` row."""
+        d = lg.lead_dir(root, "unreadable"); d.mkdir(parents=True, exist_ok=True)
         (d / "marker.json").write_text("{ not json")
         self._marker(root, "good", "2026-07-07T10:00:00")
-        assert [m["session_id"] for m in lg.list_leads(root)] == ["good"]
+        leads = lg.list_leads(root)
+        assert {m["session_id"] for m in leads} == {"good", "unreadable"}
+        assert {"session_id": "unreadable", "broken": True} in leads
 
     def test_marker_missing_started_sorts_first_without_crashing(self, root):
         d = lg.lead_dir(root, "no-started"); d.mkdir(parents=True, exist_ok=True)
@@ -2663,8 +2667,11 @@ class TestSessionEndHookLeadCleanup:
                    and r["reason"] == "other_weird_reason" for r in ledger)
 
     def test_non_lead_exits_silently_but_logs(self, tmp_path):
-        """non-lead session → exits 0 silently; SessionEnd still logged (harmless)."""
+        """non-lead session → exits 0 silently; SessionEnd still logged (harmless) — on a machine
+        that has used relay before (BUG-hooks-3/D3: the ledger write never CREATES the state
+        root, so this only holds once it already exists)."""
         root = tmp_path / ".relay-tasks"
+        root.mkdir(parents=True)
 
         rc, err = self._run(tmp_path, {"session_id": "nobody", "reason": "logout"})
 
@@ -2717,13 +2724,25 @@ class TestTombstone:
         assert lg.tombstone_lead(root, "lead-1") is True
         assert lg.tombstone_lead(root, "lead-1") is False  # already tombstoned
 
+    def test_tombstone_stores_the_reason_and_ledgers_it(self, root):
+        """THE 2026-09-05 20:16 INCIDENT: a live lead's marker was tombstoned with no reason
+        recorded and NO ledger event — this is now a property of tombstoning itself, not
+        something each caller has to remember (migrate_lead used to forget it)."""
+        self._armed(root)
+        assert lg.tombstone_lead(root, "lead-1", reason="exit") is True
+        assert lg.read_marker(root, "lead-1")["ended_reason"] == "exit"
+        events = [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+        rec = [e for e in events if e["event"] == "lead_tombstoned"]
+        assert len(rec) == 1
+        assert rec[0]["session_id"] == "lead-1" and rec[0]["reason"] == "exit"
+
     def test_revive_restores_arming_losslessly(self, root):
         before = self._armed(root)
-        lg.tombstone_lead(root, "lead-1")
+        lg.tombstone_lead(root, "lead-1", reason="exit")
         assert lg.revive_lead(root, "lead-1") is True
         assert lg.is_lead(root, "lead-1") is True
         after = lg.read_marker(root, "lead-1")
-        assert "ended" not in after and "ended_at" not in after
+        assert "ended" not in after and "ended_at" not in after and "ended_reason" not in after
         # project name in particular must come back untouched — no "-2" surprise on resume
         assert after["project"] == before["project"]
         for k in ("cwd", "iterm_session", "tab_label", "color", "model"):
@@ -2855,13 +2874,15 @@ class TestSessionStartRearmMigration:
     tombstone) is migrated forward from whatever lead marker still claims the current tab, instead
     of coming back silently unarmed."""
 
-    def _run(self, home, payload, term_session_id):
+    def _run(self, home, payload, term_session_id, extra_env=None):
         import subprocess
         env = {**os.environ, "HOME": str(home), "RELAY_NO_NOTIFY": "1"}
         if term_session_id is None:
             env.pop("TERM_SESSION_ID", None)
         else:
             env["TERM_SESSION_ID"] = term_session_id
+        if extra_env:
+            env.update(extra_env)
         p = subprocess.run(
             ["python3", str(REPO_ROOT / "hooks" / "sessionstart_lead_rearm.py")],
             input=json.dumps(payload), capture_output=True, text=True, env=env)
@@ -2946,18 +2967,36 @@ class TestSessionStartRearmMigration:
         assert "migrated_from" not in lg.read_marker(root, "lead-1")
         assert "session id changed" not in out
 
+    def test_relay_headless_never_migrates(self, tmp_path):
+        """THE INCIDENT (2026-09-05 22:18:50): a headless `claude -p` probe relay itself launches
+        (from bin/relay's `_headless_env`) inherits the lead's own $TERM_SESSION_ID/cwd — with
+        RELAY_HEADLESS=1 set on that launch, this hook must return before even attempting the
+        tab-match lookup, so the live lead's marker is never touched."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "old-sid", project="webapp", iterm_session="w1t2p0:TAB-X",
+                        cwd=str(tmp_path))
+        rc, out, err = self._run(tmp_path, {"session_id": "new-sid", "source": "resume",
+                                            "cwd": str(tmp_path)}, "w1t2p0:TAB-X",
+                                 extra_env={"RELAY_HEADLESS": "1"})
+        assert rc == 0 and out == "" and err == ""
+        assert lg.read_marker(root, "new-sid") == {}
+        assert lg.is_lead(root, "old-sid") is True   # untouched — never even looked at
+        assert not (root / "sessions.jsonl").exists()
+
 
 class TestStopHookMigration:
     """hooks/stop_lead_watch.py's minimal one-call fallback in the "not a lead" branch: same
     tab-match migration, reached only when is_lead(sid) is already false."""
 
-    def _run(self, home, payload, term_session_id):
+    def _run(self, home, payload, term_session_id, extra_env=None):
         import subprocess
         env = {**os.environ, "HOME": str(home), "RELAY_NO_NOTIFY": "1"}
         if term_session_id is None:
             env.pop("TERM_SESSION_ID", None)
         else:
             env["TERM_SESSION_ID"] = term_session_id
+        if extra_env:
+            env.update(extra_env)
         p = subprocess.run(
             ["python3", str(REPO_ROOT / "hooks" / "stop_lead_watch.py")],
             input=json.dumps(payload), capture_output=True, text=True, env=env)
@@ -2986,14 +3025,16 @@ class TestStopHookMigration:
         other_project = tmp_path / "other-project"; other_project.mkdir()
         lg.write_marker(root, "old-sid", project="webapp", iterm_session="w1t2p0:TAB-X",
                         cwd=str(other_project))
-        lg.tombstone_lead(root, "old-sid")
+        lg.tombstone_lead(root, "old-sid", reason="exit")   # setup-only: ledgers its own event
+        before = (root / "sessions.jsonl").read_text()
         rc, err = self._run(tmp_path, {"session_id": "new-sid", "cwd": str(tmp_path)}, "w1t2p0:TAB-X")
         assert rc == 0 and err == ""
         assert lg.is_lead(root, "new-sid") is False
         assert lg.read_marker(root, "new-sid") == {}
         assert lg.read_marker(root, "old-sid")["ended"] is True   # still tombstoned, untouched
         assert "migrated_to" not in lg.read_marker(root, "old-sid")
-        assert not (root / "sessions.jsonl").exists()   # no lead_migrated, no ambiguous, nothing
+        assert (root / "sessions.jsonl").read_text() == before   # no lead_migrated, no ambiguous —
+                                                                  # the HOOK itself adds nothing
 
     def test_symlinked_same_cwd_still_migrates(self, tmp_path):
         """Same project reached via a different (symlinked) path must still count as the same
@@ -3031,6 +3072,20 @@ class TestStopHookMigration:
         if events_path.exists():
             events = [json.loads(l) for l in events_path.read_text().splitlines()]
             assert not any(e["event"] == "lead_migrate_ambiguous" for e in events)
+
+    def test_relay_headless_never_migrates(self, tmp_path):
+        """THE INCIDENT (2026-09-05 22:18:50): a headless `claude -p` probe relay itself launches
+        inherits the lead's own $TERM_SESSION_ID/cwd — with RELAY_HEADLESS=1 set on that launch,
+        this hook must return before even attempting the tab-match lookup."""
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "old-sid", project="webapp", iterm_session="w1t2p0:TAB-X",
+                        cwd=str(tmp_path))
+        rc, err = self._run(tmp_path, {"session_id": "new-sid", "cwd": str(tmp_path)},
+                            "w1t2p0:TAB-X", extra_env={"RELAY_HEADLESS": "1"})
+        assert rc == 0 and err == ""
+        assert lg.read_marker(root, "new-sid") == {}
+        assert lg.is_lead(root, "old-sid") is True   # untouched — never even looked at
+        assert not (root / "sessions.jsonl").exists()
 
 
 class TestFindLeadByTab:
@@ -3190,6 +3245,18 @@ class TestMigrateLead:
         assert old["migrated_to"] == "new-sid"
         assert lg.is_lead(root, "old-sid") is False
 
+    def test_the_migration_tombstone_carries_a_reason_and_is_ledgered(self, root):
+        """THE 2026-09-05 20:16 INCIDENT: THIS was the reachable path — migrate_lead used to
+        tombstone old_sid with no reason and no `lead_tombstoned` ledger event at all (only
+        `lead_migrated`, which says a migration happened, not that a tombstone did)."""
+        self._armed(root)
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True
+        assert lg.read_marker(root, "old-sid")["ended_reason"] == "migrated"
+        events = [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+        rec = [e for e in events if e["event"] == "lead_tombstoned"]
+        assert len(rec) == 1
+        assert rec[0]["session_id"] == "old-sid" and rec[0]["reason"] == "migrated"
+
     def test_new_id_starts_armed_not_tombstoned(self, root):
         self._armed(root)
         assert lg.migrate_lead(root, "old-sid", "new-sid") is True
@@ -3231,6 +3298,154 @@ class TestMigrateLead:
         assert lg.migrate_lead(root, "old-sid", "new-sid") is True
 
 
+class TestLeadStillLiveGuard:
+    """lead_guard.lead_still_live / safe_migrate_by_tab — THE INCIDENT (2026-09-05 22:18:50,
+    ledger `lead_migrated old=4dff0f10... new=4a75a4a9...` then `session_end 4a75a4a9...
+    reason=other was_lead=true`): a headless `claude -p` probe relay itself launches inherited the
+    live lead's own tab+cwd, and its SessionStart hook matched and migrated the marker onto the
+    throwaway probe, tombstoning the real, still-running lead.
+
+    NOTE on what this deliberately does NOT check: the fix note that named this guard also
+    proposed refusing when the candidate's `last_active` is under `poll_seconds` old. That signal
+    was dropped — `last_active` is re-stamped on EVERY lead turn (including a lead's very last one
+    before it genuinely exits), so "fresh" is true of nearly any recently-used lead whether or not
+    its process has since exited; gating on it here would also block the ORDINARY, legitimate
+    id-changed-on-resume migration this same code path exists to perform (0.3.50's own
+    `TestSessionStartRearmMigration`/`TestStopHookMigration` above, whose `old-sid` markers are
+    always freshly written and must still migrate). `lead_still_live` instead asks the one
+    question that actually distinguishes "still running" from "just exited": is a `claude` process
+    still attached to the old marker's own tab right now."""
+
+    def test_still_live_when_the_tab_has_a_live_claude_process(self, root, monkeypatch):
+        lg.write_marker(root, "old-sid", iterm_session="w1t2p0:X")
+        monkeypatch.setattr(lg, "_tab_has_live_claude", lambda iterm_session: True)
+        assert lg.lead_still_live(lg.read_marker(root, "old-sid"), 1800) is True
+
+    def test_not_live_when_the_tab_has_no_claude_process(self, root, monkeypatch):
+        lg.write_marker(root, "old-sid", iterm_session="w1t2p0:X")
+        monkeypatch.setattr(lg, "_tab_has_live_claude", lambda iterm_session: False)
+        assert lg.lead_still_live(lg.read_marker(root, "old-sid"), 1800) is False
+
+    def test_fresh_last_active_alone_does_not_count_as_live(self, root, monkeypatch):
+        """The exact case named in the class docstring: `write_marker` always stamps a
+        just-now `last_active`, and that must NOT by itself make a candidate look live."""
+        lg.write_marker(root, "old-sid", iterm_session="w1t2p0:X")
+        marker = lg.read_marker(root, "old-sid")  # last_active is `now()`, stamped just above
+        monkeypatch.setattr(lg, "_tab_has_live_claude", lambda iterm_session: False)
+        assert lg.lead_still_live(marker, 1800) is False
+
+    def test_safe_migrate_refuses_and_ledgers_when_live(self, root, monkeypatch):
+        lg.write_marker(root, "old-sid", iterm_session="w1t2p0:X", cwd="/proj")
+        monkeypatch.setattr(lg, "_tab_has_live_claude", lambda iterm_session: True)
+        result = lg.safe_migrate_by_tab(root, "w1t2p0:X", "/proj", "new-sid", 1800)
+        assert result is None
+        assert lg.read_marker(root, "new-sid") == {}
+        assert lg.is_lead(root, "old-sid") is True   # untouched
+        events = [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+        assert [e["event"] for e in events] == ["lead_migrate_refused_live"]
+        assert events[0]["old_sid"] == "old-sid" and events[0]["session_id"] == "new-sid"
+
+    def test_safe_migrate_proceeds_when_not_live(self, root, monkeypatch):
+        lg.write_marker(root, "old-sid", iterm_session="w1t2p0:X", cwd="/proj")
+        monkeypatch.setattr(lg, "_tab_has_live_claude", lambda iterm_session: False)
+        result = lg.safe_migrate_by_tab(root, "w1t2p0:X", "/proj", "new-sid", 1800)
+        assert result == "old-sid"
+        assert lg.read_marker(root, "new-sid")["migrated_from"] == "old-sid"
+
+    def test_no_tab_match_is_a_plain_noop(self, root, monkeypatch):
+        monkeypatch.setattr(lg, "_tab_has_live_claude", lambda iterm_session: True)
+        assert lg.safe_migrate_by_tab(root, "w1t2p0:NOBODY", None, "new-sid", 1800) is None
+        assert not (root / "sessions.jsonl").exists()
+
+
+class TestTabHasLiveClaudeExcludesOwnAncestry:
+    """`_tab_has_live_claude` itself (NOT monkeypatched away, unlike every test above) — the fix
+    for the bug where it returned True for ANY `claude` on the tab's tty, including the very
+    process whose SessionStart hook is asking. A genuine same-tab `claude --resume` always saw
+    itself (an ancestor of the resumed process is the OLD claude binary still exec'd on that tty
+    at hook time) and so always refused its own legitimate migration. `_tty_by_id` is monkeypatched
+    (as the two tests above it do); `ps` itself is mocked at the `subprocess.run` level so both the
+    ancestry walk (`ps -o ppid=`) and the tty pid scan (`ps -axo pid=,tty=,comm=`) run their real
+    code, exercising the actual exclusion logic rather than a stand-in for it."""
+
+    TTY = "/dev/ttys005"
+
+    def _fake_ps(self, ancestry_chain, tty_pids):
+        """A `subprocess.run` stand-in that answers BOTH `ps` shapes `_tab_has_live_claude`'s own
+        machinery issues: `ps -o ppid= -p <pid>` (the ancestry walk — `ancestry_chain` maps a pid
+        to its parent pid) and `ps -axo pid=,tty=,comm=` (the tty scan — `tty_pids` is a list of
+        (pid, comm) attached to `self.TTY`)."""
+        import subprocess as _sp
+
+        def run(cmd, **kwargs):
+            if cmd[:2] == ["ps", "-o"]:
+                pid = int(cmd[cmd.index("-p") + 1])
+                ppid = ancestry_chain.get(pid)
+                out = ("%d\n" % ppid) if ppid is not None else ""
+                return _sp.CompletedProcess(cmd, 0, out, "")
+            if cmd[:2] == ["ps", "-axo"]:
+                lines = ["%d %s %s" % (pid, self.TTY.removeprefix("/dev/"), comm)
+                         for pid, comm in tty_pids]
+                return _sp.CompletedProcess(cmd, 0, "\n".join(lines) + "\n", "")
+            raise AssertionError("unexpected ps invocation: %r" % (cmd,))
+        return run
+
+    def test_only_the_hooks_own_ancestor_claude_on_the_tty_is_not_live(self, monkeypatch):
+        """(a) — the only `claude` on the tty is the calling process's own ancestor (the resumed
+        process's parent claude, still exec'd on the tty at the moment SessionStart fires): not
+        foreign, so not live, so migration is free to proceed."""
+        monkeypatch.setattr(lg, "_tty_by_id", lambda iterm_id: self.TTY)
+        self_pid = os.getpid()
+        parent_pid = self_pid + 10000  # arbitrary — just needs to differ from self_pid
+        monkeypatch.setattr(lg.subprocess, "run",
+                             self._fake_ps({self_pid: parent_pid, parent_pid: 1},
+                                            [(parent_pid, "claude")]))
+        assert lg._tab_has_live_claude("w1t2p0:X") is False
+
+    def test_a_second_unrelated_claude_on_the_tty_is_live(self, monkeypatch):
+        """(b) — a `claude` on the tty that is NOT in the calling process's ancestry (THE INCIDENT
+        shape: a separate, still-running lead process) — foreign, so live, so migration is
+        refused."""
+        monkeypatch.setattr(lg, "_tty_by_id", lambda iterm_id: self.TTY)
+        self_pid = os.getpid()
+        parent_pid = self_pid + 10000
+        other_pid = self_pid + 20000  # not in {self_pid, parent_pid}
+        monkeypatch.setattr(lg.subprocess, "run",
+                             self._fake_ps({self_pid: parent_pid, parent_pid: 1},
+                                            [(parent_pid, "claude"), (other_pid, "claude")]))
+        assert lg._tab_has_live_claude("w1t2p0:X") is True
+
+    def test_safe_migrate_proceeds_when_only_the_askers_own_ancestor_is_on_the_tty(self, root, monkeypatch):
+        """(a), end to end through `safe_migrate_by_tab` — no `_tab_has_live_claude` monkeypatch,
+        so this exercises the real ancestry-exclusion path all the way through the migration
+        decision, not just the helper in isolation."""
+        lg.write_marker(root, "old-sid", iterm_session="w1t2p0:X", cwd="/proj")
+        monkeypatch.setattr(lg, "_tty_by_id", lambda iterm_id: self.TTY)
+        self_pid = os.getpid()
+        parent_pid = self_pid + 10000
+        monkeypatch.setattr(lg.subprocess, "run",
+                             self._fake_ps({self_pid: parent_pid, parent_pid: 1},
+                                            [(parent_pid, "claude")]))
+        result = lg.safe_migrate_by_tab(root, "w1t2p0:X", "/proj", "new-sid", 1800)
+        assert result == "old-sid"
+        assert lg.read_marker(root, "new-sid")["migrated_from"] == "old-sid"
+
+    def test_safe_migrate_refuses_when_a_second_unrelated_claude_is_on_the_tty(self, root, monkeypatch):
+        """(b), end to end — THE INCIDENT shape reproduced through the real migration path."""
+        lg.write_marker(root, "old-sid", iterm_session="w1t2p0:X", cwd="/proj")
+        monkeypatch.setattr(lg, "_tty_by_id", lambda iterm_id: self.TTY)
+        self_pid = os.getpid()
+        parent_pid = self_pid + 10000
+        other_pid = self_pid + 20000
+        monkeypatch.setattr(lg.subprocess, "run",
+                             self._fake_ps({self_pid: parent_pid, parent_pid: 1},
+                                            [(parent_pid, "claude"), (other_pid, "claude")]))
+        result = lg.safe_migrate_by_tab(root, "w1t2p0:X", "/proj", "new-sid", 1800)
+        assert result is None
+        assert lg.read_marker(root, "new-sid") == {}
+        assert lg.is_lead(root, "old-sid") is True   # untouched
+
+
 class TestHooksAreExecutable:
     """Every hook registered in hooks.json is invoked by the harness as a BARE PATH, so it must
     carry the executable bit. A hook created without +x fails silently at runtime — and unit tests
@@ -3238,13 +3453,18 @@ class TestHooksAreExecutable:
     caught a real, silently-broken SessionStart hook; it exists so that can't recur."""
 
     def test_every_registered_hook_is_executable(self):
+        import shlex
         cfg = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())
         checked = []
         for event, entries in cfg["hooks"].items():
             for entry in entries:
                 for h in entry.get("hooks", []):
                     cmd = h.get("command", "")
-                    rel = cmd.replace("${CLAUDE_PLUGIN_ROOT}/", "").split()[0]
+                    # BUG-hooks-2's fix quotes the placeholder ('${CLAUDE_PLUGIN_ROOT}'/hooks/...),
+                    # so recovering the real relative path needs a shell-shaped split (shlex), not
+                    # a plain string replace — the quotes are real syntax, not a literal prefix.
+                    resolved = cmd.replace("${CLAUDE_PLUGIN_ROOT}", str(REPO_ROOT))
+                    rel = os.path.relpath(shlex.split(resolved)[0], REPO_ROOT)
                     path = REPO_ROOT / rel
                     assert path.exists(), f"{event}: {rel} does not exist"
                     assert os.access(path, os.X_OK), (

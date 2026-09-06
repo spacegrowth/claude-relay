@@ -123,10 +123,35 @@ class TestSessionEndReasonPolicy:
         assert marker_state(tmp_path) == "armed"
 
     @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    @pytest.mark.parametrize("reason", ["other", None])
+    def test_unknown_reasons_ledger_session_end_ignored(self, drv, reason, tmp_path):
+        """THE 2026-09-05 20:16 INCIDENT: a missing/unknown reason must never tombstone (the test
+        above), but it used to leave only the generic `session_end` line to infer that from — now
+        it says so explicitly, with the raw payload keys, so a genuinely novel SessionEnd shape is
+        investigable rather than indistinguishable from "nothing happened"."""
+        H.arm_lead(tmp_path)
+        payload = {"session_id": "lead-1", "reason": reason, "cwd": "/work"}
+        assert drv(END, payload, tmp_path).returncode == 0
+        rec = [r for r in H.ledger(tmp_path) if r["event"] == "session_end_ignored"]
+        assert len(rec) == 1
+        assert rec[0]["session_id"] == "lead-1" and rec[0]["reason"] == reason
+        assert rec[0]["payload_keys"] == sorted(payload.keys())
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
     def test_a_missing_reason_key_preserves_the_arming(self, drv, tmp_path):
         H.arm_lead(tmp_path)
         assert drv(END, {"session_id": "lead-1"}, tmp_path).returncode == 0
         assert marker_state(tmp_path) == "armed"
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_missing_reason_key_also_ledgers_session_end_ignored(self, drv, tmp_path):
+        H.arm_lead(tmp_path)
+        payload = {"session_id": "lead-1"}
+        assert drv(END, payload, tmp_path).returncode == 0
+        rec = [r for r in H.ledger(tmp_path) if r["event"] == "session_end_ignored"]
+        assert len(rec) == 1
+        assert rec[0]["reason"] is None
+        assert rec[0]["payload_keys"] == ["session_id"]
 
 
 class TestSessionEndScoping:
@@ -188,6 +213,10 @@ class TestSessionEndLedger:
 
     @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
     def test_a_non_lead_session_end_is_logged_as_such(self, drv, tmp_path):
+        """BUG-hooks-3/D3: logging only happens when `~/.relay-tasks` already exists (this
+        machine has used relay before) — pre-create the root the same way an earlier arm would,
+        so this test still exercises "logged as such" rather than "not logged at all"."""
+        H.state_root(tmp_path).mkdir(parents=True)
         drv(END, {"session_id": "some-other-session", "reason": "exit"}, tmp_path)
         rec = [r for r in H.ledger(tmp_path) if r["event"] == "session_end"][0]
         assert rec["was_lead"] is False
@@ -313,11 +342,12 @@ class TestSessionStartStateMachine:
         SessionEnd, so it can't unarm anything. This hook still runs on every compaction, so it
         must stay cheap and EXPLICITLY no-op there"."""
         root = H.arm_lead(tmp_path)
-        lg.tombstone_lead(root, "lead-1")
+        lg.tombstone_lead(root, "lead-1", reason="exit")   # setup-only: ledgers its own event
+        before = H.ledger_events(tmp_path)
         run = drv(START, {"session_id": "lead-1", "source": source}, tmp_path)
         assert run.returncode == 0 and run.stdout == ""
         assert marker_state(tmp_path) == "tombstoned"
-        assert H.ledger_events(tmp_path) == []
+        assert H.ledger_events(tmp_path) == before   # the HOOK itself adds nothing here
 
     @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
     def test_compaction_never_unarms_a_live_lead(self, drv, tmp_path):
