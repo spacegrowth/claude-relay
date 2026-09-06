@@ -9,6 +9,14 @@ dozens of pre-existing tests across this suite exercise those two functions dire
 notify awareness (some even pass a plausible-looking `iterm_session` string), and without this
 fixture every one of those runs would shell out to the real notifier.
 
+RELAY_NO_TIDY=1 is set for every test for the same reason, one notch more serious: `relay tidy`
+(and the automatic tidy after spawn/handoff/resume/restart) reorders REAL iTerm tabs through
+iTerm's Python API, and the tab bar it would reorder is the human's own. `iterm.reorder_tabs`
+checks this variable first and returns (False, "disabled by RELAY_NO_TIDY") — so even a test that
+reaches the automatic tidy through an unstubbed backend can never move a real tab. A test asserting
+ON the tidy stubs `reorder_tabs` at the backend seam (see tests/test_cli_tidy.py) rather than
+unsetting this.
+
 A test that specifically wants to exercise the REAL notify chain deletes this env var itself
 (`monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)` — see `TestNotifyFallback` and
 `TestDesktopNudgeUsesTheSharedNotifyChain` in tests/test_lead_guard.py and tests/test_relay.py) AND
@@ -21,3 +29,4 @@ import pytest
 @pytest.fixture(autouse=True)
 def _relay_no_notify_by_default(monkeypatch):
     monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
+    monkeypatch.setenv("RELAY_NO_TIDY", "1")

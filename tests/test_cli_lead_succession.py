@@ -432,6 +432,45 @@ class TestHandoff:
         pred = relay.lead_guard.read_marker(relay.STATE_ROOT, self._successor(relay))["predecessor"]
         assert pred["tab_label"] == "[ex-Lead] webapp"
 
+    def test_the_successor_inherits_the_predecessors_tab_color(self, relay, terms, tmp_path,
+                                                               monkeypatch):
+        """Backlog row 63 / README "Telling tabs apart": "each lead gets a stable color … and every
+        executor it spawns inherits it". A handoff transfers the lead's identity AND re-parents its
+        executors, so picking a fresh color for the successor made one group read as two."""
+        arm_lead(relay, "lead-old", "webapp", iterm_session="w0t0p0:OLD", backend="iterm",
+                 color=[210, 172, 124], started="2020-01-01T00:00:00")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-old")
+        run_main(relay, "handoff", self._doc(tmp_path))
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, self._successor(relay))
+        assert m["color"] == [210, 172, 124]
+        assert terms.spawns[0]["tab_color"] == [210, 172, 124]   # the successor's TAB too
+
+    def test_a_predecessor_with_no_color_falls_back_to_a_picked_one(self, relay, terms, tmp_path,
+                                                                    outgoing):
+        """"falling back to pick_lead_color only when the caller has none" — and the caller's own
+        (absent) claim must not steer the pick."""
+        run_main(relay, "handoff", self._doc(tmp_path))
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, self._successor(relay))
+        assert tuple(m["color"]) in {tuple(c) for c in relay.lead_guard.TAB_PALETTE}
+
+    def test_the_transferred_color_is_not_treated_as_taken(self, relay, terms, tmp_path,
+                                                           monkeypatch):
+        """pick_lead_color's `exclude_leads`: the outgoing lead's color is being TRANSFERRED, not
+        shared, so it must not count as claimed while the successor's fallback pick runs."""
+        arm_lead(relay, "lead-old", "webapp", iterm_session="w0t0p0:OLD", backend="iterm",
+                 color="not-a-color", started="2020-01-01T00:00:00")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-old")
+        picked = {}
+        real = relay.lead_guard.pick_lead_color
+
+        def spy(state_root, sid, exclude_leads=()):
+            picked["exclude"] = tuple(exclude_leads)
+            return real(state_root, sid, exclude_leads)
+
+        monkeypatch.setattr(relay.lead_guard, "pick_lead_color", spy)
+        run_main(relay, "handoff", self._doc(tmp_path))
+        assert picked["exclude"] == ("lead-old",)
+
     def test_the_successor_never_inherits_the_autonomous_posture(self, relay, terms, tmp_path,
                                                                  monkeypatch):
         """cmd_handoff: "autonomous — False/"config", never inherited from the outgoing lead"."""

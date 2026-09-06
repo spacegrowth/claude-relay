@@ -46,6 +46,17 @@ LEAD_DEFAULTS = {
     "executor_skip_permissions": False,  # spawn executors with --dangerously-skip-permissions
     "terminal_app": "auto",      # "iterm" | "terminal" | "auto" ($TERM_PROGRAM decides; iTerm default)
     "tab_colors": True,          # iTerm only: color each lead's tab + its executors' tabs alike
+    "tidy_tabs": True,           # iTerm only (backlog row 64): after every event that changes which
+                                  # tabs exist or who owns them — spawn, `send --rotate/--upgrade`,
+                                  # handoff, close-predecessor, resume, restart — re-order the tab
+                                  # bar into [Lead] [Exec 1] [Exec 2] … [Lead 2] [Exec 2.1] … and
+                                  # re-apply each lead's color to its own group. Purely cosmetic and
+                                  # entirely best-effort: it needs the optional `iterm2` package and
+                                  # iTerm's Python API enabled (the same one-time toggle adjacent-tab
+                                  # placement needs), and degrades to one dim line without them, so
+                                  # False here is only for someone who arranges their own tab bar.
+                                  # `relay tidy` runs regardless — this key governs the AUTOMATIC
+                                  # tidy only.
     "executor_layout": "tab",    # "tab" | "pane" (pane: iTerm only, split into the lead's window)
     "handoff_nudge": True,       # suggest handing off when the lead transcript gets heavy
     "handoff_nudge_mb": 5,       # SESSION-AGE signal (MB on disk, a compaction proxy) for BOTH
@@ -168,22 +179,6 @@ LEAD_DEFAULTS = {
                                   # CLI's actual wording differs.
                                   r"^(?:you'?ve hit your (?:session|usage) limit"
                                   r"|(?:claude )?usage limit reached)"),
-    "board_live": False,          # the lead's on/off switch for `relay board` LIVE mode: when true,
-                                  # a plain `relay board` (no --live flag) writes the live-styled
-                                  # page (meta-refresh + a board.json sidecar), AND every
-                                  # state-changing command (list/check/send/spawn) plus the lead's
-                                  # own Stop hook keep rewriting board.html/board.json in place —
-                                  # no server process, just a file that stays at most one turn
-                                  # stale. `relay board --live` also turns this behavior on for the
-                                  # CURRENT board.html without touching config (see bin/relay's
-                                  # _is_board_live_active: the board.json sidecar's mere presence on
-                                  # disk is itself proof a live board is active, so the auto-rewrite
-                                  # keeps going after just one `--live` run).
-    "board_refresh_seconds": 10,  # the live board's <meta http-equiv="refresh"> interval (N) — also
-                                  # the unit the "stale" threshold is measured in (3×N, bin/relay's
-                                  # board_render.render): a page not rewritten within 3 refresh
-                                  # cycles is presumed abandoned (lead stopped nudging state) and its
-                                  # "updated HH:MM:SS" header turns red.
 }
 
 # Distinguishable, colorblind-tolerant tab colors — brightened so they remain visible when dimmed
@@ -208,13 +203,18 @@ def lead_color(session_id):
     return list(TAB_PALETTE[h % len(TAB_PALETTE)])
 
 
-def pick_lead_color(state_root, session_id):
+def pick_lead_color(state_root, session_id, exclude_leads=()):
     """Collision-free lead color: walks TAB_PALETTE forward from lead_color's hash index to find an
     unused color. Re-arm stable: if this lead's marker already claims a CURRENT palette color,
     returns it unchanged. Stale (old-palette) colors fall through to re-pick from current palette.
     Stale colors don't block slots (self-heals as leads re-arm). All 6 current palette slots claimed
     by OTHER leads → falls back to lead_color (acceptable at >6 leads). Fully defensive: any error
-    → lead_color fallback. Returns [r, g, b]."""
+    → lead_color fallback. Returns [r, g, b].
+
+    `exclude_leads` — session ids whose claimed color must NOT count as taken. The handoff case
+    (cmd_handoff): the outgoing lead's color is being TRANSFERRED to its successor, not shared with
+    it, so treating the caller's own color as claimed would push the successor onto a different
+    color and repaint the whole group at every handoff."""
     try:
         import hashlib
         # Check if this lead already has a marker with a CURRENT-palette color (re-arm stability).
@@ -225,10 +225,12 @@ def pick_lead_color(state_root, session_id):
             if tuple(existing_color) in {tuple(c) for c in TAB_PALETTE}:
                 return existing_color
 
-        # Gather colors claimed by OTHER leads (skip this lead's marker).
+        # Gather colors claimed by OTHER leads (skip this lead's marker, and any lead the caller
+        # named as excluded — see `exclude_leads`).
+        skip = {session_id} | {s for s in (exclude_leads or ())}
         claimed = set()
         for lead in list_leads(state_root):
-            if lead.get("session_id") == session_id:
+            if lead.get("session_id") in skip:
                 continue  # skip this lead's own marker if it exists
             color = lead.get("color")
             if isinstance(color, list) and len(color) == 3:
@@ -574,7 +576,7 @@ def _atomic_write_json(path, obj):
 def write_marker(state_root, session_id, model=None, iterm_session=None, project=None, cwd=None,
                  tab_label=None, color=None, plugin_version=None, stop_hook_timeout=None,
                  predecessor=None, started=None, backend=None, autonomous=False,
-                 autonomous_source="config"):
+                 autonomous_source="config", lineage_started=None):
     d = lead_dir(state_root, session_id)
     d.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(marker_path(state_root, session_id), {
@@ -585,6 +587,14 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
         "color": color,              # [r,g,b] tab color; this lead's executors inherit it at spawn
         "last_active": now(),        # heartbeat — refreshed on every write_marker call
         "started": started or now(), # preserved across re-arms by callers that read the existing marker first
+        # When the FIRST lead of this lineage started — inherited unchanged through every handoff
+        # (cmd_handoff passes the outgoing lead's own lineage), and preserved across re-arms exactly
+        # like `started`/`predecessor`. `started` is per-session and a successor's is always brand
+        # new, so it can't answer "where in the tab bar has this lead's group always sat" — which is
+        # what `relay tidy` orders lead groups by, so a handoff doesn't teleport a whole group to
+        # the end of the tab bar. None for a lead that never came through a handoff (its own
+        # `started` is its lineage's).
+        "lineage_started": lineage_started,
         "model": model,
         "iterm_session": iterm_session,  # $TERM_SESSION_ID — recorded tab metadata (debugging)
         "backend": backend,          # which terminal app hosts this lead's OWN tab ("iterm" |

@@ -225,17 +225,6 @@ def main():
             except Exception:
                 pass
 
-        # Live board (task: "make relay board live"): every lead turn-end is also a "state
-        # changed" moment for the board — rewrite board.html/board.json in place so a page left
-        # open sees fresh state within one meta-refresh interval, with NO server process.
-        # Unconditional (unlike the sweep above): refresh_live_board itself no-ops instantly
-        # unless live mode is actually active (config board_live, or a prior `--live` run's
-        # board.json sidecar), so this costs nothing extra for a lead that never touched `board`.
-        try:
-            subprocess.run([RELAY_BIN, "_refresh-board"], capture_output=True, timeout=25)
-        except Exception:
-            pass
-
         transcript_path = payload.get("transcript_path")
 
         # #22: promote announced-but-unproven wakes once delivery is PROVEN.

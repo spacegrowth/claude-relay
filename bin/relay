@@ -26,6 +26,7 @@ Commands:
   relay handoff <handoff.md> [--project NAME] [--model NAME]  # succeed this lead with a pre-armed fresh one
   relay close-predecessor                    # close the outgoing lead's tab after a handoff, on user go
   relay nudge-lead <lead> "<message>"        # type a message into a LEAD's own tab; always sends
+  relay tidy [--dry-run]                     # re-order the tab bar into [Lead] [Exec…] [Lead 2] [Exec…]
 """
 import argparse
 import contextlib
@@ -67,6 +68,69 @@ def term_backend(s):
     opened in Terminal.app must keep being addressed there even if relay now runs under iTerm).
     Pre-backend session records (no field) use this invocation's selected backend."""
     return backend.by_name((s or {}).get("backend")) or iterm
+
+
+# ── tab colors: one color per lead GROUP, always ────────────────────────────────────────────────
+# A lead and every executor it currently owns wear ONE color, so the tab bar groups them at a
+# glance (README "Telling tabs apart"). Two things kept breaking that: the color was resolved once
+# at spawn from the owner's marker (an executor that changed hands kept its old lead's color
+# forever), and a marker with no `color` at all — a stepped-down owner, a lead armed while
+# `tab_colors` was off — silently produced an UNPAINTED tab rather than a color. `_owner_color`
+# below is the single answer to "what color does this executor wear", and `_paint_tab` re-applies
+# it to a tab that already exists.
+def _color_ok(color):
+    """Whether a stored marker color is something relay can actually paint with ([r, g, b])."""
+    return isinstance(color, list) and len(color) == 3
+
+
+def _paint_tab(bk, handle, color):
+    """Paint an EXISTING tab by writing iTerm's tab-color escape straight to its tty — the same tty
+    channel `notify_via_tty` uses, and the only one available to a process with no controlling
+    terminal (a hook or this CLI). `tab_color` at spawn only covers tabs relay is opening; a tab
+    that changed owner, or that a tidy is re-grouping, is already open.
+
+    Best-effort and never raises: no-ops for a non-iTerm backend, a missing handle/color, a tab
+    whose id no longer resolves, or an unwritable tty. Returns True only if the escape was written."""
+    if not color or not handle or getattr(bk, "NAME", "") != "iterm":
+        return False
+    try:
+        tty = bk.tty_by_id(handle)
+        if not tty:
+            return False
+        with open(tty, "w") as f:
+            f.write(bk.tab_color_escape(color))
+        return True
+    except Exception:
+        return False
+
+
+def _owner_color(owner_lead, cfg=None):
+    """The color an executor owned by `owner_lead` must wear: its CURRENT owner lead's marker color,
+    resolved fresh at every spawn/rotate/resume/restart/adopt rather than cached at spawn.
+
+    A lead whose marker has no usable color gets one PICKED and persisted here, so a group never
+    ends up half-painted — the observed "rotate under a stepped-down owner opens a colorless tab"
+    case. When there is no marker to persist into (the owner stepped down, or was never a lead),
+    the picked color is still used for the tab and `update_marker` no-ops: writing a marker for a
+    non-lead would make a dead session read as armed, which is far worse than an unpersisted color.
+    Returns [r, g, b], or None when `tab_colors` is off or there is no owner at all."""
+    cfg = lead_guard.load_config(STATE_ROOT) if cfg is None else cfg
+    if not cfg.get("tab_colors", True) or not owner_lead:
+        return None
+    color = lead_guard.read_marker(STATE_ROOT, owner_lead).get("color")
+    if _color_ok(color):
+        return color
+    color = lead_guard.pick_lead_color(STATE_ROOT, owner_lead)
+    lead_guard.update_marker(STATE_ROOT, owner_lead, color=color)  # no-op when there's no marker
+    return color
+
+
+def _recolor_executor_tab(s):
+    """Re-apply the CURRENT owner lead's color to an executor's live tab. Ownership moves an
+    executor between lead groups (`_maybe_adopt` on a claim, `_reparent_executors` at handoff) but
+    the tab was painted once, at spawn — without this the tab keeps the colour of the lead that no
+    longer owns it. Best-effort; returns True only if the tab was actually repainted."""
+    return _paint_tab(term_backend(s), s.get("iterm_session"), _owner_color(s.get("owner_lead")))
 
 
 # ── tab husks self-identify (§4 synthesis, task #4) ─────────────────────────────────────────────
@@ -1161,7 +1225,10 @@ def cmd_spawn(args):
     # owner_lead itself is resolved above, before the packet build.
     owner_marker = lead_guard.read_marker(STATE_ROOT, owner_lead) if owner_lead else {}
     owner_project = owner_marker.get("project")
-    tab_color = owner_marker.get("color") if cfg.get("tab_colors", True) else None
+    # Via `_owner_color`, never `owner_marker.get("color")` directly: a `send --rotate` names the
+    # RETIRING session's owner, which may be a lead that has since stepped down — its marker is `{}`,
+    # and reading the color off it opened every rotated successor's tab unpainted.
+    tab_color = _owner_color(owner_lead, cfg)
 
     # Arm the executor-side wake escalation (wake-watch design §4): a plain `claude` launch gets NO
     # hooks, so this executor only gets the escalation Stop hook if we pass it explicitly here.
@@ -1243,7 +1310,6 @@ def cmd_spawn(args):
     })
     append_ledger("spawned", session_id=session_id, worktree=worktree, topic=args.topic, tab_label=label)
     append_ledger("packet_sent", session_id=session_id, packet=n)
-    refresh_live_board()  # `spawn` is a state-change moment (see refresh_live_board) — no-op unless live
     if launch_failed:
         append_ledger("launch_failed", session_id=session_id, attempts=2)
         print(f"spawn: claude did NOT launch for '{session_id}' — no PID and the tab title "
@@ -1261,6 +1327,9 @@ def cmd_spawn(args):
     if not label_ok:
         print(f"WARNING: tab title '{label}' didn't take — send/close/focus may not find this tab "
               f"(retry with: relay focus {session_id})", file=sys.stderr)
+    # The new tab landed at the end of its window; put it back beside the rest of its lead's group.
+    # This is also the tidy for `send --rotate/--upgrade`, which spawns its successor through here.
+    maybe_tidy_tabs("spawn")
 
 
 def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
@@ -1277,10 +1346,10 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
             pass
     cfg = lead_guard.load_config(STATE_ROOT)
     skip_perms = bool(cfg.get("executor_skip_permissions", False))
-    # Re-inherit the owning lead's tab color (the fresh tab starts uncolored).
-    tab_color = None
-    if cfg.get("tab_colors", True) and s.get("owner_lead"):
-        tab_color = lead_guard.read_marker(STATE_ROOT, s["owner_lead"]).get("color")
+    # Re-inherit the CURRENT owning lead's tab color (the fresh tab starts uncolored) — resolved
+    # now, not read off the record, so an executor that changed hands since its last launch comes
+    # back in its new lead's color rather than its old one's.
+    tab_color = _owner_color(s.get("owner_lead"), cfg)
     # A resume (`resume_id` set) reopens the SAME conversation — build_claude_cmd doesn't even pass
     # --model on that path, so whatever model that conversation already runs is exempt and untouched
     # here. A restart (`session_uuid` set) is a genuinely FRESH launch though, so it gets the same
@@ -1352,6 +1421,9 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     s["busy_since_epoch"] = time.time()
     s["updated"] = now()
     write_session(session_id, s)
+    # resume/restart open a BRAND-NEW tab at the end of the window — re-tidy so the executor lands
+    # back in its lead's group rather than after everyone else's.
+    maybe_tidy_tabs("relaunch")
     return pid, label
 
 
@@ -1396,6 +1468,7 @@ def _maybe_adopt(session_id, s, force=False, quiet=False):
         s["owner_project"] = caller_marker.get("project")
         s["updated"] = now()
         write_session(session_id, s)
+        _recolor_executor_tab(s)   # it just changed groups — its tab must change color with it
         append_ledger("adopted", session_id=session_id, from_lead=owner, to_lead=caller, forced=bool(force))
         if not quiet:
             if owner:
@@ -1428,9 +1501,201 @@ def _reparent_executors(old_owner, new_owner, new_owner_project):
         s["owner_project"] = new_owner_project
         s["updated"] = now()
         write_session(sid, s)
+        _recolor_executor_tab(s)   # ownership moved, so the tab's color moves with it
         append_ledger("adopted", session_id=sid, from_lead=old_owner, to_lead=new_owner, forced=False)
         moved.append(sid)
     return moved
+
+
+# ── relay tidy: one lead group per stretch of tab bar (backlog row 64) ─────────────────────────
+# The tab bar drifts. Executors are appended wherever a new tab lands, a handoff successor opens at
+# the end, a rotate leaves a husk mid-row — so after an hour the [Lead] and [Exec] tabs of one lead
+# are scattered between another lead's. `relay tidy` recomputes the order every lead's tabs SHOULD
+# be in — [Lead] [Exec 1] [Exec 2] … [Lead 2] [Exec 2.1] … — hands it to iTerm's Python API, and
+# re-applies each lead's color to its own group on the way past. It is entirely cosmetic: every
+# failure path degrades to one dim line, never to a failed command.
+TIDY_TERMINAL_STATUSES = ("closed", "superseded", "dead")
+
+
+def _lead_order_key(marker):
+    """Where a lead's group sits in the tab bar: its LINEAGE start, not its own `started`. A handoff
+    successor is a brand-new marker with a brand-new `started`, so ordering on `started` alone would
+    send the whole group to the end of the tab bar at every handoff. `lineage_started` (stamped by
+    cmd_handoff from the outgoing lead's own lineage, preserved across re-arms by cmd_lead_start)
+    keeps a successor in the slot its predecessor held — and keeps it there once `relay
+    close-predecessor` has removed the husk."""
+    return marker.get("lineage_started") or marker.get("started") or ""
+
+
+def _handle_window(handle):
+    """The window part of a captured iTerm handle ("w0t1p0:UUID" → "w0"), or None when the handle
+    isn't in that form. iTerm renumbers windows as they open and close, so this is a HINT, not an
+    identity: tidy uses it only to leave an executor that is plainly in a DIFFERENT window from its
+    lead where it is, and the real per-window grouping is done live, against the actual windows, by
+    `iterm.reorder_tabs`."""
+    m = re.match(r"^(w\d+)t\d+p\d+:", str(handle or ""))
+    return m.group(1) if m else None
+
+
+def _spawn_order():
+    """{session_id: the ledger `spawned` ts}, the order executors were opened in — the ledger is
+    append-only and never rewritten, so it survives every later status change. A session with no
+    `spawned` record (pruned ledger, hand-made record) is absent; callers fall back to `created`."""
+    out = {}
+    for sid, events in _ledger_by_session().items():
+        for e in events:
+            if e.get("event") == "spawned":
+                out[sid] = e.get("ts") or ""
+                break
+    return out
+
+
+def tidy_groups():
+    """The desired tab grouping, computed purely from state (no terminal calls): one entry per armed
+    lead, oldest lineage first, each carrying the executors that lead currently owns in spawn order.
+
+    Each group is {"lead", "project", "handle", "color", "window", "executors", "elsewhere"}:
+      handle/window  the lead's own iTerm handle and its (hint) window.
+      executors      [{"sid", "handle", "label"}] — non-terminal executors of this lead, on the
+                     iTerm backend, in ledger `spawned` order, that are in the lead's own window.
+      elsewhere      sids of this lead's executors that are plainly in ANOTHER window; they are
+                     reported but never ordered — moving them would drag a tab across windows.
+    A broken marker row, a tombstoned or migrated husk (not armed, yet still holding the tab id of
+    a live lead), a lead with no captured handle (nothing to anchor its group to) and any non-iTerm
+    lead are skipped entirely: their tabs stay exactly where they are."""
+    spawned = _spawn_order()
+    by_owner = {}
+    for sid in all_session_ids():
+        s = read_session(sid)
+        if not s or s.get("status") in TIDY_TERMINAL_STATUSES or not s.get("owner_lead"):
+            continue
+        if (s.get("backend") or "iterm") != "iterm":
+            continue
+        by_owner.setdefault(s["owner_lead"], []).append(s)
+    groups = []
+    for m in sorted(lead_guard.list_leads(STATE_ROOT), key=_lead_order_key):
+        sid = m.get("session_id")
+        handle = m.get("iterm_session")
+        if m.get("broken") or not handle or (m.get("backend") or "iterm") != "iterm":
+            continue
+        # A tombstone (`ended`: the session exited but is resumable) and a migrated husk
+        # (`migrated_to`: superseded by a later session id) are NOT armed leads — but both retain
+        # the iterm_session of the tab they were armed in, which a live lead usually still holds.
+        # Left in, each husk becomes its own group over that SAME tab: the tab is repainted once
+        # per husk, and a dead lineage's older `lineage_started` can steal the front slot from the
+        # live lead. `list_leads` is a raw directory walk, so this filter must be here.
+        if lead_guard.is_tombstoned(m) or m.get("migrated_to"):
+            continue
+        window = _handle_window(handle)
+        execs, elsewhere = [], []
+        for s in sorted(by_owner.get(sid, []),
+                        key=lambda s: (spawned.get(s["session_id"]) or s.get("created") or "",
+                                       s["session_id"])):
+            ex_handle = s.get("iterm_session")
+            ex_window = _handle_window(ex_handle)
+            if not ex_handle:
+                continue                       # no handle → no tab we can address
+            if window and ex_window and ex_window != window:
+                elsewhere.append(s["session_id"])
+                continue
+            execs.append({"sid": s["session_id"], "handle": ex_handle,
+                          "label": s.get("tab_label") or f"[Exec] {s['session_id']}"})
+        groups.append({"lead": sid, "project": m.get("project"), "handle": handle,
+                       "color": m.get("color"), "window": window,
+                       "executors": execs, "elsewhere": elsewhere})
+    return groups
+
+
+def tidy_order(groups):
+    """The flat list of iTerm handles `iterm.reorder_tabs` takes: each lead immediately followed by
+    its own executors, then the next lead. Windows are NOT separated here — reorder_tabs groups the
+    handles by the window each tab is actually in and orders each window independently, so one flat
+    list covers every window at once."""
+    order = []
+    for g in groups:
+        order.append(g["handle"])
+        order.extend(e["handle"] for e in g["executors"])
+    return order
+
+
+def _paint_group(g, cfg=None):
+    """Re-apply one lead's color to its own tab and to every executor tab in its group, so a group
+    that drifted apart (an adopted executor, a lead armed before it had a color) converges again.
+    Picks and persists a color for a lead that has none — never leaves a group half-painted."""
+    color = _owner_color(g["lead"], cfg)
+    if not color:
+        return 0
+    g["color"] = color
+    painted = 1 if _paint_tab(iterm_backend, g["handle"], color) else 0
+    for e in g["executors"]:
+        painted += 1 if _paint_tab(iterm_backend, e["handle"], color) else 0
+    return painted
+
+
+def _tidy_now(cfg=None):
+    """Compute the order, re-color every group, apply the order. Returns (ok, reason, groups).
+    Shared by `relay tidy` and the automatic post-spawn/handoff/resume tidy so both can only ever
+    do the same thing."""
+    cfg = lead_guard.load_config(STATE_ROOT) if cfg is None else cfg
+    groups = tidy_groups()
+    for g in groups:
+        _paint_group(g, cfg)
+    order = tidy_order(groups)
+    if not order:
+        return False, "no lead tabs to order", groups
+    ok, reason = iterm_backend.reorder_tabs(order)
+    return ok, reason, groups
+
+
+def maybe_tidy_tabs(after):
+    """The automatic tidy, called after every event that changes which tabs exist or who owns them
+    (spawn — which also covers `send --rotate/--upgrade`, since that spawns the successor —
+    handoff, close-predecessor, resume and restart).
+
+    Cosmetic by definition, so it can never fail its caller: config `tidy_tabs: false` turns it off
+    silently, RELAY_NO_TIDY (the test-suite kill-switch) skips it entirely, and every other failure
+    — API off, package missing, no matching tab, an unexpected exception — degrades to ONE dim
+    line. Returns True only when tabs were actually reordered."""
+    if os.environ.get("RELAY_NO_TIDY"):
+        return False
+    try:
+        cfg = lead_guard.load_config(STATE_ROOT)
+        if not cfg.get("tidy_tabs", True):
+            return False
+        ok, reason, _ = _tidy_now(cfg)
+    except Exception as e:
+        ok, reason = False, f"{type(e).__name__}: {e}"
+    if not ok:
+        print(c(f"  · tab tidy skipped ({reason}) — `{RELAY_BIN} tidy --dry-run` to see the "
+                f"order it wanted", "dim"))
+    return bool(ok)
+
+
+def cmd_tidy(args):
+    """`relay tidy [--dry-run]` — put the tab bar back into [Lead] [Exec 1] [Exec 2] … [Lead 2]
+    [Exec 2.1] … order and re-apply each lead's color to its own group.
+
+    Explicit, so it runs regardless of the `tidy_tabs` config key (that key governs only the
+    AUTOMATIC tidy after spawn/handoff/resume/restart). `--dry-run` prints the order it would apply
+    and touches nothing — including the colors."""
+    groups = tidy_groups()
+    if not groups:
+        print("tidy: no armed lead with a captured iTerm tab — nothing to order.")
+        return
+    for g in groups:
+        color = g.get("color")
+        color_note = f"  color {','.join(str(int(v)) for v in color)}" if _color_ok(color) else "  color -"
+        print(c(f"[Lead] {g['project'] or '-'}  ({(g['lead'] or '?')[:8]}…){color_note}", "bold"))
+        for i, e in enumerate(g["executors"], 1):
+            print(f"  {i}. {e['label']}")
+        for sid in g["elsewhere"]:
+            print(c(f"  · {sid} — another window, left where it is", "dim"))
+    if args.dry_run:
+        print(c(f"dry run — {len(tidy_order(groups))} tab(s) would be reordered; nothing moved.",
+                "dim"))
+        return
+    ok, reason, _ = _tidy_now()
+    print(f"tidy: {reason}" if ok else c(f"tidy: not applied — {reason}", "red"))
 
 
 def cmd_restart(args):
@@ -1547,14 +1812,19 @@ def cmd_resume_lead(sid, force=False):
     #                  inverted posture with nothing said — the silent autonomy §6f warns against.
     #                  The restore nudge tells the lead to re-run `relay lead-start`, which applies
     #                  the config default and announces it, so nothing is lost by waiting for that.
+    #   lineage_started — PRESERVED, for the same reason `started` is: a restore is the same lead,
+    #                  and dropping it would send this lead's whole tab group to the end of the tab
+    #                  bar at the next tidy (see `_lead_order_key`).
     lead_guard.write_marker(STATE_ROOT, sid, model=model, project=project, cwd=cwd,
                             tab_label=label, color=color, iterm_session=iterm_session,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
                             backend=iterm.NAME,
                             started=marker.get("started"),
+                            lineage_started=marker.get("lineage_started"),
                             predecessor=marker.get("predecessor"),
                             autonomous=False, autonomous_source="config")
     append_ledger("lead_resumed", session_id=sid, project=project)
+    maybe_tidy_tabs("lead resume")  # the restored lead's tab reopened at the end of the window
     print(f"restored lead '{project}' (session {sid}) — reopening its conversation")
 
 
@@ -1719,7 +1989,6 @@ def cmd_send(args):
             print(f"'{args.session_id}' is {s['status']} — queued as #{item['id']}, delivers when it "
                   f"next goes idle" + (f" ({pending} queued, oldest first)" if pending > 1 else "")
                   + f"\n  inspect/cancel: {RELAY_BIN} queue {args.session_id} [--cancel <id|all>]")
-            refresh_live_board()  # `send` is a state-change moment — no-op unless live
             return
         sys.exit(f"session '{args.session_id}' is {s['status']} — refusing to send (would inject mid-turn). Only reported/idle sessions are safe send targets.")
     if s["status"] == "superseded":
@@ -1881,7 +2150,6 @@ def cmd_send(args):
                     else (f"MCP set widened to {lead_guard.mcp_spec_label(s.get('mcp'))}" if mcp_relaunch
                           else f"tab '{s['tab_label']}' was gone"))
             print(f"{note} — resumed with full context and delivered packet {n:03d}")
-            refresh_live_board()  # `send` is a state-change moment — no-op unless live
             return
         # No captured Claude session (spawned before session-id capture) → today's behavior.
         s["status"] = "dead"
@@ -1898,7 +2166,6 @@ def cmd_send(args):
     write_session(args.session_id, s)
     append_ledger("packet_sent", session_id=args.session_id, packet=n)
     print(f"sent packet {n:03d} to session '{args.session_id}' (existing tab)")
-    refresh_live_board()  # `send` is a state-change moment — no-op unless live
 
 
 def _queue_lock(session_id, stale_seconds=120):
@@ -2704,13 +2971,10 @@ def _lead_age_text(m):
         return "-"
 
 
-def board_data(include_all=True, lead_sid=None, sweep=True):
+def board_data(include_all=True, lead_sid=None):
     """Everything `relay board` renders, assembled from the SAME functions `relay list` uses
-    (_check_one, _lead_liveness_verdict, wake_hook_state, _usage_for_session, seed_entries…) so the
-    page and the table can't disagree. Also runs the auto-close sweep like list does — unless
-    `sweep=False` (the live-board refresh path, called from `list`/`check`/`send`/`spawn`/the lead's
-    Stop hook: each of those has ALREADY run its own correctly-scoped sweep this turn, so the
-    refresh must never sweep a second time under a different scope)."""
+    (_check_one, _lead_liveness, wake_hook_state, _usage_for_session, seed_entries…) so the page and
+    the table can't disagree. Also runs the auto-close sweep like list does."""
     cfg = lead_guard.load_config(STATE_ROOT)
     poll_seconds = cfg.get("poll_seconds", 1800)
     poll_interval = cfg.get("poll_interval", 5)
@@ -2722,7 +2986,7 @@ def board_data(include_all=True, lead_sid=None, sweep=True):
         if lead_guard.poll_lock_state(STATE_ROOT, sid, poll_interval) == "stale":
             wake = "stuck"
         on, _src = lead_guard.autonomous_state(m)
-        leads.append({**m, "wake": wake, "liveness": _lead_liveness_verdict(m), "auto": bool(on),
+        leads.append({**m, "wake": wake, "liveness": _lead_liveness(m), "auto": bool(on),
                       "paused": bool(m.get("paused")), "last_active_age": _lead_age_text(m),
                       "mb": _mb_cell_text(_transcript_mb_for(sid))})
     rows = []
@@ -2732,11 +2996,9 @@ def board_data(include_all=True, lead_sid=None, sweep=True):
             continue
         n = s.get("current_packet")
         rows.append({**s, "reported": (packets_dir(sid) / f"{n:03d}-report.md").exists()})
-    acted = []
-    if sweep:
-        lead_caller = _armed_lead_caller()
-        acted = auto_close_sweep("board", sids=[r["session_id"] for r in rows] if lead_caller else [],
-                                  lead_sid=lead_caller)
+    lead_caller = _armed_lead_caller()
+    acted = auto_close_sweep("board", sids=[r["session_id"] for r in rows] if lead_caller else [],
+                              lead_sid=lead_caller)
     if acted:
         hit = {a[0] for a in acted}
         rows = [({**read_session(r["session_id"]), "reported": r["reported"]} if r["session_id"] in hit else r) for r in rows]
@@ -2818,106 +3080,14 @@ def board_data(include_all=True, lead_sid=None, sweep=True):
             "relay_bin": RELAY_BIN, "leads": leads, "executors": execs, "warnings": warnings, "ledger_tail": ledger_tail}
 
 
-def _board_json_path(html_path):
-    """The sibling `board.json` path for a given board.html path (or wherever --out pointed) —
-    same directory, same stem, `.json` extension."""
-    return html_path.with_suffix(".json")
-
-
-def _atomic_write_text(path, text):
-    """Write `text` to `path` via a sibling tmp file + os.replace, never a straight in-place
-    `write_text` — same shape as `write_session`/`lead_guard._atomic_write_json`. A browser mid-reload
-    (meta-refresh or the JS `fetch('board.json')` poll) must never observe a half-written board.html
-    or board.json."""
-    path = Path(path)
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
-
-
-def _is_board_live_active(cfg=None):
-    """Whether relay should keep rewriting the DEFAULT board.html/board.json on every
-    state-changing command — true when the lead has flipped `board_live: true` in config, OR when
-    a `relay board --live` has already been run at least once (proven by the board.json sidecar's
-    mere presence at the default location, so the auto-refresh keeps going after just one
-    `--live` run without needing the config flag too). Fail-open to False on any read error —
-    a config/disk hiccup here must silently mean "not live", never crash a caller."""
-    try:
-        cfg = cfg if cfg is not None else lead_guard.load_config(STATE_ROOT)
-        if cfg.get("board_live"):
-            return True
-        return _board_json_path(STATE_ROOT / "board.html").exists()
-    except Exception:
-        return False
-
-
-def refresh_live_board():
-    """Rewrite the DEFAULT board.html + board.json in place, IF live mode is active
-    (_is_board_live_active) — the no-server-process trick this whole feature rests on: relay
-    itself re-renders the page from current on-disk state at every moment state actually changes
-    (list/check/send/spawn, and the lead's Stop hook via `_refresh-board`), so a tab left open
-    sees fresh content within one meta-refresh interval without ever calling out to anything.
-    Always renders with sweep=False (see board_data's docstring) — the caller triggering this
-    refresh has already run its own correctly-scoped auto-close sweep this turn (or, for the Stop
-    hook path, delegates that separately to `_auto-close-sweep`); this rewrite must never be a
-    SECOND, differently-scoped sweep. Fail-open: best-effort, never raises — a rendering hiccup
-    here must never break the real command that triggered it."""
-    try:
-        cfg = lead_guard.load_config(STATE_ROOT)
-        if not _is_board_live_active(cfg):
-            return
-        refresh_seconds = int(cfg.get("board_refresh_seconds", lead_guard.LEAD_DEFAULTS["board_refresh_seconds"]))
-        data = board_data(sweep=False)
-        out = STATE_ROOT / "board.html"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(out, board_render.render(data, live=True, refresh_seconds=refresh_seconds))
-        _atomic_write_text(_board_json_path(out), json.dumps(data, indent=2, default=str))
-    except Exception:
-        pass
-
-
-def cmd_refresh_board(args):
-    """Internal: the lead Stop hook's live-board trigger (hooks/stop_lead_watch.py), mirroring
-    `_auto-close-sweep`'s pattern — a thin CLI entry point so the hook stays a subprocess call with
-    no relay internals imported. A no-op when live mode isn't active (see refresh_live_board)."""
-    refresh_live_board()
-
-
 def cmd_board(args):
-    cfg = lead_guard.load_config(STATE_ROOT)
-    live_arg = getattr(args, "live", None)
-    out = Path(args.out).expanduser() if args.out else (STATE_ROOT / "board.html")
-    if live_arg == "off":
-        # Turning live mode off just means removing the board.json sidecar — its mere presence
-        # at the default location is what `_is_board_live_active` treats as "live", so deleting it
-        # is enough to stop `refresh_live_board` rewriting the page on every state change. But the
-        # `board_live: true` config key is an independent, higher-priority "on" switch (see
-        # `_is_board_live_active`) — removing the sidecar can't override that, so say so instead of
-        # silently no-op'ing.
-        sidecar = _board_json_path(out)
-        removed = sidecar.exists()
-        try:
-            sidecar.unlink()
-        except FileNotFoundError:
-            pass
-        if cfg.get("board_live"):
-            print("sidecar removed, but config board_live: true still holds live mode on — "
-                  "unset it in the config to fully turn live mode off")
-        elif removed:
-            print(f"live mode off ({sidecar} removed)")
-        else:
-            print("live mode was already off (no board.json sidecar)")
-        return
     data = board_data(lead_sid=getattr(args, "lead", None))
     if args.json:
         print(json.dumps(data, indent=2, default=str))
         return
-    live = bool(live_arg) or bool(cfg.get("board_live"))
-    refresh_seconds = int(cfg.get("board_refresh_seconds", lead_guard.LEAD_DEFAULTS["board_refresh_seconds"]))
+    out = Path(args.out).expanduser() if args.out else (STATE_ROOT / "board.html")
     out.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(out, board_render.render(data, live=live, refresh_seconds=refresh_seconds))
-    if live:
-        _atomic_write_text(_board_json_path(out), json.dumps(data, indent=2, default=str))
+    out.write_text(board_render.render(data))
     print(str(out))
     print(path_to_file_url(out))
     if args.open:
@@ -3194,7 +3364,6 @@ def cmd_check(args):
     with sink:
         acted = auto_close_sweep("check", sids=[sid for sid in ids if sid] if lead_caller else [],
                                   lead_sid=lead_caller)
-    refresh_live_board()  # `check` is a state-change moment (see refresh_live_board) — no-op unless live
     if args.json:
         for s in results:
             hit = next((a for a in acted if a[0] == s.get("session_id")), None)
@@ -3559,22 +3728,6 @@ def _lead_liveness_cell(m):
     return _LIVENESS_CELL[_lead_liveness(m)]
 
 
-def _lead_liveness_verdict(m):
-    """The full liveness verdict for one lead marker, including the two overrides `relay list`
-    applies on top of `_lead_liveness`'s live/unreachable/ghost — 'broken' for a marker
-    `list_leads` could not even read (no tab/cwd identity to probe), and 'ended_but_alive' for a
-    TOMBSTONED marker whose tab still probes alive (the hijack/silent-tombstone shape, Packet-002
-    item 3: a genuinely paused/resumable exit doesn't leave its own tab running). Shared by
-    `cmd_list` and `board_data` so the two surfaces can't disagree about which leads are actually
-    the hijack/silent-tombstone case."""
-    if m.get("broken"):
-        return "broken"
-    verdict = _lead_liveness(m)
-    if verdict == "live" and lead_guard.is_tombstoned(m):
-        return "ended_but_alive"
-    return verdict
-
-
 def _find_transcript_path(claude_session):
     """First matching transcript JSONL for `claude_session`, scanning the same project dirs as
     conversation_transcript_exists (see _transcript_project_dirs). Returns a Path, or None when
@@ -3814,7 +3967,6 @@ def cmd_list(args):
         hit = {a[0] for a in acted}
         rows = [({**read_session(r["session_id"]), "reported": r["reported"]} if r["session_id"] in hit else r)
                 for r in rows]
-    refresh_live_board()  # `list` is a state-change moment (see refresh_live_board) — no-op unless live
     if not show_all:
         rows = [s for s in rows if s.get("owner_lead") in (None, lead_sid)]
 
@@ -3877,10 +4029,20 @@ def cmd_list(args):
         _WAKE_CELL = {"ok": ("ok", ("green",)), "stale": ("STALE", ("red", "bold")),
                       "unknown": ("ver?", ("dim",)), "stuck": ("stuck", ("red", "bold"))}
         # One liveness verdict per lead, computed up front — see the LIVE column comment below.
-        # _lead_liveness_verdict (module-level, shared with board_data) short-circuits a broken
-        # marker (D2) to "broken" and overrides a TOMBSTONED-but-alive-tab marker to
-        # "ended_but_alive" (Packet-002 item 3's hijack/silent-tombstone shape) rather than the
-        # reassuring green "live".
+        # A broken marker (D2) short-circuits to "broken": it carries no tab/cwd identity to run
+        # the is_alive probe against, and it isn't a real "how stale is this lead" question.
+        # Packet-002 item 3: a TOMBSTONED marker whose tab still probes alive is not an ordinary
+        # "live" lead — a genuinely paused/resumable exit doesn't leave its own tab running (the
+        # process exited), so a live tab plus an ended marker is the hijack/silent-tombstone shape
+        # this whole packet exists to surface — overridden to "ended_but_alive" ("ended?", red)
+        # rather than the reassuring green "live".
+        def _lead_liveness_verdict(m):
+            if m.get("broken"):
+                return "broken"
+            verdict = _lead_liveness(m)
+            if verdict == "live" and lead_guard.is_tombstoned(m):
+                return "ended_but_alive"
+            return verdict
         liveness_by_sid = {m.get("session_id"): _lead_liveness_verdict(m) for m in leads}
         # One usage reading per lead, computed up front (same memoize-once rationale as liveness
         # above) — feeds the CTX column and is cached on disk itself (_usage_for_session's
@@ -4811,19 +4973,19 @@ def cmd_lead_start(args):
     # id — this CLI process has no controlling terminal, so /dev/tty is unavailable). iTerm only.
     cfg = lead_guard.load_config(STATE_ROOT)
     color = lead_guard.pick_lead_color(STATE_ROOT, args.session_id) if cfg.get("tab_colors", True) else None
-    if color and getattr(iterm, "NAME", "") == "iterm" and not getattr(args, "no_rename", False):
-        tty = iterm.tty_by_id(iterm_session)
-        if tty:
-            try:
-                with open(tty, "w") as f:
-                    f.write(iterm.tab_color_escape(color))
-            except OSError:
-                pass  # cosmetic — never block arming on a paint failure
+    if not getattr(args, "no_rename", False):
+        _paint_tab(iterm, iterm_session, color)  # cosmetic — never blocks arming on a paint failure
     lead_guard.write_marker(STATE_ROOT, args.session_id, model=args.model,
                             iterm_session=iterm_session, project=project, cwd=cwd,
                             tab_label=tab_label, color=color,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
                             predecessor=existing.get("predecessor"), started=existing.get("started"),
+                            # Preserved like started/predecessor, and for the same reason: a re-arm
+                            # (the /relay:mode every handoff successor is told to run) rewrites the
+                            # WHOLE marker, so anything not re-passed is dropped — and losing this
+                            # would send an established lead's whole tab group to the end of the
+                            # tab bar at the next tidy.
+                            lineage_started=existing.get("lineage_started"),
                             # Autonomous posture (§6f, #16 phase 1) is stamped FRESH on every arm from
                             # config — deliberately NOT preserved like predecessor/started. Arming is
                             # the reset point: you opt into auto for a plan you're confident about, and
@@ -4882,7 +5044,18 @@ def cmd_handoff(args):
     successor_sid = str(uuid.uuid4())  # pinned — this IS the successor's session id
     tab_label = f"[Lead] {slugify(project)}"
     cfg = lead_guard.load_config(STATE_ROOT)
-    color = lead_guard.pick_lead_color(STATE_ROOT, successor_sid) if cfg.get("tab_colors", True) else None
+    # The successor INHERITS the outgoing lead's tab color (backlog row 63). A handoff transfers a
+    # lead's identity, and its executors are re-parented (not respawned) a few lines below — picking
+    # a fresh color here recolored the successor's own tab while every inherited executor kept the
+    # predecessor's, so one group read as two. `pick_lead_color` is the fallback only for a caller
+    # that has no usable color (tab_colors turned on after that lead armed, a hand-edited marker),
+    # and it is told to ignore the caller's claim: that color is being transferred, not shared, so
+    # counting it as taken would push the successor off it for no reason.
+    color = None
+    if cfg.get("tab_colors", True):
+        color = caller_marker.get("color")
+        if not _color_ok(color):
+            color = lead_guard.pick_lead_color(STATE_ROOT, successor_sid, exclude_leads=(caller,))
     # Record the predecessor NOW, while its marker is still readable — by the time the successor
     # gets around to acting on it, `clear_lead(caller)` below will have deleted it, so this is the
     # only place this information can be captured.
@@ -4894,6 +5067,12 @@ def cmd_handoff(args):
     # and the post-spawn refresh are two writes of one lead, and letting the second re-default
     # `started` to its own now() would make the field mean "when the tab finished opening".
     successor_started = now()
+    # When this LINEAGE began — the outgoing lead's own lineage, or (first handoff) its `started`.
+    # `relay tidy` orders lead groups by this, so a handoff leaves the successor's group in the slot
+    # the predecessor's held instead of teleporting it to the end of the tab bar; `close-predecessor`
+    # then removes the husk without moving anything.
+    lineage_started = (caller_marker.get("lineage_started") or caller_marker.get("started")
+                       or successor_started)
 
     # PRE-ARM: write the successor's marker BEFORE it ever runs a turn, so its gate + auto-wake are
     # live from the moment the tab opens — no /relay:mode needed. Stamping matches cmd_lead_start
@@ -4911,7 +5090,7 @@ def cmd_handoff(args):
                             tab_label=tab_label, color=color,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
                             predecessor=predecessor, started=successor_started,
-                            backend=iterm.NAME,
+                            lineage_started=lineage_started, backend=iterm.NAME,
                             autonomous=False, autonomous_source="config")
     lead_guard.write_head(STATE_ROOT, successor_sid, lead_guard.git_head(cwd))
 
@@ -4977,7 +5156,7 @@ def cmd_handoff(args):
                             tab_label=tab_label, color=color, iterm_session=iterm_session,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
                             predecessor=predecessor, started=successor_started,
-                            backend=iterm.NAME,
+                            lineage_started=lineage_started, backend=iterm.NAME,
                             autonomous=False, autonomous_source="config")
 
     # 11a (lead-found, 2026-09-05 22:01): re-parent every inherited executor NOW, before the caller
@@ -5003,6 +5182,10 @@ def cmd_handoff(args):
         append_ledger("predecessor_retitled", from_lead=caller, to_lead=successor_sid,
                       tab_label=ex_title)
 
+    # The successor's tab opened at the end of the window and every inherited executor is now
+    # under a new owner — re-tidy so the whole lineage sits together again, in the slot the
+    # predecessor's group held (see `_lead_order_key`).
+    maybe_tidy_tabs("handoff")
     print(f"handoff complete — successor lead '{project}' (session {successor_sid}) opened, "
           f"pre-armed; this session has stepped down (gate + auto-wake off here).")
 
@@ -5058,6 +5241,7 @@ def cmd_close_predecessor(args):
     marker.pop("predecessor", None)
     lead_guard.marker_path(STATE_ROOT, caller).write_text(json.dumps(marker, indent=2))
     append_ledger("predecessor_closed", session_id=caller, predecessor=pred_sid, tab_closed=bool(closed))
+    maybe_tidy_tabs("close-predecessor")  # the husk is gone; close the gap it left in the tab bar
     print(f"close-predecessor: predecessor {pred_sid[:8] if pred_sid else '?'}… — {tab_note}")
 
 
@@ -5511,10 +5695,6 @@ def main():
     bd.add_argument("--out", help="write the page here (default ~/.relay-tasks/board.html)")
     bd.add_argument("--lead", help="scope executors to this lead's (plus unowned)")
     bd.add_argument("--json", action="store_true", help="emit the board data instead of HTML")
-    bd.add_argument("--live", nargs="?", const="on", default=None, choices=["on", "off"],
-                     help="write a sibling board.json + a meta-refresh page, and keep both rewritten "
-                     "on every list/check/send/spawn and lead Stop hook — no server process (same as "
-                     "config board_live: true); `--live off` removes the sidecar to turn it back off")
     bd.set_defaults(func=cmd_board)
 
     stp = sub.add_parser("stats", help="join each executor packet's (model, effort) to its outcome "
@@ -5548,9 +5728,6 @@ def main():
     acs = sub.add_parser("_auto-close-sweep", help=argparse.SUPPRESS)  # internal: lead Stop hook trigger
     acs.add_argument("--lead", help="only this lead's executors")
     acs.set_defaults(func=cmd_auto_close_sweep)
-
-    rfb = sub.add_parser("_refresh-board", help=argparse.SUPPRESS)  # internal: lead Stop hook trigger
-    rfb.set_defaults(func=cmd_refresh_board)
 
     ck = sub.add_parser("check")
     ck.add_argument("session_id", nargs="?")
@@ -5691,6 +5868,11 @@ def main():
     hf.add_argument("--project", help="successor's project name (default: caller lead's project, else cwd basename)")
     hf.add_argument("--model", help="successor's model (default: caller lead's marker model)")
     hf.set_defaults(func=cmd_handoff)
+
+    td = sub.add_parser("tidy", help="re-order every lead's tabs into [Lead] [Exec 1] [Exec 2] … "
+                                     "[Lead 2] … and re-apply each lead's color to its group")
+    td.add_argument("--dry-run", action="store_true", help="print the order it would apply, move nothing")
+    td.set_defaults(func=cmd_tidy)
 
     cp = sub.add_parser("close-predecessor")
     cp.set_defaults(func=cmd_close_predecessor)

@@ -183,6 +183,7 @@ relay keep <session_id> [--off]            pin/unpin an executor against auto-cl
 relay verify <sid> --for-autocommit [--in-plan] [--diff-reviewed]   the auto-commit gate: CLEARED / NOT-CLEARED-BECAUSE-… (flags are the lead's own attestations)
 /relay:handoff <handoff.md>                 succeed this lead: pre-armed successor tab, then step down
 relay close-predecessor                    successor-only: close the outgoing lead's tab, on user go
+relay tidy [--dry-run]                     re-group the tab bar: [Lead] [Exec 1] [Exec 2] … [Lead 2] … + re-apply each lead's color
 relay status [session_id] [--statusline]   read-only, statusline-safe one-liner (see below)
 relay whoami [<token>] [--json]            "who am I, who is my lead" — token: a lead's session id, an executor's relay name, or its claude_session uuid; defaults to $CLAUDE_CODE_SESSION_ID
 ```
@@ -470,15 +471,9 @@ model + `LAUNCH`, `TOKENS` (with cache warm/cold and a hit-rate chip)/MB, packet
 (gist, the report's outcome sentence and TL;DR, links to the packet / report / diff page) and
 copyable `relay …` commands. Filter box, "show closed", light theme by default with a remembered
 ☀️/🌙 switch. It is built from exactly the functions `relay list` uses (and runs the same liveness
-refresh and auto-close sweep), so it can't disagree with the table; by default it is a **snapshot** —
-re-run to refresh. `relay board --live` (or config `board_live: true`) keeps it live instead, still
-with no server process: it writes a sibling `board.json` next to `board.html`, adds a meta-refresh
-(`board_refresh_seconds`, default 10s) so an open tab reloads itself, and relay then rewrites both
-files in place on every `list`/`check`/`send`/`spawn` and the lead's own Stop hook — so a page left
-open stays at most one turn stale, with the header's "updated HH:MM:SS" turning red once nothing has
-rewritten it for 3× the refresh interval. Written to `~/.relay-tasks/board.html` (`--out` to change),
-`--lead <sid>` to scope, `--json` for the data, `--live off` to turn live mode back off (removes the
-`board.json` sidecar; a lingering `board_live: true` in config still holds it on).
+refresh and auto-close sweep), so it can't disagree with the table; it is a **snapshot** — re-run to
+refresh. Written to `~/.relay-tasks/board.html` (`--out` to change), `--lead <sid>` to scope,
+`--json` for the data.
 
 ### relay stats
 
@@ -537,7 +532,19 @@ Closing is parking, not loss: the report is on disk, staged work stays in the wo
   holds onto its name, so re-arming in the same folder reclaims the base name.
 - **Per-lead tab colors** (iTerm only): each lead gets a stable color from a 6-color palette, and
   every executor it spawns inherits it — so with multiple leads running, one glance groups each
-  lead with its workers. Disable with `"tab_colors": false`.
+  lead with its workers. The color follows a lead's *identity*, not its session: a handoff
+  successor keeps its predecessor's color, and an executor that changes hands (adopted, or
+  re-parented at a handoff) is repainted in its new owner's color rather than keeping its old
+  one's. Disable with `"tab_colors": false`.
+- **Grouped tab order** (iTerm only): `relay tidy` puts the tab bar back into `[Lead]` `[Exec 1]`
+  `[Exec 2]` … `[Lead 2]` `[Exec 2.1]` … order — each lead followed by the executors it currently
+  owns, in spawn order — and re-applies every lead's color to its own group on the way past. It
+  runs automatically after the events that disturb the order (spawn, `send --rotate/--upgrade`,
+  handoff, `close-predecessor`, resume, restart); `"tidy_tabs": false` turns that off, and
+  `relay tidy --dry-run` prints the order it would apply without moving anything. Executors in a
+  different window from their lead are left where they are. Needs the same optional `iterm2`
+  package and Python API toggle as adjacent-tab placement below — without them it degrades to one
+  dim line, never a failed command.
 - **Pane layout** (iTerm only): set `"executor_layout": "pane"` (or pass `--pane` at spawn) to open
   executors as split panes inside the lead's own tab instead of separate tabs; `--tab` forces a
   tab for one spawn regardless of config. Falls back to a tab if the lead's iTerm session can't be
@@ -571,6 +578,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_default_effort` | "high" | Thinking effort an executor launches with when neither `--effort` nor a packet `EFFORT:` line pins one — relay's own policy (the CLI default), never your personal `effortLevel` from `~/.claude/settings.json`. Validated against `--effort`'s own levels (`low`\|`medium`\|`high`\|`xhigh`\|`max`); an invalid value is refused at spawn |
 | `terminal_app` | "auto" | "iterm" \| "terminal" \| "auto" (auto-detect via `$TERM_PROGRAM`; iTerm default) |
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
+| `tidy_tabs` | true | iTerm only; after a spawn/rotate/handoff/close-predecessor/resume/restart, re-order the tab bar into `[Lead] [Exec…] [Lead 2] [Exec…]` and re-apply each lead's color to its group (see [Telling tabs apart](#telling-tabs-apart)). Needs the optional `iterm2` package + iTerm's Python API; degrades to one dim line without them. `relay tidy` runs regardless of this key |
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
 | `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) — the secondary "session age" (compaction-count) signal for **both** leads and executors: MB on disk never shrinks, so a big number alone means several compactions in even when live context currently looks fine. Fires the lead's handoff nudge/statusline segment alongside tokens, and is the executor fallback reading (`relay send`'s gate, `relay list`'s heavy footnote) only when a transcript can't be parsed for real usage at all |

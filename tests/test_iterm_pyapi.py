@@ -1,7 +1,10 @@
 """
 Unit tests for scripts/iterm_pyapi.py: the pure placement-index arithmetic (no live iTerm2
 connection needed) and the availability-gate behavior of try_create_adjacent_tab (import blocked
-→ None, no lead_handle → None, any exception during connect/locate/create → None, never raises).
+→ None, no lead_handle → None, any exception during connect/locate/create → None, never raises) —
+plus the same two halves for try_reorder_tabs (`relay tidy`'s only route to a real tab bar).
+
+Every iterm2 object here is a mock: no test in this file ever connects to iTerm2, and none may.
 
 Run: pytest tests/test_iterm_pyapi.py -v
 """
@@ -126,3 +129,137 @@ class TestTryCreateAdjacentTab:
         monkeypatch.setitem(sys.modules, "iterm2", fake_iterm2)
         result = pyapi.try_create_adjacent_tab("w1t2p0:LEAD-UUID")
         assert result == "NEW-TAB-SESSION-ID"
+
+
+class TestWindowTabOrder:
+    """`_window_tab_order`: "the tabs holding a desired id come first, in `desired`'s order, with
+    every other tab after them in its existing relative order"."""
+
+    def test_desired_tabs_move_to_the_front_in_order(self):
+        tabs = [["x"], ["b"], ["y"], ["a"]]
+        order, matched = pyapi._window_tab_order(tabs, ["a", "b"])
+        assert order == [3, 1, 0, 2]        # a, b, then x and y in their existing order
+        assert matched == ["a", "b"]
+
+    def test_unknown_tabs_keep_their_existing_relative_order(self):
+        tabs = [["p"], ["q"], ["a"], ["r"]]
+        order, _ = pyapi._window_tab_order(tabs, ["a"])
+        assert order == [2, 0, 1, 3]
+
+    def test_ids_this_window_does_not_hold_are_skipped(self):
+        tabs = [["a"], ["z"]]
+        order, matched = pyapi._window_tab_order(tabs, ["elsewhere", "a", "nowhere"])
+        assert matched == ["a"]
+        assert order == [0, 1]
+
+    def test_a_tab_named_twice_is_placed_once(self):
+        """A split pane: one tab, two sessions, both in `desired`."""
+        tabs = [["x"], ["lead", "exec"]]
+        order, matched = pyapi._window_tab_order(tabs, ["lead", "exec"])
+        assert order == [1, 0]
+        assert matched == ["lead"]
+
+    def test_an_already_ordered_window_is_unchanged(self):
+        tabs = [["a"], ["b"], ["c"]]
+        order, _ = pyapi._window_tab_order(tabs, ["a", "b"])
+        assert order == [0, 1, 2]
+
+    def test_no_tabs_is_empty(self):
+        assert pyapi._window_tab_order([], ["a"]) == ([], [])
+
+
+def _fake_app(monkeypatch, windows):
+    """An `iterm2` module whose async_get_app returns `windows`. Nothing here talks to iTerm."""
+    fake_iterm2 = mock.MagicMock()
+
+    async def fake_connect():
+        return mock.MagicMock()
+
+    async def fake_get_app(connection):
+        app = mock.MagicMock()
+        app.windows = windows
+        return app
+
+    fake_iterm2.Connection.async_create = fake_connect
+    fake_iterm2.async_get_app = fake_get_app
+    monkeypatch.setitem(sys.modules, "iterm2", fake_iterm2)
+    return fake_iterm2
+
+
+def _window(*tab_session_ids):
+    """A mock iTerm window whose tabs hold the given session ids, recording every async_set_tabs
+    call on `window.set_calls` as a list of the session-id lists it was handed."""
+    tabs = []
+    for ids in tab_session_ids:
+        tabs.append(mock.MagicMock(sessions=[mock.MagicMock(session_id=i) for i in ids]))
+    window = mock.MagicMock()
+    window.tabs = tabs
+    window.set_calls = []
+
+    async def async_set_tabs(new_tabs):
+        window.set_calls.append([[s.session_id for s in t.sessions] for t in new_tabs])
+
+    window.async_set_tabs = async_set_tabs
+    return window
+
+
+class TestTryReorderTabs:
+    def test_no_ids_is_refused_without_connecting(self):
+        assert pyapi.try_reorder_tabs([]) == (False, "nothing to order")
+        assert pyapi.try_reorder_tabs(None)[0] is False
+
+    def test_import_blocked_returns_false_and_a_reason(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "iterm2", None)
+        ok, reason = pyapi.try_reorder_tabs(["w0t0p0:A"])
+        assert ok is False and "unavailable" in reason
+
+    def test_a_refused_connection_never_raises(self, monkeypatch):
+        fake_iterm2 = mock.MagicMock()
+
+        async def boom():
+            raise ConnectionRefusedError("no API listener")
+
+        fake_iterm2.Connection.async_create = boom
+        monkeypatch.setitem(sys.modules, "iterm2", fake_iterm2)
+        ok, reason = pyapi.try_reorder_tabs(["w0t0p0:A"])
+        assert ok is False and "ConnectionRefusedError" in reason
+
+    def test_no_matching_tab_returns_false(self, monkeypatch):
+        window = _window(["OTHER"])
+        _fake_app(monkeypatch, [window])
+        ok, reason = pyapi.try_reorder_tabs(["w0t0p0:A"])
+        assert ok is False and "no iTerm tab found" in reason
+        assert window.set_calls == []
+
+    def test_handles_and_bare_uuids_both_resolve(self, monkeypatch):
+        window = _window(["X"], ["LEAD"], ["EXEC"])
+        _fake_app(monkeypatch, [window])
+        ok, _ = pyapi.try_reorder_tabs(["w0t1p0:LEAD", "EXEC"])
+        assert ok is True
+        assert window.set_calls == [[["LEAD"], ["EXEC"], ["X"]]]
+
+    def test_each_window_is_ordered_with_only_its_own_tabs(self, monkeypatch):
+        """async_set_tabs MOVES a tab that belongs to another window — so a window may only ever be
+        handed its own tabs, or tidying would drag tabs across windows."""
+        w1 = _window(["A-EXEC"], ["A-LEAD"])
+        w2 = _window(["B-EXEC"], ["OTHER"], ["B-LEAD"])
+        _fake_app(monkeypatch, [w1, w2])
+        ok, _ = pyapi.try_reorder_tabs(["A-LEAD", "A-EXEC", "B-LEAD", "B-EXEC"])
+        assert ok is True
+        assert w1.set_calls == [[["A-LEAD"], ["A-EXEC"]]]
+        assert w2.set_calls == [[["B-LEAD"], ["B-EXEC"], ["OTHER"]]]
+
+    def test_a_window_already_in_order_is_left_untouched(self, monkeypatch):
+        window = _window(["LEAD"], ["EXEC"], ["X"])
+        _fake_app(monkeypatch, [window])
+        ok, reason = pyapi.try_reorder_tabs(["LEAD", "EXEC"])
+        assert ok is True and reason == "already in order"
+        assert window.set_calls == []
+
+    def test_ids_with_no_tab_are_reported_but_do_not_fail_the_tidy(self, monkeypatch):
+        window = _window(["X"], ["LEAD"])
+        _fake_app(monkeypatch, [window])
+        ok, reason = pyapi.try_reorder_tabs(["LEAD", "GONE"])
+        assert ok is True
+        assert "1 session id(s) had no tab" in reason
+        assert window.set_calls == [[["LEAD"], ["X"]]]

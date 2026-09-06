@@ -170,6 +170,30 @@ def tab_color_printf(rgb):
     return tab_color_escape(rgb).replace("\033", "\\033").replace("\a", "\\a")
 
 
+def reorder_tabs(window_ordering, timeout=None):
+    """Move the tabs holding `window_ordering`'s iTerm session ids to the FRONT of their OWN window,
+    in that order, leaving every other tab in that window after them in its existing order — how
+    `relay tidy` puts the tab bar back into [Lead] [Exec 1] [Exec 2] … [Lead 2] [Exec 2.1] … order.
+    Ids may be handles ("w#t#p#:UUID") or bare UUIDs; tabs in different windows are grouped and
+    ordered per window, and no tab is ever moved BETWEEN windows.
+
+    Returns `(ok, reason)` and never raises — False plus the reason when the `iterm2` package is
+    missing, iTerm's Python API is off, the connection fails, or nothing anywhere matches. iTerm's
+    Python API only: AppleScript's `move tab` / `set index of tab` are no-ops on this app (see
+    iterm_pyapi's module docstring), which is why the whole feature is optional and degrades to a
+    single dim line.
+
+    RELAY_NO_TIDY is an absolute kill-switch, checked FIRST: this is the only code path that can
+    reorder a human's real tabs, so it must be switchable off from the environment. The test suite
+    sets it for every test (tests/conftest.py) — a test asserting on tidy stubs this function
+    instead of unsetting it."""
+    if os.environ.get("RELAY_NO_TIDY"):
+        return False, "disabled by RELAY_NO_TIDY"
+    if timeout is None:
+        return iterm_pyapi.try_reorder_tabs(window_ordering)
+    return iterm_pyapi.try_reorder_tabs(window_ordering, timeout)
+
+
 def notify_via_tty(tty_path, title, body):
     """Write iTerm's OSC 777 'notify' escape straight to a session's tty device — the same channel
     tab_color_escape uses, which is why it works from a controlling-terminal-less process (a hook
