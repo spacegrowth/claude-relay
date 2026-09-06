@@ -470,9 +470,15 @@ model + `LAUNCH`, `TOKENS` (with cache warm/cold and a hit-rate chip)/MB, packet
 (gist, the report's outcome sentence and TL;DR, links to the packet / report / diff page) and
 copyable `relay …` commands. Filter box, "show closed", light theme by default with a remembered
 ☀️/🌙 switch. It is built from exactly the functions `relay list` uses (and runs the same liveness
-refresh and auto-close sweep), so it can't disagree with the table; it is a **snapshot** — re-run to
-refresh. Written to `~/.relay-tasks/board.html` (`--out` to change), `--lead <sid>` to scope,
-`--json` for the data.
+refresh and auto-close sweep), so it can't disagree with the table; by default it is a **snapshot** —
+re-run to refresh. `relay board --live` (or config `board_live: true`) keeps it live instead, still
+with no server process: it writes a sibling `board.json` next to `board.html`, adds a meta-refresh
+(`board_refresh_seconds`, default 10s) so an open tab reloads itself, and relay then rewrites both
+files in place on every `list`/`check`/`send`/`spawn` and the lead's own Stop hook — so a page left
+open stays at most one turn stale, with the header's "updated HH:MM:SS" turning red once nothing has
+rewritten it for 3× the refresh interval. Written to `~/.relay-tasks/board.html` (`--out` to change),
+`--lead <sid>` to scope, `--json` for the data, `--live off` to turn live mode back off (removes the
+`board.json` sidecar; a lingering `board_live: true` in config still holds it on).
 
 ### relay stats
 

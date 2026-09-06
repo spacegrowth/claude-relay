@@ -8,10 +8,28 @@ never looks alarmed. Warm-white ground, one cobalt accent, muted semantic colour
 client-side (click a rail item, or a URL #hash); search filters the rail. Light by default, dark
 via a remembered toggle. Self-contained: no web fonts, no external assets.
 
-Pure: render(data) -> html. `data` is assembled by bin/relay's board_data from the same helpers
-`relay list` uses, so the page can never disagree with the table.
+Pure: render(data, live=False, refresh_seconds=10) -> html. `data` is assembled by bin/relay's
+board_data from the same helpers `relay list` uses, so the page can never disagree with the table.
+
+Live mode (`live=True`, task "make relay board live"): there is still NO server process — relay
+itself rewrites board.html (+ a sibling board.json) in place whenever on-disk state actually
+changes (bin/relay's refresh_live_board, called from list/check/send/spawn and the lead's Stop
+hook). This page's job is just to stay honest about how stale ITS OWN copy might be between those
+rewrites: a `<meta http-equiv="refresh">` reloads it from disk every `refresh_seconds`, and the
+"updated HH:MM:SS" badge in the header turns red once the embedded `generated` timestamp is more
+than 3×refresh_seconds old — computed twice, deliberately: once here in Python at render time (for
+a correct FIRST paint, and for any no-JS/no-reload fallback), and again by the page's own inline JS
+using the viewer's live wall-clock (Date.now()) — because a `file://` page that just sits open
+between reloads needs to notice staleness on its own, without another render() ever running.
+SHORTCUT (deliberately small per the packet): the JS also does a best-effort `fetch('board.json')`
+each refresh_seconds — pure progressive enhancement, only ever used to refresh the "updated" badge
+in place (never a from-JSON DOM re-render, which would mean maintaining this whole renderer twice,
+once in Python once in JS). `fetch` is blocked by Chrome on file:// by default, so it silently
+throws there and the meta-refresh reload above is what actually keeps the page current — same as
+if fetch didn't exist. It only helps on the rare setup serving these files over http(s).
 """
 import html
+import time
 
 
 def _e(x):
@@ -52,6 +70,8 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 .kpi{display:flex;flex-direction:column;line-height:1.1}
 .kpi b{font-size:19px;font-weight:700}.kpi span{font-size:11px;color:var(--muted);letter-spacing:.01em}
 .kpi.rev b{color:var(--ok)} .kpi.busy b{color:var(--warn)} .kpi.bad b{color:var(--bad)}
+.upd{font-size:11px;color:var(--muted);white-space:nowrap}
+.upd.stale{color:var(--bad);font-weight:600}
 .grow{flex:1}
 .search{width:min(300px,30vw);padding:9px 13px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);font-size:13px;transition:border-color .12s}
 .search::placeholder{color:var(--faint)}
@@ -193,6 +213,29 @@ _JS = r"""
   });
   var b=document.getElementById('board');var def=(b&&b.dataset.default)||'home';
   var h=location.hash.slice(1);select(h&&document.getElementById(h)?h:def);
+  // Live board (task "make relay board live"): no server — relay itself rewrites board.html on
+  // disk (bin/relay's refresh_live_board); this page's own JS just has to notice, on the viewer's
+  // real wall-clock, when its copy has gone stale between rewrites. See board_render.py's module
+  // docstring for why fetch() here only patches the "updated" badge (progressive enhancement,
+  // meta-refresh is the real staleness fallback) rather than re-rendering the whole page from JSON.
+  var upd=document.getElementById('board-updated');
+  if(upd){
+   function paint(){
+    var gen=parseInt(upd.dataset.gen,10),rs=parseInt(upd.dataset.refresh,10)||10;
+    if(!gen)return;
+    upd.classList.toggle('stale',(Date.now()-gen)>rs*3000);
+   }
+   function pull(){
+    fetch('board.json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+     var t=d&&d.generated?Date.parse(d.generated):NaN;
+     if(!isNaN(t)){upd.dataset.gen=t;upd.textContent='updated '+new Date(t).toTimeString().slice(0,8);paint();}
+    }).catch(function(){});  // local pages block fetch — meta-refresh is the real fallback, not an error
+   }
+   paint();
+   setInterval(paint,1000);
+   var rsMs=(parseInt(upd.dataset.refresh,10)||10)*1000;
+   setInterval(pull,rsMs);
+  }
  });
 })();
 """
@@ -362,7 +405,29 @@ def _lead_dot(m):
         return '<span class="cdot" style="background:var(--dim)"></span>'
 
 
-def render(data):
+def _updated_badge(data, refresh_seconds):
+    """The live page's "updated HH:MM:SS" header badge — red once `generated` is more than
+    3×refresh_seconds old. Computed here (Python, at render/rewrite time) for a correct FIRST
+    paint; the page's own inline JS re-derives the same "stale" class from `data-gen` against the
+    viewer's live wall-clock, since a file:// page sitting open between rewrites gets no further
+    help from this function (see module docstring). `generated` is bin/relay's `now()` format
+    (local "%Y-%m-%dT%H:%M:%S", no timezone) — parsed the same way _lead_age_text parses it, and
+    handed to JS as local-time epoch millis so `Date.parse` of the same string (also interpreted
+    as local time by the browser spec for a timezone-less date-time form) lines up with it."""
+    generated = data.get("generated") or ""
+    gen_ms = None
+    try:
+        gen_ms = int(time.mktime(time.strptime(generated, "%Y-%m-%dT%H:%M:%S")) * 1000)
+    except Exception:
+        pass
+    stale = gen_ms is not None and (time.time() * 1000 - gen_ms) > refresh_seconds * 3000
+    label = generated[11:19] if len(generated) >= 19 else (generated or "-")
+    cls = "upd stale" if stale else "upd"
+    return (f'<span id="board-updated" class="{cls}" data-gen="{gen_ms or ""}" '
+            f'data-refresh="{_e(refresh_seconds)}">updated {_e(label)}</span>')
+
+
+def render(data, live=False, refresh_seconds=10):
     relay_bin = data.get("relay_bin") or "relay"
     leads = data.get("leads") or []
     execs = data.get("executors") or []
@@ -371,21 +436,23 @@ def render(data):
         by_lead.setdefault(ex.get("owner_lead"), []).append(ex)
     lead_names = {m.get("session_id"): (m.get("project") or m.get("session_id")) for m in leads}
     terminal = ("closed", "superseded", "dead", "launch-failed")
-    live = [e for e in execs if e.get("status") not in terminal]
-    reported = [e for e in live if e.get("status") == "reported"]
-    busy = [e for e in live if e.get("status") in ("busy", "stalled")]
+    live_execs = [e for e in execs if e.get("status") not in terminal]
+    reported = [e for e in live_execs if e.get("status") == "reported"]
+    busy = [e for e in live_execs if e.get("status") in ("busy", "stalled")]
     closed = [e for e in execs if e.get("status") in terminal]
     warnings = data.get("warnings") or []
 
     kpis = (f'<div class="kpi rev"><b class="num">{len(reported)}</b><span>to review</span></div>'
             f'<div class="kpi busy"><b class="num">{len(busy)}</b><span>working</span></div>'
-            f'<div class="kpi"><b class="num">{len(live)}</b><span>live</span></div>'
+            f'<div class="kpi"><b class="num">{len(live_execs)}</b><span>live</span></div>'
             f'<div class="kpi"><b class="num">{len(leads)}</b><span>leads</span></div>')
     if warnings:
         kpis += f'<div class="kpi bad"><b class="num">{len(warnings)}</b><span>alerts</span></div>'
+    upd_badge = _updated_badge(data, refresh_seconds) if live else ""
     top = (f'<div class="top"><div class="brand">\U0001F6A6 relay</div><div class="kpis">{kpis}</div>'
-           f'<div class="grow"></div><input id="q" class="search" placeholder="Filter executors…">'
+           f'<div class="grow"></div>{upd_badge}<input id="q" class="search" placeholder="Filter executors…">'
            f'<button class="tbtn" id="tbtn" onclick="toggleTheme()">☾</button></div>')
+    meta_refresh = f'<meta http-equiv="refresh" content="{_e(refresh_seconds)}">' if live else ""
 
     rail = ['<nav class="side">']
     if reported:
@@ -397,7 +464,7 @@ def render(data):
         mine = [e for e in by_lead.get(sid, []) if e.get("status") not in terminal]
         wake = m.get("wake")
         wchip = f'<span class="wake {"bad" if wake in ("stale", "stuck") else ""}">{_e(wake)}</span>' if wake and wake != "ok" else ""
-        liveclass = "gl lv-bad" if m.get("liveness") in ("unreachable", "ghost") else "gl"
+        liveclass = "gl lv-bad" if m.get("liveness") in ("unreachable", "ghost", "ended_but_alive") else "gl"
         rail.append(f'<details class="grp" open><summary>{_lead_dot(m)}'
                     f'<span class="{liveclass}">{_e(m.get("project") or sid)}</span>'
                     f'{wchip}<span class="count num">{len(mine)}</span></summary>'
@@ -420,10 +487,10 @@ def render(data):
     tiles = (f'<div class="tiles">'
              f'<div class="tile rev"><b class="num">{len(reported)}</b><span>reported · awaiting review</span></div>'
              f'<div class="tile busy"><b class="num">{len(busy)}</b><span>busy / stalled</span></div>'
-             f'<div class="tile"><b class="num">{len(live)}</b><span>live executors</span></div>'
+             f'<div class="tile"><b class="num">{len(live_execs)}</b><span>live executors</span></div>'
              f'<div class="tile"><b class="num">{len(leads)}</b><span>leads</span></div>'
              f'<div class="tile"><b class="num">{len(closed)}</b><span>closed / dead</span></div></div>')
-    default_id = "ex-" + reported[0]["session_id"] if reported else ("ex-" + live[0]["session_id"] if live else "home")
+    default_id = "ex-" + reported[0]["session_id"] if reported else ("ex-" + live_execs[0]["session_id"] if live_execs else "home")
     home_cls = "panel show" if default_id == "home" else "panel"
     home = [f'<section class="{home_cls}" id="home"><h1 class="h1">Overview</h1>',
             f'<div class="sub-h">generated {_e(data.get("generated"))} · relay {_e(data.get("plugin_version") or "?")} · click an executor to drill in</div>',
@@ -448,6 +515,7 @@ def render(data):
                                  show=(f'ex-{e["session_id"]}' == default_id)) for e in execs)
 
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            + meta_refresh +
             "<title>relay board</title><style>" + _CSS + "</style></head><body>"
             + f'<div id="board" data-default="{_e(default_id)}">' + top + '<div class="app">' + "".join(rail) + '<main class="detail">'
             + "".join(home) + panels + "</main></div></div><script>" + _JS + "</script></body></html>")

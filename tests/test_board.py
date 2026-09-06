@@ -1,5 +1,5 @@
 """relay board — pure renderer + the data collector wired through cmd_board (mocked terminal)."""
-import importlib.machinery, importlib.util, json, os, sys
+import importlib.machinery, importlib.util, json, os, sys, time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -8,6 +8,34 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "lib")); sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import board_render  # noqa: E402
+
+
+def _ts(seconds_ago=0):
+    """A `generated`-shaped timestamp ("%Y-%m-%dT%H:%M:%S", local time, bin/relay's `now()` format)
+    `seconds_ago` seconds in the past — for exercising board_render's stale/fresh header logic
+    without a real relay module."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - seconds_ago))
+
+
+def _write_lead(relay, tmp_path, sid="lead-1", **kw):
+    kw.setdefault("project", "proj")
+    kw.setdefault("cwd", str(tmp_path))
+    kw.setdefault("tab_label", "[Lead] proj")
+    relay.lead_guard.write_marker(relay.STATE_ROOT, sid, **kw)
+    return sid
+
+
+def _write_exec(relay, tmp_path, sid="e1", owner="lead-1", status="reported"):
+    relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+    relay.write_session(sid, {"session_id": sid, "worktree": str(tmp_path), "topic": "t", "scope": "t",
+        "tab_label": "x", "model": "sonnet", "mcp": "none", "context": "200k", "agent": "relay-executor",
+        "pid": None, "claude_session": None, "status": status, "current_packet": 1, "owner_lead": owner,
+        "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
+    (relay.packets_dir(sid) / "001-packet.md").write_text("# do the thing\n")
+    if status == "reported":
+        (relay.packets_dir(sid) / "001-report.md").write_text(
+            "Done.\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: x\n")
+    return sid
 
 
 def load_relay_module(state_root):
@@ -72,6 +100,203 @@ class TestRenderer:
         html2 = board_render.render({"leads": [{"session_id": "L"}], "executors": [closed], "relay_bin": "/x/relay"})
         assert ">Closed<" in html2 and "auto: landed" in html2
         assert "/x/relay close e1" not in html2 and "/x/relay resume e1" in html2
+
+    def test_updated_badge_and_meta_refresh_only_when_live(self):
+        data = {"leads": [], "executors": [], "generated": _ts(0)}
+        html = board_render.render(data, live=True, refresh_seconds=7)
+        assert 'http-equiv="refresh" content="7"' in html
+        assert 'id="board-updated"' in html and 'class="upd"' in html and 'class="upd stale"' not in html
+        html_snapshot = board_render.render(data)  # live=False (default) — the one-shot snapshot mode
+        assert 'http-equiv="refresh"' not in html_snapshot and 'id="board-updated"' not in html_snapshot
+
+    def test_updated_badge_turns_red_once_past_3x_refresh_seconds(self):
+        # refresh_seconds=10 → stale threshold is 30s old; 35s old must read red, 20s old must not.
+        stale_html = board_render.render({"leads": [], "executors": [], "generated": _ts(35)},
+                                         live=True, refresh_seconds=10)
+        assert 'class="upd stale"' in stale_html
+        fresh_html = board_render.render({"leads": [], "executors": [], "generated": _ts(20)},
+                                         live=True, refresh_seconds=10)
+        assert 'class="upd stale"' not in fresh_html and 'class="upd"' in fresh_html
+
+    def test_ended_but_alive_lead_renders_red_on_the_rail(self):
+        html = board_render.render({"leads": [{"session_id": "L", "project": "webapp", "liveness": "ended_but_alive"}],
+                                    "executors": []})
+        assert 'class="gl lv-bad"' in html
+
+
+class TestLiveBoard:
+    """`relay board --live` (and the `board_live` config default): board.html gains a meta-refresh
+    + "updated" badge and a sibling board.json is written, then every state-changing command keeps
+    both rewritten in place with no server process (bin/relay's refresh_live_board)."""
+
+    def test_live_writes_json_sidecar_and_meta_refresh(self, relay, tmp_path):
+        _write_lead(relay, tmp_path)
+        _write_exec(relay, tmp_path)
+        with mock.patch.object(relay, "_lead_liveness", return_value="live"), \
+             mock.patch.object(relay, "session_pid_alive", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_board(SimpleNamespace(json=False, out=None, open=False, lead=None, live=True))
+        html_path, json_path = relay.STATE_ROOT / "board.html", relay.STATE_ROOT / "board.json"
+        assert html_path.exists() and json_path.exists()
+        html = html_path.read_text()
+        assert 'http-equiv="refresh" content="10"' in html and 'id="board-updated"' in html
+        data = json.loads(json_path.read_text())
+        assert data["executors"][0]["session_id"] == "e1"
+
+    def test_plain_board_writes_no_sidecar_or_refresh(self, relay, tmp_path):
+        """Back-compat: an ordinary `relay board` (no --live, no config flag) stays the one-shot
+        snapshot it always was — no sidecar, no meta-refresh, `args` need not even carry `live`."""
+        _write_lead(relay, tmp_path)
+        with mock.patch.object(relay, "_lead_liveness", return_value="live"):
+            relay.cmd_board(SimpleNamespace(json=False, out=None, open=False, lead=None))
+        html_path = relay.STATE_ROOT / "board.html"
+        assert html_path.exists() and "http-equiv=\"refresh\"" not in html_path.read_text()
+        assert not (relay.STATE_ROOT / "board.json").exists()
+
+    def test_config_board_live_true_makes_plain_board_live(self, relay, tmp_path):
+        relay.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps({"board_live": True}))
+        _write_lead(relay, tmp_path)
+        with mock.patch.object(relay, "_lead_liveness", return_value="live"):
+            relay.cmd_board(SimpleNamespace(json=False, out=None, open=False, lead=None))
+        assert (relay.STATE_ROOT / "board.json").exists()
+
+    def test_is_board_live_active_via_config_or_prior_live_write(self, relay):
+        assert relay._is_board_live_active({"board_live": False}) is False
+        assert relay._is_board_live_active({"board_live": True}) is True
+        relay.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "board.json").write_text("{}")
+        assert relay._is_board_live_active({"board_live": False}) is True  # prior --live proves it
+
+    def test_refresh_live_board_noop_when_not_live(self, relay):
+        relay.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        relay.refresh_live_board()
+        assert not (relay.STATE_ROOT / "board.html").exists()
+        assert not (relay.STATE_ROOT / "board.json").exists()
+
+    def test_refresh_live_board_never_sweeps(self, relay):
+        """The one behavior the packet calls out explicitly: the refresh path must NEVER be a
+        second, differently-scoped auto-close sweep — it always calls board_data(sweep=False)."""
+        relay.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "board.json").write_text("{}")  # proves live is active
+        with mock.patch.object(relay, "board_data", wraps=relay.board_data) as bd:
+            relay.refresh_live_board()
+        bd.assert_called_once_with(sweep=False)
+
+    def test_board_data_sweep_false_never_calls_auto_close_sweep(self, relay, tmp_path, monkeypatch):
+        _write_lead(relay, tmp_path, sid="lead-1")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-1")
+        with mock.patch.object(relay, "auto_close_sweep") as sweep_mock, \
+             mock.patch.object(relay, "_lead_liveness", return_value="live"):
+            relay.board_data(sweep=False)
+            sweep_mock.assert_not_called()
+            relay.board_data(sweep=True)
+            sweep_mock.assert_called_once()
+
+    def test_check_rewrites_live_board_without_board_being_rerun(self, relay, tmp_path):
+        """Acceptance: `relay board --live` writes board.html+json, and a SUBSEQUENT `relay check
+        <sid>` rewrites both again (new content on disk) without `relay board` running a second
+        time."""
+        _write_lead(relay, tmp_path)
+        _write_exec(relay, tmp_path, sid="e1", status="busy")
+        with mock.patch.object(relay, "_lead_liveness", return_value="live"), \
+             mock.patch.object(relay, "session_pid_alive", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_board(SimpleNamespace(json=False, out=None, open=False, lead=None, live=True))
+            json_path = relay.STATE_ROOT / "board.json"
+            before = json.loads(json_path.read_text())
+            assert before["executors"][0]["status"] == "busy"
+            (relay.packets_dir("e1") / "001-report.md").write_text(
+                "Done.\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: x\n")
+            relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=True))
+        after = json.loads(json_path.read_text())
+        assert after["executors"][0]["status"] == "reported"
+
+    def test_list_and_spawn_also_trigger_the_refresh(self, relay, tmp_path):
+        """The other state-change moments the packet names: `relay list` and `relay spawn`."""
+        _write_lead(relay, tmp_path)
+        relay.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "board.json").write_text("{}")  # proves live is already active
+        with mock.patch.object(relay, "refresh_live_board") as rlb:
+            relay.cmd_list(SimpleNamespace(json=False, lead=None, all=True, closed=False))
+        rlb.assert_called_once()
+
+        with mock.patch.object(relay, "refresh_live_board") as rlb, \
+             mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: {}), \
+             mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=123):
+            packet = tmp_path / "p.md"; packet.write_text("do a thing")
+            relay.cmd_spawn(SimpleNamespace(worktree=str(tmp_path), topic="t", packet=str(packet),
+                model=None, model_override=None, mcp=None, effort=None, keep=False, name="e2",
+                scope=None, seed=None, lead=None, skip_perms=None, pane=None))
+        rlb.assert_called_once()
+
+
+    def test_refresh_live_board_atomic_write_leaves_no_tmp_and_full_content(self, relay, tmp_path):
+        """`refresh_live_board` and `cmd_board --live` must write board.html/board.json via a
+        sibling tmp file + os.replace (bin/relay's `_atomic_write_text`, same shape as
+        `write_session`/`lead_guard._atomic_write_json`) — never a plain `write_text` a
+        mid-reload browser could catch half-written. Proxy for that: no `.tmp` sibling survives
+        the write, and both files hold complete, parseable content afterwards."""
+        _write_lead(relay, tmp_path)
+        _write_exec(relay, tmp_path)
+        with mock.patch.object(relay, "_lead_liveness", return_value="live"), \
+             mock.patch.object(relay, "session_pid_alive", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_board(SimpleNamespace(json=False, out=None, open=False, lead=None, live=True))
+        html_path, json_path = relay.STATE_ROOT / "board.html", relay.STATE_ROOT / "board.json"
+        tmps = list(relay.STATE_ROOT.glob("*.tmp"))
+        assert tmps == [], f"leftover tmp files: {tmps}"
+        assert "</html>" in html_path.read_text()          # a truncated write couldn't close the tag
+        data = json.loads(json_path.read_text())            # a half-written file wouldn't even parse
+        assert data["executors"][0]["session_id"] == "e1"
+        # a second rewrite (refresh_live_board, the list/check/send/spawn path) must also stay clean
+        (relay.packets_dir("e1") / "001-report.md").write_text(
+            "Done.\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: x\n")
+        with mock.patch.object(relay, "_lead_liveness", return_value="live"):
+            relay.refresh_live_board()
+        assert list(relay.STATE_ROOT.glob("*.tmp")) == []
+        assert "</html>" in html_path.read_text()
+        assert json.loads(json_path.read_text())["executors"][0]["status"] == "reported"
+
+
+class TestLiveOff:
+    """`relay board --live off` — the only way to turn live mode back off once the board.json
+    sidecar exists (see `_is_board_live_active`'s docstring: its mere presence re-arms the rewrite
+    forever)."""
+
+    def test_live_off_removes_sidecar_and_prints_one_line(self, relay, capsys):
+        relay.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "board.json").write_text("{}")   # proves live was active
+        relay.cmd_board(SimpleNamespace(json=False, out=None, open=False, lead=None, live="off"))
+        assert not (relay.STATE_ROOT / "board.json").exists()
+        out_lines = [l for l in capsys.readouterr().out.splitlines() if l]
+        assert len(out_lines) == 1 and "off" in out_lines[0]
+
+    def test_live_off_with_config_board_live_true_says_config_still_holds_it_on(self, relay, capsys):
+        relay.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        (relay.STATE_ROOT / "lead" / "config.json").write_text(json.dumps({"board_live": True}))
+        (relay.STATE_ROOT / "board.json").write_text("{}")
+        relay.cmd_board(SimpleNamespace(json=False, out=None, open=False, lead=None, live="off"))
+        out_lines = [l for l in capsys.readouterr().out.splitlines() if l]
+        assert len(out_lines) == 1
+        assert "config" in out_lines[0] and "board_live" in out_lines[0]
+
+
+class TestEndedButAliveOnBoard:
+    """§Also bullet: `relay board` used to call `_lead_liveness` directly, so a tombstoned lead
+    whose tab is still alive rendered green "live" on the board while `relay list` already showed
+    red "ended?" for the same marker. board_data must use the same verdict as `relay list`."""
+
+    def test_board_data_matches_lists_ended_but_alive_verdict(self, relay, tmp_path):
+        _write_lead(relay, tmp_path, sid="lead-1")
+        relay.lead_guard.tombstone_lead(relay.STATE_ROOT, "lead-1")
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            data = relay.board_data(sweep=False)
+        assert data["leads"][0]["liveness"] == "ended_but_alive"
+        assert board_render.render(data).count('class="gl lv-bad"') >= 1
 
 
 class TestCmdBoard:

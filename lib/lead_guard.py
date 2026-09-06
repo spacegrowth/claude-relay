@@ -168,6 +168,22 @@ LEAD_DEFAULTS = {
                                   # CLI's actual wording differs.
                                   r"^(?:you'?ve hit your (?:session|usage) limit"
                                   r"|(?:claude )?usage limit reached)"),
+    "board_live": False,          # the lead's on/off switch for `relay board` LIVE mode: when true,
+                                  # a plain `relay board` (no --live flag) writes the live-styled
+                                  # page (meta-refresh + a board.json sidecar), AND every
+                                  # state-changing command (list/check/send/spawn) plus the lead's
+                                  # own Stop hook keep rewriting board.html/board.json in place —
+                                  # no server process, just a file that stays at most one turn
+                                  # stale. `relay board --live` also turns this behavior on for the
+                                  # CURRENT board.html without touching config (see bin/relay's
+                                  # _is_board_live_active: the board.json sidecar's mere presence on
+                                  # disk is itself proof a live board is active, so the auto-rewrite
+                                  # keeps going after just one `--live` run).
+    "board_refresh_seconds": 10,  # the live board's <meta http-equiv="refresh"> interval (N) — also
+                                  # the unit the "stale" threshold is measured in (3×N, bin/relay's
+                                  # board_render.render): a page not rewritten within 3 refresh
+                                  # cycles is presumed abandoned (lead stopped nudging state) and its
+                                  # "updated HH:MM:SS" header turns red.
 }
 
 # Distinguishable, colorblind-tolerant tab colors — brightened so they remain visible when dimmed
