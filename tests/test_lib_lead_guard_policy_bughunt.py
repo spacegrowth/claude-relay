@@ -629,10 +629,13 @@ class TestExecutorAgent:
         assert "asyncRewake" not in json.dumps(s)
 
     def test_the_settings_file_is_per_executor_and_can_carry_a_fallback_model(self, tmp_path):
+        """Packet-002 item 5 (lead-found): a bare string here made Claude Code 2.1.263 refuse the
+        settings file — `fallbackModel` must be a list — so `write_escalation_settings` now wraps
+        it (see `lead_guard.normalize_fallback_models`)."""
         p = lg.write_escalation_settings(tmp_path, "/plug", "bh-lib", fallback="sonnet")
         assert Path(p) == tmp_path / "bh-lib" / "settings.json"
         content = json.loads(Path(p).read_text())
-        assert content["fallbackModel"] == "sonnet"
+        assert content["fallbackModel"] == ["sonnet"]
         assert content["hooks"]["Stop"][0]["hooks"][0]["command"].endswith("bh-lib")
         p2 = lg.write_escalation_settings(tmp_path, "/plug", "bh-lib", include_hooks=False)
         assert json.loads(Path(p2).read_text()) == {}

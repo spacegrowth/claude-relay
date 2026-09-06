@@ -123,12 +123,19 @@ LEAD_DEFAULTS = {
                                     # (the landed path still applies while auto_close is true)
     "executor_fallback_model": None,  # when set (a concrete model id, or a list tried in order),
                                   # every executor's per-launch --settings file carries
-                                  # {"fallbackModel": ...} so an OVERLOADED primary falls back to a
-                                  # model YOU chose, with the CLI's visible notice — instead of
-                                  # wherever. Settings-file route on purpose: the --fallback-model
-                                  # FLAG is print-mode-only, the settings key works interactively
-                                  # (docs: model-config "Fallback model chains"). Default None =
-                                  # no configured fallback (the documented default).
+                                  # {"fallbackModel": [...]} so an OVERLOADED primary falls back to
+                                  # a model YOU chose, with the CLI's visible notice — instead of
+                                  # wherever. A bare string is accepted and wrapped into a
+                                  # one-element list (see normalize_fallback_models) — Claude Code
+                                  # validates this settings key as a LIST, not a string, so a bare
+                                  # id here used to fail EVERY spawn's settings validation. An entry
+                                  # equal to the executor's own launch model (compared with any
+                                  # `[1m]` suffix stripped) is silently dropped — falling back to
+                                  # the model already running would just spin in place, not
+                                  # actually recover. Settings-file route on purpose: the
+                                  # --fallback-model FLAG is print-mode-only, the settings key works
+                                  # interactively (docs: model-config "Fallback model chains").
+                                  # Default None = no configured fallback (the documented default).
     "executor_escalation": True,  # arm every spawned executor with the escalation Stop hook
                                   # (wake-watch design §9): once its report lands and it goes idle,
                                   # push a nudge into the owning lead's tab, once. A net UNDER the
@@ -817,7 +824,31 @@ def is_tombstoned(marker):
         return False
 
 
-def tombstone_lead(state_root, session_id, reason=None, now_ts=None):
+def _notify_marker_change(state_root, marker, verb, reason):
+    """LOUD desktop banner for a marker migration or tombstone — lead-found gap: both used to be
+    silent, so a hijack (THE INCIDENT, 2026-09-05 22:18:50) or an ordinary pause could leave a lead
+    dark (no wakes, no gate) with nothing on screen saying why. `verb` is "migrated" or "ended";
+    `marker` is the OLD marker (its `iterm_session`/`project` — the tab that just lost its arming,
+    not whatever tab the new/surviving session happens to be in). RELAY_HEADLESS=1 (every headless
+    `claude -p` probe relay itself launches) skips this entirely — a probe reading/migrating state
+    is not a human at a tab who needs telling; `notify_banner` itself already honours
+    RELAY_NO_NOTIFY. Never raises; a failed banner must never turn a successful migrate/tombstone
+    into a failed one."""
+    if os.environ.get("RELAY_HEADLESS") == "1":
+        return
+    try:
+        cfg = load_config(state_root)
+        project = (marker or {}).get("project") or "lead"
+        iterm_session = (marker or {}).get("iterm_session")
+        title = "relay: lead %s %s" % (project, verb)
+        subtitle = reason or verb
+        message = "%s — run /relay:mode to re-arm" % (reason or verb)
+        notify_banner(cfg, title, subtitle, message, iterm_session=iterm_session)
+    except Exception:
+        pass
+
+
+def tombstone_lead(state_root, session_id, reason=None, now_ts=None, notify=True):
     """Mark a lead ended-but-resumable instead of deleting it. Retains every other field so
     revive_lead() is lossless.
 
@@ -834,6 +865,12 @@ def tombstone_lead(state_root, session_id, reason=None, now_ts=None):
     tombstone primitive migrate_lead and others also rely on, so it does not itself refuse a call
     with no reason; it just no longer loses the fact that one wasn't given.
 
+    Also fires the LOUD `_notify_marker_change` desktop banner on every successful tombstone
+    UNLESS `notify=False` — `migrate_lead` passes that (it already fires its own "migrated" banner
+    for the same event; without it a single migration would pop two banners, one saying "migrated"
+    and a second, more alarming one saying "ended", for what the lead should see as ONE thing that
+    happened).
+
     Returns True if a marker was actually tombstoned (no marker, or an already-tombstoned one,
     returns False so callers can stay quiet). Never raises."""
     try:
@@ -846,6 +883,8 @@ def tombstone_lead(state_root, session_id, reason=None, now_ts=None):
             "%Y-%m-%dT%H:%M:%S", time.localtime(now_ts))
         marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
         append_ledger(state_root, "lead_tombstoned", session_id=session_id, reason=reason)
+        if notify:
+            _notify_marker_change(state_root, m, "ended", reason or "tombstoned")
         return True
     except Exception:
         return False
@@ -1172,10 +1211,13 @@ def migrate_lead(state_root, old_sid, new_sid):
                 sj.write_text(json.dumps(s, indent=2))
                 moved_execs.append(s.get("session_id") or d.name)
 
-        tombstone_lead(state_root, old_sid, reason="migrated")
+        tombstone_lead(state_root, old_sid, reason="migrated", notify=False)  # own banner below —
+                                                                               # see tombstone_lead's
+                                                                               # `notify` docstring
         update_marker(state_root, old_sid, migrated_to=new_sid)
 
         append_ledger(state_root, "lead_migrated", old=old_sid, new=new_sid, executors=moved_execs)
+        _notify_marker_change(state_root, old_marker, "migrated", "migrated to a new session id")
         return True
     except Exception:
         return False
@@ -2859,14 +2901,65 @@ def build_escalation_settings(plugin_root, exec_name, timeout=30):
     }
 
 
+def _strip_1m_suffix(model_id):
+    """Strip a trailing `[1m]` context-window marker (with any surrounding whitespace) from a
+    model id string, for same-model comparisons where "sonnet[1m]" and "sonnet" name the same
+    underlying tier. Non-strings pass through unchanged (never raises on odd config content)."""
+    if not isinstance(model_id, str):
+        return model_id
+    return re.sub(r"\s*\[1m\]\s*$", "", model_id).strip()
+
+
+def normalize_fallback_models(fallback, exec_model=None):
+    """Claude Code 2.1.263 validates a `--settings` file's `fallbackModel` key as a LIST, not a
+    bare string — but README documents `executor_fallback_model` as a single model id (the common
+    case), so a bare string there made EVERY new executor fail settings validation at launch
+    (lead-found incident: every spawn broke, tonight, across three projects). This normalizes:
+
+      - a bare string  → wrapped in a one-element list
+      - a list         → passed through unchanged (already the form Claude Code wants)
+      - None/empty     → None (no fallbackModel key at all)
+
+    and then drops any entry naming the SAME model as `exec_model` (the executor's own launch
+    model) — compared with any trailing `[1m]` context-window suffix stripped from BOTH sides
+    (`_strip_1m_suffix`), since a fallback pointing at the model already running would just spin in
+    place on an overload rather than actually falling back to anything different.
+
+    Returns `(models, dropped)`: `models` is the normalized list with any self-referential entries
+    removed (None if nothing is left to configure), `dropped` is the list of raw entries removed
+    for matching `exec_model` (empty when nothing was dropped — including when `exec_model` is not
+    given at all). Pure and never raises; this module never prints — callers own how (or whether)
+    to surface `dropped` to the human."""
+    if not fallback:
+        return None, []
+    models = list(fallback) if isinstance(fallback, list) else [fallback]
+    dropped = []
+    if exec_model:
+        exec_key = _strip_1m_suffix(exec_model)
+        kept = []
+        for m in models:
+            if _strip_1m_suffix(m) == exec_key:
+                dropped.append(m)
+            else:
+                kept.append(m)
+        models = kept
+    return (models or None), dropped
+
+
 def write_escalation_settings(state_root, plugin_root, exec_name, timeout=30, include_hooks=True,
-                              fallback=None, effort=None):
+                              fallback=None, effort=None, exec_model=None):
     """Write this executor's own `--settings` file into its state dir. PER-EXECUTOR (not shared),
     because the file carries that executor's relay name as a hook argument — see
     build_escalation_settings for why the hook can't derive it. Regenerated on each call so it
     always points at the CURRENTLY live plugin_root/version. Returns the path (str), or None on any
     failure — a write failure must fall back to spawning WITHOUT escalation armed rather than
     failing the whole spawn.
+
+    `fallback` is normalized through `normalize_fallback_models` (string→list, self-referential
+    entries against `exec_model` dropped) before being stamped as `fallbackModel` — see that
+    function for the "why" (a bare string broke Claude Code's own settings validation). Callers
+    that also want to WARN about a dropped entry should call `normalize_fallback_models` themselves
+    first (this function doesn't print — see that function's own docstring).
 
     `effort`, when given, is also stamped into the file as `{"effortLevel": effort}` — belt and
     braces alongside the `--effort` CLI flag (executor effort policy above): Claude Code's
@@ -2878,8 +2971,9 @@ def write_escalation_settings(state_root, plugin_root, exec_name, timeout=30, in
         d.mkdir(parents=True, exist_ok=True)
         p = d / "settings.json"
         content = build_escalation_settings(plugin_root, exec_name, timeout=timeout) if include_hooks else {}
-        if fallback:
-            content["fallbackModel"] = fallback
+        models, _dropped = normalize_fallback_models(fallback, exec_model)
+        if models:
+            content["fallbackModel"] = models
         if effort:
             content["effortLevel"] = effort
         p.write_text(json.dumps(content, indent=2))

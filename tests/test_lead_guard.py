@@ -1854,6 +1854,64 @@ class TestEscalationSettings:
         content = json.loads(Path(p).read_text())
         assert "v2" in content["hooks"]["Stop"][0]["hooks"][0]["command"]
 
+    def test_fallback_string_becomes_a_one_element_list_in_the_written_file(self, root, tmp_path):
+        """Lead-found (packet-002 item 5): a bare string here made Claude Code 2.1.263 refuse the
+        settings file (fallbackModel must be a list)."""
+        p = lg.write_escalation_settings(root, str(tmp_path), "exec-7", fallback="claude-opus-4-8")
+        content = json.loads(Path(p).read_text())
+        assert content["fallbackModel"] == ["claude-opus-4-8"]
+
+    def test_fallback_equal_to_exec_model_is_dropped(self, root, tmp_path):
+        p = lg.write_escalation_settings(root, str(tmp_path), "exec-7", fallback="sonnet",
+                                         exec_model="sonnet")
+        content = json.loads(Path(p).read_text())
+        assert "fallbackModel" not in content
+
+    def test_fallback_1m_suffix_still_matches_exec_model_for_dropping(self, root, tmp_path):
+        p = lg.write_escalation_settings(root, str(tmp_path), "exec-7", fallback="sonnet[1m]",
+                                         exec_model="sonnet")
+        content = json.loads(Path(p).read_text())
+        assert "fallbackModel" not in content
+
+
+class TestNormalizeFallbackModels:
+    """lead_guard.normalize_fallback_models — the pure logic write_escalation_settings/
+    bin/relay's `_maybe_escalation_settings_file` both rely on (packet-002 item 5). This module
+    never prints (bin/relay owns that); `dropped` is what a caller prints from."""
+
+    def test_none_or_empty_stays_none_with_nothing_dropped(self):
+        assert lg.normalize_fallback_models(None) == (None, [])
+        assert lg.normalize_fallback_models("") == (None, [])
+        assert lg.normalize_fallback_models([]) == (None, [])
+
+    def test_bare_string_wraps_into_a_one_element_list(self):
+        assert lg.normalize_fallback_models("claude-opus-4-8") == (["claude-opus-4-8"], [])
+
+    def test_list_passes_through_unchanged_when_no_exec_model_given(self):
+        models, dropped = lg.normalize_fallback_models(["claude-opus-4-8", "sonnet"])
+        assert models == ["claude-opus-4-8", "sonnet"] and dropped == []
+
+    def test_entry_equal_to_exec_model_is_dropped_and_reported(self):
+        models, dropped = lg.normalize_fallback_models("sonnet", exec_model="sonnet")
+        assert models is None
+        assert dropped == ["sonnet"]
+
+    def test_1m_suffix_stripped_on_both_sides_for_comparison(self):
+        models, dropped = lg.normalize_fallback_models("sonnet[1m]", exec_model="sonnet")
+        assert models is None and dropped == ["sonnet[1m]"]
+        models, dropped = lg.normalize_fallback_models("sonnet", exec_model="sonnet[1m]")
+        assert models is None and dropped == ["sonnet"]
+
+    def test_only_the_matching_entry_is_dropped_from_a_list(self):
+        models, dropped = lg.normalize_fallback_models(["sonnet", "claude-opus-4-8"],
+                                                        exec_model="sonnet")
+        assert models == ["claude-opus-4-8"]
+        assert dropped == ["sonnet"]
+
+    def test_a_non_matching_exec_model_drops_nothing(self):
+        models, dropped = lg.normalize_fallback_models(["claude-opus-4-8"], exec_model="haiku")
+        assert models == ["claude-opus-4-8"] and dropped == []
+
 
 # ---- lead heartbeat ----------------------------------------------------------------------------
 
@@ -2736,6 +2794,36 @@ class TestTombstone:
         assert len(rec) == 1
         assert rec[0]["session_id"] == "lead-1" and rec[0]["reason"] == "exit"
 
+    def test_tombstone_fires_the_loud_notify_banner_at_the_old_iterm_session(self, root, monkeypatch):
+        """Packet-002 item 1 (lead-found: a silent tombstone can go unnoticed until the lead
+        happens to check) — `notify_banner` is the transport seam every relay banner already goes
+        through (its own docstring), so mocking it here proves `tombstone_lead` really drives that
+        shared chain, addressed at the TOMBSTONED marker's own tab, not the caller's."""
+        self._armed(root)
+        calls = []
+        monkeypatch.setattr(lg, "notify_banner", lambda *a, **k: calls.append((a, k)))
+        assert lg.tombstone_lead(root, "lead-1", reason="exit") is True
+        assert len(calls) == 1
+        _args, kwargs = calls[0]
+        assert kwargs.get("iterm_session") == "w1t2p0:ABC"   # this marker's own iterm_session
+
+    def test_tombstone_notify_is_suppressed_by_notify_false(self, root, monkeypatch):
+        """The escape hatch `migrate_lead` relies on to avoid a double banner (its own notify test
+        below) — proven directly here rather than only inferred from migrate_lead's call count."""
+        self._armed(root)
+        calls = []
+        monkeypatch.setattr(lg, "notify_banner", lambda *a, **k: calls.append((a, k)))
+        assert lg.tombstone_lead(root, "lead-1", reason="migrated", notify=False) is True
+        assert calls == []
+
+    def test_headless_skips_the_tombstone_notify(self, root, monkeypatch):
+        self._armed(root)
+        monkeypatch.setenv("RELAY_HEADLESS", "1")
+        calls = []
+        monkeypatch.setattr(lg, "notify_banner", lambda *a, **k: calls.append((a, k)))
+        assert lg.tombstone_lead(root, "lead-1", reason="exit") is True
+        assert calls == []
+
     def test_revive_restores_arming_losslessly(self, root):
         before = self._armed(root)
         lg.tombstone_lead(root, "lead-1", reason="exit")
@@ -3261,6 +3349,28 @@ class TestMigrateLead:
         self._armed(root)
         assert lg.migrate_lead(root, "old-sid", "new-sid") is True
         assert lg.is_lead(root, "new-sid") is True
+
+    def test_migrate_fires_exactly_one_loud_notify_banner_at_the_old_iterm_session(self, root, monkeypatch):
+        """Packet-002 item 1 — `migrate_lead` fires its OWN "migrated" banner and must suppress the
+        one its internal `tombstone_lead(..., reason="migrated")` call would otherwise also fire
+        (TestTombstone.test_tombstone_notify_is_suppressed_by_notify_false proves that suppression
+        directly); this proves the end-to-end count through the real (non-mocked) call chain is
+        exactly one, addressed at the OLD marker's tab, not wherever the resumed session landed."""
+        self._armed(root)
+        calls = []
+        monkeypatch.setattr(lg, "notify_banner", lambda *a, **k: calls.append((a, k)))
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True
+        assert len(calls) == 1
+        _args, kwargs = calls[0]
+        assert kwargs.get("iterm_session") == "w1t2p0:X"     # old-sid's own iterm_session
+
+    def test_headless_skips_the_migrate_notify(self, root, monkeypatch):
+        self._armed(root)
+        monkeypatch.setenv("RELAY_HEADLESS", "1")
+        calls = []
+        monkeypatch.setattr(lg, "notify_banner", lambda *a, **k: calls.append((a, k)))
+        assert lg.migrate_lead(root, "old-sid", "new-sid") is True
+        assert calls == []
 
     def test_ledgers_exactly_one_lead_migrated_event(self, root):
         self._armed(root)

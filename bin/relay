@@ -129,7 +129,7 @@ LAUNCH_GRACE_SECONDS = 3.0
 EXECUTOR_ESCALATION_TIMEOUT_SECONDS = 30
 
 
-def _maybe_escalation_settings_file(exec_name, effort=None):
+def _maybe_escalation_settings_file(exec_name, effort=None, model=None):
     """The `--settings` file to launch an executor with (arms hooks/executor_escalation.py, carries
     executor_fallback_model, and — belt and braces alongside `--effort` on the command line —
     stamps `effortLevel` so the pinned effort holds even on a relaunch path that might drop the
@@ -139,17 +139,29 @@ def _maybe_escalation_settings_file(exec_name, effort=None):
     effort resolution is always explicit), so in practice this returns None only on a write
     failure or when escalation/fallback/effort are ALL absent (e.g. a test that omits `effort`).
 
+    `model` is this executor's OWN resolved launch model — passed through to
+    `lead_guard.normalize_fallback_models`/`write_escalation_settings` so a configured fallback
+    equal to it (spinning in place on an overload, not actually recovering) is dropped; a drop
+    prints a yellow spawn-time warning naming the entry, since a silently-thinner fallback chain
+    than the human configured is exactly the kind of thing this whole packet exists to surface.
+
     `exec_name` (the RELAY name) is baked into the hook command: the hook can't derive its own
     identity from Claude Code's payload, which carries the Claude session id while relay files
     state under the relay name. See lead_guard.build_escalation_settings."""
     cfg = lead_guard.load_config(STATE_ROOT)
     esc = bool(cfg.get("executor_escalation", True))
     fallback = cfg.get("executor_fallback_model")
-    if not esc and not fallback and not effort:
+    models, dropped = lead_guard.normalize_fallback_models(fallback, model)
+    if dropped:
+        print(c(f"  ⚠ executor_fallback_model: dropped {', '.join(str(d) for d in dropped)} — "
+                f"same as this executor's own launch model ({model}); configure a DIFFERENT "
+                f"fallback or leave it unset", "yellow"))
+    if not esc and not models and not effort:
         return None
     return lead_guard.write_escalation_settings(STATE_ROOT, _plugin_root(), exec_name,
                                                 timeout=EXECUTOR_ESCALATION_TIMEOUT_SECONDS,
-                                                include_hooks=esc, fallback=fallback, effort=effort)
+                                                include_hooks=esc, fallback=fallback, effort=effort,
+                                                exec_model=model)
 
 TEMPLATE_FOOTER = """
 
@@ -1153,7 +1165,7 @@ def cmd_spawn(args):
 
     # Arm the executor-side wake escalation (wake-watch design §4): a plain `claude` launch gets NO
     # hooks, so this executor only gets the escalation Stop hook if we pass it explicitly here.
-    settings_file = _maybe_escalation_settings_file(session_id, effort=effort)
+    settings_file = _maybe_escalation_settings_file(session_id, effort=effort, model=resolved_model)
 
     def launch_attempt():
         """One full launch: open the tab, then read back the two INDEPENDENT signals that say it
@@ -1317,7 +1329,7 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
         session_uuid=session_uuid,
         resume_id=resume_id,
         tab_color=tab_color,
-        settings_file=_maybe_escalation_settings_file(session_id, effort=effort),  # re-arm
+        settings_file=_maybe_escalation_settings_file(session_id, effort=effort, model=model),  # re-arm
                                                           # escalation on the fresh tab too — a
                                                           # resumed/restarted executor must not
                                                           # silently lose wake coverage, and the
@@ -2218,6 +2230,17 @@ def _color_on():
 
 def c(text, *styles):
     if not styles or not _color_on():
+        return text
+    return "".join(_ANSI[s] for s in styles) + text + _ANSI["reset"]
+
+
+def _force_color(text, *styles):
+    """Like `c()`, but skips the `isatty()` gate — for the ONE alarm that must render red even
+    though `bin/relay status --statusline`'s stdout is always piped straight to Claude Code's own
+    statusline renderer (never a real tty), so `c()`'s isatty() check would silently swallow this
+    exact color on every real invocation (packet-002 item 2 — a hijack/silent-tombstone must be
+    LOUD, not quietly correct-but-invisible). Still honours NO_COLOR."""
+    if os.environ.get("NO_COLOR"):
         return text
     return "".join(_ANSI[s] for s in styles) + text + _ANSI["reset"]
 
@@ -3174,7 +3197,7 @@ def _weight_segment(state_root, lead_sid, transcript_path):
     return ""
 
 
-def _lead_status_line(lead_sid, marker, transcript_path=None):
+def _lead_status_line(lead_sid, marker, transcript_path=None, statusline=False):
     """The LEAD view: busy-executor NAMES (stored status busy, no report yet — a bare count doesn't
     tell you WHO, per live-usage feedback), reported-executor names (report file exists, status not
     closed/superseded — computed WITHOUT writing anything; report-file existence is only a
@@ -3187,9 +3210,20 @@ def _lead_status_line(lead_sid, marker, transcript_path=None):
     That is the whole point: "am I armed right now?" had no glanceable answer, so silent unarming
     went unnoticed for days (docs/lead-arming-durability.md). A blank status line must mean "not a
     lead", never "armed but quiet"."""
-    if lead_guard.is_tombstoned(marker):
+    if lead_guard.is_tombstoned(marker) or marker.get("migrated_to"):
+        if statusline:
+            # LOUD (packet-002 item 2): a genuinely resumable exit does not keep rendering its OWN
+            # statusline — that process already ended. Reaching this branch from a LIVE
+            # --statusline call means SOMETHING ELSE pulled this exact tab's marker out from under
+            # it while the tab kept running: a migration (this marker now carries `migrated_to`) or
+            # a silent tombstone (THE INCIDENT, 2026-09-05 22:18:50) — the hijack shape this whole
+            # packet exists to make impossible to miss. Forced red: this stdout is always piped to
+            # Claude Code's own statusline renderer, never a real tty (see `_force_color`).
+            return _force_color("lead ENDED — /relay:mode", "red", "bold")
         # PAUSED: session exited but resumable. Not armed — gate and wake are OFF — so it would be
         # actively misleading to render executor/wake segments as though a live lead were watching.
+        # (Positional `relay status <sid>` — a human/script diagnostic, not the live statusline —
+        # keeps this softer wording; only the actual on-screen statusline needs the alarm above.)
         return f"⏸ {marker.get('project') or 'lead'} paused"
 
     busy = []
@@ -3268,10 +3302,11 @@ def cmd_status(args):
     sid, transcript_path = _resolve_status_payload(args)
     if not sid:
         return
+    statusline_mode = bool(getattr(args, "statusline", False))
 
     marker = lead_guard.read_marker(STATE_ROOT, sid)
     if marker:
-        line = _lead_status_line(sid, marker, transcript_path)
+        line = _lead_status_line(sid, marker, transcript_path, statusline=statusline_mode)
         if line:
             print(line)
         return
@@ -3303,7 +3338,7 @@ def cmd_status(args):
     if tab_sid:
         tab_marker = lead_guard.read_marker(STATE_ROOT, tab_sid)
         if tab_marker:
-            line = _lead_status_line(tab_sid, tab_marker, transcript_path)
+            line = _lead_status_line(tab_sid, tab_marker, transcript_path, statusline=statusline_mode)
             if line:
                 print(line)
 
@@ -3408,7 +3443,10 @@ _LIVENESS_CELL = {"live": ("live", ("green",)), "unreachable": ("unreachable", (
                   # D2 (BUG-lib-8/BUG-hooks-1's mitigation): a marker `list_leads` could not read at
                   # all — distinct from "ghost" (a marker it CAN read, just stale): this one carries
                   # no cwd/project/tab identity to even attempt an is_alive probe against.
-                  "broken": ("broken", ("red", "bold"))}
+                  "broken": ("broken", ("red", "bold")),
+                  # Packet-002 item 3: a tombstoned marker whose tab still probes alive — hijack or
+                  # silent tombstone, not an ordinary pause (see cmd_list's liveness override).
+                  "ended_but_alive": ("ended?", ("red", "bold"))}
 
 
 def _lead_liveness_cell(m):
@@ -3722,8 +3760,19 @@ def cmd_list(args):
         # One liveness verdict per lead, computed up front — see the LIVE column comment below.
         # A broken marker (D2) short-circuits to "broken": it carries no tab/cwd identity to run
         # the is_alive probe against, and it isn't a real "how stale is this lead" question.
-        liveness_by_sid = {m.get("session_id"): ("broken" if m.get("broken") else _lead_liveness(m))
-                           for m in leads}
+        # Packet-002 item 3: a TOMBSTONED marker whose tab still probes alive is not an ordinary
+        # "live" lead — a genuinely paused/resumable exit doesn't leave its own tab running (the
+        # process exited), so a live tab plus an ended marker is the hijack/silent-tombstone shape
+        # this whole packet exists to surface — overridden to "ended_but_alive" ("ended?", red)
+        # rather than the reassuring green "live".
+        def _lead_liveness_verdict(m):
+            if m.get("broken"):
+                return "broken"
+            verdict = _lead_liveness(m)
+            if verdict == "live" and lead_guard.is_tombstoned(m):
+                return "ended_but_alive"
+            return verdict
+        liveness_by_sid = {m.get("session_id"): _lead_liveness_verdict(m) for m in leads}
         # One usage reading per lead, computed up front (same memoize-once rationale as liveness
         # above) — feeds the CTX column and is cached on disk itself (_usage_for_session's
         # usage.json), but still worth reading once rather than twice (width calc + row render).
@@ -3834,6 +3883,13 @@ def cmd_list(args):
             if m.get("broken"):
                 print(c(f"  ⚠ {m.get('session_id')}: lead marker unreadable — re-run /relay:mode "
                         f"to re-arm", "red"))
+        # Packet-002 item 3 — one line per hijack/silent-tombstone lead, named by its own sid (same
+        # per-item shape as the broken-marker footnote above: this is the one row that needs its
+        # OWN command run IN THAT TAB, not a generic "check on it" the aggregated footnotes give).
+        for m in leads:
+            if liveness_by_sid[m.get("session_id")] == "ended_but_alive":
+                print(c(f"  ⚠ {m.get('session_id')}: marker ended but the tab is alive — hijack or "
+                        f"silent tombstone; run /relay:mode in that tab", "red"))
         if any(st == "stuck" for st in wake_states.values()):
             print(c("  ⚠ WAKE=stuck: a dead watcher's lock is blocking wakes for this lead — it "
                     "will self-heal on the lead's next turn (the lock is now auto-broken), and any "

@@ -573,7 +573,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_default_context` | "1m" | Context window an executor launches with when nothing else decides it (no packet `CONTEXT:` line, no `[1m]` on `--model`, referenced reading under the heuristic). `"1m"` or `"200k"`. Shipped `1m`: the window is a **ceiling, not consumption** — you pay for tokens used, so a bounded packet costs the same either way, and 1M stops executors compacting early on real work. A packet can still pin `CONTEXT: 200k`; haiku (no 1M window) always runs 200K |
 | `auto_close` | true | Park finished executors automatically — see [Auto-close](#auto-close-finished-executors-park-themselves) |
 | `auto_close_idle_minutes` | 60 | Idle-after-report threshold for the auto-close timer path; 0 = timer off (the landed path still applies) |
-| `executor_fallback_model` | unset | A concrete model id (or list, tried in order) that overloaded executors fall back to — e.g. `"claude-opus-4-8"`. Delivered via each executor's per-launch `--settings` file (`fallbackModel` — the `--fallback-model` flag is print-mode-only; the settings key works interactively), so if capacity fallback happens it goes where YOU chose, with the CLI's visible notice. Unset = no configured fallback (the documented default) |
+| `executor_fallback_model` | unset | A concrete model id (or list, tried in order) that overloaded executors fall back to — e.g. `"claude-opus-4-8"`. A bare string is accepted and wrapped into a one-element list — Claude Code's `--settings` file requires `fallbackModel` to be a list, not a string, so passing a single id straight through failed every spawn's settings validation. A fallback equal to the executor's own launch model (compared with any `[1m]` suffix stripped) is dropped, with a spawn-time warning, since falling back to the model already running would just spin in place. Delivered via each executor's per-launch `--settings` file (`fallbackModel` — the `--fallback-model` flag is print-mode-only; the settings key works interactively), so if capacity fallback happens it goes where YOU chose, with the CLI's visible notice. Unset = no configured fallback (the documented default) |
 | `executor_escalation` | true | Arm every spawned executor with the second-layer one-shot push (see [Auto-wake and notifications](#auto-wake-and-notifications)) |
 | `autonomous_mode` | false | Posture a newly-armed lead holds. false = wait for you on every approval beat (safe default). true = new leads start in autonomous mode. `/relay:auto on\|off` flips it mid-session either way (see [Autonomous mode](#autonomous-mode)) |
 | `stall_threshold_seconds` | 2700 | How long an executor can be `busy` with no report before `stalled` — kept independent of `poll_seconds` so the two don't flip at the same instant |
@@ -718,6 +718,14 @@ spawn ceiling still applies.
   *still* gone after your next turn, migrate by hand: `/relay:mode` re-arms this session as a fresh
   lead, `relay adopt <sid> --force` for each executor the old lead owned, then `relay close --self
   <old-session-id>` to retire the orphaned marker.
+- **No wakes, no gate, and the tab looks fine?** Your marker may have been migrated or tombstoned
+  out from under you (a hijack, or a silent tombstone during plugin-reload churn) without you
+  noticing — this used to be invisible until you happened to check. Two signals now catch it: the
+  statusline itself turns into a red **`lead ENDED — /relay:mode`** alarm (instead of quietly going
+  blank), and `relay list`'s LEADS table renders that row's LIVE cell as **`ended?`** in red with a
+  footnote naming the session id — a live tab whose own marker says it already ended is exactly the
+  hijack/silent-tombstone shape, not an ordinary resumable pause (which never leaves its tab running
+  to notice). Either signal means the same fix: re-run `/relay:mode` in that tab to re-arm.
 - **A stale row in the LEADS table with an old LAST ACTIVE** is a dead lead (tab closed/crashed
   without `/relay:stop`) — `relay prune` clears it once it's older than `--days`; a lead you're
   actively using is never pruned.

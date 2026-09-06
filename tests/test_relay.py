@@ -4551,6 +4551,37 @@ class TestLeadLiveness:
         row = [l for l in out.splitlines() if l.startswith("legacy")][0]
         assert row.split()[-1]  # rendered a full row, no crash
 
+    def test_tombstoned_but_alive_lead_renders_ended_and_footnote(self, relay, capsys, monkeypatch):
+        """Packet-002 item 3 — the hijack/silent-tombstone shape: a marker that's ENDED (tombstoned)
+        but whose tab still probes alive. A genuinely resumable pause doesn't leave its own tab
+        running (the process exited), so this combination must NOT read as the reassuring plain
+        "live" — it gets its own "ended?" cell (red) plus a named footnote telling the human which
+        tab to go fix."""
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp",
+                                      tab_label="[Lead] webapp", iterm_session="w0t0p0:X")
+        relay.lead_guard.tombstone_lead(relay.STATE_ROOT, "lead-1")
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            out = self._render(relay, capsys, monkeypatch)
+        row = [l for l in out.splitlines() if l.startswith("webapp")][0]
+        assert "ended?" in row.split()
+        assert "live" not in row.split()   # must not ALSO read as plain "live"
+        footnote_lines = [l for l in out.splitlines() if "hijack or silent tombstone" in l]
+        assert len(footnote_lines) == 1
+        assert "lead-1" in footnote_lines[0]
+        assert "/relay:mode" in footnote_lines[0]
+
+    def test_tombstoned_and_dead_tab_lead_is_not_ended_but_alive(self, relay, capsys, monkeypatch):
+        """The ordinary, non-alarming pause: tombstoned AND the tab is actually gone — an everyday
+        resumable exit, not a hijack. Must render as the existing dim liveness verdict, no red
+        "ended?" cell and no hijack footnote."""
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp",
+                                      tab_label="[Lead] webapp", iterm_session="w0t0p0:X")
+        relay.lead_guard.tombstone_lead(relay.STATE_ROOT, "lead-1")
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            out = self._render(relay, capsys, monkeypatch)
+        assert "ended?" not in out
+        assert "hijack or silent tombstone" not in out
+
 
 class TestLeadTranscriptMB:
     """§9: `relay list`'s MB cell — a lead's OWN transcript size, read straight from disk (list
@@ -5030,9 +5061,46 @@ class TestStatus:
         relay.cmd_status(self._args(session_id="lead-1"))
         assert "webapp" in capsys.readouterr().out
 
+    def test_statusline_shows_the_red_ended_alarm_for_a_plain_tombstone(self, relay, capsys, monkeypatch):
+        """Packet-002 item 2 — the LIVE statusline (not positional `relay status <sid>`, which
+        keeps the softer "paused" wording — see the test right below) must scream when its OWN
+        marker is tombstoned: a genuinely resumable exit doesn't keep rendering its own statusline
+        (that process already ended), so reaching this in --statusline mode means the tab is still
+        running with its arming pulled out from under it."""
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
+        relay.lead_guard.tombstone_lead(relay.STATE_ROOT, "lead-1")
+        relay.cmd_status(self._args(session_id="lead-1", statusline=True))
+        out = capsys.readouterr().out
+        assert "lead ENDED" in out and "/relay:mode" in out
+        assert "\033[31m" in out          # forced red — not gated on isatty (statusline is piped)
+        assert "paused" not in out
+
+    def test_statusline_shows_the_red_ended_alarm_for_a_migrated_marker(self, relay, capsys, monkeypatch):
+        """The other trigger named by item 2: `migrated_to` (THE INCIDENT shape — a hijack, not an
+        ordinary pause)."""
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "old-sid", project="webapp")
+        relay.lead_guard.migrate_lead(relay.STATE_ROOT, "old-sid", "new-sid")
+        relay.cmd_status(self._args(session_id="old-sid", statusline=True))
+        out = capsys.readouterr().out
+        assert "lead ENDED" in out and "/relay:mode" in out
+
+    def test_statusline_ended_alarm_honours_no_color(self, relay, capsys, monkeypatch):
+        monkeypatch.setenv("NO_COLOR", "1")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        relay.lead_guard.tombstone_lead(relay.STATE_ROOT, "lead-1")
+        relay.cmd_status(self._args(session_id="lead-1", statusline=True))
+        out = capsys.readouterr().out
+        assert "lead ENDED" in out
+        assert "\033[" not in out
+
     def test_paused_lead_renders_as_paused_not_armed(self, relay, capsys):
         """A tombstoned lead is NOT armed (gate and wake off), so it must say so rather than render
-        the armed token — and must not show executor/wake segments implying a live watcher."""
+        the armed token — and must not show executor/wake segments implying a live watcher. This is
+        the POSITIONAL `relay status <sid>` view (statusline=False) — the LIVE statusline instead
+        shows the red "lead ENDED" alarm (see the tests above); only the actual on-screen statusline
+        needs to be loud, a manual/scripted status check can stay purely informative."""
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", stop_hook_timeout=1800)
         relay.lead_guard.tombstone_lead(relay.STATE_ROOT, "lead-1")
         relay.cmd_status(self._args(session_id="lead-1"))
@@ -6662,9 +6730,13 @@ class TestExecutorFallbackModel:
         return cap
 
     def test_fallback_in_settings_alongside_hooks(self, relay, tmp_path):
+        """Lead-found (packet-002 item 5): Claude Code 2.1.263 validates `fallbackModel` as a
+        LIST, not a bare string — README documents a single model id as the normal case, so a bare
+        string here (the form this config value actually takes) broke EVERY spawn's settings
+        validation until `normalize_fallback_models` wraps it."""
         cap = self._spawn(relay, tmp_path, {"executor_fallback_model": "claude-opus-4-8"})
         d = json.loads(Path(cap["settings_file"]).read_text())
-        assert d["fallbackModel"] == "claude-opus-4-8" and "hooks" in d
+        assert d["fallbackModel"] == ["claude-opus-4-8"] and "hooks" in d
 
     def test_fallback_alone_when_escalation_off(self, relay, tmp_path):
         cap = self._spawn(relay, tmp_path, {"executor_escalation": False,
@@ -6673,6 +6745,34 @@ class TestExecutorFallbackModel:
         # No hooks (escalation off), but fallbackModel AND the always-on effortLevel both ride —
         # the settings file carries whatever's configured, never just one key at a time.
         assert d == {"fallbackModel": ["claude-opus-4-8", "claude-sonnet-4-6"], "effortLevel": "high"}
+
+    def test_list_passed_through_unchanged(self, relay, tmp_path):
+        """A list was already the correct shape before this fix — must still ride verbatim (order
+        preserved, nothing added/removed) when none of its entries match the executor's own
+        model."""
+        cap = self._spawn(relay, tmp_path,
+                          {"executor_fallback_model": ["claude-opus-4-8", "claude-sonnet-4-6"]},
+                          name="fb5")
+        d = json.loads(Path(cap["settings_file"]).read_text())
+        assert d["fallbackModel"] == ["claude-opus-4-8", "claude-sonnet-4-6"]
+
+    def test_same_model_entry_dropped_with_warning(self, relay, tmp_path, capsys):
+        """The executor in this harness launches on "sonnet" unresolved (the stubbed `_probe_model`
+        returns no id — see `load_relay_module`), so configuring "sonnet" as the fallback is exactly
+        the self-referential case: it must be dropped (spinning in place on an overload recovers
+        nothing) and the drop must be visible, never silent."""
+        cap = self._spawn(relay, tmp_path, {"executor_fallback_model": "sonnet"}, name="fb6")
+        d = json.loads(Path(cap["settings_file"]).read_text())
+        assert "fallbackModel" not in d
+        out = capsys.readouterr().out
+        assert "executor_fallback_model" in out and "dropped" in out and "sonnet" in out
+
+    def test_same_model_entry_dropped_from_a_list_others_kept(self, relay, tmp_path, capsys):
+        cap = self._spawn(relay, tmp_path,
+                          {"executor_fallback_model": ["sonnet", "claude-opus-4-8"]}, name="fb7")
+        d = json.loads(Path(cap["settings_file"]).read_text())
+        assert d["fallbackModel"] == ["claude-opus-4-8"]
+        assert "dropped" in capsys.readouterr().out
 
     def test_unset_means_no_key_and_kill_switch_still_writes_effort_only_file(self, relay, tmp_path):
         cap = self._spawn(relay, tmp_path, {}, name="fb3")
