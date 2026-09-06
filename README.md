@@ -157,106 +157,65 @@ And the three nouns:
 
 ```
 /relay:mode                          adopt the lead role (arms the gate + auto-wake)
-/relay:spawn <worktree> <topic> <packet.md> [--model NAME] [--name LABEL] [--seed SID|PATH]
-             [--mcp [SPEC]] [--keep]       MCP servers (default none; packet `MCP:` line usually
-                                            decides); --keep pins it against auto-close
-             [--effort LEVEL]              thinking effort (low|medium|high|xhigh|max), or an
-                                            `EFFORT:` line in the packet; unset = relay's own
-                                            executor_default_effort (the CLI default, "high") —
-                                            never your personal effortLevel; fixed per process
-                                            (resume/restart --effort changes it)
-                                            context window: `--model sonnet[1m]`, or the packet's
-                                            `CONTEXT: 1m` line, or relay picks 1m when the packet's
-                                            referenced reading is big; default 200K
-/relay:send  <session_id> <packet.md>      follow-up into the SAME session (reuse > respawn);
-                                            a packet `MCP:` line the executor lacks → relaunches
-                                            its conversation with the wider set, then delivers
-             [--rotate]                    heavy session? retire it + spawn a seeded successor
-                                            (1M window when the tier has one) with this packet first
-             [--upgrade]                   same, but ONE TIER UP (haiku→sonnet→opus): the answer to
-                                            the round-3 nudge when the current tier isn't landing it
-             [--when-idle]                 busy target? queue it; delivers when it next goes idle
+/relay:spawn <worktree> <topic> <packet.md> [--model] [--name] [--seed] [--mcp SPEC] [--effort LEVEL] [--keep]
+                                            MCP/effort/context window: see Executor MCP servers,
+                                            Executor effort, Executor context window below; --keep pins against auto-close
+/relay:send  <session_id> <packet.md> [--rotate] [--upgrade] [--when-idle]
+                                            follow-up into the SAME session (reuse > respawn); flags: see Retiring a heavy executor / Queueing below
 relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --when-idle
 /relay:check [<session_id> | --all]        busy / reported / stalled / dead
-/relay:board [--open] [--out PATH] [--lead] one HTML page for everything: leads → executors →
-                                            packet timelines (gist, outcome, TL;DR), status, launch,
-                                            tokens, warnings, copyable commands; light/dark toggle
-relay stats [--lead SID] [--json]          one row per packet ever sent (incl. closed/dead): (model,
-             [--since DAYS]                  effort) → outcome (rounds, verify verdict, report status),
-                                            + a per-session token trailer and a SUMMARY grouped by
-                                            (model, effort); see "relay stats" below
-relay doctor [--offline] [--quick]         prove the installed claude CLI still honours relay's launch
-                                            flags (strict MCP, executor agent, commit deny, model
-                                            aliases) + plumbing; run after every Claude Code update
-relay lint <packet.md> [--worktree W]      advisory packet checks (MCP mentioned but not declared,
-             [--model M] [--strict]          big reading on 200K, asks to commit/ask, no Preconditions,
-                                            haiku/opus packet-shape hints, front-loaded reading…);
-                                            the same checks print at spawn/send
-/relay:list                                leads + active executors (closed hidden; --closed shows);
-                                            TOKENS (real prompt/output spend) and LAUNCH
-                                            (mcp/context/role) per executor; parks finished ones
+/relay:board [--open] [--out PATH] [--lead] one HTML page for everything: leads → executors → packet timelines, status, launch, tokens, warnings; light/dark toggle
+relay stats [--lead SID] [--since DAYS] [--json]   one row per packet ever sent → outcome (rounds, verdict, status) + a token trailer and a SUMMARY; see below
+relay doctor [--offline] [--quick]         prove the installed claude CLI still honours relay's launch flags + plumbing; run after every Claude Code update
+relay lint <packet.md> [--worktree W] [--model M] [--strict]   advisory packet checks (MCP undeclared, big reading on 200K, no Preconditions, shape hints…)
+/relay:list                                leads + active executors (closed hidden; --closed shows); TOKENS and LAUNCH (mcp/context/role); parks finished ones
 /relay:close <session_id> [--supersede <new_id>]   (rarely needed — finished executors auto-close)
 relay keep <session_id> [--off]            pin/unpin an executor against auto-close
-/relay:retire <session_id> [--force]       close it AND leave a successor-seed.md, so respawning
-                                            fresh over the same territory is cheap
+/relay:retire <session_id> [--force]       close it AND leave a successor-seed.md, so respawning fresh over the same territory is cheap
 /relay:stop                                unarm: step down from lead mode (gate + auto-wake off)
 /relay:focus <session_id>                  jump to that session's tab/pane/window (executor or lead)
 /relay:resume <session_id> [--mcp SPEC]    reopen a dead tab's conversation, context intact
 /relay:restart <session_id> [--mcp SPEC]   re-run a dead session's packet fresh (loses context)
 /relay:route retain "<reason>"             open a grace window when the gate blocks lead work
-/relay:auto on|off|status                  autonomous posture: proceed by default on routine in-plan
-                                            steps instead of asking (per-session; committing still stops)
+/relay:auto on|off|status                  autonomous posture: proceed by default on routine, in-plan steps (per-session; committing still stops)
 /relay:diff <session_id>                   render staged changes to an HTML review page and open it
-/relay:verify <session_id> [--rerun]       machine-check a report against its staged reality:
-                                            MALFORMED / MISMATCH / INCONCLUSIVE / COUNTS-MATCH
-                                            (never "PASS" — see below for why that matters)
-relay verify <sid> --for-autocommit        the auto-commit gate: CLEARED / NOT-CLEARED-BECAUSE-…
-             [--in-plan] [--diff-reviewed]  (the two flags are the lead's own attestations)
+/relay:verify <session_id> [--rerun]       machine-check a report against its staged reality: MALFORMED / MISMATCH / INCONCLUSIVE / COUNTS-MATCH (never "PASS" — see below for why)
+relay verify <sid> --for-autocommit [--in-plan] [--diff-reviewed]   the auto-commit gate: CLEARED / NOT-CLEARED-BECAUSE-… (flags are the lead's own attestations)
 /relay:handoff <handoff.md>                 succeed this lead: pre-armed successor tab, then step down
 relay close-predecessor                    successor-only: close the outgoing lead's tab, on user go
 relay status [session_id] [--statusline]   read-only, statusline-safe one-liner (see below)
-relay whoami [<token>] [--json]            "who am I, who is my lead" — token: a lead's session id,
-                                            an executor's relay name, or its claude_session uuid;
-                                            defaults to $CLAUDE_CODE_SESSION_ID when omitted
+relay whoami [<token>] [--json]            "who am I, who is my lead" — token: a lead's session id, an executor's relay name, or its claude_session uuid; defaults to $CLAUDE_CODE_SESSION_ID
 ```
 
-Anywhere a command above takes a session id, you can pass the executor's name (its id, set at
-`spawn --name`), a lead's project name, or a unique prefix of either's id — no more pasting lead
-UUIDs. `relay focus webapp` and `relay stop docs-site` just work. A project name that
-matches more than one lead (e.g. an old + new lead after a handoff) never guesses: it exits listing
-every candidate sid instead, newest-first, so you can pick one or pass a unique prefix.
+Anywhere a command above takes a session id, you can pass the executor's name (set at `spawn
+--name`), a lead's project name, or a unique prefix of either's id — no more pasting lead UUIDs:
+`relay focus webapp` and `relay stop docs-site` just work. A project name matching more than one
+lead (e.g. an old + new lead after a handoff) never guesses — it lists every candidate, newest-first.
 
 Also: `relay list`'s `TOKENS` column is real spend — prompt (incl. cache reads/writes) / output
-tokens summed from the executor's transcript (deduped per message, cached per transcript size) — so
-"what did sonnet vs haiku actually cost on this territory" is a glance; `--json` carries the full
-breakdown (`usage`: input, cache_read, cache_create, output, requests, models). `LAUNCH` is
-`mcp/context/role` (`none/200k/A`: no MCP servers, 200K window, agent-roled; `G` = pre-agent session
-on full-GATES packets). `relay list` hides closed/superseded/dead sessions by default; pass `--closed` to reveal them (capped at 15 most recent). `relay report <sid>` prints a finished report in a green banner, and
-`relay prune [--days N] [--dry-run]` clears old closed/dead session state, and also clears dead
-lead markers older than `--days` ("ghost" leads from crashed/abandoned tabs — a lead you're
-actively using is never pruned). `relay diff <sid>
-[--open] [--all]` renders an executor's `git diff --staged` to a self-contained, offline HTML page
-(side-by-side via a vendored, checksummed diff2html — see [VENDOR.md](VENDOR.md) — with a stdlib
-fallback if that bundle is missing or fails its integrity check) so you review diffs in one click
-without spending model tokens on it. Its output (and every executor's closing line) includes a
-cmd+clickable `file://` URL to the page.
+tokens from the executor's transcript; `--json` carries the full breakdown (`usage`: input,
+cache_read, cache_create, output, requests, models). `LAUNCH` is `mcp/context/role`
+(`none/1m/A`: no MCP servers, 1M window, agent-roled — `none/200k/A` for 200K; `G` = pre-agent
+session on full-GATES packets). `relay list` hides closed/superseded/dead by default (`--closed`
+reveals, capped at 15). `relay report <sid>` prints a finished report in a green banner; `relay
+prune [--days N] [--dry-run]` clears old closed/dead state and stale lead markers (a lead you're
+actively using is never pruned). `relay diff <sid> [--open] [--all]` renders an executor's `git diff
+--staged` to a self-contained, offline HTML page (vendored, checksummed diff2html with a stdlib
+fallback — see [VENDOR.md](VENDOR.md)) so you review diffs in one click; its output (and every
+executor's closing line) includes a cmd+clickable `file://` URL.
 
 Type them, or just describe what you want ("check on my sessions") — the lead invokes the right one.
 
 ### Status line integration (optional)
 
-`relay status` is deliberately dumb: it reads markers + `session.json` files as they already are
-and checks report-file existence — **it writes nothing** — so it's safe to call on every status-line
-render (Claude Code can re-run your `statusLine` command multiple times a minute). It prints one
-line: the LEAD view (busy-executor NAMES, reported-executor names, a `WAKE` warning if auto-wake is
-unhealthy) or the EXECUTOR view (its packet + state, and "for <project>" when it's owned by a lead)
-— whichever role the current session has. For any other session it prints nothing, so it never adds
-noise to an unrelated status line.
+`relay status` is deliberately dumb: it reads markers + `session.json` as-is and checks report-file
+existence — **it writes nothing**, so it's safe on every status-line render. It prints the LEAD view
+(busy/reported executor names, a `WAKE` warning if unhealthy) or the EXECUTOR view (packet + state,
+"for <project>" when owned) — whichever role the session has; any other session gets nothing.
 
-Claude Code pipes a JSON payload with a top-level `session_id` field to your `statusLine` command's
-stdin (confirmed against the [statusline docs](https://code.claude.com/docs/en/statusline.md)). That
-stdin is only read once — if your status line already parses it for other purposes, capture it into
-a variable and re-pipe it to `relay status --statusline`:
+Claude Code pipes a JSON payload (a top-level `session_id` field) to your `statusLine` command's
+stdin, and that stdin is read only once — if your script already parses it for other purposes,
+capture it into a variable and re-pipe it to `relay status --statusline`:
 
 ```json
 {
@@ -267,11 +226,9 @@ a variable and re-pipe it to `relay status --statusline`:
 }
 ```
 
-A marketplace install lands at a **versioned** path
-(`~/.claude/plugins/cache/claude-relay/relay/<version>/bin/relay`) with no `latest`/`current`
-symlink, and `<version>` changes on every `/plugin update` — hardcoding it silently breaks your
-status line's relay segment on the next update (no error, it just stops appearing). Resolve it
-version-agnostically instead:
+A marketplace install lands at a **versioned** path with no `latest`/`current` symlink, and the
+version changes on every `/plugin update` — hardcoding it silently breaks your status line's relay
+segment on the next update. Resolve it version-agnostically instead:
 
 ```bash
 #!/bin/bash
@@ -283,23 +240,17 @@ relay_bin=$(ls -d "$HOME/.claude/plugins/cache/claude-relay/relay"/*/bin/relay 2
 echo "$input" | "$relay_bin" status --statusline
 ```
 
-A ready-to-copy, POSIX-`sh` version of this — plus the resolver's "not found" case (so a stale path
-is visible instead of silently dropping the segment) and both the plain and `🚦:(...)`-wrapped
-rendering of relay's segment: [`examples/statusline.sh`](examples/statusline.sh).
+A ready-to-copy, POSIX-`sh` version — plus the resolver's "not found" case and both the plain and
+`🚦:(...)`-wrapped rendering: [`examples/statusline.sh`](examples/statusline.sh).
 
-If you'd rather not thread stdin through, `--statusline` is optional: `relay status
-"$CLAUDE_CODE_SESSION_ID"` (or with no argument at all, since `relay status` falls back to that same
-env var) works from a plain shell command with no JSON parsing.
+No stdin to thread? `--statusline` is optional: `relay status "$CLAUDE_CODE_SESSION_ID"` (or with no
+argument at all, since it falls back to that same env var) works from a plain shell command.
 
-The LEAD view also carries a context-weight segment — an ambient early warning before the one-shot
-[handoff nudge](#handing-off-a-long-lived-lead) fires, and a persistent pointer to `/relay:handoff`
-after it does, so you're not relying on catching that single wake. It only appears via
-`--statusline` (that's the only invocation that carries `transcript_path`, confirmed present in the
-statusline JSON payload against the same docs). It's token-first, like the executor heaviness
-footnote: live context (from 60% of `context_nudge_tokens` upward) is the primary reading;
-transcript-MB (the secondary "session age" signal — it never shrinks, so a big number means several
-compactions in even when live context looks fine) rides alongside it once MB alone is past
-`handoff_nudge_mb`:
+The LEAD view also carries a context-weight segment — an early warning before the one-shot
+[handoff nudge](#handing-off-a-long-lived-lead) fires — appearing only via `--statusline`.
+Token-first: live context (from 60% of `context_nudge_tokens` up) is the primary reading;
+transcript-MB rides alongside once it passes `handoff_nudge_mb` (MB never shrinks, so a big number
+alone still means several compactions in):
 
 ```
 🚦 busy: tk-parser,tk-render · ✅ tk-auth · 84k ctx
@@ -307,9 +258,8 @@ compactions in even when live context looks fine) rides alongside it once MB alo
 ```
 
 Honest limit: `relay status` reads stored state + report-file existence only — no liveness refresh.
-A crashed executor may still read `busy` in your status line until the next `relay list`/`relay
-check` runs; those commands remain the decision surface for whether something actually needs
-attention.
+A crashed executor may still read `busy` until the next `relay list`/`relay check`; those commands
+remain the decision surface for whether something actually needs attention.
 
 ## The routing gate (friction, not trust)
 
@@ -397,13 +347,11 @@ relay verify <session_id> --for-autocommit --in-plan --diff-reviewed
 
 prints `AUTO-COMMIT: CLEARED` or `AUTO-COMMIT: NOT-CLEARED-BECAUSE-<reason>`, exits 0 only when
 cleared, and records an `auto_commit` ledger event with the verdict and diff stat. Conditions 3 and
-5 are not machine-knowable, so they are **the lead's explicit attestations** — without both flags
-the answer is always NOT-CLEARED, and a bare invocation can never clear by accident. Every
-NOT-CLEARED path falls back to stopping and asking, naming the failed condition.
+5 are not machine-knowable — they are **the lead's explicit attestations**; without both flags the
+answer is always NOT-CLEARED, and every NOT-CLEARED path falls back to stopping and asking.
 
-This is the one place the verifier's own caveat matters most: **it gates the automation, it does not
-replace the review.** `COUNTS-MATCH` means some numbers agreed — never that the report is true. That
-is exactly why condition 5 exists and why no amount of green output removes it.
+This is the one place the verifier's own caveat matters most — see
+[Verifying a report](#verifying-a-report-and-why-it-cant-tell-you-the-report-is-true) for why `COUNTS-MATCH` is never truth and condition 5 exists regardless.
 
 Autonomy never becomes silence: every autonomous action is announced *with the round-trip it
 replaced* ("proceeded: sent packet 003 — under manual mode this would have waited for your go"),
@@ -421,48 +369,36 @@ While the lead sits idle, a Stop hook watches in the background. When an executo
 the lead **wakes**, announces what's ready, and **waits for your direction** — it never auto-reviews
 or auto-commits (unless you've turned on [autonomous mode](#autonomous-mode), where committing still
 needs all five auto-commit conditions above). You also get a macOS notification naming the project
-and executor. Three tiers,
-first one that applies wins:
+and executor. Three tiers, first one that applies wins:
 
-**A second layer underneath.** Every spawned executor is also armed with its own Stop hook — a
-one-shot PUSH, not a background watcher. Once its report lands and it goes idle, it fires exactly
-once: if the lead already surfaced the report itself, nothing more happens (logged as
-`escalation_resolved`, not silent); if the report's owning lead has no owner or its marker is gone
-(crashed/closed/pruned), you get notified directly; otherwise it types a message straight into the
-lead's tab — **unconditionally**, even if the lead is mid-turn (a spike proved that's safe: the
-message queues in the input box and is delivered intact at the lead's next turn-end, so there's no
-busy check to wait on). No grace window, no polling, no retry — it acts once and exits. This is a net
-under the lead's own poller, not a replacement for it — a healthy idle lead already surfaces its own
-reports before this hook even runs. (The push itself is `relay nudge-lead` — internal plumbing this
-hook calls, not something you run by hand; `relay whoami` is, though — see [Commands](#commands).)
-
-1. **iTerm native** (no external tool needed): the hook writes the notification straight to the
-   lead's own tty using iTerm's OSC 777 escape. Clicking it **focuses the lead's session natively**
-   — iTerm's own click-to-source behavior, confirmed live. No coalescing: several wakes in a row
-   stack as separate banners rather than replacing one another.
-2. **terminal-notifier** (if installed, and tier 1 didn't apply — e.g. Terminal.app, or the lead's
-   iTerm session couldn't be resolved): clicking runs `relay focus <lead>`, and repeated wakes
-   **coalesce** per lead (replace rather than stack) via `-group`.
-3. **osascript fallback** (neither of the above): macOS's built-in `display notification`, same
-   info, **not clickable**.
+1. **iTerm native** (no external tool needed): writes straight to the lead's own tty via iTerm's OSC
+   777 escape. Clicking it **focuses the lead's session natively** (confirmed live). No coalescing —
+   repeated wakes stack as separate banners.
+2. **terminal-notifier** (if installed and tier 1 didn't apply — e.g. Terminal.app, or the lead's
+   iTerm session couldn't be resolved): clicking runs `relay focus <lead>`; repeated wakes
+   **coalesce** per lead via `-group`.
+3. **osascript fallback** (neither of the above): macOS's `display notification`, same info,
+   **not clickable**.
 
 One-time gotcha for tier 1: macOS must allow iTerm to post notifications — **System Settings →
 Notifications → iTerm → Allow Notifications** (iTerm's own in-app setting is not enough).
 
-Tier 1's banners carry a **"Session …" title that iTerm forces** — no escape parameter overrides or
-suppresses it. To get a clean, relay-set title/subtitle instead, set `"notify_via":
-"terminal-notifier"` in the config: relay then skips the OSC tier and uses terminal-notifier (or
-osascript if it's not installed). You lose the OSC tier's native click-to-the-posting-session, but
-terminal-notifier's click still runs `relay focus <lead>`.
+Tier 1's banners carry a **"Session …" title that iTerm forces** — no escape parameter overrides it.
+Set `"notify_via": "terminal-notifier"` in the config for a clean, relay-set title/subtitle instead
+(skips the OSC tier, falling back to osascript if terminal-notifier isn't installed; you lose native
+click-to-the-posting-session, but terminal-notifier's click still runs `relay focus <lead>`).
+
+**A second layer underneath.** Every spawned executor also carries a one-shot Stop-hook push (`relay
+nudge-lead`, internal plumbing). Once its report lands and it goes idle, it fires once: it types
+into the lead's tab if the lead hasn't already surfaced the report, or notifies you directly if the
+owning lead is gone (crashed/closed/pruned). A net under the lead's own poller, not a replacement.
 
 Wakes are scoped to executors the lead owns — multiple leads on different projects don't cross-wake.
 
-Separately, relay nudges a lead **once** (ever, per session) on two signals: primarily its live
-context (`context_nudge_tokens`, default 150k) — the cost/quality number that actually tracks
-compaction, mirroring the executor heaviness gate — and secondarily its transcript file size on
-disk (`handoff_nudge_mb`, default 5MB), which never shrinks so a big number alone still means
-several compactions in. Either crossing its threshold fires the nudge; the suggested flow is the
-same either way: write a handoff md, then `/relay:handoff <md>`.
+Separately, relay nudges a lead **once** ever on two signals: primarily live context
+(`context_nudge_tokens`, default 150k), secondarily transcript size on disk (`handoff_nudge_mb`,
+default 5MB, which never shrinks). Either threshold fires the nudge; the flow is the same either
+way — write a handoff md, then `/relay:handoff <md>`.
 
 ### Handing off a long-lived lead
 
@@ -540,45 +476,27 @@ refresh. Written to `~/.relay-tasks/board.html` (`--out` to change), `--lead <si
 
 ### relay stats
 
-`relay stats` joins each executor packet's (model, effort) to what actually happened to it, so the
-model/effort rubric in [Executor effort](#executor-effort) and the spawn skill can be checked
-against data instead of memory. It reads ONLY what's already on disk (the ledger, packets, reports,
-the same `_usage_for_session` cache `relay list`/`relay board` use) — it writes nothing. Definitions:
+`relay stats` joins each packet's (model, effort) to what happened, checkable against the rubric in
+[Executor effort](#executor-effort) instead of memory. Reads ONLY what's on disk (ledger, packets,
+reports, `relay list`'s usage cache) — writes nothing. Definitions:
 
 - A **packet** = one `NNN-packet.md` under a session's packets dir.
-- A packet is **landed** when its report exists, claims at least one path under "What changed", and
-  every claimed path is clean in the worktree (nothing staged/modified/untracked for it) at a
-  moment relay looks. It is recorded once per (session, packet) as a `landed` ledger event; a
-  packet whose report claims no paths can never land (investigation packets) and its ROUNDS stays
-  `-`. relay looks at three moments: `relay send` (before delivering the next packet — the common
-  case, since a manual `git commit` is otherwise invisible to relay), `relay list`/`relay check`
-  (when a session reads `reported`), and the auto-close sweep (right before it parks a session for
-  the same reason) — so the fact is ledgered no matter which of the three a lead's workflow hits
-  first.
-- **Rounds** = number of packets sent to that session whose gist/first line marks them as a
-  follow-up on an earlier packet. relay's ledger doesn't record that linkage, so this falls back to
-  counting packets sent to the same session strictly after this one, up to the lead's next real
-  commit boundary — the earlier of a real `auto_commit` ledger event (only the `--for-autocommit`
-  path emits it) or a `landed` event (see above; this is what makes ROUNDS populate for the common
-  case of a lead committing by hand). When neither event follows a packet's send at all — a packet
-  still in flight, or one whose report claims no paths — ROUNDS renders `-` rather than a
-  fabricated number.
-- **Verdict** = the last `report_verify` ledger event for that session+packet (`COUNTS-MATCH` /
-  `MISMATCH` / `MALFORMED` / `INCONCLUSIVE`, see [Verifying a report](#verifying-a-report-and-why-it-cant-tell-you-the-report-is-true)),
-  else `-`.
-- **Tokens**: per-packet spend isn't recorded anywhere, only per-SESSION prompt/output (same
-  `transcript_usage` `relay list` uses). `relay stats` reports that per-session total plus its
-  packet count, so `tok/pkt (avg)` is an honest average, not a per-packet measurement — labeled as
-  such in the table and the SUMMARY.
+- A packet is **landed** when its report exists, claims ≥1 path under "What changed", and every
+  claimed path is clean in the worktree at a moment relay looks (`send`, `list`/`check`, or the
+  auto-close sweep). Recorded once per (session, packet); a report claiming no paths never lands.
+- **Rounds** = packets sent to the same session after this one, up to the lead's next commit
+  boundary (`auto_commit` or `landed` — see `landed` above); relay's ledger doesn't record follow-up
+  linkage directly, so this is the fallback, and it renders `-` when neither event follows.
+- **Verdict** = the last `report_verify` event for that session+packet (`COUNTS-MATCH` / `MISMATCH` /
+  `MALFORMED` / `INCONCLUSIVE`, see [Verifying a report](#verifying-a-report-and-why-it-cant-tell-you-the-report-is-true)), else `-`.
+- **Tokens**: per-packet spend isn't recorded, only per-SESSION prompt/output; `relay stats` reports
+  that total plus packet count, so `tok/pkt (avg)` is an honest average, not a per-packet measurement.
 
-The table is one row per packet (SESSION, PKT, MODEL — the concrete id resolved back to its tier
-word — EFFORT, ROUNDS, VERDICT, STATUS from the report's TL;DR `Status:` line), a per-session
-trailer line with its token totals, then a SUMMARY grouped by (MODEL, EFFORT): packet count, mean
-rounds, % `COUNTS-MATCH`, % exactly `Status: clean` (`clean-with-caveats` does not count), and avg
-tok/pkt. Closed/superseded/dead sessions are included — that's where the history is. `--lead <sid>`
-scopes to that lead's executors plus unowned ones (same rule as `relay board --lead`); `--since
-DAYS` filters on the packet's send ledger timestamp (a packet with no recorded send time is never
-filtered out); `--json` emits `{rows, sessions, summary}`.
+The table is one row per packet (SESSION, PKT, MODEL, EFFORT, ROUNDS, VERDICT, STATUS), a
+per-session token trailer, then a SUMMARY grouped by (MODEL, EFFORT): packet count, mean rounds, %
+`COUNTS-MATCH`, % exactly `Status: clean`, avg tok/pkt — closed/dead sessions included, that's where
+the history is. `--lead <sid>` scopes to that lead (+ unowned); `--since DAYS` filters on send time;
+`--json` emits `{rows, sessions, summary}`.
 
 ### Auto-close: finished executors park themselves
 
@@ -681,54 +599,40 @@ mid-session with `/relay:mode`, which `--agent` (launch-time only) can't do.
 
 ### Executor context window (200K vs 1M)
 
-Claude Code opens the default 200K window for a bare model alias and the 1M window for the
-`[1m]` suffix (`sonnet[1m]`, `opus[1m]`; Haiku 4.5 has no 1M flavour). The window is fixed when
-the executor process starts and `--resume` keeps the conversation's model, so this is a **spawn-time
-decision** — and the lead makes it, or relay does mechanically on the lead's behalf; the executor
-never picks its own. Precedence: an explicit `[1m]` on `--model` → the packet's `CONTEXT: 1m` /
-`CONTEXT: 200k` line → relay's heuristic (it stats the files the packet names; ≥ ~600KB of
-referenced reading ≈ 150K tokens → `[1m]`, printed as `context: 1m (from referenced reading ~720KB)`)
-→ the `executor_default_context` config (**shipped `1m`** — the window is a ceiling, not
-consumption, so a bounded packet costs the same either way; set it to `200k` to reinstate
-early-compaction discipline). A packet can pin `CONTEXT: 200k` to opt one executor down. A session
-that ran heavy is widened by `relay retire` + respawn — the
-successor seed says `declare CONTEXT: 1m` when that applies. `haiku[1m]` is refused; a
-packet/heuristic asking for 1M on haiku degrades to 200K with a note.
+Bare model aliases typically open a 200K window, and the `[1m]` suffix opens 1M (`sonnet[1m]`,
+`opus[1m]`; Haiku 4.5 has no 1M flavour) — but the account decides, not the alias: some accounts
+already resolve bare `sonnet`/`opus` to 1M, so relay learns the real window from `relay doctor`
+rather than assuming it (see "How relay proves it" below). The window is fixed at spawn
+(`--resume` keeps the conversation's model) — the lead decides it, or relay does mechanically on
+its behalf; the executor never picks its own. Precedence: an explicit `[1m]` on `--model` → the
+packet's `CONTEXT: 1m`/`200k` line → relay's heuristic (≥ ~600KB of referenced reading ≈ 150K
+tokens → `[1m]`) → the `executor_default_context` config (**shipped `1m`** — a ceiling, not
+consumption, so a bounded packet costs the same either way). A packet can pin `CONTEXT: 200k` to
+opt one executor down; a heavy session is widened via `relay retire` + respawn. `haiku[1m]` is
+refused — a packet/heuristic asking for 1M on haiku degrades to 200K with a note.
 
 **How relay proves it.** Everything above decides which window an executor is *launched* with — a
-`context: 1m/200k` field relay writes and then trusts. Nothing before this stamped it against
+`context: 1m/200k` field relay writes and then trusts, nothing before this stamped it against
 reality. Three things now do:
 - `relay doctor`'s "model aliases + context window" check reads the actual `contextWindow` off a
-  live probe's `result.modelUsage` for `haiku`, `sonnet`, `sonnet[1m]`, `opus`, and `opus[1m]`
-  (skipping the opus pair when `executor_model_ceiling` is below opus). It PASSes iff every
-  `[1m]` probe reports 1_000_000, `haiku` reports 200_000, and no bare alias reports *more* than
-  its `[1m]` form — it does **not** assert bare `sonnet`/`opus` must be 200_000, because some
-  accounts already resolve them to 1_000_000 (verified live on this machine 2026-09-05, driven by
-  an account-level `sonnet1m45MigrationComplete` rollout). relay **learns** each model's real
-  window from the probe instead of asserting a number the account can change, and caches every
-  probed model into `~/.relay-tasks/tier_windows.json`. When a bare tier already equals its
-  `[1m]` form, doctor adds an ℹ line noting the suffix is a no-op for that tier on this account.
-- `relay list`'s CTX column renders `<live>/<window>`, reading the REAL window from
-  `tier_windows.json` when doctor has probed that session's model, falling back to the launch-time
-  stamp otherwise — so a session launched `200k` before doctor learned the account's true window
-  renders `<live>/1M` with no contradiction once the cache catches up. It appends `✓` the moment a
-  session's own traffic makes a 1M window self-evident: a single request whose input+cache_read+
-  cache_creation exceeds 200K could not have succeeded on a 200K window. A session whose
-  real-or-stamped window is contradicted by such a request renders `!` instead, with a footnote —
-  the footnote says to check `relay doctor`. The board's context chip shows the same string and flag.
-- `tests/test_e2e_context.py` pins the live numbers against the real CLI (`sonnet[1m]`/`opus[1m]` →
-  1_000_000, `haiku` → 200_000, bare `sonnet`/`opus` learned rather than asserted), the same way
+  live probe for `haiku`, `sonnet`, `sonnet[1m]`, `opus`, `opus[1m]` (skipping the opus pair below
+  `executor_model_ceiling`). It PASSes iff every `[1m]` probe reports 1_000_000, `haiku` reports
+  200_000, and no bare alias reports more than its `[1m]` form — it never requires bare
+  `sonnet`/`opus` to be 200_000, since some accounts already resolve them to 1M. relay **learns**
+  each model's real window from the probe rather than asserting one, caching it in
+  `~/.relay-tasks/tier_windows.json` (adding an ℹ when a bare tier already equals its `[1m]` form).
+- `relay list`'s CTX column renders `<live>/<window>` from that cache (falling back to the
+  launch-time stamp until doctor has probed it), and appends `✓` once a session's own traffic makes
+  a 1M window self-evident — a request whose input+cache tokens exceed 200K could not have run on
+  one — or `!` if traffic contradicts the stamped window, with a footnote pointing at `relay doctor`.
+- `tests/test_e2e_context.py` pins the live numbers against the real CLI, the same way
   `test_e2e_agent.py` pins the executor agent.
 
-**Cache state.** Separate from the window size, Claude Code caches an executor's last request's
-prefix for `cache_ttl_minutes` (default 60, matching the CLI's own 1-hour prompt-cache TTL) — inside
-that window the next turn's send is nearly free; past it, the cache has expired and the next turn
-re-writes the whole prefix from scratch. `relay list`'s TOKENS column, the board, and `relay send`'s
-advisory line all show it as `warm` (still cached) or `cold~<N>` (expired; `<N>` is the estimated
-rewrite — the live context tokens that will be re-sent). It's a read, not a gate: a cold session
-isn't heavy by itself, but a heavy AND cold session is the strongest case for `relay send --rotate`
-over sending straight in — the rewrite is happening either way, so a fresh executor gets it instead
-of a bloated one.
+**Cache state.** Separate from window size, Claude Code caches an executor's last request's prefix
+for `cache_ttl_minutes` (default 60) — inside that window the next send is nearly free; past it, the
+whole prefix re-writes. `relay list`'s TOKENS column, the board, and `relay send`'s advisory line
+show it as `warm` or `cold~<N>` (the estimated rewrite). It's a read, not a gate: a heavy AND cold
+session is the strongest case for `relay send --rotate` over sending straight in.
 
 ### Executor effort
 
@@ -766,19 +670,11 @@ spawn ceiling still applies.
 
 ## Troubleshooting
 
-- **First, `relay doctor`.** It proves the installed Claude Code still behaves the way relay's launch
-  line assumes — `--strict-mcp-config` loads zero servers, the executor agent applies without
-  replacing the harness prompt, `git commit` is denied under skip-permissions, and each model tier
-  reports the real window it should — plus the plumbing (binary, agent file, hooks, state dir,
-  config, configured MCP servers). The model-aliases check reads the **real `contextWindow`** off
-  the live `result` event's `modelUsage` for `haiku`, `sonnet`, `sonnet[1m]`, `opus`, `opus[1m]`
-  (not the `[1m]` suffix string — a CLI could resolve the suffix to an id and still hand back a
-  200K window, and this check would catch that); it PASSes when every `[1m]` probe reports
-  1_000_000, `haiku` reports 200_000, and no bare alias reports more than its `[1m]` form — it does
-  **not** require bare `sonnet`/`opus` to be 200_000, since an account can already default them to
-  1M, and FAILs — never silently passes — when a CLI is too old to carry `contextWindow` at all. A
-  few small calls (up to five); `--offline` for plumbing only, `--quick` to skip the slow probes.
-  Run it after every Claude Code update and before a relay release.
+- **First, `relay doctor`.** Proves the installed Claude Code still behaves the way relay's launch
+  line assumes — strict MCP, the executor agent, commit-deny under skip-permissions, and each
+  model tier's real context window (see [Executor context window](#executor-context-window-200k-vs-1m)
+  for what that check proves) — plus plumbing (binary, agent file, hooks, state dir, config, MCP
+  servers); `--offline` for plumbing only, `--quick` skips slow probes, run after every update.
 
 - **`/relay:check --all`** tells you the real state (busy/reported/stalled/dead) — trust it over how
   a tab looks. `stalled` means go look at that tab.
