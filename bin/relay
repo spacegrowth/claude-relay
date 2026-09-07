@@ -313,11 +313,10 @@ AFTERCARE_FOOTER = """
 ---
 (relay — SUCCESSOR AFTERCARE; do not remove)
 You were pre-armed by relay handoff under pinned session id {successor_sid}.
-1. VERIFY ARMING once you've settled: run /relay:mode — idempotent if your session id matches the
-   pin; it arms your REAL id if the pin didn't hold. If your id differs from {successor_sid}, also
-   run: relay stop {successor_sid}   (clears the orphaned pre-armed marker).
-2. THE PREDECESSOR'S TAB: its identity is recorded in your marker. ASK the user whether to close
-   it; on their go run: relay close-predecessor . Never close it unasked.
+1. VERIFY ARMING: run /relay:mode — idempotent if your id matches the pin; if it differs, that
+   arms your REAL id — also run: relay stop {successor_sid} (clears the orphaned pre-arm).
+2. THE PREDECESSOR'S TAB is named in your marker. ASK the user before closing it: relay
+   close-predecessor. Never close it unasked.
 3. Your first send/resume of an inherited executor adopts it automatically.
 4. REVIEWS: default to /relay:review <sid> for any inherited executor's report — the fork reads
    the whole diff every time (no blanket carve-out for relay's own gated files); read its findings,
@@ -1314,6 +1313,7 @@ def cmd_spawn(args):
     })
     append_ledger("spawned", session_id=session_id, worktree=worktree, topic=args.topic, tab_label=label)
     append_ledger("packet_sent", session_id=session_id, packet=n)
+    refresh_live_board()  # `spawn` is a state-change moment (see refresh_live_board) — no-op unless live
     if launch_failed:
         append_ledger("launch_failed", session_id=session_id, attempts=2)
         print(f"spawn: claude did NOT launch for '{session_id}' — no PID and the tab title "
@@ -1993,6 +1993,7 @@ def cmd_send(args):
             print(f"'{args.session_id}' is {s['status']} — queued as #{item['id']}, delivers when it "
                   f"next goes idle" + (f" ({pending} queued, oldest first)" if pending > 1 else "")
                   + f"\n  inspect/cancel: {RELAY_BIN} queue {args.session_id} [--cancel <id|all>]")
+            refresh_live_board()  # `send` is a state-change moment — no-op unless live
             return
         sys.exit(f"session '{args.session_id}' is {s['status']} — refusing to send (would inject mid-turn). Only reported/idle sessions are safe send targets.")
     if s["status"] == "superseded":
@@ -2154,6 +2155,7 @@ def cmd_send(args):
                     else (f"MCP set widened to {lead_guard.mcp_spec_label(s.get('mcp'))}" if mcp_relaunch
                           else f"tab '{s['tab_label']}' was gone"))
             print(f"{note} — resumed with full context and delivered packet {n:03d}")
+            refresh_live_board()  # `send` is a state-change moment — no-op unless live
             return
         # No captured Claude session (spawned before session-id capture) → today's behavior.
         s["status"] = "dead"
@@ -2170,6 +2172,7 @@ def cmd_send(args):
     write_session(args.session_id, s)
     append_ledger("packet_sent", session_id=args.session_id, packet=n)
     print(f"sent packet {n:03d} to session '{args.session_id}' (existing tab)")
+    refresh_live_board()  # `send` is a state-change moment — no-op unless live
 
 
 def _queue_lock(session_id, stale_seconds=120):
@@ -2985,14 +2988,18 @@ def _lead_age_text(m):
         return "-"
 
 
-def board_data(include_all=True, lead_sid=None):
+def board_data(include_all=True, lead_sid=None, sweep=True):
     """Everything `relay board` renders, assembled from the SAME functions `relay list` uses
-    (_check_one, _lead_liveness, wake_hook_state, _usage_for_session, seed_entries…) so the page and
-    the table can't disagree. Also runs the auto-close sweep like list does."""
+    (_check_one, _lead_liveness_verdict, wake_hook_state, _usage_for_session, seed_entries…) so the
+    page and the table can't disagree. Also runs the auto-close sweep like list does — unless
+    `sweep=False` (the live-board refresh path, called from `list`/`check`/`send`/`spawn`/the lead's
+    Stop hook: each of those has ALREADY run its own correctly-scoped sweep this turn, so the
+    refresh must never sweep a second time under a different scope)."""
     cfg = lead_guard.load_config(STATE_ROOT)
     poll_seconds = cfg.get("poll_seconds", 1800)
     poll_interval = cfg.get("poll_interval", 5)
     tier_windows = lead_guard.load_tier_windows(STATE_ROOT)
+    mb_threshold = _heaviness_threshold_mb()
     leads = []
     for m in lead_guard.list_leads(STATE_ROOT):
         sid = m.get("session_id")
@@ -3000,9 +3007,24 @@ def board_data(include_all=True, lead_sid=None):
         if lead_guard.poll_lock_state(STATE_ROOT, sid, poll_interval) == "stale":
             wake = "stuck"
         on, _src = lead_guard.autonomous_state(m)
-        leads.append({**m, "wake": wake, "liveness": _lead_liveness(m), "auto": bool(on),
+        # Lead chip: the LEAD's own line (lead_nudge_tokens, window-capped) — never the
+        # executors-only context_nudge_tokens the executor chips below use. Mirrors relay list's
+        # LEADS CTX/heavy footnote so the board and the table never disagree.
+        usage = _lead_usage_for(m)
+        mb = _transcript_mb_for(sid)
+        window = lead_guard.lead_window_for(m.get("model"), tier_windows)
+        threshold = lead_guard.lead_nudge_threshold(cfg, window)
+        heavy = lead_guard.is_heavy(usage, mb, threshold, mb_threshold)
+        heavy_reading = (lead_guard.lead_nudge_reading_text(usage.get("last_prompt") or 0, threshold, window)
+                          if usage is not None else lead_guard.heavy_reading_text(None, mb))
+        # _lead_liveness_verdict is the SAME verdict relay list's LEADS table uses (shared with
+        # _lead_liveness_verdict's other caller below) so a tombstoned-but-alive lead reads
+        # "ended?" on both the table and the board.
+        leads.append({**m, "wake": wake, "liveness": _lead_liveness_verdict(m), "auto": bool(on),
                       "paused": bool(m.get("paused")), "last_active_age": _lead_age_text(m),
-                      "mb": _mb_cell_text(_transcript_mb_for(sid))})
+                      "mb": _mb_cell_text(mb),
+                      "ctx": lead_guard.human_tokens(usage.get("last_prompt")) if usage else "-",
+                      "heavy": heavy, "heavy_reading": heavy_reading})
     rows = []
     for sid in all_session_ids():
         s = _check_one(sid)
@@ -3010,9 +3032,11 @@ def board_data(include_all=True, lead_sid=None):
             continue
         n = s.get("current_packet")
         rows.append({**s, "reported": (packets_dir(sid) / f"{n:03d}-report.md").exists()})
-    lead_caller = _armed_lead_caller()
-    acted = auto_close_sweep("board", sids=[r["session_id"] for r in rows] if lead_caller else [],
-                              lead_sid=lead_caller)
+    acted = []
+    if sweep:
+        lead_caller = _armed_lead_caller()
+        acted = auto_close_sweep("board", sids=[r["session_id"] for r in rows] if lead_caller else [],
+                                  lead_sid=lead_caller)
     if acted:
         hit = {a[0] for a in acted}
         rows = [({**read_session(r["session_id"]), "reported": r["reported"]} if r["session_id"] in hit else r) for r in rows]
@@ -3094,14 +3118,106 @@ def board_data(include_all=True, lead_sid=None):
             "relay_bin": RELAY_BIN, "leads": leads, "executors": execs, "warnings": warnings, "ledger_tail": ledger_tail}
 
 
+def _board_json_path(html_path):
+    """The sibling `board.json` path for a given board.html path (or wherever --out pointed) —
+    same directory, same stem, `.json` extension."""
+    return html_path.with_suffix(".json")
+
+
+def _atomic_write_text(path, text):
+    """Write `text` to `path` via a sibling tmp file + os.replace, never a straight in-place
+    `write_text` — same shape as `write_session`/`lead_guard._atomic_write_json`. A browser mid-reload
+    (meta-refresh or the JS `fetch('board.json')` poll) must never observe a half-written board.html
+    or board.json."""
+    path = Path(path)
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _is_board_live_active(cfg=None):
+    """Whether relay should keep rewriting the DEFAULT board.html/board.json on every
+    state-changing command — true when the lead has flipped `board_live: true` in config, OR when
+    a `relay board --live` has already been run at least once (proven by the board.json sidecar's
+    mere presence at the default location, so the auto-refresh keeps going after just one
+    `--live` run without needing the config flag too). Fail-open to False on any read error —
+    a config/disk hiccup here must silently mean "not live", never crash a caller."""
+    try:
+        cfg = cfg if cfg is not None else lead_guard.load_config(STATE_ROOT)
+        if cfg.get("board_live"):
+            return True
+        return _board_json_path(STATE_ROOT / "board.html").exists()
+    except Exception:
+        return False
+
+
+def refresh_live_board():
+    """Rewrite the DEFAULT board.html + board.json in place, IF live mode is active
+    (_is_board_live_active) — the no-server-process trick this whole feature rests on: relay
+    itself re-renders the page from current on-disk state at every moment state actually changes
+    (list/check/send/spawn, and the lead's Stop hook via `_refresh-board`), so a tab left open
+    sees fresh content within one meta-refresh interval without ever calling out to anything.
+    Always renders with sweep=False (see board_data's docstring) — the caller triggering this
+    refresh has already run its own correctly-scoped auto-close sweep this turn (or, for the Stop
+    hook path, delegates that separately to `_auto-close-sweep`); this rewrite must never be a
+    SECOND, differently-scoped sweep. Fail-open: best-effort, never raises — a rendering hiccup
+    here must never break the real command that triggered it."""
+    try:
+        cfg = lead_guard.load_config(STATE_ROOT)
+        if not _is_board_live_active(cfg):
+            return
+        refresh_seconds = int(cfg.get("board_refresh_seconds", lead_guard.LEAD_DEFAULTS["board_refresh_seconds"]))
+        data = board_data(sweep=False)
+        out = STATE_ROOT / "board.html"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(out, board_render.render(data, live=True, refresh_seconds=refresh_seconds))
+        _atomic_write_text(_board_json_path(out), json.dumps(data, indent=2, default=str))
+    except Exception:
+        pass
+
+
+def cmd_refresh_board(args):
+    """Internal: the lead Stop hook's live-board trigger (hooks/stop_lead_watch.py), mirroring
+    `_auto-close-sweep`'s pattern — a thin CLI entry point so the hook stays a subprocess call with
+    no relay internals imported. A no-op when live mode isn't active (see refresh_live_board)."""
+    refresh_live_board()
+
+
 def cmd_board(args):
+    cfg = lead_guard.load_config(STATE_ROOT)
+    live_arg = getattr(args, "live", None)
+    out = Path(args.out).expanduser() if args.out else (STATE_ROOT / "board.html")
+    if live_arg == "off":
+        # Turning live mode off just means removing the board.json sidecar — its mere presence
+        # at the default location is what `_is_board_live_active` treats as "live", so deleting it
+        # is enough to stop `refresh_live_board` rewriting the page on every state change. But the
+        # `board_live: true` config key is an independent, higher-priority "on" switch (see
+        # `_is_board_live_active`) — removing the sidecar can't override that, so say so instead of
+        # silently no-op'ing.
+        sidecar = _board_json_path(out)
+        removed = sidecar.exists()
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+        if cfg.get("board_live"):
+            print("sidecar removed, but config board_live: true still holds live mode on — "
+                  "unset it in the config to fully turn live mode off")
+        elif removed:
+            print(f"live mode off ({sidecar} removed)")
+        else:
+            print("live mode was already off (no board.json sidecar)")
+        return
     data = board_data(lead_sid=getattr(args, "lead", None))
     if args.json:
         print(json.dumps(data, indent=2, default=str))
         return
-    out = Path(args.out).expanduser() if args.out else (STATE_ROOT / "board.html")
+    live = bool(live_arg) or bool(cfg.get("board_live"))
+    refresh_seconds = int(cfg.get("board_refresh_seconds", lead_guard.LEAD_DEFAULTS["board_refresh_seconds"]))
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(board_render.render(data))
+    _atomic_write_text(out, board_render.render(data, live=live, refresh_seconds=refresh_seconds))
+    if live:
+        _atomic_write_text(_board_json_path(out), json.dumps(data, indent=2, default=str))
     print(str(out))
     print(path_to_file_url(out))
     if args.open:
@@ -3378,6 +3494,7 @@ def cmd_check(args):
     with sink:
         acted = auto_close_sweep("check", sids=[sid for sid in ids if sid] if lead_caller else [],
                                   lead_sid=lead_caller)
+    refresh_live_board()  # `check` is a state-change moment (see refresh_live_board) — no-op unless live
     if args.json:
         for s in results:
             hit = next((a for a in acted if a[0] == s.get("session_id")), None)
@@ -3436,15 +3553,20 @@ def _resolve_status_payload(args):
     return (sid or os.environ.get("CLAUDE_CODE_SESSION_ID") or None), transcript_path
 
 
-def _weight_segment(state_root, lead_sid, transcript_path):
+def _weight_segment(state_root, lead_sid, transcript_path, model=None):
     """The context-weight / handoff-awareness segment: ambient early warning before the one-shot
     handoff nudge (stop_lead_watch) fires, persistent pointer after. `transcript_path` is only
     ever set in --statusline mode (see _resolve_status_payload), so this is silent for positional-
-    id/env-var invocations — there's no transcript to measure.
+    id/env-var invocations — there's no transcript to measure. `model` (from the lead's own
+    marker, when the caller has it) resolves the window-aware nudge line — see
+    lead_guard.lead_nudge_threshold; omitted/None (the common case — real lead markers carry
+    `model: null`) leaves lead_guard.lead_window_for's own result at None, i.e. the line stays
+    uncapped rather than guessed down to 200k.
 
     Token-first, like the executor heaviness footnote (_heavy_reading_text): when the transcript's
     usage can be parsed, live context (last_prompt) is the primary reading — "<ctx>k ctx" from 60%
-    of context_nudge_tokens, "<ctx>k ctx → /relay:handoff" at/after the threshold or once nudged.
+    of the LEAD's own nudge line (lead_nudge_tokens, window-capped — never the executors-only
+    context_nudge_tokens), "<ctx>k ctx → /relay:handoff" at/after the threshold or once nudged.
     Transcript-MB stays the secondary "session age" (compaction-count) signal: it's folded in
     alongside ctx whenever MB alone is past handoff_nudge_mb (or the once-ever nudge already
     fired) even if tokens haven't crossed their own threshold — a big MB-on-disk means several
@@ -3458,7 +3580,8 @@ def _weight_segment(state_root, lead_sid, transcript_path):
         return ""
     mb = lead_guard.transcript_mb(transcript_path)
     mb_threshold = float(cfg.get("handoff_nudge_mb", 5))
-    token_threshold = float(cfg.get("context_nudge_tokens", lead_guard.LEAD_DEFAULTS["context_nudge_tokens"]))
+    window = lead_guard.lead_window_for(model, lead_guard.load_tier_windows(state_root))
+    token_threshold = lead_guard.lead_nudge_threshold(cfg, window)
     nudged = lead_guard.handoff_nudged(state_root, lead_sid)
     mb_over = (mb >= mb_threshold) or (nudged and mb > 0)
     mb_near = mb >= 0.6 * mb_threshold
@@ -3557,7 +3680,7 @@ def _lead_status_line(lead_sid, marker, transcript_path=None, statusline=False):
         segments.append("WAKE stale")
 
     if transcript_path:
-        weight = _weight_segment(STATE_ROOT, lead_sid, transcript_path)
+        weight = _weight_segment(STATE_ROOT, lead_sid, transcript_path, model=marker.get("model"))
         if weight:
             segments.append(weight)
 
@@ -3746,6 +3869,22 @@ def _lead_liveness_cell(m):
     used to hide behind ("indistinguishable from an idle one", §3) — while 'ghost' is dim (already
     long gone, nothing urgent to act on beyond eventual `relay prune`)."""
     return _LIVENESS_CELL[_lead_liveness(m)]
+
+
+def _lead_liveness_verdict(m):
+    """The full liveness verdict for one lead marker, including the two overrides `relay list`
+    applies on top of `_lead_liveness`'s live/unreachable/ghost — 'broken' for a marker
+    `list_leads` could not even read (no tab/cwd identity to probe), and 'ended_but_alive' for a
+    TOMBSTONED marker whose tab still probes alive (the hijack/silent-tombstone shape, Packet-002
+    item 3: a genuinely paused/resumable exit doesn't leave its own tab running). Shared by
+    `cmd_list` and `board_data` so the two surfaces can't disagree about which leads are actually
+    the hijack/silent-tombstone case."""
+    if m.get("broken"):
+        return "broken"
+    verdict = _lead_liveness(m)
+    if verdict == "live" and lead_guard.is_tombstoned(m):
+        return "ended_but_alive"
+    return verdict
 
 
 def _find_transcript_path(claude_session):
@@ -3948,9 +4087,13 @@ def _lead_mb_cell(m):
 
 
 def _heaviness_threshold_tokens():
-    """§6e's heaviness threshold, in tokens (`context_nudge_tokens`, default 150000) — the LIVE
-    context (transcript_usage's `last_prompt`) actually driving cost/compaction, not the MB proxy.
-    Replaces `handoff_nudge_mb` as the executor-heaviness signal; see LEAD_DEFAULTS."""
+    """§6e's EXECUTOR heaviness threshold, in tokens (`context_nudge_tokens`, default 150000) — the
+    LIVE context (transcript_usage's `last_prompt`) actually driving cost/compaction, not the MB
+    proxy. Replaces `handoff_nudge_mb` as the executor-heaviness signal; see LEAD_DEFAULTS. A LEAD's
+    own line is a separate, higher config (`lead_nudge_tokens`) — see `lead_guard.lead_nudge_threshold`
+    — never this one; every executor-only surface (cmd_send's gate, auto_close_sweep,
+    board_data/cmd_list's EXECUTORS heavy footnote/CTX columns) keeps reading this function
+    unchanged."""
     return float(lead_guard.load_config(STATE_ROOT).get("context_nudge_tokens",
                  lead_guard.LEAD_DEFAULTS["context_nudge_tokens"]))
 
@@ -4006,6 +4149,7 @@ def cmd_list(args):
         hit = {a[0] for a in acted}
         rows = [({**read_session(r["session_id"]), "reported": r["reported"]} if r["session_id"] in hit else r)
                 for r in rows]
+    refresh_live_board()  # `list` is a state-change moment (see refresh_live_board) — no-op unless live
     if not show_all:
         rows = [s for s in rows if s.get("owner_lead") in (None, lead_sid)]
 
@@ -4068,20 +4212,10 @@ def cmd_list(args):
         _WAKE_CELL = {"ok": ("ok", ("green",)), "stale": ("STALE", ("red", "bold")),
                       "unknown": ("ver?", ("dim",)), "stuck": ("stuck", ("red", "bold"))}
         # One liveness verdict per lead, computed up front — see the LIVE column comment below.
-        # A broken marker (D2) short-circuits to "broken": it carries no tab/cwd identity to run
-        # the is_alive probe against, and it isn't a real "how stale is this lead" question.
-        # Packet-002 item 3: a TOMBSTONED marker whose tab still probes alive is not an ordinary
-        # "live" lead — a genuinely paused/resumable exit doesn't leave its own tab running (the
-        # process exited), so a live tab plus an ended marker is the hijack/silent-tombstone shape
-        # this whole packet exists to surface — overridden to "ended_but_alive" ("ended?", red)
-        # rather than the reassuring green "live".
-        def _lead_liveness_verdict(m):
-            if m.get("broken"):
-                return "broken"
-            verdict = _lead_liveness(m)
-            if verdict == "live" and lead_guard.is_tombstoned(m):
-                return "ended_but_alive"
-            return verdict
+        # _lead_liveness_verdict (module-level, shared with board_data) short-circuits a broken
+        # marker (D2) to "broken" and overrides a TOMBSTONED-but-alive-tab marker to
+        # "ended_but_alive" (Packet-002 item 3's hijack/silent-tombstone shape) rather than the
+        # reassuring green "live".
         liveness_by_sid = {m.get("session_id"): _lead_liveness_verdict(m) for m in leads}
         # One usage reading per lead, computed up front (same memoize-once rationale as liveness
         # above) — feeds the CTX column and is cached on disk itself (_usage_for_session's
@@ -4089,6 +4223,22 @@ def cmd_list(args):
         lead_usage_by_sid = {m.get("session_id"): _lead_usage_for(m) for m in leads}
         lead_ctx_by_sid = {sid: (lead_guard.human_tokens(u.get("last_prompt")) if u else "-")
                            for sid, u in lead_usage_by_sid.items()}
+        # Heaviness: a LEAD's own line (lead_nudge_tokens, window-capped) — never the
+        # executors-only context_nudge_tokens the EXECUTORS table's heavy footnote uses below.
+        # window_for(model, tier_windows) is `relay doctor`'s probed real window when known;
+        # lead_window_for's fallback is 1_000_000 for a `[1m]`-suffixed model, else None (genuinely
+        # unknown — never guessed down to 200_000). See lead_guard.lead_nudge_threshold for the
+        # 200k cap rationale, which only fires when the window IS known to be exactly 200_000.
+        tier_windows = lead_guard.load_tier_windows(STATE_ROOT)
+        lead_mb_by_sid = {m.get("session_id"): _transcript_mb_for(m.get("session_id")) for m in leads}
+        lead_window_by_sid = {m.get("session_id"): lead_guard.lead_window_for(m.get("model"), tier_windows)
+                               for m in leads}
+        lead_threshold_by_sid = {sid: lead_guard.lead_nudge_threshold(lead_cfg, w)
+                                  for sid, w in lead_window_by_sid.items()}
+        lead_mb_threshold = _heaviness_threshold_mb()
+        lead_heavy_by_sid = {sid: lead_guard.is_heavy(lead_usage_by_sid[sid], lead_mb_by_sid[sid],
+                                                       lead_threshold_by_sid[sid], lead_mb_threshold)
+                             for sid in lead_threshold_by_sid}
         # Calculate dynamic widths for LEADS table with per-column caps.
         lead_cols = [
             ("PROJECT", 22, [m.get("project") or "-" for m in leads]),
@@ -4163,6 +4313,24 @@ def cmd_list(args):
                 f"{m.get('project') or (m.get('session_id') or '?')[:8]} "
                 f"(↪ migrated from {m['migrated_from'][:8]})" for m in migrated_leads)
             print(c(f"  ↪ {names}", "dim"))
+        # LEADS heavy footnote — the lead sibling of the EXECUTORS one below, same "say it in
+        # words" rule, but on the LEAD's own line (never context_nudge_tokens): NUDGE wording,
+        # not a verdict, and names the line and the window so a capped 200k lead isn't confused
+        # for a plain 300k reading.
+        def _lead_heavy_reading(m):
+            sid = m.get("session_id")
+            usage = lead_usage_by_sid.get(sid)
+            if usage is not None:
+                return lead_guard.lead_nudge_reading_text(
+                    usage.get("last_prompt") or 0, lead_threshold_by_sid[sid], lead_window_by_sid[sid])
+            return lead_guard.heavy_reading_text(None, lead_mb_by_sid[sid])  # unreadable transcript — MB proxy
+        heavy_leads = [m for m in leads if lead_heavy_by_sid.get(m.get("session_id"))]
+        if heavy_leads:
+            parts = ", ".join(f"{m.get('project') or (m.get('session_id') or '?')[:8]} "
+                              f"({_lead_heavy_reading(m)})" for m in heavy_leads)
+            print(c(f"  ⚠ heavy: {parts} — no verdict on the work, just a heads up: write a "
+                    f"handoff md and run /relay:handoff <md> to open a fresh, pre-armed successor.",
+                    "yellow"))
         # Footnote only when something needs action — a stale (or unknown) wake hook is exactly the
         # silent condition that used to cost a forensic investigation to find.
         # Autonomy must never be quiet: if any lead is proceeding without asking, say so in words
@@ -5193,7 +5361,8 @@ def cmd_handoff(args):
     # a prior revision inlined the full aftercare (with the pinned UUID twice) here and the typed
     # launch command truncated mid-seed on a real run, corrupting the shell.
     seed = (f"You are the successor lead for project '{project}', pre-armed by relay handoff. Read "
-            f"{handoff_copy_path} and follow its SUCCESSOR AFTERCARE section before anything else.")
+            f"{handoff_copy_path} — follow SUCCESSOR AFTERCARE, then use /relay:review <sid> for "
+            f"reports.")
 
     # never leave the project leadless; never leave a ghost on failure: a failed spawn must NOT
     # step the caller down (it's still the only live lead), and must NOT leave the successor's
@@ -5774,6 +5943,10 @@ def main():
     bd.add_argument("--out", help="write the page here (default ~/.relay-tasks/board.html)")
     bd.add_argument("--lead", help="scope executors to this lead's (plus unowned)")
     bd.add_argument("--json", action="store_true", help="emit the board data instead of HTML")
+    bd.add_argument("--live", nargs="?", const="on", default=None, choices=["on", "off"],
+                     help="write a sibling board.json + a meta-refresh page, and keep both rewritten "
+                     "on every list/check/send/spawn and lead Stop hook — no server process (same as "
+                     "config board_live: true); `--live off` removes the sidecar to turn it back off")
     bd.set_defaults(func=cmd_board)
 
     stp = sub.add_parser("stats", help="join each executor packet's (model, effort) to its outcome "
@@ -5807,6 +5980,9 @@ def main():
     acs = sub.add_parser("_auto-close-sweep", help=argparse.SUPPRESS)  # internal: lead Stop hook trigger
     acs.add_argument("--lead", help="only this lead's executors")
     acs.set_defaults(func=cmd_auto_close_sweep)
+
+    rfb = sub.add_parser("_refresh-board", help=argparse.SUPPRESS)  # internal: lead Stop hook trigger
+    rfb.set_defaults(func=cmd_refresh_board)
 
     ck = sub.add_parser("check")
     ck.add_argument("session_id", nargs="?")

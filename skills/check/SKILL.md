@@ -25,3 +25,8 @@ detects it, it doesn't fix it.
 report you've already seen gets parked once its work has landed (claimed files clean in the
 worktree) or it has idled past `auto_close_idle_minutes` — printed as a 🛏 line. Nothing is lost;
 `/relay:send` resumes it. Pin with `relay keep <sid>` if a follow-up is imminent.
+
+**Never `cat` a report, transcript or ledger in the lead.** If `check` shows `stalled` (or the user
+asks "why is it stuck"/"what is it doing"/"did the wake fire"), that is a diagnosis question, not
+a packet review — route it through `/relay:review <sid> --why` instead of opening any of those
+files yourself; the fork reads them in its own disposable context and answers in 8 lines.

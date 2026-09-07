@@ -12,9 +12,10 @@ activity it would otherwise miss, and ANNOUNCE-AND-WAIT (never auto-act). Two th
           edit-gate can't see). These already exist at stop time → checked synchronously, instantly.
 
 Also, once per lead ever: if live context (transcript_usage's last_prompt) has grown past
-context_nudge_tokens, OR the transcript file has grown past handoff_nudge_mb (the secondary
-"session age" / compaction-count signal), nudge a handoff (summarize → /relay:stop → fresh session
-+ /relay:mode) — a best-effort nudge, not automation.
+lead_nudge_tokens (a LEAD's own line — window-capped via lead_guard.lead_nudge_threshold; see
+LEAD_DEFAULTS — never the executors-only context_nudge_tokens), OR the transcript file has grown
+past handoff_nudge_mb (the secondary "session age" / compaction-count signal), nudge a handoff
+(summarize → /relay:stop → fresh session + /relay:mode) — a best-effort nudge, not automation.
 
 Contract (proven by the asyncRewake spike — see docs/async-rewake-findings.md): runs in the
 background; exit 0 → silent, lead stays idle; exit 2 → the idle lead WAKES with this script's
@@ -233,6 +234,17 @@ def main():
             except Exception:
                 pass
 
+        # Live board (task: "make relay board live"): every lead turn-end is also a "state
+        # changed" moment for the board — rewrite board.html/board.json in place so a page left
+        # open sees fresh state within one meta-refresh interval, with NO server process.
+        # Unconditional (unlike the sweep above): refresh_live_board itself no-ops instantly
+        # unless live mode is actually active (config board_live, or a prior `--live` run's
+        # board.json sidecar), so this costs nothing extra for a lead that never touched `board`.
+        try:
+            subprocess.run([RELAY_BIN, "_refresh-board"], capture_output=True, timeout=25)
+        except Exception:
+            pass
+
         transcript_path = payload.get("transcript_path")
 
         # #22: promote announced-but-unproven wakes once delivery is PROVEN.
@@ -285,8 +297,9 @@ def main():
             if cfg.get("handoff_nudge", True) and not lg.handoff_nudged(STATE_ROOT, sid):
                 mb = lg.transcript_mb(transcript_path)
                 usage = lg.transcript_usage(transcript_path)
-                token_threshold = float(cfg.get("context_nudge_tokens",
-                                                 lg.LEAD_DEFAULTS["context_nudge_tokens"]))
+                marker = lg.read_marker(STATE_ROOT, sid)
+                window = lg.lead_window_for(marker.get("model"), lg.load_tier_windows(STATE_ROOT))
+                token_threshold = lg.lead_nudge_threshold(cfg, window)
                 mb_threshold = float(cfg.get("handoff_nudge_mb", 5))
                 tokens = usage.get("last_prompt") if usage else None
                 tokens_over = tokens is not None and tokens >= token_threshold
@@ -296,8 +309,7 @@ def main():
                                                               # can't double-nudge; worst case one
                                                               # nudge is silently skipped
                     if tokens_over:  # token-first: say the real signal when it's the one that tripped
-                        reading = (f"{lg.human_tokens(tokens)} live context, past "
-                                   f"{lg.human_tokens(token_threshold)}")
+                        reading = lg.lead_nudge_reading_text(tokens, token_threshold, window)
                     else:
                         reading = (f"~{mb:.1f}MB transcript, past {mb_threshold:g}MB: several "
                                    "compactions in")

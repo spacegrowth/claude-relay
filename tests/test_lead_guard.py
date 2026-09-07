@@ -2437,6 +2437,86 @@ class TestIsHeavy:
         assert lg.heavy_reading_text(None, None) == "unknown"
 
 
+class TestLeadNudgeSplit:
+    """Task: split the heaviness threshold by role — leads nudge at `lead_nudge_tokens` (default
+    300000) on a 1M window, executors keep `context_nudge_tokens` (default 150000) unchanged.
+    `lead_nudge_threshold` caps a 200k-window lead's line to `context_nudge_tokens` (both configs
+    stay independently configurable) so it's never told it has room the window doesn't have."""
+
+    def test_lead_defaults_are_split_from_executor(self):
+        assert lg.LEAD_DEFAULTS["lead_nudge_tokens"] == 300000
+        assert lg.LEAD_DEFAULTS["context_nudge_tokens"] == 150000
+
+    def test_lead_window_for_infers_1m_from_model_suffix(self):
+        assert lg.lead_window_for("claude-sonnet-5[1m]", {}) == 1_000_000
+
+    def test_lead_window_for_unknown_without_1m_suffix_or_probe(self):
+        # A bare model (no [1m] suffix) or no model at all is genuinely unknown — never guessed
+        # down to 200_000 (backlog row 49: a bare model is never ASSERTED to be 200k). Every real
+        # lead marker on this machine carries `model: null`, so defaulting to 200_000 here would
+        # silently cap every lead's nudge line at 150k and the 300k line would never apply.
+        assert lg.lead_window_for("claude-sonnet-5", {}) is None
+        assert lg.lead_window_for(None, {}) is None
+
+    def test_lead_window_for_prefers_probed_tier_windows(self):
+        tier_windows = {"claude-sonnet-5": {"window": 1_000_000, "alias": "sonnet"}}
+        # a bare (no [1m]) model string would otherwise be unknown (None) — the real probe wins.
+        assert lg.lead_window_for("claude-sonnet-5", tier_windows) == 1_000_000
+
+    def test_unknown_window_marker_nudges_at_310k_not_160k(self):
+        # End-to-end: a real lead marker (`model: null`, no probed tier entry — the common case on
+        # this machine) must NOT be treated as a 200k window, or the 300k line never applies to any
+        # real lead (backlog row 49 + the bug this test guards against).
+        marker = {"model": None}
+        window = lg.lead_window_for(marker.get("model"), {})
+        assert window is None
+        threshold = lg.lead_nudge_threshold(lg.LEAD_DEFAULTS, window)
+        assert threshold == 300000
+        assert lg.is_heavy({"last_prompt": 160_000}, None, threshold, 5) is False
+        assert lg.is_heavy({"last_prompt": 310_000}, None, threshold, 5) is True
+
+    def test_uncapped_on_a_1m_window(self):
+        assert lg.lead_nudge_threshold(lg.LEAD_DEFAULTS, 1_000_000) == 300000
+
+    def test_uncapped_when_window_unknown(self):
+        assert lg.lead_nudge_threshold(lg.LEAD_DEFAULTS, None) == 300000
+
+    def test_capped_to_context_nudge_tokens_on_a_200k_window(self):
+        assert lg.lead_nudge_threshold(lg.LEAD_DEFAULTS, 200_000) == 150000
+
+    def test_cap_follows_both_configs_independently(self):
+        # "both configurable": bumping either number moves the effective 200k-window line, not just
+        # lead_nudge_tokens — the cap is context_nudge_tokens itself, never a hardcoded 150000.
+        cfg = dict(lg.LEAD_DEFAULTS, lead_nudge_tokens=400000, context_nudge_tokens=100000)
+        assert lg.lead_nudge_threshold(cfg, 200_000) == 100000
+        assert lg.lead_nudge_threshold(cfg, 1_000_000) == 400000
+
+    def test_lead_nudge_reading_text_names_line_and_window(self):
+        assert (lg.lead_nudge_reading_text(312_000, 300_000, 1_000_000)
+                == "312k live, line 300k on a 1M window")
+        assert "?" in lg.lead_nudge_reading_text(160_000, 150_000, None)
+
+    # ── the packet's four required scenarios ──────────────────────────────────────────────
+    def test_lead_at_200k_is_not_nudged_on_a_1m_window(self):
+        threshold = lg.lead_nudge_threshold(lg.LEAD_DEFAULTS, 1_000_000)
+        assert lg.is_heavy({"last_prompt": 200_000}, None, threshold, 5.0) is False
+
+    def test_lead_is_nudged_at_310k_on_a_1m_window(self):
+        threshold = lg.lead_nudge_threshold(lg.LEAD_DEFAULTS, 1_000_000)
+        assert lg.is_heavy({"last_prompt": 310_000}, None, threshold, 5.0) is True
+
+    def test_a_200k_window_lead_is_nudged_at_160k(self):
+        threshold = lg.lead_nudge_threshold(lg.LEAD_DEFAULTS, 200_000)
+        assert lg.is_heavy({"last_prompt": 160_000}, None, threshold, 5.0) is True
+
+    def test_executor_gate_unchanged_at_150k(self):
+        # Executors read context_nudge_tokens directly — never lead_nudge_threshold — so the
+        # split must leave this exact reading untouched.
+        threshold = lg.LEAD_DEFAULTS["context_nudge_tokens"]
+        assert lg.is_heavy({"last_prompt": 150_000}, None, threshold, 5.0) is True
+        assert lg.is_heavy({"last_prompt": 149_999}, None, threshold, 5.0) is False
+
+
 class TestHandoffNudge:
     """Stop hook: once-ever nudge to hand off when the lead's transcript grows past
     handoff_nudge_mb. Transcript size is a PROXY for session weight, not context occupancy — hence
@@ -2484,16 +2564,20 @@ class TestHandoffNudge:
         # token-first: live context alone (transcript file itself stays tiny) trips the nudge.
         root = tmp_path / ".relay-tasks"
         lg.write_marker(root, "lead-1")
-        transcript = self._usage_file(tmp_path / "transcript.jsonl", 212000)
+        transcript = self._usage_file(tmp_path / "transcript.jsonl", 310000)
         rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
                                         "transcript_path": str(transcript)})
         assert rc == 2
         assert "getting heavy" in err
-        assert "live context" in err
+        # lead_nudge_reading_text names the line AND the window (a bare marker with no `model`
+        # leaves the window genuinely unknown — None, never guessed at 200_000, see backlog row 49
+        # / the None-window bugfix — so the effective line stays UNCAPPED at lead_nudge_tokens,
+        # 300k, per lead_nudge_threshold; the unknown window renders as "?").
+        assert "310k live, line 300k on a ? window" in err
         assert lg.handoff_nudged(root, "lead-1")
         events = self._ledger_events(root)
         ev = [e for e in events if e["event"] == "handoff_nudged" and e["session_id"] == "lead-1"][0]
-        assert ev["tokens"] == 212000
+        assert ev["tokens"] == 310000
         assert ev["mb"] < 1
 
     def test_nudges_on_mb_past_threshold_with_tokens_below(self, tmp_path):
@@ -2523,10 +2607,37 @@ class TestHandoffNudge:
         assert "getting heavy" not in err
         assert not lg.handoff_nudged(root, "lead-1")
 
+    def test_1m_window_lead_not_nudged_below_300k_line(self, tmp_path):
+        # A lead marker recording a `[1m]`-suffixed model resolves a KNOWN 1M window and reads
+        # lead_nudge_tokens UNCAPPED (300k) — same uncapped 300k a bare/unknown-window lead now
+        # gets too (lead_nudge_threshold only caps a KNOWN 200_000 window) — so 212k stays silent
+        # either way.
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", model="claude-sonnet-5[1m]")
+        transcript = self._usage_file(tmp_path / "transcript.jsonl", 212000)
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                        "transcript_path": str(transcript)})
+        assert rc == 0
+        assert "getting heavy" not in err
+        assert not lg.handoff_nudged(root, "lead-1")
+
+    def test_1m_window_lead_nudged_past_300k_line(self, tmp_path):
+        root = tmp_path / ".relay-tasks"
+        lg.write_marker(root, "lead-1", model="claude-sonnet-5[1m]")
+        transcript = self._usage_file(tmp_path / "transcript.jsonl", 312000)
+        rc, err = self._run(tmp_path, {"session_id": "lead-1", "cwd": str(tmp_path),
+                                        "transcript_path": str(transcript)})
+        assert rc == 2
+        assert "312k live, line 300k on a 1M window" in err
+        assert lg.handoff_nudged(root, "lead-1")
+
     def test_token_nudge_still_fires_exactly_once(self, tmp_path):
+        # A bare marker's window is unknown (None), uncapped at lead_nudge_tokens (300k default) —
+        # 310000 crosses that line, unlike 212000 which no longer does since the fix (see
+        # test_nudges_on_tokens_past_threshold_with_mb_below above).
         root = tmp_path / ".relay-tasks"
         lg.write_marker(root, "lead-1")
-        transcript = self._usage_file(tmp_path / "transcript.jsonl", 212000)
+        transcript = self._usage_file(tmp_path / "transcript.jsonl", 310000)
         payload = {"session_id": "lead-1", "cwd": str(tmp_path), "transcript_path": str(transcript)}
         assert self._run(tmp_path, payload)[0] == 2
         rc, err = self._run(tmp_path, payload)

@@ -76,3 +76,32 @@ actually found, not just a boolean saying "reviewed: yes". (Bare `--diff-reviewe
 
 In manual (non-autonomous) mode there's no gate to clear — read the findings, decide, then commit
 or send a fix-list packet exactly as you would have after reading the diff yourself.
+
+## `/relay:review <session> --why` — diagnosis mode
+
+A second, separate use of this skill: a diagnosis question about a session's *state*, not a
+finished packet's diff — "why is it stalled", "what is it doing", "did the wake fire". Same
+principle as the review mode above (route the read through a fork, never spend the lead's own
+context on it), different fixed prompt — this one reads state, not a diff, and answers in **at
+most 8 lines**:
+
+```
+You are diagnosing executor session $session_id on the lead's behalf — NOT a packet review, do
+not read or diff any code. Read, in order:
+1. `${CLAUDE_PLUGIN_ROOT}/bin/relay check $session_id --json` for its status, current packet,
+   worktree and `claude_session`.
+2. Its current report, if any (~/.relay-tasks/$session_id/packets/<NNN>-report.md).
+3. The tail of its transcript (~50 lines): find it with
+   `find ~/.claude/projects -name "<claude_session>.jsonl"`, then read the last records.
+4. Its ledger entries: `grep '"session_id": *"'$session_id'"' ~/.relay-tasks/sessions.jsonl`
+   (or `grep $session_id` if that yields nothing), most recent last.
+
+Then answer in AT MOST 8 LINES, no preamble: what it was actually doing right before going idle
+(or now, if still busy), whether it is truly stalled or just slow, and whether the wake/
+notification actually fired for its last report (if any).
+```
+
+**Never `cat` a report, transcript or ledger in the lead itself** — for a diagnosis question
+exactly as much as for a packet review, that read belongs in the fork's disposable context, not
+yours. Route every "what's it doing" / "is it stuck" / "did it wake me" question through
+`--why`, even a quick-looking one.

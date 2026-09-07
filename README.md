@@ -58,6 +58,16 @@ wakes you when an executor finishes.
 | `relay close` | closes the tab | window may linger (Cmd-W it) |
 | Lead push-wake (`nudge-lead`) | yes | no — Terminal.app can't inject text into a running process; a Terminal-hosted lead degrades to its own at-Stop check + desktop notification |
 
+**Why the lead's own model matters**: this role's value is judgment calls (what to delegate, when
+to reuse a session, whether a report is truly mergeable) — that needs a strong reasoning model, and
+no skill can switch it programmatically, so `/relay:mode` has the session say its own tier out loud
+rather than trust it silently. Known limitation, confirmed empirically: the self-check becomes
+unreliable after multiple `/model` switches within one continuing session (self-knowledge of "which
+model am I" doesn't reliably refresh on every switch), and there's no known way to verify the
+running model programmatically. Decide the model once at session start — the session's launch
+model, or a single `/model` switch made before invoking `/relay:mode` — and don't switch again
+expecting the check to stay accurate; start a fresh session instead if you need a different one.
+
 Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
 
 ## Install
@@ -133,7 +143,8 @@ The flow, in five beats:
 
 1. **Design** — tell the session what to build, or point it at a brief.
 2. **`/relay:mode`** — arm it as the lead. (Order is flexible: arm first and then describe the
-   work, or design first and arm after — both work.)
+   work, or design first and arm after — both work. Armed with no task yet? Don't invent one —
+   say you're ready and wait to be told what to build, then propose the split as usual.)
 3. **Approve the split** — the lead proposes executors + packet files and **waits for your go**.
 4. **Spawn** — executors build in parallel, each in its own tab/pane, each on the model the lead
    picked for it (`--model`, per executor — see [Why](#why)); the lead wakes you as each one
@@ -249,7 +260,8 @@ argument at all, since it falls back to that same env var) works from a plain sh
 
 The LEAD view also carries a context-weight segment — an early warning before the one-shot
 [handoff nudge](#handing-off-a-long-lived-lead) fires — appearing only via `--statusline`.
-Token-first: live context (from 60% of `context_nudge_tokens` up) is the primary reading;
+Token-first: live context (from 60% of `lead_nudge_tokens` up — a lead's OWN line, window-capped;
+see the Config table — never the executors-only `context_nudge_tokens`) is the primary reading;
 transcript-MB rides alongside once it passes `handoff_nudge_mb` (MB never shrinks, so a big number
 alone still means several compactions in):
 
@@ -414,15 +426,24 @@ owning lead is gone (crashed/closed/pruned). A net under the lead's own poller, 
 Wakes are scoped to executors the lead owns — multiple leads on different projects don't cross-wake.
 
 Separately, relay nudges a lead **once** ever on two signals: primarily live context
-(`context_nudge_tokens`, default 150k), secondarily transcript size on disk (`handoff_nudge_mb`,
-default 5MB, which never shrinks). Either threshold fires the nudge; the flow is the same either
-way — write a handoff md, then `/relay:handoff <md>`.
+(`lead_nudge_tokens`, default 300k on a 1M window — a lead's OWN, higher line; a lead's handoff
+costs more than an executor's rotation and its context grows slowly once diffs are reviewed by a
+fork, so it earns more room than the executors-only `context_nudge_tokens`, 150k, before nudging),
+secondarily transcript size on disk (`handoff_nudge_mb`, default 5MB, which never shrinks). When
+the lead's real context window is known (via `relay doctor`'s probe, or inferred from its model) to
+be 200k rather than 1M, the effective line is capped to `context_nudge_tokens` instead — a
+200k-window lead can never actually reach 300k live context, so it's still nudged, just on the same
+line an executor would be. Either threshold fires the nudge; the flow is the same either way —
+write a handoff md, then `/relay:handoff <md>`. When a wake carries this nudge, the lead surfaces it
+alongside whatever else woke it and lets the user decide whether to hand off — it never steps down
+or starts a fresh session unilaterally.
 
 ### Handing off a long-lived lead
 
 Heavy session (large transcript, or just wanting a fresh context)? Distill what matters to a
 handoff md — what's in flight, what's reviewed/committed, open questions, next steps — then run
-`/relay:handoff <handoff.md>`. It opens a **pre-armed** successor tab (gate + auto-wake already
+`/relay:handoff <handoff.md>`. A handoff file should fit one screen — it's a distillation for the
+successor to read once, not an archive. It opens a **pre-armed** successor tab (gate + auto-wake already
 active from turn one), seeds it with a short pointer at a relay-prepared copy of your handoff file
 (your source md is untouched — relay appends a SUCCESSOR AFTERCARE section to its own copy), and
 steps this session down as its final act. Inherited executors adopt automatically on the
@@ -488,9 +509,15 @@ model + `LAUNCH`, `TOKENS` (with cache warm/cold and a hit-rate chip)/MB, packet
 (gist, the report's outcome sentence and TL;DR, links to the packet / report / diff page) and
 copyable `relay …` commands. Filter box, "show closed", light theme by default with a remembered
 ☀️/🌙 switch. It is built from exactly the functions `relay list` uses (and runs the same liveness
-refresh and auto-close sweep), so it can't disagree with the table; it is a **snapshot** — re-run to
-refresh. Written to `~/.relay-tasks/board.html` (`--out` to change), `--lead <sid>` to scope,
-`--json` for the data.
+refresh and auto-close sweep), so it can't disagree with the table; by default it is a **snapshot** —
+re-run to refresh. `relay board --live` (or config `board_live: true`) keeps it live instead, still
+with no server process: it writes a sibling `board.json` next to `board.html`, adds a meta-refresh
+(`board_refresh_seconds`, default 10s) so an open tab reloads itself, and relay then rewrites both
+files in place on every `list`/`check`/`send`/`spawn` and the lead's own Stop hook — so a page left
+open stays at most one turn stale, with the header's "updated HH:MM:SS" turning red once nothing has
+rewritten it for 3× the refresh interval. Written to `~/.relay-tasks/board.html` (`--out` to change),
+`--lead <sid>` to scope, `--json` for the data, `--live off` to turn live mode back off (removes the
+`board.json` sidecar; a lingering `board_live: true` in config still holds it on).
 
 ### relay stats
 
@@ -599,7 +626,8 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
 | `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) — the secondary "session age" (compaction-count) signal for **both** leads and executors: MB on disk never shrinks, so a big number alone means several compactions in even when live context currently looks fine. Fires the lead's handoff nudge/statusline segment alongside tokens, and is the executor fallback reading (`relay send`'s gate, `relay list`'s heavy footnote) only when a transcript can't be parsed for real usage at all |
-| `context_nudge_tokens` | 150000 | The cost/context signal for **both** leads and executors: heavy when the LAST request's live context (input + cache_read + cache_creation tokens — the real spend the next turn pays, not a transcript-size proxy) is at/above this many tokens. Primary trigger for the lead's own handoff nudge/statusline segment (mirroring the executor gate) and for `relay send`'s heaviness gate, `relay list`'s heavy footnote/CTX columns, and the board |
+| `context_nudge_tokens` | 150000 | The cost/context signal for **executors**: heavy when the LAST request's live context (input + cache_read + cache_creation tokens — the real spend the next turn pays, not a transcript-size proxy) is at/above this many tokens. Drives `relay send`'s heaviness gate, `relay list`/board's heavy footnote/CTX columns, and `relay send --rotate` advice. A lead's own line is `lead_nudge_tokens` (below) — never this key |
+| `lead_nudge_tokens` | 300000 | A **lead's** own heaviness/handoff-nudge line, on a 1M window — a lead's handoff costs more than an executor's rotation (a fresh successor-seed vs. a plain respawn) and its context grows slowly once diffs are reviewed by a fork, so it earns a higher line than `context_nudge_tokens`. Drives the lead's own handoff nudge (Stop hook), `relay status --statusline`'s weight segment, `relay list`'s LEADS CTX/heavy footnote, and the board's lead chip. When the lead's real context window is known (`relay doctor`'s probe, or inferred from a `[1m]`-suffixed model) to be 200k rather than 1M, the EFFECTIVE line is capped to `context_nudge_tokens` instead — a 200k-window lead can never reach 300k live context, so it's still nudged, just on the executor's line |
 | `cache_ttl_minutes` | 60 | Claude Code's prompt-cache TTL — how long an executor's last request stays cached free. Drives the warm/cold readout in `relay list`'s TOKENS column, the board, and `relay send`'s advisory line — see [Cache state](#executor-context-window-200k-vs-1m) |
 | `executor_default_context` | "1m" | Context window an executor launches with when nothing else decides it (no packet `CONTEXT:` line, no `[1m]` on `--model`, referenced reading under the heuristic). `"1m"` or `"200k"`. Shipped `1m`: the window is a **ceiling, not consumption** — you pay for tokens used, so a bounded packet costs the same either way, and 1M stops executors compacting early on real work. A packet can still pin `CONTEXT: 200k`; haiku (no 1M window) always runs 200K |
 | `auto_close` | true | Park finished executors automatically — see [Auto-close](#auto-close-finished-executors-park-themselves) |

@@ -1295,6 +1295,46 @@ class TestCmdList:
         assert "…and" not in out
 
 
+class TestLeadsHeavyFootnote:
+    """`relay list`'s LEADS heavy footnote (task: split the heaviness threshold by role) reads
+    lead_nudge_threshold — the LEAD's own line, window-capped — never the executors-only
+    context_nudge_tokens the EXECUTORS footnote below it uses."""
+
+    def _args(self):
+        return SimpleNamespace(json=False, lead=None, all=False, closed=False)
+
+    def test_1m_window_lead_silent_below_300k_line(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", model="claude-sonnet-5[1m]")
+        monkeypatch.setattr(relay, "_lead_usage_for", lambda m: {"last_prompt": 200000})
+        relay.cmd_list(self._args())
+        out = capsys.readouterr().out
+        assert "heavy" not in out.lower()
+
+    def test_1m_window_lead_heavy_past_300k_line(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", model="claude-sonnet-5[1m]")
+        monkeypatch.setattr(relay, "_lead_usage_for", lambda m: {"last_prompt": 310000})
+        relay.cmd_list(self._args())
+        out = capsys.readouterr().out
+        assert "⚠ heavy: webapp (310k live, line 300k on a 1M window)" in out
+
+    def test_unknown_window_lead_silent_at_160k(self, relay, capsys, monkeypatch):
+        # A bare model (no [1m] suffix, no probed tier entry) is a genuinely UNKNOWN window, never
+        # guessed down to 200_000 (the bug: it used to cap this lead's line to 150k, so 160k read
+        # as heavy when it should still be silent on the uncapped 300k line).
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", model="claude-sonnet-5")
+        monkeypatch.setattr(relay, "_lead_usage_for", lambda m: {"last_prompt": 160000})
+        relay.cmd_list(self._args())
+        out = capsys.readouterr().out
+        assert "heavy" not in out.lower()
+
+    def test_unknown_window_lead_heavy_at_310k(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp", model="claude-sonnet-5")
+        monkeypatch.setattr(relay, "_lead_usage_for", lambda m: {"last_prompt": 310000})
+        relay.cmd_list(self._args())
+        out = capsys.readouterr().out
+        assert "⚠ heavy: webapp (310k live, line 300k on a ? window)" in out
+
+
 class TestVersionTuple:
     """_version_tuple: real numeric ordering for version strings, not lexical — "0.3.14" sorts
     BELOW "0.3.9" as strings, which is exactly the trap the stale-hooks footnote must not fall into."""
@@ -3390,6 +3430,24 @@ class TestCheckDiffSize:
         out = capsys.readouterr().out
         assert "(diff: 1 files +1/-1)" in out
 
+    def test_check_never_prints_more_than_ready_flag_plus_diff_size(self, relay, tmp_path, capsys):
+        """Item 4 (row 65): `relay check` must never print the report's TL;DR block or body —
+        just the ready flag and the diff size, one line per session. Uses TestVerify.REPORT, whose
+        body carries every TL;DR field plus a `## What changed` section and a closing sentence, so
+        any leak beyond that one line would show up here."""
+        tv = TestVerify()
+        repo = tv._repo(tmp_path)
+        tv._mk(relay, "e1", repo, tv.REPORT)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=False))
+        out = capsys.readouterr().out
+        lines = [l for l in out.splitlines() if l.strip()]
+        assert len(lines) == 1  # exactly one line of output for this one session
+        assert "(diff: 1 files +1/-1)" in lines[0]
+        for leak in ("Risk flags", "UNVERIFIED", "Changed:", "## What changed",
+                     "ready for the lead to review"):
+            assert leak not in out, f"{leak!r} leaked into `relay check` output"
+
     def test_unreported_session_shows_no_diff_size(self, relay, tmp_path, capsys):
         tv = TestVerify()
         repo = tv._repo(tmp_path)
@@ -4144,6 +4202,24 @@ class TestAdoption:
         out = capsys.readouterr().out
         assert "NOT yet proven delivered" in out
         assert "(diff: 1 files +1/-1)" in out
+
+    def test_list_never_prints_more_than_the_diff_size(self, relay, tmp_path, capsys, monkeypatch):
+        """Item 4 (row 65): `relay list`'s reported/unannounced rows must never leak the report's
+        TL;DR block or body — the diff size is all that travels next to a report here. The report
+        written below carries every TL;DR field plus a body section, so a leak would show up."""
+        monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        tv = TestVerify()
+        repo = tv._repo(tmp_path)
+        self._mk(relay, owner_lead="lead-1", status="reported")
+        (relay.packets_dir("e1") / "001-report.md").write_text(tv.REPORT)
+        s = relay.read_session("e1"); s["worktree"] = str(repo); relay.write_session("e1", s)
+        relay.cmd_list(SimpleNamespace(json=False, lead=None, all=False, closed=False))
+        out = capsys.readouterr().out
+        assert "(diff: 1 files +1/-1)" in out
+        for leak in ("Risk flags", "UNVERIFIED", "Changed:", "## What changed",
+                     "ready for the lead to review"):
+            assert leak not in out, f"{leak!r} leaked into `relay list` output"
 
     def test_list_stays_quiet_once_the_wake_is_proven(self, relay, capsys, monkeypatch):
         monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
@@ -5429,10 +5505,17 @@ class TestStatusMigrationFallback:
 
 
 class TestWeightSegmentTokenFirst:
-    """_weight_segment (statusline): token-first like the executor heaviness footnote —
-    context_nudge_tokens drives the primary reading; handoff_nudge_mb is the secondary "session
-    age" signal, folded in alongside ctx whenever MB is independently past ITS OWN threshold (even
-    when tokens aren't). Falls back to the original MB-only rendering when usage can't be parsed."""
+    """_weight_segment (statusline): token-first like the executor heaviness footnote — the LEAD's
+    own line (lead_nudge_tokens, window-capped via lead_guard.lead_nudge_threshold — NEVER the
+    executors-only context_nudge_tokens) drives the primary reading; handoff_nudge_mb is the
+    secondary "session age" signal, folded in alongside ctx whenever MB is independently past ITS
+    OWN threshold (even when tokens aren't). Falls back to the original MB-only rendering when
+    usage can't be parsed. Every test below omits `model`, so lead_window_for's window is
+    genuinely unknown (None, not a guessed 200_000 — see backlog row 49 / the None-window bugfix)
+    and lead_nudge_threshold leaves the line UNCAPPED at 300000, same as TestWeightSegment1mWindow
+    below (that class's `[1m]`-suffixed lead resolves a known 1M window instead of None, but
+    lead_nudge_threshold only caps when the window is known to be exactly 200_000, so both classes
+    share the same effective 300000 line)."""
 
     def _usage_file(self, path, last_prompt, grow_to_mb=None):
         """A minimal real-shaped transcript line (`_write_usage_transcript`'s sibling, but writing
@@ -5450,11 +5533,21 @@ class TestWeightSegmentTokenFirst:
                 f.truncate(int(grow_to_mb * 1024 * 1024))
         return path
 
-    def test_tokens_only_over_threshold(self, relay, tmp_path):
+    def test_tokens_near_but_not_over_the_uncapped_line(self, relay, tmp_path):
+        # 212k is past 60% of the uncapped 300k line (180k) but not past the line itself — the
+        # ambient "near" reading (no handoff arrow). Before the None-window fix, an unknown window
+        # was guessed at 200_000 and capped this line to 150000, so 212k read as OVER — this is
+        # exactly the bug: an unknown window must not silently act like a 200k one.
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1")
         transcript = self._usage_file(tmp_path / "t.jsonl", 212000)
         seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", str(transcript))
-        assert seg == "212k ctx → /relay:handoff"
+        assert seg == "212k ctx"
+
+    def test_tokens_over_the_uncapped_line(self, relay, tmp_path):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1")
+        transcript = self._usage_file(tmp_path / "t.jsonl", 310000)
+        seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", str(transcript))
+        assert seg == "310k ctx → /relay:handoff"
 
     def test_mb_only_over_threshold_shows_both(self, relay, tmp_path):
         # MB alone past its threshold still nudges — and still says the (below-threshold) ctx
@@ -5484,6 +5577,48 @@ class TestWeightSegmentTokenFirst:
         transcript = self._usage_file(tmp_path / "t.jsonl", 500)
         seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", str(transcript))
         assert seg == ""
+
+
+class TestWeightSegment1mWindow:
+    """_weight_segment's `model` param (task: split the heaviness threshold by role): a lead whose
+    marker records a `[1m]`-suffixed model resolves a KNOWN 1M window and reads lead_nudge_tokens
+    UNCAPPED (300000) — the same uncapped 300000 the bare/unknown-window lead in
+    TestWeightSegmentTokenFirst above also gets, since lead_nudge_threshold only caps when the
+    window is known to be exactly 200_000 (see test_lead_guard.py's
+    test_capped_to_context_nudge_tokens_on_a_200k_window for that case, only reachable via a
+    `relay doctor`-probed 200k window, never an unprobed bare model)."""
+
+    def _usage_file(self, path, last_prompt):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"type": "assistant", "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": {"id": "m1", "model": "claude-sonnet-5", "usage": {
+                "input_tokens": 0, "cache_read_input_tokens": last_prompt,
+                "cache_creation_input_tokens": 0, "output_tokens": 10}}})
+        path.write_text(line + "\n")
+        return path
+
+    def test_212k_is_near_but_not_over_on_a_1m_window(self, relay, tmp_path):
+        # 212k is past 60% of the 300k line (180k) but not past the line itself — the ambient
+        # "near" reading (no handoff arrow), unlike the bare/200k-window lead above where 212k is
+        # already OVER its capped 150k line and gets the "→ /relay:handoff" arrow.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", model="claude-sonnet-5[1m]")
+        transcript = self._usage_file(tmp_path / "t.jsonl", 212000)
+        seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", str(transcript), model="claude-sonnet-5[1m]")
+        assert seg == "212k ctx"
+
+    def test_150k_is_silent_on_a_1m_window(self, relay, tmp_path):
+        # 150k would already be OVER the bare/200k-window lead's capped line — silent here, since
+        # it's well below 60% of the uncapped 300k line (180k).
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", model="claude-sonnet-5[1m]")
+        transcript = self._usage_file(tmp_path / "t.jsonl", 150000)
+        seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", str(transcript), model="claude-sonnet-5[1m]")
+        assert seg == ""
+
+    def test_310k_nudges_on_a_1m_window(self, relay, tmp_path):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", model="claude-sonnet-5[1m]")
+        transcript = self._usage_file(tmp_path / "t.jsonl", 310000)
+        seg = relay._weight_segment(relay.STATE_ROOT, "lead-1", str(transcript), model="claude-sonnet-5[1m]")
+        assert seg == "310k ctx → /relay:handoff"
 
 
 class TestResolveSid:

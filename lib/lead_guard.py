@@ -67,14 +67,30 @@ LEAD_DEFAULTS = {
                                  # LEAD's handoff nudge/statusline segment alongside tokens, and is
                                  # the EXECUTOR fallback reading when a transcript can't be parsed
                                  # for real usage at all.
-    "context_nudge_tokens": 150000,  # the COST/CONTEXT signal for BOTH leads and executors
-                                 # (bin/relay's cmd_send gate, `relay list`'s heavy footnote and CTX
-                                 # columns, board, and the lead's own handoff nudge/statusline
-                                 # segment): heavy when the LAST request's live context (input +
-                                 # cache_read + cache_create — transcript_usage's `last_prompt`) is
-                                 # at/above this many tokens. This is the number that actually drives
-                                 # cost/compaction; handoff_nudge_mb is the fallback reading only
-                                 # when usage can't be read at all.
+    "context_nudge_tokens": 150000,  # the COST/CONTEXT signal for EXECUTORS ONLY (bin/relay's
+                                 # cmd_send gate, `relay list`/board's heavy footnote and CTX
+                                 # columns, `relay send --rotate` advice): heavy when the LAST
+                                 # request's live context (input + cache_read + cache_create —
+                                 # transcript_usage's `last_prompt`) is at/above this many tokens.
+                                 # This is the number that actually drives cost/compaction;
+                                 # handoff_nudge_mb is the fallback reading only when usage can't be
+                                 # read at all. A LEAD's own nudge reads `lead_nudge_tokens` instead
+                                 # (below) — a lead's handoff costs more than an executor's rotation
+                                 # (a fresh successor-seed vs. a plain respawn) and its context grows
+                                 # slowly once diffs are reviewed by a fork, so it earns a higher line.
+    "lead_nudge_tokens": 300000,  # the LEAD's own heaviness/handoff-nudge line, on a 1M window: the
+                                 # Stop hook's handoff nudge, `relay status --statusline`'s weight
+                                 # segment, `relay list`'s LEADS CTX/heavy footnote, and the board's
+                                 # lead chip all read this (never context_nudge_tokens, which is
+                                 # executors-only — see above). See `lead_nudge_threshold` for the
+                                 # window-aware cap: a lead whose REAL context window (tier_windows.json
+                                 # / `relay doctor`'s probe) is known to be 200_000 can never actually
+                                 # reach 300k live context, so its EFFECTIVE line is capped to
+                                 # `min(lead_nudge_tokens, context_nudge_tokens)` — never told it has
+                                 # room the window doesn't have. An unprobed/unknown window leaves this
+                                 # uncapped (most leads run the 1M window — executor_default_context
+                                 # ships "1m" — and guessing 200k for an unprobed one would nudge it
+                                 # far too early).
     "cache_ttl_minutes": 60,     # Claude Code's prompt-cache TTL for a main conversation (each executor
                                  # is one): 1 hour when signed in with a Claude plan within its included
                                  # usage; 5 minutes on an API key / cloud provider / usage credits unless
@@ -179,6 +195,22 @@ LEAD_DEFAULTS = {
                                   # CLI's actual wording differs.
                                   r"^(?:you'?ve hit your (?:session|usage) limit"
                                   r"|(?:claude )?usage limit reached)"),
+    "board_live": False,          # the lead's on/off switch for `relay board` LIVE mode: when true,
+                                  # a plain `relay board` (no --live flag) writes the live-styled
+                                  # page (meta-refresh + a board.json sidecar), AND every
+                                  # state-changing command (list/check/send/spawn) plus the lead's
+                                  # own Stop hook keep rewriting board.html/board.json in place —
+                                  # no server process, just a file that stays at most one turn
+                                  # stale. `relay board --live` also turns this behavior on for the
+                                  # CURRENT board.html without touching config (see bin/relay's
+                                  # _is_board_live_active: the board.json sidecar's mere presence on
+                                  # disk is itself proof a live board is active, so the auto-rewrite
+                                  # keeps going after just one `--live` run).
+    "board_refresh_seconds": 10,  # the live board's <meta http-equiv="refresh"> interval (N) — also
+                                  # the unit the "stale" threshold is measured in (3×N, bin/relay's
+                                  # board_render.render): a page not rewritten within 3 refresh
+                                  # cycles is presumed abandoned (lead stopped nudging state) and its
+                                  # "updated HH:MM:SS" header turns red.
 }
 
 # Distinguishable, colorblind-tolerant tab colors — brightened so they remain visible when dimmed
@@ -2570,6 +2602,48 @@ def heavy_reading_text(usage, mb):
     if usage is not None:
         return f"{human_tokens(usage.get('last_prompt') or 0)} ctx"
     return f"{mb:.1f}MB (transcript unreadable for usage; MB proxy)" if mb is not None else "unknown"
+
+
+def lead_window_for(model, tier_windows=None):
+    """The REAL context window for a LEAD's own conversation, or None when it's genuinely unknown.
+    A lead's marker carries no explicit `context` stamp the way an executor's session record does
+    (see `ctx_window_cell`) — only `model`, which may carry the `[1m]` suffix — so this prefers
+    `relay doctor`'s probed window (`window_for`) when known, then infers 1_000_000 from a
+    `[1m]`-suffixed model. Anything else (a bare model like "sonnet"/"opus", or no model at all)
+    returns None rather than guessing 200_000: backlog row 49 already rules that a bare model is
+    never ASSERTED to be 200k, and since every real lead marker on this machine carries
+    `model: null`, defaulting to 200_000 here would silently cap every lead's nudge line at 150k
+    (see `lead_nudge_threshold`) and the 300k line would never apply to a real lead. Callers
+    (`lead_nudge_threshold`, `lead_nudge_reading_text`) already treat None as "uncapped" / "?"."""
+    real = window_for(model, tier_windows) if model and tier_windows else None
+    if real is not None:
+        return real
+    return 1_000_000 if model_has_1m(model) else None
+
+
+def lead_nudge_threshold(cfg, window=None):
+    """The EFFECTIVE lead handoff-nudge threshold, in tokens: `lead_nudge_tokens` (default 300000)
+    — see LEAD_DEFAULTS for why a lead earns a higher line than an executor's
+    `context_nudge_tokens`. Capped to `context_nudge_tokens` (default 150000) when `window` — the
+    lead's REAL context window, from `lead_window_for` — is known to be exactly 200_000: a
+    200k-window lead can never actually reach 300k live context, so nudging it on that line would
+    silently mean 'never'; capping instead means it's still told when it's heavy, just on the same
+    line an executor would be. `window` None/unknown, or any other value (1_000_000 included),
+    leaves the threshold uncapped."""
+    lead_t = float(cfg.get("lead_nudge_tokens", LEAD_DEFAULTS["lead_nudge_tokens"]))
+    if window == 200_000:
+        exec_t = float(cfg.get("context_nudge_tokens", LEAD_DEFAULTS["context_nudge_tokens"]))
+        return min(lead_t, exec_t)
+    return lead_t
+
+
+def lead_nudge_reading_text(tokens, threshold, window):
+    """The lead-specific 'how heavy' reading that NAMES the line and the window (unlike the plain
+    executor `heavy_reading_text`, a lead's line can be capped by its window, so the reading has to
+    show which line actually applies): '<live> live, line <threshold> on a <window> window', e.g.
+    '312k live, line 300k on a 1M window'. `window` None/unknown renders as '?'."""
+    win_label = _fmt_window(window) if window else "?"
+    return (f"{human_tokens(tokens)} live, line {human_tokens(threshold)} on a {win_label} window")
 
 
 def launch_cell(s):

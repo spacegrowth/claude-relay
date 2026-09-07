@@ -222,6 +222,35 @@ class TestStopHookReportWake:
         assert "(diff: 1 files +1/-1)" in run.stderr
 
     @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_wake_line_never_prints_more_than_first_line_plus_diff_size(self, drv, tmp_path):
+        """Item 4 (row 65): the wake must never surface the report's TL;DR block or body — only its
+        first line, the diff size, and a pointer to the report file. The report below carries every
+        TL;DR field plus a body section, so a leak would show up in `run.stderr`."""
+        armed(tmp_path)
+        repo = tmp_path / "repo"; repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / "a.py").write_text("one\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "init")
+        (repo / "a.py").write_text("changed\n")
+        self._git(repo, "add", "a.py")
+        report = ("Changed the source file; suite green, staged.\n\n"
+                  "Status: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: a.py\n\n"
+                  "## What changed\n- a.py:1 — changed it.\n\n"
+                  "My changes are staged, not committed, ready for the lead to review.\n")
+        H.make_executor(tmp_path, report=report, worktree=str(repo))
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert run.returncode == WAKE
+        assert "(diff: 1 files +1/-1)" in run.stderr
+        assert "Changed the source file; suite green, staged." in run.stderr  # the first line only
+        for leak in ("Risk flags", "UNVERIFIED", "Changed:", "## What changed",
+                     "ready for the lead to review"):
+            assert leak not in run.stderr, f"{leak!r} leaked into the wake line"
+        # exactly two lines for this one report: the head+brief line, and the "report: <path>" line
+        report_lines = [l for l in run.stderr.splitlines() if "exec-1" in l or "report:" in l]
+        assert len(report_lines) == 2
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
     def test_several_reports_are_all_surfaced_in_one_wake(self, drv, tmp_path):
         armed(tmp_path)
         H.make_executor(tmp_path, "exec-a", report="alpha done\n")
@@ -563,7 +592,7 @@ class TestStopHookHandoffNudge:
         """"token-first: say the real signal when it's the one that tripped" (L303-305). A SMALL
         transcript whose last request carried a lot of live context must still nudge, and the
         reading must quote tokens, not MB."""
-        armed(tmp_path, context_nudge_tokens=1000, handoff_nudge_mb=1000)
+        armed(tmp_path, lead_nudge_tokens=1000, context_nudge_tokens=1000, handoff_nudge_mb=1000)
         transcript = tmp_path / "t.jsonl"
         transcript.write_text(json.dumps({
             "type": "assistant", "timestamp": "2026-09-05T10:00:00Z",
@@ -573,7 +602,12 @@ class TestStopHookHandoffNudge:
         }) + "\n")
         run = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript)), tmp_path)
         assert run.returncode == WAKE
-        assert "live context, past" in run.stderr
+        # A LEAD's own reading names the line and the window (lead_guard.lead_nudge_reading_text):
+        # this marker carries no `model`, so lead_window_for's window is genuinely unknown (None,
+        # never guessed at 200_000 — see backlog row 49 / the None-window bugfix), which leaves the
+        # line UNCAPPED at lead_nudge_tokens (pinned to 1000 here, this test's config) — see
+        # lead_guard.lead_nudge_threshold. The unknown window renders as "?".
+        assert "1.5k live, line 1.0k on a ? window" in run.stderr
         assert "MB transcript" not in run.stderr
         tok = [r for r in H.ledger(tmp_path) if r["event"] == "handoff_nudged"][0]
         assert tok["tokens"] == 1500
