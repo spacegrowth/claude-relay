@@ -4229,6 +4229,39 @@ class TestAdoption:
         relay.cmd_list(SimpleNamespace(json=False, lead=None, all=False, closed=False))
         assert "NOT yet proven delivered" not in capsys.readouterr().out
 
+    def test_list_does_not_footnote_a_report_that_already_landed(self, relay, tmp_path, capsys,
+                                                                 monkeypatch):
+        """Lead review of packet 001: the WAKE skips a report whose claimed files are already clean
+        at HEAD — somebody reviewed and committed it — but this line went on demanding delivery of
+        work that is already in main, forever. Same `report_landed` helper as the wake, so the two
+        can never disagree about what counts as unannounced."""
+        monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        repo = TestVerify()._repo(tmp_path, staged=())      # nothing in flight → the work landed
+        self._mk(relay, owner_lead="lead-1", status="reported")
+        s = relay.read_session("e1"); s["worktree"] = str(repo); relay.write_session("e1", s)
+        (relay.packets_dir("e1") / "001-report.md").write_text(
+            "Changed the source file; suite green, staged.\n\nStatus: clean\nRisk flags: none\n"
+            "UNVERIFIED: none\nChanged: src.py\n\n## What changed\n- src.py:1 — changed it.\n")
+        relay.cmd_list(SimpleNamespace(json=False, lead=None, all=False, closed=False))
+        assert "NOT yet proven delivered" not in capsys.readouterr().out
+
+    def test_list_still_footnotes_a_report_whose_work_is_still_in_flight(self, relay, tmp_path,
+                                                                        capsys, monkeypatch):
+        """The other half: an UNLANDED report must still be named — the landed filter must not
+        swallow the very signal this footnote exists for."""
+        monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        repo = TestVerify()._repo(tmp_path)                 # src.py staged → still in flight
+        self._mk(relay, owner_lead="lead-1", status="reported")
+        s = relay.read_session("e1"); s["worktree"] = str(repo); relay.write_session("e1", s)
+        (relay.packets_dir("e1") / "001-report.md").write_text(
+            "Changed the source file; suite green, staged.\n\nStatus: clean\nRisk flags: none\n"
+            "UNVERIFIED: none\nChanged: src.py\n\n## What changed\n- src.py:1 — changed it.\n")
+        relay.cmd_list(SimpleNamespace(json=False, lead=None, all=False, closed=False))
+        out = capsys.readouterr().out
+        assert "NOT yet proven delivered" in out and "e1 (packet 001)" in out
+
     def test_list_does_not_footnote_another_leads_report(self, relay, capsys, monkeypatch):
         # ownership-scoped exactly like the wake itself — no cross-lead noise
         monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
@@ -4810,6 +4843,111 @@ class TestLeadLiveness:
             out = self._render(relay, capsys, monkeypatch)
         assert "ended?" not in out
         assert "hijack or silent tombstone" not in out
+
+
+class TestListCollapsesStaleForeignLeads:
+    """Row 70 item 8 (issue 07-list-prints-ghost-leads.md): every `relay list --lead <sid>` printed
+    18 LEADS rows — 16 of them `ghost`/`⏸ paused` leads from OTHER projects, up to 28 days old —
+    plus the "↪ migrated from" and "⚠ LIVE=ghost" lists naming them all again. ~2k tokens a call,
+    none of it actionable from that lead. Ghost/paused leads on a DIFFERENT project now collapse to
+    one dim line; `--all-leads` still shows everything."""
+
+    def _stale(self, relay, sid, project, ended=False):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, sid, project=project,
+                                      tab_label=f"[Lead] {project}", iterm_session="w0t0p0:X")
+        if ended:
+            relay.lead_guard.tombstone_lead(relay.STATE_ROOT, sid)
+        mp = relay.lead_guard.marker_path(relay.STATE_ROOT, sid)
+        m = json.loads(mp.read_text())
+        m["last_active"] = "2000-01-01T00:00:00"
+        mp.write_text(json.dumps(m))
+
+    def _render(self, relay, capsys, monkeypatch, **over):
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        args = dict(lead=None, all=True, json=False, closed=False, all_leads=False)
+        args.update(over)
+        capsys.readouterr()
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            relay.cmd_list(SimpleNamespace(**args))
+        return capsys.readouterr().out
+
+    def test_other_projects_ghosts_collapse_to_one_line_under_lead_scope(self, relay, capsys,
+                                                                        monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "mine", project="webapp",
+                                      tab_label="[Lead] webapp", iterm_session="w0t0p0:M")
+        self._stale(relay, "old-a", "other_one")
+        self._stale(relay, "old-b", "other_two", ended=True)
+        out = self._render(relay, capsys, monkeypatch, lead="mine")
+        assert "other_one" not in out and "other_two" not in out
+        assert "2 ghost/paused leads in other projects hidden" in out
+        assert "relay list --all-leads" in out and "relay prune" in out
+        assert "webapp" in out
+
+    def test_the_collapsed_leads_are_not_named_by_the_footnotes_either(self, relay, capsys,
+                                                                       monkeypatch):
+        """The whole cost was the repetition: the row, then "LIVE=ghost: …", then "↪ migrated
+        from …", each naming the same dead leads again."""
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "mine", project="webapp",
+                                      tab_label="[Lead] webapp", iterm_session="w0t0p0:M")
+        self._stale(relay, "old-a", "other_one")
+        out = self._render(relay, capsys, monkeypatch, lead="mine")
+        assert "LIVE=ghost" not in out
+
+    def test_a_ghost_on_the_same_project_is_still_shown(self, relay, capsys, monkeypatch):
+        """Same-project dead leads are the ones you might actually resume or prune — never hidden."""
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "mine", project="webapp",
+                                      tab_label="[Lead] webapp", iterm_session="w0t0p0:M")
+        self._stale(relay, "old-a", "webapp")
+        out = self._render(relay, capsys, monkeypatch, lead="mine")
+        assert "ghost/paused leads in other projects hidden" not in out
+
+    def test_a_live_lead_on_another_project_is_never_hidden(self, relay, capsys, monkeypatch):
+        """Only ghost/paused rows collapse — a LIVE lead elsewhere is real, current information."""
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "mine", project="webapp",
+                                      tab_label="[Lead] webapp", iterm_session="w0t0p0:M")
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "them", project="other_one",
+                                      tab_label="[Lead] other_one", iterm_session="w0t0p0:T")
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        capsys.readouterr()
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_list(SimpleNamespace(lead="mine", all=True, json=False, closed=False,
+                                           all_leads=False))
+        out = capsys.readouterr().out
+        assert "other_one" in out
+
+    def test_all_leads_shows_them_again(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "mine", project="webapp",
+                                      tab_label="[Lead] webapp", iterm_session="w0t0p0:M")
+        self._stale(relay, "old-a", "other_one")
+        out = self._render(relay, capsys, monkeypatch, lead="mine", all_leads=True)
+        assert "other_one" in out
+        assert "ghost/paused leads in other projects hidden" not in out
+
+    def test_without_lead_the_reference_project_is_the_cwd(self, relay, capsys, monkeypatch,
+                                                            tmp_path):
+        """No `--lead` means no lead identity to scope by — the cwd's project name stands in, so a
+        bare `relay list` run from a project still collapses other projects' dead weight."""
+        here = tmp_path / "webapp"; here.mkdir()
+        monkeypatch.chdir(here)
+        self._stale(relay, "old-a", "other_one")
+        self._stale(relay, "mine-ghost", "webapp")
+        out = self._render(relay, capsys, monkeypatch)
+        assert "other_one" not in out
+        assert "webapp" in out
+        assert "1 ghost/paused leads in other projects hidden" in out
+
+    def test_json_output_is_never_filtered(self, relay, capsys, monkeypatch):
+        """--json is the programmatic surface — filtering there would silently drop rows a script
+        is entitled to see (cmd_list's own "fully unfiltered" rule)."""
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "mine", project="webapp")
+        self._stale(relay, "old-a", "other_one")
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        capsys.readouterr()
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            relay.cmd_list(SimpleNamespace(lead="mine", all=True, json=True, closed=False,
+                                           all_leads=False))
+        data = json.loads(capsys.readouterr().out)
+        assert {m["session_id"] for m in data["leads"]} == {"mine", "old-a"}
 
 
 class TestLeadTranscriptMB:

@@ -274,6 +274,95 @@ class TestStopHookReportWake:
         assert "日本語 — ünïcodé brief" in run.stderr
 
 
+class TestStopHookSkipsLandedReports:
+    """Row 70 item 4 (issue 03-surfaced-not-carried-on-adopt.md), belt-and-braces half: after a
+    handoff the wake re-surfaced two reports the PREDECESSOR had already reviewed AND COMMITTED as
+    "✅ executor reported … review needed" — a turn burned per stale report, and a real risk of
+    re-reviewing committed work. A report whose claimed files are already clean at HEAD has landed
+    (the same test auto-close uses); the wake skips it and ledgers `wake_skipped_landed`."""
+
+    def _git(self, repo, *args):
+        import subprocess
+        subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+    def _repo(self, tmp_path, dirty=False):
+        repo = tmp_path / "repo"; repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / "a.py").write_text("one\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "init")
+        if dirty:
+            (repo / "a.py").write_text("still in flight\n")
+        return repo
+
+    REPORT = ("Fixed the thing; suite green, staged.\n\nStatus: clean\nRisk flags: none\n"
+              "UNVERIFIED: none\nChanged: one module\n\n## What changed\n- `a.py:1` — rewritten\n")
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_landed_report_does_not_wake_the_lead(self, drv, tmp_path):
+        armed(tmp_path)
+        repo = self._repo(tmp_path)          # claimed a.py is clean → the lead committed it
+        H.make_executor(tmp_path, report=self.REPORT, worktree=str(repo), status="reported")
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert run.returncode == SILENT
+        assert "wake_skipped_landed" in H.ledger_events(tmp_path)
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_an_unlanded_report_still_wakes(self, drv, tmp_path):
+        armed(tmp_path)
+        repo = self._repo(tmp_path, dirty=True)   # the work is still sitting in the worktree
+        H.make_executor(tmp_path, report=self.REPORT, worktree=str(repo), status="reported")
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert run.returncode == WAKE
+        assert "wake_skipped_landed" not in H.ledger_events(tmp_path)
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_skipped_landed_report_is_stamped_surfaced_and_never_asked_about_again(self, drv,
+                                                                                     tmp_path):
+        """Lead review of packet 001: skipping alone left the report in `new_reports_for` forever —
+        a git status on EVERY Stop hook, and `relay list` naming it under "NOT yet proven
+        delivered" for good. Landing IS the terminal outcome, so the skip stamps it surfaced."""
+        armed(tmp_path)
+        repo = self._repo(tmp_path)
+        H.make_executor(tmp_path, report=self.REPORT, worktree=str(repo), status="reported")
+        assert lg.new_reports_for(H.state_root(tmp_path), "lead-1")   # it is pending before
+        assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == SILENT
+        assert lg.new_reports_for(H.state_root(tmp_path), "lead-1") == []
+        assert lg.load_surfaced(H.state_root(tmp_path), "lead-1") == {"exec-1:1"}
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_the_landed_skip_is_ledgered_once_not_on_every_stop(self, drv, tmp_path):
+        """The consequence of the stamp: a second Stop hook has nothing left to skip, so it neither
+        re-runs `report_landed` nor writes a second `wake_skipped_landed`."""
+        armed(tmp_path)
+        repo = self._repo(tmp_path)
+        H.make_executor(tmp_path, report=self.REPORT, worktree=str(repo), status="reported")
+        drv(STOP, stop_payload(tmp_path), tmp_path)
+        drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert H.ledger_events(tmp_path).count("wake_skipped_landed") == 1
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_an_unlanded_report_is_not_stamped_surfaced(self, drv, tmp_path):
+        """The stamp is the landed path's alone: a real wake still goes through the two-phase
+        pending → proven-delivery promotion, never straight to surfaced."""
+        armed(tmp_path)
+        repo = self._repo(tmp_path, dirty=True)
+        H.make_executor(tmp_path, report=self.REPORT, worktree=str(repo), status="reported")
+        assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == WAKE
+        assert lg.load_surfaced(H.state_root(tmp_path), "lead-1") == set()
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_report_claiming_nothing_still_wakes(self, drv, tmp_path):
+        """"No claims" is not evidence of landing — an ops report must still reach its lead."""
+        armed(tmp_path)
+        repo = self._repo(tmp_path)
+        H.make_executor(tmp_path, report="Investigated; nothing staged.\n", worktree=str(repo),
+                        status="reported")
+        assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == WAKE
+
+
 class TestStopHookOwnershipScoping:
     """new_reports_for:1077-1090 — "ONLY reports from executors this lead owns ... Another lead's
     executors and UNOWNED ones ... never wake this lead"."""

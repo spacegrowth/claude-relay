@@ -161,9 +161,28 @@ def _report_brief(path, maxlen=200):
 
 def _report_lines(lg, sid):
     """(display lines, surfaced keys) for executor reports this lead hasn't been told about. Each
-    line carries a BRIEF of the report (its first line) so you know what happened at a glance."""
+    line carries a BRIEF of the report (its first line) so you know what happened at a glance.
+
+    Row 70 item 4 (belt and braces): a report whose claimed files are already clean at HEAD has
+    LANDED — somebody, usually a predecessor lead before a handoff, already reviewed and committed
+    it. Waking on that costs a turn and invites a re-review of committed work, so it is skipped and
+    ledgered (`wake_skipped_landed`) rather than announced. `report_landed` is conservative: it says
+    False for anything it cannot prove, so an uncertain report still wakes."""
     lines, keys = [], []
     for key, exsid, packet, path in lg.new_reports_for(STATE_ROOT, sid):
+        if lg.report_landed(STATE_ROOT, exsid, path):
+            # Lead review of packet 001: skipping is not enough. `new_reports_for` returns this
+            # report again on EVERY Stop hook (a git status each time) and `relay list` keeps
+            # naming it under "NOT yet proven delivered" forever, because nothing ever stamps it.
+            # Landing IS the terminal outcome for a report — the lead reviewed and committed it —
+            # so stamp it surfaced here, once, exactly as the #17 delivery-proven channels do.
+            try:
+                lg.mark_surfaced(STATE_ROOT, sid, [key])
+                lg.append_ledger(STATE_ROOT, "wake_skipped_landed", session_id=sid,
+                                 executor=exsid, packet=packet, key=key, reason="landed")
+            except Exception:
+                pass
+            continue
         brief = _report_brief(path)
         # Item 4 (lead-context-burn note): diff size travels next to the report here too, so the
         # very first thing the lead sees says whether an inline read is affordable.

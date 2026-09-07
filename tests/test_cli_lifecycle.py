@@ -699,6 +699,30 @@ class TestAdopt:
         rec = ledger_events(relay, "adopted")
         assert rec[-1]["forced"] is True and rec[-1]["from_lead"] == "lead-live"
 
+    # ── row 70 item 4 (issue 03-surfaced-not-carried-on-adopt.md) ────────────────────────────────
+    # The surfaced set is per LEAD id. Adoption moved the executor but not the stamps, so a report
+    # the previous owner had already reviewed and committed re-woke the new owner as "review
+    # needed". Adoption now carries that executor's surfaced/pending entries across — and ONLY that
+    # executor's: adopting one session must not import the old owner's whole history.
+
+    def test_adopt_carries_the_surfaced_stamp_for_that_executor(self, relay, terms, monkeypatch):
+        arm_lead(relay, "lead-new", "p")
+        make_session(relay, "e1", owner_lead="lead-gone")
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-gone", ["e1:1", "e9:1"])
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-new")
+        run_main(relay, "adopt", "e1")
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, "lead-new") == {"e1:1"}
+
+    def test_adopt_carries_the_pending_stamp_for_that_executor(self, relay, terms, monkeypatch):
+        arm_lead(relay, "lead-new", "p")
+        make_session(relay, "e1", owner_lead="lead-gone")
+        relay.lead_guard.mark_pending(relay.STATE_ROOT, "lead-gone", ["e1:1"])
+        relay.lead_guard.mark_pending(relay.STATE_ROOT, "lead-gone", ["e9:1"])
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-new")
+        run_main(relay, "adopt", "e1")
+        pending = relay.lead_guard.load_pending(relay.STATE_ROOT, "lead-new")
+        assert set(pending) == {"e1:1"}
+
     def test_adopt_of_an_unknown_session_is_refused(self, relay, terms, monkeypatch):
         arm_lead(relay, "lead-new", "p")
         monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-new")
@@ -730,6 +754,140 @@ class TestKeep:
         with pytest.raises(SystemExit) as e:
             run_main(relay, "keep", "nope")
         assert "no such session: nope" in str(e.value)
+
+    # ── row 70 item 2: a pin says WHO pinned it and WHEN ─────────────────────────────────────────
+    # A pin is permanent and invisible: `relay list` showed a bare 📌 with no way to tell whether
+    # THIS lead pinned it five minutes ago or a lead three handoffs back pinned it last week — so
+    # nobody ever releases one. The stamp (`keep_by` + `keep_at`) is what makes that answerable.
+
+    def test_keep_stamps_who_pinned_it_and_when(self, relay, terms, monkeypatch):
+        make_session(relay, "e1")
+        arm_lead(relay, "lead-1", "webapp")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-1")
+        run_main(relay, "keep", "e1")
+        s = relay.read_session("e1")
+        assert s["keep_by"] == "lead-1"
+        assert s["keep_at"]
+
+    def test_keep_off_clears_the_stamp(self, relay, terms, monkeypatch):
+        make_session(relay, "e1", keep=True, keep_by="lead-1", keep_at=relay.now())
+        run_main(relay, "keep", "e1", "--off")
+        s = relay.read_session("e1")
+        assert s["keep_by"] is None and s["keep_at"] is None
+
+    def test_spawn_keep_stamps_the_pinning_lead_too(self, relay, terms, tmp_path, monkeypatch):
+        """`spawn --keep` is the other way a pin is created — it must carry the same stamp."""
+        arm_lead(relay, "lead-1", "webapp")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-1")
+        run_main(relay, "spawn", str(git_repo(tmp_path / "wt")), "topic",
+                 write_packet(tmp_path), "--keep")
+        sid = next(s for s in relay.all_session_ids())
+        s = relay.read_session(sid)
+        assert s["keep"] is True and s["keep_by"] == "lead-1" and s["keep_at"]
+
+    def test_list_renders_the_pin_footnote(self, relay, terms, capsys):
+        arm_lead(relay, "lead-1", "webapp")
+        make_session(relay, "e1", keep=True, keep_by="lead-1", keep_at="2020-01-01T00:00:00")
+        run_main(relay, "list", "--all")
+        out = capsys.readouterr().out
+        assert "📌 e1: pinned by webapp" in out
+        assert "ago" in out
+        assert "relay keep e1 --off" in out
+
+    def test_a_pin_from_before_the_stamp_says_so(self, relay, terms, capsys):
+        """Pins created before `keep_at` existed have no age — the line must say that, not render
+        a bare dash mid-sentence."""
+        arm_lead(relay, "lead-1", "webapp")
+        make_session(relay, "e1", keep=True, keep_by="lead-1")
+        run_main(relay, "list", "--all")
+        out = capsys.readouterr().out
+        assert "📌 e1: pinned by webapp (when: unrecorded)" in out
+
+
+# ── row 70 item 7: a stuck executor is `stalled`, and retire/restart take it without --force ────
+
+def write_transcript(relay, tmp_path, monkeypatch, claude_session, age_seconds):
+    """A fake `<config-dir>/projects/<slug>/<claude_session>.jsonl` whose mtime is `age_seconds` in
+    the past — row 66's fixture (copied from tests/test_relay.py): the stall decision reads the
+    TRANSCRIPT's mtime, not just `busy_since`."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+    proj = tmp_path / "cfg" / "projects" / "-w"
+    proj.mkdir(parents=True, exist_ok=True)
+    f = proj / f"{claude_session}.jsonl"
+    f.write_text("{}")
+    mtime = time.time() - age_seconds
+    os.utime(f, (mtime, mtime))
+
+
+class TestStalledLifecycle:
+    """Issue 06-stuck-executor-shows-busy.md (2026-09-06, `gm-feedfix`): an executor waiting on a
+    macOS prompt it could not answer showed `busy 27m` for 70+ minutes — token and request counts
+    never moved, nothing staged — and `relay retire` refused without `--force` ("still busy"). Row
+    66 already defines `stalled` as "no TRANSCRIPT activity past `stall_threshold_seconds`"; this
+    pins that definition down and makes retire/restart honour it."""
+
+    def _stuck(self, relay, tmp_path, monkeypatch, live_pid, sid="e1", transcript_age=None):
+        make_session(relay, sid, status="busy", report=False, pid=live_pid,
+                     pid_started=relay.pid_start_time(live_pid),
+                     busy_since="2020-01-01T00:00:00",
+                     busy_since_epoch=time.time() - 90000, claude_session=f"cs-{sid}")
+        if transcript_age is None:
+            transcript_age = relay._stall_threshold_seconds() + 600
+        write_transcript(relay, tmp_path, monkeypatch, f"cs-{sid}", transcript_age)
+        return relay.read_session(sid)
+
+    def test_a_transcript_idle_past_the_threshold_reads_stalled(self, relay, terms, tmp_path,
+                                                                monkeypatch, live_pid):
+        """Row 66, confirmed: the status FIELD still says busy and the process is alive, but the
+        transcript hasn't moved past the threshold — so the verdict is `stalled`."""
+        self._stuck(relay, tmp_path, monkeypatch, live_pid)
+        assert relay.read_session("e1")["status"] == "busy"
+        assert relay._check_one("e1")["status"] == "stalled"
+
+    def test_list_shows_stalled_even_though_the_stored_status_says_busy(self, relay, terms, tmp_path,
+                                                                       monkeypatch, live_pid,
+                                                                       capsys):
+        self._stuck(relay, tmp_path, monkeypatch, live_pid)
+        run_main(relay, "list", "--all")
+        out = capsys.readouterr().out
+        assert "stalled" in out
+        assert "busy" not in out.split("EXECUTORS")[1]
+
+    def test_a_fresh_transcript_still_reads_busy(self, relay, terms, tmp_path, monkeypatch,
+                                                 live_pid):
+        """Row 66's headline case, kept: busy for hours but the transcript was written seconds ago
+        → genuinely working, never `stalled`."""
+        self._stuck(relay, tmp_path, monkeypatch, live_pid, transcript_age=3)
+        assert relay._check_one("e1")["status"] == "busy"
+
+    def test_retire_accepts_a_stalled_session_without_force(self, relay, terms, tmp_path,
+                                                            monkeypatch, live_pid):
+        self._stuck(relay, tmp_path, monkeypatch, live_pid)
+        run_main(relay, "retire", "e1")
+        assert relay.read_session("e1")["superseded_by"] == relay.SEED_RETIRED_BY_SEED
+        assert (relay.session_dir("e1") / relay.SEED_FILENAME).is_file()
+
+    def test_retire_still_refuses_a_genuinely_busy_session(self, relay, terms, tmp_path,
+                                                           monkeypatch, live_pid):
+        self._stuck(relay, tmp_path, monkeypatch, live_pid, transcript_age=3)
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "retire", "e1")
+        assert "still busy on packet" in str(e.value)
+        assert relay.read_session("e1")["superseded_by"] != relay.SEED_RETIRED_BY_SEED
+
+    def test_restart_accepts_a_stalled_session_without_force(self, relay, terms, tmp_path,
+                                                             monkeypatch, live_pid):
+        self._stuck(relay, tmp_path, monkeypatch, live_pid)
+        run_main(relay, "restart", "e1")
+        assert ledger_events(relay, "restarted")[-1]["session_id"] == "e1"
+
+    def test_restart_still_refuses_a_live_session_with_a_fresh_transcript(self, relay, terms,
+                                                                          tmp_path, monkeypatch,
+                                                                          live_pid):
+        self._stuck(relay, tmp_path, monkeypatch, live_pid, transcript_age=3)
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "restart", "e1")
+        assert "still looks alive" in str(e.value)
 
 
 # ── the auto-close sweep ────────────────────────────────────────────────────────────────────────
@@ -779,6 +937,94 @@ class TestAutoCloseSweep:
         self._finished(relay, tmp_path)
         relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-1", ["e1:1"])
         relay.enqueue_packet("e1", "GOAL — later job.\n", "src")
+        assert relay.auto_close_sweep("test", sids=["e1"], lead_sid="lead-1") == []
+
+    # Row 70 item 1 (issue 01-heavy-queue-deadlock.md): a session that is heavy AND has a
+    # --when-idle packet queued used to be un-parkable AND un-deliverable — `deliver_queued` refuses
+    # (heavy gate), so the item sits at the head with `last_error` set, and the sweep saw "queued > 0"
+    # and skipped the session forever. A queue whose head is undeliverable-for-heaviness is not a
+    # session "in use": it reads as EMPTY for the landed/idle rules.
+    HEAVY_ERROR = ("session 'e1' is heavy — its live context is 178k tokens, past the 150k nudge — "
+                   "every turn re-sends all of it (~17k tokens' worth at the cached rate, just to "
+                   "remember). That's not a verdict on its work")
+
+    def _stuck_heavy_queue(self, relay, sid="e1", error=None):
+        """The on-disk shape `deliver_queued` leaves after the heavy gate refuses: the head item
+        put BACK with `last_error` set to cmd_send's heaviness refusal."""
+        item = relay.enqueue_packet(sid, "GOAL — the packet that can never be delivered.\n",
+                                    "/src/later.md")
+        item["last_error"] = error if error is not None else self.HEAVY_ERROR
+        relay.write_queue(sid, [item])
+        return item
+
+    def test_a_queue_stuck_on_heaviness_does_not_hold_the_session_open(self, relay, terms, tmp_path,
+                                                                       monkeypatch):
+        self._finished(relay, tmp_path)
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-1", ["e1:1"])
+        self._stuck_heavy_queue(relay, "e1")
+        monkeypatch.setattr(relay, "_is_heavy", lambda *a, **k: True)
+        acted = relay.auto_close_sweep("test", sids=["e1"], lead_sid="lead-1")
+        assert acted == [("e1", "retire", "landed")]
+
+    def test_parking_a_stuck_heavy_queue_cancels_it_and_ledgers_the_source(self, relay, terms,
+                                                                          tmp_path, monkeypatch):
+        """Nothing vanishes silently: the stuck queue is cancelled at park time and the ledger
+        names the packet source, so the carried-away work is recoverable from history."""
+        self._finished(relay, tmp_path)
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-1", ["e1:1"])
+        self._stuck_heavy_queue(relay, "e1")
+        monkeypatch.setattr(relay, "_is_heavy", lambda *a, **k: True)
+        relay.auto_close_sweep("test", sids=["e1"], lead_sid="lead-1")
+        assert relay.read_queue("e1") == []
+        cancelled = ledger_events(relay, "queue_cancelled_on_park")
+        assert [e["source"] for e in cancelled] == ["/src/later.md"]
+        assert cancelled[0]["session_id"] == "e1"
+
+    def test_a_queue_stuck_on_something_else_still_holds_the_session_open(self, relay, terms,
+                                                                         tmp_path):
+        """Only the HEAVINESS refusal is the deadlock — a queue stuck on anything else (tab
+        unreachable, superseded) is still a session with work waiting, so it stays open."""
+        self._finished(relay, tmp_path)
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-1", ["e1:1"])
+        self._stuck_heavy_queue(relay, "e1", error="tab unreachable")
+        assert relay.auto_close_sweep("test", sids=["e1"], lead_sid="lead-1") == []
+
+    # Row 70 item 3 (note §3): an OPS report — Status: clean, "What changed" says nothing was
+    # staged — claims no paths, so the landed rule ("claimed and every claimed path clean") could
+    # never fire and the session sat out the whole idle timer with nothing left to do.
+    def _ops_report(self, relay, sid="e1", status="clean", changed="none", age=300):
+        rp = relay.packets_dir(sid) / "001-report.md"
+        rp.write_text(f"Investigated the deadlock; no code changed.\n\nStatus: {status}\n"
+                      f"Risk flags: none\nUNVERIFIED: none\nChanged: {changed}\n\n"
+                      f"## What changed\n- nothing staged — investigation only\n")
+        age_file(rp, age)
+
+    def test_a_clean_no_change_ops_report_lands_immediately(self, relay, terms, tmp_path):
+        self._finished(relay, tmp_path, claims=False)
+        self._ops_report(relay)
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-1", ["e1:1"])
+        assert relay.auto_close_sweep("test", sids=["e1"], lead_sid="lead-1") == \
+            [("e1", "close", "landed")]
+
+    def test_a_dirty_worktree_blocks_the_no_change_landing(self, relay, terms, tmp_path):
+        """"claims set empty AND the worktree clean" — an ops report that says it staged nothing
+        while the worktree is plainly dirty has NOT landed; the timer still applies."""
+        wt = self._finished(relay, tmp_path, claims=False)
+        self._ops_report(relay)
+        (wt / "scratch.txt").write_text("left behind\n")
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-1", ["e1:1"])
+        assert relay.auto_close_sweep("test", sids=["e1"], lead_sid="lead-1") == []
+
+    def test_a_blocked_no_change_report_does_not_land(self, relay, terms, tmp_path):
+        self._finished(relay, tmp_path, claims=False)
+        self._ops_report(relay, status="blocked")
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-1", ["e1:1"])
+        assert relay.auto_close_sweep("test", sids=["e1"], lead_sid="lead-1") == []
+
+    def test_a_no_change_report_still_waits_out_the_grace(self, relay, terms, tmp_path):
+        self._finished(relay, tmp_path, claims=False)
+        self._ops_report(relay, age=5)
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-1", ["e1:1"])
         assert relay.auto_close_sweep("test", sids=["e1"], lead_sid="lead-1") == []
 
     def test_a_dirty_claimed_path_blocks_the_landed_reason(self, relay, terms, tmp_path):

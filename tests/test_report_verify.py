@@ -118,6 +118,42 @@ class TestIsNoneValue:
         assert not rv.is_none_value(v)
 
 
+# ── row 70 item 3: the ops report that legitimately changed nothing ───────────────────────────
+class TestCleanNoChangeReport:
+    """An OPS packet (investigate, verify, answer a question) stages nothing on purpose and its
+    report says so. `claimed_paths` then returns an empty set, which auto-close read as "the landed
+    test is unavailable" — so a finished ops session waited out the full idle timer. This is the
+    positive assertion that separates "SAYS it changed nothing" from "we could parse no claims"."""
+
+    def _report(self, changed="none", section="- nothing staged — investigation only\n",
+                status="clean"):
+        return (f"Investigated the deadlock; no code changed.\n\nStatus: {status}\n"
+                f"Risk flags: none\nUNVERIFIED: none\nChanged: {changed}\n\n"
+                f"## What changed\n{section}\n")
+
+    @pytest.mark.parametrize("changed", ["none", "None.", "nothing", "nothing staged",
+                                         "no files changed", "none — investigation only", "n/a"])
+    def test_a_none_ish_changed_field_counts(self, changed):
+        assert rv.clean_no_change_report(self._report(changed=changed))
+
+    def test_a_none_ish_what_changed_section_counts_on_its_own(self):
+        assert rv.clean_no_change_report(self._report(changed="see below",
+                                                      section="- nothing staged\n"))
+
+    def test_a_report_that_names_files_does_not_count(self):
+        assert not rv.clean_no_change_report(self._report(changed="one module",
+                                                          section="- `bin/relay:10` — thing\n"))
+
+    @pytest.mark.parametrize("status", ["blocked", "partial", "clean-with-caveats"])
+    def test_only_status_clean_counts(self, status):
+        """A blocked/partial ops report has NOT finished — parking it on the landed path would
+        close a session whose work is still owed."""
+        assert not rv.clean_no_change_report(self._report(status=status))
+
+    def test_a_report_with_no_tldr_at_all_does_not_count(self):
+        assert not rv.clean_no_change_report("Did some things.\n\n## What changed\n- none\n")
+
+
 # ── claimed files ─────────────────────────────────────────────────────────────────────────────
 class TestClaimedPaths:
     def test_scoped_to_what_changed_section(self):
@@ -223,6 +259,69 @@ class TestStagedReality:
         result = rv.verify(text, reality(modified=["docs/notes.md"]))
         assert result["verdict"] == rv.MISMATCH
         assert "but NOT staged" in rendered(result)
+
+    # ── row 70 item 6 (issue 05-verify-relative-path-mismatch.md) ────────────────────────────────
+    # Observed on gm-app-000221-r6: the report's "What changed" listed `lib/types.ts`,
+    # `components/DetailPane.svelte` — relative to `app/src`, which its own section header named.
+    # All 21 files were staged under `app/src/...`. verify printed MISMATCH and a ✗ per file, and
+    # the lead had to read the whole list to see it was a path-resolution false positive.
+
+    SUBDIR_REPORT = ("Rewrote the detail pane; suite green, staged, not committed.\n\n"
+                     "Status: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: two files\n\n"
+                     "## What changed (paths relative to `app/src`)\n"
+                     "- `lib/types.ts:4` — added the Thread type\n"
+                     "- `components/DetailPane.svelte:20` — renders it\n")
+
+    def test_a_unique_staged_suffix_match_is_confirmed_not_accused(self):
+        result = rv.verify(self.SUBDIR_REPORT,
+                           reality(staged=["app/src/lib/types.ts",
+                                           "app/src/components/DetailPane.svelte"]))
+        assert result["verdict"] == rv.COUNTS_MATCH
+        assert result["claimed_missing"] == []
+        assert sorted(result["claimed_staged"]) == ["components/DetailPane.svelte", "lib/types.ts"]
+
+    def test_a_suffix_matched_claim_is_not_also_counted_as_unclaimed(self):
+        result = rv.verify(self.SUBDIR_REPORT,
+                           reality(staged=["app/src/lib/types.ts",
+                                           "app/src/components/DetailPane.svelte"]))
+        assert result["unclaimed"] == []
+
+    def test_the_resolution_is_said_out_loud(self):
+        result = rv.verify(self.SUBDIR_REPORT,
+                           reality(staged=["app/src/lib/types.ts",
+                                           "app/src/components/DetailPane.svelte"]))
+        out = rendered(result)
+        assert "lib/types.ts — resolved to staged `app/src/lib/types.ts`" in out
+
+    def test_an_ambiguous_suffix_stays_a_mismatch_naming_both(self):
+        """Two staged files could be meant — the tool must not pick one. It stays a mismatch, and
+        says which candidates it saw so the reader can settle it in one glance."""
+        result = rv.verify(self.SUBDIR_REPORT,
+                           reality(staged=["app/src/lib/types.ts", "web/src/lib/types.ts",
+                                           "app/src/components/DetailPane.svelte"]))
+        assert result["verdict"] == rv.MISMATCH
+        assert "lib/types.ts" in result["claimed_missing"]
+        out = rendered(result)
+        assert "matches 2 staged paths" in out
+        assert "app/src/lib/types.ts" in out and "web/src/lib/types.ts" in out
+
+    def test_a_claim_that_is_a_real_repo_file_is_never_suffix_resolved(self):
+        """`lib/types.ts` really exists at the repo root here — the report meant THAT file, which
+        is not staged. Resolving it against a deeper staged path would hide a real mismatch."""
+        r = reality(staged=["app/src/lib/types.ts", "app/src/components/DetailPane.svelte"])
+        r["repo_files"] = ["lib/types.ts"]
+        result = rv.verify(self.SUBDIR_REPORT, r)
+        assert result["verdict"] == rv.MISMATCH
+        assert "lib/types.ts" in result["claimed_missing"]
+
+    def test_suffix_matching_respects_segment_boundaries(self):
+        """`lib/types.ts` must not match `app/mylib/types.ts` — a suffix that starts mid-segment is
+        a different file, and matching it would be a manufactured confirmation."""
+        text = ("Did it; staged, not committed.\n\nStatus: clean\nRisk flags: none\n"
+                "UNVERIFIED: none\nChanged: one file\n\n## What changed\n- `lib/types.ts`\n")
+        result = rv.verify(text, reality(staged=["app/mylib/types.ts"]))
+        assert result["verdict"] == rv.MISMATCH
+        assert result["claimed_missing"] == ["lib/types.ts"]
 
     def test_unscoped_claim_is_advisory_not_a_mismatch(self):
         """With no 'What changed' section the tool cannot tell 'I changed x' from 'I read x', so

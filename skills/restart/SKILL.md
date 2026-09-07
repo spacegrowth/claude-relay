@@ -16,4 +16,7 @@ conversation. It does NOT carry over the prior conversation — use `/relay:resu
 worktree (and any staged work) is untouched, so restarting re-does the packet on top of whatever is
 already there; use it when the previous attempt was botched and you want a clean redo.
 
-If the session still looks alive, relay refuses unless you pass `--force`.
+If the session still looks alive, relay refuses unless you pass `--force` — except when it is
+provably stuck: a session whose transcript has not been written for longer than
+`stall_threshold_seconds` (process alive, going nowhere) is exactly what restart is for, and is
+accepted without `--force`.

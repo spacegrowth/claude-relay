@@ -142,6 +142,47 @@ def is_none_value(value):
     return bool(value) and value.strip().rstrip(".").lower() == "none"
 
 
+# ── "this report changed nothing, on purpose" ─────────────────────────────────────────────────
+# Row 70 item 3 (2026-09-06 field note §3). An OPS packet — investigate, verify, answer a question
+# — legitimately stages nothing, and its report says so ("Changed: none", "What changed: nothing
+# staged"). `claimed_paths` then returns an empty set, which auto-close's landed rule read as "the
+# landed test is unavailable here", so a finished ops session sat out the full idle timer with
+# nothing left to do. This is the POSITIVE assertion that separates "the report says it changed
+# nothing" from "we could not parse any claims", and only that first shape may land.
+# The trailing group lets a none-value carry an explanation ("none — investigation only") without
+# stopping it from reading as none; anything that names work stops matching at the first word.
+_NOTHING_RE = re.compile(
+    r"^\s*[-*>\s]*(?:none|nothing(?:\s+(?:staged|changed))?|no\s+files?(?:\s+(?:changed|staged))?|"
+    r"n/?a|no\s+(?:code\s+)?changes?)\b\s*(?:[—–\-:;,(].*)?$",
+    re.IGNORECASE)
+
+
+def says_nothing_changed(text):
+    """True when the report POSITIVELY asserts it changed nothing — its TL;DR `Changed:` field is a
+    none-value, or every non-blank line of its "What changed" section is. Absence of either says
+    nothing at all and reads as False."""
+    tl = parse_tldr(text)
+    if tl.get("changed") and _NOTHING_RE.match(tl["changed"]):
+        return True
+    section = what_changed_section(text)
+    if section is None:
+        return False
+    lines = [ln for ln in section.splitlines() if ln.strip()]
+    return bool(lines) and all(_NOTHING_RE.match(ln) for ln in lines)
+
+
+def clean_no_change_report(text):
+    """True when the report is a FINISHED ops report: a well-formed `Status: clean` TL;DR whose
+    "What changed"/`Changed:` says it staged nothing (`says_nothing_changed`). Anything else —
+    blocked/partial/caveated status, a malformed or absent TL;DR, a report that names files — is
+    False, because parking on this signal closes a session and work that is still owed must not be
+    closed out from under its lead."""
+    tl = parse_tldr(text)
+    if tl.get("problems") or (tl.get("status") or "").strip().rstrip(".") != "clean":
+        return False
+    return says_nothing_changed(text)
+
+
 # ── claimed files ─────────────────────────────────────────────────────────────────────────────
 # A path mention is only a CLAIM if it looks like a repo path. diff_render's mention regex is
 # deliberately permissive (it intersects against staged files afterwards, so over-matching there
@@ -343,6 +384,38 @@ def claims_staged(text):
     return bool(_STAGED_CONFIRM_RE.search(text))
 
 
+# ── subdirectory-relative claims ──────────────────────────────────────────────────────────────
+# Row 70 item 6 (2026-09-06, gm-app-000221-r6). A report's "What changed" listed `lib/types.ts`,
+# `components/DetailPane.svelte` — relative to `app/src`, which the section header itself named.
+# All 21 files were staged under `app/src/...`, so every one read as "claimed, NOT staged" and the
+# run stamped MISMATCH: a pure path-resolution false positive, and exactly the false accusation
+# this module's own filters exist to avoid. A claimed path that is a suffix of exactly ONE staged
+# path is the same file written from a different root, so it is CONFIRMED. Two or more matches is
+# genuinely ambiguous — the tool must not pick one, so the claim stays a mismatch and the
+# candidates are named. The match is segment-anchored ("/" + claim): `lib/types.ts` must not match
+# `app/mylib/types.ts`, which is a different file.
+
+
+def resolve_claim_suffixes(claims, staged, repo_files=None):
+    """({claim: staged_path} for unique matches, {claim: [staged_paths]} for ambiguous ones).
+
+    A claim already in `staged`, or that names a REAL file in the repo (`repo_files`, when the
+    caller supplies it), is never resolved: it means the file it names, and quietly re-pointing it
+    at a deeper staged path would hide a real mismatch instead of finding one."""
+    known = set(repo_files or ())
+    resolved, ambiguous = {}, {}
+    staged = list(staged or ())
+    for p in claims:
+        if p in staged or p in known:
+            continue
+        matches = [sp for sp in staged if sp.endswith("/" + p)]
+        if len(matches) == 1:
+            resolved[p] = matches[0]
+        elif len(matches) > 1:
+            ambiguous[p] = matches
+    return resolved, ambiguous
+
+
 # ── the verdict ───────────────────────────────────────────────────────────────────────────────
 def _finding(level, code, text):
     return {"level": level, "code": code, "text": text}
@@ -357,15 +430,26 @@ def verify(report_text, reality):
     modified = set(reality.get("modified") or [])
     claims, scoped = claimed_paths(report_text)
     claims = plausible_claims(claims, reality.get("repo_entries") or (), staged)
+    resolved, ambiguous = resolve_claim_suffixes(claims, staged, reality.get("repo_files"))
     findings = []
 
-    claimed_staged = [p for p in claims if p in staged]
-    claimed_missing = [p for p in claims if p not in staged]
-    unclaimed = [p for p in staged if p not in claims]
+    claimed_staged = [p for p in claims if p in staged or p in resolved]
+    claimed_missing = [p for p in claims if p not in staged and p not in resolved]
+    unclaimed = [p for p in staged if p not in claims and p not in set(resolved.values())]
 
+    for p, match in resolved.items():
+        findings.append(_finding("note", "claimed-path-resolved",
+                                 f"{p} — resolved to staged `{match}` (the report writes its paths "
+                                 f"relative to a subdirectory; unique suffix match, so this is "
+                                 f"confirmed, not accused)"))
     for p in claimed_missing:
         why = ("modified in the worktree but NOT staged" if p in modified
                else "not staged, and not modified in the worktree")
+        if p in ambiguous:
+            findings.append(_finding("note", "claimed-path-ambiguous",
+                                     f"{p} — matches {len(ambiguous[p])} staged paths "
+                                     f"({', '.join('`%s`' % m for m in ambiguous[p])}); ambiguous, "
+                                     f"so nothing is assumed — say which one you meant"))
         if scoped:
             findings.append(_finding("mismatch", "claimed-not-staged",
                                      f"{p} — claimed under \"What changed\" but {why}"))

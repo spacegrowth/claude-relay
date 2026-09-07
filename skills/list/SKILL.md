@@ -10,11 +10,14 @@ Run: `${CLAUDE_PLUGIN_ROOT}/bin/relay list --lead "${CLAUDE_CODE_SESSION_ID}"` (
 substitutes the plugin's absolute path and the current session id when this skill loads — call it
 this way, not as bare `relay`, which often isn't on the Bash tool's non-interactive PATH).
 
-The output has two sections: a **LEADS** block (every lead/project in flight, always shown in full,
-with a relative `LAST ACTIVE` age so you can spot a probably-crashed lead) and an **EXECUTORS**
-table (with a `PROJECT` column). Passing `--lead "${CLAUDE_CODE_SESSION_ID}"` scopes the executors
-to *this* lead's project — its own executors plus any unowned ones — so a lead sees its own work by
-default. If the calling session isn't a lead the scoping simply matches no owned executors (unowned
+The output has two sections: a **LEADS** block (every lead/project in flight, with a relative
+`LAST ACTIVE` age so you can spot a probably-crashed lead) and an **EXECUTORS** table (with a
+`PROJECT` column). Passing `--lead "${CLAUDE_CODE_SESSION_ID}"` scopes the executors to *this*
+lead's project — its own executors plus any unowned ones — so a lead sees its own work by default.
+It also makes that lead's project the reference for the LEADS block: other projects' **ghost and
+paused** leads collapse into one dim line rather than filling the table (and re-appearing in the
+`LIVE=ghost` / `↪ migrated from` footnotes). Live, unreachable and same-project leads are never
+hidden; `--all-leads` shows every row again, `relay prune` clears the dead ones. If the calling session isn't a lead the scoping simply matches no owned executors (unowned
 ones still show), which is harmless.
 
 By default, closed/superseded/dead sessions are hidden — pass `--closed` to reveal them (capped at
@@ -28,7 +31,10 @@ executor "doesn't have" a tool or compacts early.
 Running `list` also **auto-closes** finished executors (reported, report already seen by you,
 work landed in the worktree or idle past `auto_close_idle_minutes`) and prints a 🛏 line for each —
 they show as `closed (auto)` under `--closed`, and `/relay:send` brings one back with full context.
-A `reported 📌` status is a pinned session (`relay keep`) that auto-close leaves alone.
+A `reported 📌` status is a pinned session (`relay keep`) that auto-close leaves alone; a
+📌 footnote per pinned session names who pinned it and how long ago, with the release command.
+A 🛏 footnote calls out a session that is **not** auto-closed because its `--when-idle` queue
+is deadlocked on the heaviness gate — `relay send <sid> <packet> --rotate` carries it to a successor.
 
 Use `${CLAUDE_PLUGIN_ROOT}/bin/relay list --all` for the **global** view — every executor across
 every project, regardless of owner.

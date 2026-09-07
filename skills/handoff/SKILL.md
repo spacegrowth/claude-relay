@@ -33,8 +33,11 @@ never modified; relay appends a SUCCESSOR AFTERCARE section to its own copy inst
 successor's launch prompt stays a one-line pointer (a prior version inlined the aftercare directly
 into the prompt and it truncated a real launch command — see `build_handoff_copy`). **As its final
 act, this steps the CURRENT session down** — the gate and auto-wake here turn off. Any executors
-this lead owned are inherited by the successor automatically the first time it sends or resumes
-them (adopt-on-claim); nothing to re-wire by hand.
+this lead owned are re-parented to the successor here, and each one's already-seen report stamps
+travel with it, so a report the outgoing lead reviewed and committed doesn't re-wake the successor
+as new. If any of them are **pinned** (`relay keep` / `spawn --keep`), the handoff output names
+them — auto-close will never park a pinned executor, so the successor inherits them indefinitely
+until someone runs `relay keep <sid> --off`.
 
 **Aftercare, for the successor.** Once it's settled in (read the handoff, run `/relay:list`), the
 successor runs `/relay:mode` — idempotent if the pre-arm pin held, and it arms for real if Claude

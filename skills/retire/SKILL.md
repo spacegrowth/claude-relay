@@ -37,6 +37,9 @@ this is a judgement call, not a rule.
 - *still busy on packet NNN and has not reported* — retiring now kills that packet's work
   unreported, and the seed can't summarise a report that was never written. Wait for it
   (`/relay:check`), or pass `--force` to retire anyway (that packet is then seeded as `NO REPORT`).
+  A session that is busy but **provably stuck** — its transcript hasn't been written for longer
+  than `stall_threshold_seconds`, the shape an executor waiting on an unanswerable OS prompt takes
+  — is accepted without `--force`: there is nothing live left to interrupt.
 - *already retired* — the seed already exists; the message prints its path. Just spawn with it.
 
 (`--keep-tab` retires but leaves the terminal tab open, same as `/relay:close`.)

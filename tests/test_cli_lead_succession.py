@@ -586,6 +586,100 @@ class TestHandoff:
         assert relay.read_session("e-other")["owner_lead"] == "some-other-lead"
         assert ledger_events(relay, "adopted") == []
 
+    # ── row 70 item 2: inherited pins are named at handoff ───────────────────────────────────────
+    # A pin survives every handoff and auto-close never touches it, so a successor silently inherits
+    # executors it will never park and never knew were pinned. Say so once, at the moment of
+    # inheritance, with the release command.
+
+    def test_inherited_pins_are_named_in_the_handoff_output(self, relay, terms, tmp_path, outgoing,
+                                                            capsys):
+        make_session(relay, "e1", owner_lead="lead-old", status="busy", keep=True)
+        make_session(relay, "e2", owner_lead="lead-old", status="reported", keep=True)
+        make_session(relay, "e3", owner_lead="lead-old", status="busy")   # unpinned
+        run_main(relay, "handoff", self._doc(tmp_path))
+        out = capsys.readouterr().out
+        assert "2 pinned executors inherited: e1, e2" in out
+        assert "relay keep <sid> --off" in out
+        assert "e3" not in out.split("pinned executors inherited")[1].splitlines()[0]
+
+    def test_reparenting_carries_each_executors_surfaced_stamp(self, relay, terms, tmp_path,
+                                                                outgoing):
+        """Row 70 item 4: `_reparent_executors` carries the stamps per adopted executor, so the
+        carry does not depend on cmd_handoff's separate wholesale copy — an executor that changes
+        hands takes its "already seen" history with it wherever the re-parent is driven from."""
+        make_session(relay, "e1", owner_lead="lead-old", status="busy")
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-old", ["e1:1"])
+        moved = relay._reparent_executors("lead-old", "lead-next", "webapp")
+        assert moved == ["e1"]
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, "lead-next") == {"e1:1"}
+
+    def test_reparenting_does_not_import_another_executors_stamp(self, relay, terms, tmp_path,
+                                                                 outgoing):
+        make_session(relay, "e1", owner_lead="lead-old", status="busy")
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-old", ["e1:1", "e-elsewhere:3"])
+        relay._reparent_executors("lead-old", "lead-next", "webapp")
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, "lead-next") == {"e1:1"}
+
+    def test_no_pins_means_no_pin_line(self, relay, terms, tmp_path, outgoing, capsys):
+        make_session(relay, "e1", owner_lead="lead-old", status="busy")
+        run_main(relay, "handoff", self._doc(tmp_path))
+        assert "pinned executors inherited" not in capsys.readouterr().out
+
+    # Lead review of packet 001: the console line above reaches the OUTGOING lead only — the one
+    # console the successor never reads. The same sentence has to travel into the aftercare, which
+    # is the document the successor is told to read before anything else.
+
+    def _copy(self, relay):
+        sid = self._successor(relay)
+        return (relay.lead_guard.lead_dir(relay.STATE_ROOT, sid) / "handoff.md").read_text()
+
+    def test_inherited_pins_are_named_in_the_successors_handoff_copy(self, relay, terms, tmp_path,
+                                                                     outgoing):
+        make_session(relay, "e1", owner_lead="lead-old", status="busy", keep=True)
+        make_session(relay, "e2", owner_lead="lead-old", status="reported", keep=True)
+        make_session(relay, "e3", owner_lead="lead-old", status="busy")     # unpinned
+        run_main(relay, "handoff", self._doc(tmp_path))
+        text = self._copy(relay)
+        assert "2 pinned executors inherited: e1, e2" in text
+        assert "relay keep <sid> --off" in text
+        pin_line = next(ln for ln in text.splitlines() if "pinned executors inherited" in ln)
+        assert "e3" not in pin_line
+
+    def test_a_single_pin_reads_as_singular_in_the_copy(self, relay, terms, tmp_path, outgoing):
+        make_session(relay, "e1", owner_lead="lead-old", status="busy", keep=True)
+        run_main(relay, "handoff", self._doc(tmp_path))
+        assert "1 pinned executor inherited: e1" in self._copy(relay)
+
+    def test_a_closed_pinned_executor_is_not_named_in_the_copy(self, relay, terms, tmp_path,
+                                                               outgoing):
+        """Same set the re-parent moves: a closed executor is not inherited, so it is not a pin the
+        successor has to care about."""
+        make_session(relay, "e1", owner_lead="lead-old", status="closed", keep=True)
+        run_main(relay, "handoff", self._doc(tmp_path))
+        assert "pinned executor" not in self._copy(relay)
+
+    def test_another_leads_pin_is_not_named_in_the_copy(self, relay, terms, tmp_path, outgoing):
+        make_session(relay, "e-other", owner_lead="some-other-lead", status="busy", keep=True)
+        run_main(relay, "handoff", self._doc(tmp_path))
+        assert "pinned executor" not in self._copy(relay)
+
+    def test_no_pins_means_no_pin_item_in_the_copy(self, relay, terms, tmp_path, outgoing):
+        """Item 5 is absent entirely rather than rendered as a "0 pinned executors" line."""
+        make_session(relay, "e1", owner_lead="lead-old", status="busy")
+        run_main(relay, "handoff", self._doc(tmp_path))
+        text = self._copy(relay)
+        assert "pinned executor" not in text and "SUCCESSOR AFTERCARE" in text
+
+    def test_the_pin_item_survives_a_re_handoff_without_stacking(self, relay, terms, tmp_path,
+                                                                 outgoing):
+        """#19 still holds with the new item: re-handing off an already-processed copy strips the
+        whole old aftercare, pin line included, before appending the fresh one."""
+        text = relay.build_handoff_copy("in flight: nothing", "successor-1", pins=["e1"])
+        again = relay.build_handoff_copy(text, "successor-2", pins=["e2", "e3"])
+        assert again.count("SUCCESSOR AFTERCARE") == 1
+        assert "2 pinned executors inherited: e2, e3" in again
+        assert "e1" not in again
+
 
 # ── close-predecessor ───────────────────────────────────────────────────────────────────────────
 

@@ -179,7 +179,8 @@ relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --whe
 relay stats [--lead SID] [--since DAYS] [--json]   one row per packet ever sent → outcome (rounds, verdict, status) + a token trailer and a SUMMARY; see below
 relay doctor [--offline] [--quick]         prove the installed claude CLI still honours relay's launch flags + plumbing; run after every Claude Code update
 relay lint <packet.md> [--worktree W] [--model M] [--strict]   advisory packet checks (MCP undeclared, big reading on 200K, no Preconditions, shape hints…)
-/relay:list                                leads + active executors (closed hidden; --closed shows); TOKENS and LAUNCH (mcp/context/role); parks finished ones
+/relay:list [--all-leads]                  leads + active executors (closed hidden; --closed shows); TOKENS and LAUNCH (mcp/context/role); parks finished ones
+                                            other projects' ghost/paused leads collapse to one line; --all-leads shows them
 /relay:close <session_id> [--supersede <new_id>]   (rarely needed — finished executors auto-close)
 relay keep <session_id> [--off]            pin/unpin an executor against auto-close
 /relay:retire <session_id> [--force]       close it AND leave a successor-seed.md, so respawning fresh over the same territory is cheap
@@ -304,6 +305,13 @@ counts and commands the report declares. It **echoes the report's risk flags and
 verbatim** on every run — surfacing them, never absorbing them, and never letting them change the
 verdict, because grading them is your job. Each run lands a `report_verify` event in the ledger.
 
+Claimed paths are matched **by suffix** when the literal path isn't staged: a report whose "What
+changed" is written relative to a subdirectory (`lib/types.ts` under a heading that says "paths
+relative to `app/src`") resolves against the one staged `app/src/lib/types.ts` and is *confirmed*,
+not accused — the match is segment-anchored, and a claim that names a real repo file is never
+re-pointed. Two staged files matching one claim is genuinely ambiguous: it stays a `MISMATCH`, and
+the note names both candidates.
+
 Declared test commands are **not re-run by default**, so verify stays fast; `--rerun` runs them.
 Only pytest-shaped commands with no shell metacharacters are ever executed, argv-only and never
 through a shell — a report is text an executor wrote, and this must not become a way for one to run
@@ -424,6 +432,16 @@ into the lead's tab if the lead hasn't already surfaced the report, or notifies 
 owning lead is gone (crashed/closed/pruned). A net under the lead's own poller, not a replacement.
 
 Wakes are scoped to executors the lead owns — multiple leads on different projects don't cross-wake.
+Ownership changing hands carries the "already seen" stamps with it: `relay adopt` / `relay send` /
+`relay resume` (adopt-on-claim) and a handoff's re-parenting each copy that executor's surfaced and
+pending entries onto the new owner, so a report the previous lead already reviewed doesn't re-wake
+the new one as brand new. Belt and braces on the same failure: the wake skips any report whose
+claimed files are **already clean at HEAD** — the same `landed` test auto-close uses — and ledgers
+`wake_skipped_landed` instead of announcing it. Landing is a terminal outcome, so that skip also
+stamps the report surfaced: it is asked about once, not re-tested on every Stop hook and named by
+`relay list` forever (which applies the same landed filter to its "NOT yet proven delivered" line).
+That test is deliberately conservative: an unreadable worktree or a report claiming no paths still
+wakes you.
 
 Separately, relay nudges a lead **once** ever on two signals: primarily live context
 (`lead_nudge_tokens`, default 300k on a 1M window — a lead's OWN, higher line; a lead's handoff
@@ -498,7 +516,10 @@ unsummarised — unless you pass `--force` (the packet is then seeded as `NO REP
 `relay send <sid> <packet.md> --rotate` is the one-step form: retire the session, spawn
 `<sid>-r2` over the same worktree/topic/scope/model/MCP set — widened to the 1M window when the
 tier has one — with the seed inherited and this packet as its first. The heaviness gate's refusal
-message points at it.
+message points at it. The retired session's `--when-idle` queue travels to the successor, minus the
+packet you are rotating in: a packet that was queued and is now being sent as 001 would otherwise
+run twice, so its queue entry is dropped instead of moved (`queue_deduped`, and the rotate output
+says how many).
 
 ### The board: one page for everything
 
@@ -550,12 +571,34 @@ up, `relay list` full of noise. Now relay parks them on two deterministic signal
 
 - **landed** — the report's "What changed" files are clean in the worktree (nothing staged, modified
   or untracked for them): you committed or discarded the work. Immediate, after a 2-minute grace.
+- **landed (no change)** — an **ops** report that stages nothing on purpose: `Status: clean` plus a
+  "What changed"/`Changed:` that positively says none/nothing, and a worktree that really is clean.
+  It claims no files, so the rule above can never fire for it; without this it sat out the whole
+  timer having finished. Same 2-minute grace. A blocked/partial/caveated or malformed report never
+  lands this way, and neither does one whose worktree state git can't read.
 - **idle** — reported for longer than `auto_close_idle_minutes` (default 60; 0 turns the timer off).
 
 Both require that the owning lead has **already seen the report** (the auto-wake dedup set) — relay
 never parks a report nobody looked at — and never touch busy/stalled sessions, ones with a
 `--when-idle` queue, unowned ones, or pinned ones (`relay keep <sid>` / `spawn --keep`; `keep --off`
 unpins). A heavy session (past the handoff threshold) is **retired** (seed written) instead of closed.
+
+One exception to "ones with a `--when-idle` queue": a queue whose **head is undeliverable because
+the session is heavy** is a deadlock, not work in flight — that session can neither receive the
+packet (the heaviness gate refuses) nor be parked, so it used to sit `reported` forever. Such a
+queue counts as **empty** for both rules; when the sweep parks the session it cancels the stuck
+queue and ledgers `queue_cancelled_on_park` naming each packet's source, so nothing vanishes
+silently. Until then `relay list` says so in words: `🛏 <sid>: not auto-closed earlier — queue
+stuck: 1 packet undeliverable (heavy) — `relay send <sid> <packet> --rotate` carries it to a
+successor`. A queue stuck on anything transient (tab unreachable, mid-supersede) still holds the
+session open — it may yet deliver.
+
+A **pin** records who set it and when (`keep_by` / `keep_at`, written by both `relay keep <sid>` and
+`spawn --keep`), so `relay list` can say `📌 <sid>: pinned by <project> <age> ago — auto-close leaves
+it alone; `relay keep <sid> --off` releases it` instead of a bare 📌 nobody can date. Pins survive a
+handoff, so `relay handoff` names the ones the successor is inheriting (`📌 N pinned executors
+inherited: … — `relay keep <sid> --off` to release`) — on the outgoing lead's console **and** as an
+item in the successor's own handoff copy, which is the only one of the two the successor reads.
 The sweep runs on `relay check`, `relay list`, and every lead turn-end (the Stop hook), scoped to
 the lead's own executors; the ledger records `auto_closed` (and, right before it, a `landed` event
 when the reason is "landed" — the same fact `relay stats` ROUNDS reads, see below) and `relay list
@@ -588,7 +631,12 @@ Closing is parking, not loss: the report is on disk, staged work stays in the wo
   `relay tidy --dry-run` prints the order it would apply without moving anything. Executors in a
   different window from their lead are left where they are. Needs the same optional `iterm2`
   package and Python API toggle as adjacent-tab placement below — without them it degrades to one
-  dim line, never a failed command.
+  dim line, never a failed command. The automatic tidy races iTerm's own tab creation, which drops
+  the API socket without a close frame, so a **connection** failure is retried once after a second
+  (a "no tab holds these ids" answer is not — it would just be re-asked). Every tidy that reaches
+  iTerm ledgers its outcome — `tidy` (windows reordered, ids unclaimed) or `tidy_skipped` (reason,
+  attempts) — and `relay list` names a lead whose last tidy was skipped, since the dim line itself
+  scrolls away.
 - **Pane layout** (iTerm only): set `"executor_layout": "pane"` (or pass `--pane` at spawn) to open
   executors as split panes inside the lead's own tab instead of separate tabs; `--tab` forces a
   tab for one spawn regardless of config. Falls back to a tab if the lead's iTerm session can't be
@@ -730,6 +778,12 @@ spawn ceiling still applies.
 
 ## Troubleshooting
 
+- **`relay list` is scoped to your project's live world.** Ghost and paused leads belonging to
+  OTHER projects collapse into one dim line (`N ghost/paused leads in other projects hidden`)
+  instead of a wall of rows that also re-named each of them in the `LIVE=ghost` and `↪ migrated
+  from` footnotes. The reference project comes from `--lead <sid>`'s marker, or from the cwd when a
+  lead there matches it. Live, unreachable, broken and same-project leads are never hidden;
+  `--all-leads` shows everything, `relay prune` clears the dead ones for good.
 - **First, `relay doctor`.** Proves the installed Claude Code still behaves the way relay's launch
   line assumes — strict MCP, the executor agent, commit-deny under skip-permissions, and each
   model tier's real context window (see [Executor context window](#executor-context-window-200k-vs-1m)
@@ -737,7 +791,10 @@ spawn ceiling still applies.
   servers); `--offline` for plumbing only, `--quick` skips slow probes, run after every update.
 
 - **`/relay:check --all`** tells you the real state (busy/reported/stalled/dead) — trust it over how
-  a tab looks. `stalled` means go look at that tab.
+  a tab looks. `stalled` means go look at that tab. An executor stuck on a prompt it cannot answer
+  (an OS permission dialog, say) keeps its process alive but stops writing its transcript, so it
+  reads `stalled` once `stall_threshold_seconds` passes — and `relay retire` / `relay restart`
+  accept it without `--force`, since there is nothing left to interrupt.
 - **Tab died mid-build?** `relay resume <sid>` reopens the same conversation with context and staged
   work intact; `relay restart <sid>` re-runs the packet fresh.
 - **Executor finished but the lead never woke?** First check `relay list` — a **`WAKE=STALE`** on the

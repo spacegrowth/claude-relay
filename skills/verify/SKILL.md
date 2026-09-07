@@ -51,6 +51,10 @@ The verdict words are deliberately chosen so they cannot be over-read at a glanc
   *staged* file the report didn't name is only a note — reports legitimately summarise.
   If the report has no "What changed" section the scan can't tell "I changed x" from "I read x",
   so it downgrades to advisory instead of accusing. It says so in the output.
+  A claim written **relative to a subdirectory** (`lib/types.ts` when `app/src/lib/types.ts` is
+  what's staged) resolves by unique suffix and is confirmed, not accused — so a report whose
+  section header names its own root no longer reads as a wall of false mismatches. Two staged files
+  matching one claim stays a `MISMATCH`, with a note naming both.
 - **Staged, not committed** — a report asserting its work is staged over an empty index is a hard
   contradiction. Commits on the branch are advisory only (you legitimately commit earlier packets
   from a reused session).

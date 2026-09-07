@@ -114,6 +114,10 @@ class FakeTerm:
         self.ttys = {}             # handle -> a real path relay's tab painter may write to
         self.reorders = []         # every reorder_tabs call, as the handle list it was given
         self.reorder_result = (True, "reordered 1 window(s)")
+        # Row 69: an optional QUEUE of results, one popped per call, for the retry tests — a
+        # single `reorder_result` cannot express "fails, then succeeds". Empty/None falls back to
+        # `reorder_result`, so every existing test is unaffected.
+        self.reorder_results = None
         self._name = None
 
     @contextlib.contextmanager
@@ -179,6 +183,8 @@ class FakeTerm:
 
     def reorder_tabs(self, window_ordering, timeout=None):
         self.reorders.append(list(window_ordering))
+        if self.reorder_results:
+            return self.reorder_results.pop(0)
         return self.reorder_result
 
 
@@ -244,6 +250,14 @@ def make_exec(relay, sid, owner_lead, handle, spawned=None, status="busy", **ove
         with open(relay.LEDGER, "a") as f:
             f.write(json.dumps({"ts": spawned, "event": "spawned", "session_id": sid}) + "\n")
     return s
+
+
+def ledger_events(relay, event=None):
+    """Every ledger record (optionally just one event name), in file order."""
+    if not relay.LEDGER.exists():
+        return []
+    recs = [json.loads(ln) for ln in relay.LEDGER.read_text().splitlines() if ln.strip()]
+    return [r for r in recs if event is None or r.get("event") == event]
 
 
 def cfg_write(relay, **kv):
@@ -601,3 +615,153 @@ class TestExecutorColorFollowsItsOwner:
         terms.alive = False
         run_main(relay, "restart", "e1")
         assert terms.spawns[0]["tab_color"] == [136, 164, 198]
+
+
+# ── backlog row 69: the post-spawn tidy loses the race with iTerm ───────────────────────────────
+
+CONN_FAIL = (False, "iterm2 python api unavailable "
+                    "(ConnectionClosedError: no close frame received or sent)")
+IMPORT_FAIL = (False, "iterm2 python api unavailable (ModuleNotFoundError: No module named 'iterm2')")
+NOT_FOUND = (False, "no iTerm tab found for any of the ordered session ids")
+REORDERED = (True, "reordered 1 window(s)")
+REORDERED_PARTIAL = (True, "reordered 2 window(s); 3 session id(s) had no tab")
+
+
+class TestTidyRetriesTheSpawnRace:
+    """Row 69: every automatic tidy fired right after `relay spawn` failed with
+    "iterm2 python api unavailable (ConnectionClosedError: no close frame received or sent)", while
+    `relay tidy` typed by hand seconds later worked every time — the API websocket is opened while
+    iTerm is still finishing the AppleScript tab creation. One retry, a second later, and ONLY for
+    a connection-shaped failure; every attempt-reaching tidy ledgers its outcome once."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_sleep(self, relay, monkeypatch):
+        """The retry's 1 s wait, recorded instead of served — a suite that actually slept a second
+        per retry test would be paying real time for a cosmetic feature."""
+        self.sleeps = []
+        monkeypatch.setattr(relay.time, "sleep", lambda s: self.sleeps.append(s))
+
+    def test_a_connection_failure_is_retried_once_and_then_succeeds(self, relay, terms, tidy_on):
+        two_leads(relay)
+        terms.reorder_results = [CONN_FAIL, REORDERED]
+        run_main(relay, "tidy")
+        assert len(terms.reorders) == 2                      # exactly one retry, not a loop
+        assert terms.reorders[0] == terms.reorders[1]        # the SAME order, asked again
+        assert self.sleeps == [relay.TIDY_RETRY_DELAY]
+        ev = ledger_events(relay, "tidy")
+        assert len(ev) == 1 and ev[0]["attempts"] == 2
+        assert ledger_events(relay, "tidy_skipped") == []
+
+    def test_the_retry_succeeding_prints_success_not_the_skipped_line(self, relay, terms, tidy_on,
+                                                                      capsys):
+        two_leads(relay)
+        terms.reorder_results = [CONN_FAIL, REORDERED]
+        run_main(relay, "tidy")
+        out = capsys.readouterr().out
+        assert "reordered 1 window(s)" in out and "not applied" not in out
+
+    def test_two_connection_failures_ledger_tidy_skipped_with_two_attempts(self, relay, terms,
+                                                                          tidy_on, capsys):
+        two_leads(relay)
+        terms.reorder_results = [CONN_FAIL, CONN_FAIL]
+        run_main(relay, "tidy")
+        assert len(terms.reorders) == 2                      # never a third
+        ev = ledger_events(relay, "tidy_skipped")
+        assert len(ev) == 1 and ev[0]["attempts"] == 2
+        assert "ConnectionClosedError" in ev[0]["reason"]
+        assert ledger_events(relay, "tidy") == []
+        assert "not applied" in capsys.readouterr().out      # the dim line, for the FINAL failure
+
+    def test_a_session_id_not_found_result_is_never_retried(self, relay, terms, tidy_on):
+        """"no tab holds these ids" is a real answer, not a race — asking again one second later
+        gets the same answer for a second of dead time."""
+        two_leads(relay)
+        terms.reorder_results = [NOT_FOUND, REORDERED]
+        run_main(relay, "tidy")
+        assert len(terms.reorders) == 1
+        assert self.sleeps == []
+        ev = ledger_events(relay, "tidy_skipped")
+        assert len(ev) == 1 and ev[0]["attempts"] == 1
+
+    def test_a_missing_iterm2_package_is_never_retried(self, relay, terms, tidy_on):
+        two_leads(relay)
+        terms.reorder_results = [IMPORT_FAIL, REORDERED]
+        run_main(relay, "tidy")
+        assert len(terms.reorders) == 1
+        assert self.sleeps == []
+
+    def test_a_first_attempt_success_ledgers_tidy_with_one_attempt_and_the_counts(self, relay,
+                                                                                  terms, tidy_on):
+        two_leads(relay)
+        terms.reorder_result = REORDERED_PARTIAL
+        run_main(relay, "tidy")
+        assert len(terms.reorders) == 1
+        ev = ledger_events(relay, "tidy")
+        assert len(ev) == 1
+        assert ev[0]["attempts"] == 1 and ev[0]["windows"] == 2 and ev[0]["missing"] == 3
+
+    def test_the_automatic_post_spawn_tidy_gets_the_same_retry(self, relay, terms, tidy_on,
+                                                               tmp_path, monkeypatch, capsys):
+        """The bug was only ever observed on the AUTOMATIC path — the retry lives in the shared
+        `_tidy_now`, so proving it through `relay spawn` proves it where it actually bites."""
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w0t0p0:A", started="2020-01-01T00:00:00")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-a")
+        terms.reorder_results = [CONN_FAIL, REORDERED]
+        run_main(relay, "spawn", str(tmp_path), "topic", write_packet(tmp_path), "--name", "e1")
+        assert len(terms.reorders) == 2
+        assert "tab tidy skipped" not in capsys.readouterr().out
+        assert [e["attempts"] for e in ledger_events(relay, "tidy")] == [2]
+
+    def test_the_tidy_event_names_the_lead_that_ran_it(self, relay, terms, tidy_on, monkeypatch):
+        two_leads(relay)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-a")
+        run_main(relay, "tidy")
+        assert ledger_events(relay, "tidy")[0]["session_id"] == "lead-a"
+
+    def test_relay_no_tidy_ledgers_nothing(self, relay, terms):
+        """The suite-wide kill-switch is deliberately NOT lifted here: "tidy does not exist" must
+        mean no ledger noise either."""
+        two_leads(relay)
+        run_main(relay, "tidy")
+        assert ledger_events(relay, "tidy") == [] and ledger_events(relay, "tidy_skipped") == []
+
+    def test_a_dry_run_never_ledgers(self, relay, terms, tidy_on):
+        two_leads(relay)
+        run_main(relay, "tidy", "--dry-run")
+        assert terms.reorders == []
+        assert ledger_events(relay, "tidy") == [] and ledger_events(relay, "tidy_skipped") == []
+
+
+class TestListNamesALeadWhoseTidyKeepsBeingSkipped:
+    """The dim "tab tidy skipped" line is printed once, mid-spawn, and scrolls away — so a tab bar
+    that has silently stopped being tidied is invisible minutes later. `relay list` reads the
+    ledger for it."""
+
+    def _tidy_once(self, relay, terms, monkeypatch, result):
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-a")
+        monkeypatch.delenv("RELAY_NO_TIDY", raising=False)
+        monkeypatch.setattr(relay.time, "sleep", lambda s: None)
+        terms.reorder_result = result
+        run_main(relay, "tidy")
+
+    def test_a_skipped_tidy_is_named_in_list(self, relay, terms, monkeypatch, capsys):
+        two_leads(relay)
+        self._tidy_once(relay, terms, monkeypatch, CONN_FAIL)
+        capsys.readouterr()
+        run_main(relay, "list")
+        out = capsys.readouterr().out
+        assert "lead-a: last tab tidy skipped after 2 attempt(s)" in out
+        assert "lead-b" not in out.split("last tab tidy skipped")[1].splitlines()[0]
+
+    def test_a_later_successful_tidy_clears_the_footnote(self, relay, terms, monkeypatch, capsys):
+        two_leads(relay)
+        self._tidy_once(relay, terms, monkeypatch, CONN_FAIL)
+        self._tidy_once(relay, terms, monkeypatch, REORDERED)
+        capsys.readouterr()
+        run_main(relay, "list")
+        assert "last tab tidy skipped" not in capsys.readouterr().out
+
+    def test_no_tidy_history_means_no_footnote(self, relay, terms, capsys):
+        two_leads(relay)
+        run_main(relay, "list")
+        assert "last tab tidy skipped" not in capsys.readouterr().out

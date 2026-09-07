@@ -261,6 +261,50 @@ class TestRotateMovesQueue:
         assert [m["queue_id"] for m in moved] == [1, 2]
         assert all(m["session_id"] == sid and m["successor"] == f"{sid}-r2" for m in moved)
 
+    # ── row 70 item 5 (issue 04-rotate-double-delivers-queued.md) ────────────────────────────────
+    # Observed on gm-app-000221-r5 → r6: `relay send <sid> <pkt> --rotate` where <pkt> was ALSO the
+    # queued `--when-idle` copy spawned the successor with it as packet 001 AND moved the queued
+    # copy onto the successor's queue — the executor would have run the same packet twice.
+
+    def test_rotating_the_same_packet_that_is_queued_does_not_move_it_twice(self, relay, terms,
+                                                                            tmp_path):
+        sid = "q1"
+        _session(relay, tmp_path, sid, owner_lead="lead-1")
+        nxt = tmp_path / "n.md"
+        nxt.write_text("# next\n\n## Preconditions\n- ok\n\ndo more")
+        relay.enqueue_packet(sid, nxt.read_text(), str(nxt))     # the SAME source, queued
+        relay.enqueue_packet(sid, "unrelated", "other.md")
+        self._rotate(relay, terms, sid, nxt)
+
+        new_queue = relay.read_queue(f"{sid}-r2")
+        assert [i["source"] for i in new_queue] == ["other.md"]
+        deduped = _ledger_events(relay, "queue_deduped")
+        assert len(deduped) == 1
+        assert deduped[0]["session_id"] == sid and deduped[0]["source"] == str(nxt)
+
+    def test_the_dedupe_is_reported_in_the_rotate_output(self, relay, terms, tmp_path, capsys):
+        sid = "q1"
+        _session(relay, tmp_path, sid, owner_lead="lead-1")
+        nxt = tmp_path / "n.md"
+        nxt.write_text("# next\n\n## Preconditions\n- ok\n\ndo more")
+        relay.enqueue_packet(sid, nxt.read_text(), str(nxt))
+        self._rotate(relay, terms, sid, nxt)
+        out = capsys.readouterr().out
+        assert "1 queued packet(s) already being sent — dropped" in out
+
+    def test_a_different_packet_is_still_moved(self, relay, terms, tmp_path):
+        """Only the packet being SENT is deduped — everything else still travels."""
+        sid = "q1"
+        _session(relay, tmp_path, sid, owner_lead="lead-1")
+        queued = tmp_path / "q.md"
+        queued.write_text("queued body")
+        relay.enqueue_packet(sid, queued.read_text(), str(queued))
+        nxt = tmp_path / "n.md"
+        nxt.write_text("# next\n\n## Preconditions\n- ok\n\ndo more")
+        self._rotate(relay, terms, sid, nxt)
+        assert [i["source"] for i in relay.read_queue(f"{sid}-r2")] == [str(queued)]
+        assert _ledger_events(relay, "queue_deduped") == []
+
     def test_an_empty_queue_moves_nothing_and_ledgers_nothing(self, relay, terms, tmp_path):
         """No queue at all must not print/ledger a spurious move — this is a real gap fix, not a
         new source of noise on the (overwhelmingly common) rotate-with-no-queue path."""
@@ -283,12 +327,38 @@ class TestQueueDeliveryFailedFootnote:
         item["last_error"] = error
         relay.write_queue(sid, [item])
 
+    # Row 70 item 1: a head stuck on the HEAVINESS gate now gets its own 🛏 footnote (below)
+    # instead of this generic one, so this test's error is a genuinely generic failure.
     def test_list_prints_the_red_footnote_naming_the_error(self, relay, terms, tmp_path, capsys):
         _session(relay, tmp_path, "e1")
-        self._stuck_queue(relay, "e1", error="session is heavy — refusing")
+        self._stuck_queue(relay, "e1", error="tab unreachable — refusing")
         relay.cmd_list(SimpleNamespace(json=False, lead=None, all=True, closed=False))
         out = capsys.readouterr().out
-        assert "e1: 1 queued packet(s) could not be delivered — session is heavy — refusing" in out
+        assert "e1: 1 queued packet(s) could not be delivered — tab unreachable — refusing" in out
+
+    # ── row 70 item 1 (issue 01-heavy-queue-deadlock.md) ─────────────────────────────────────────
+    # "relay list only prints the heaviness paragraph, not 'this is why it is still open'". A head
+    # item the heaviness gate keeps refusing is the ONE stuck-queue shape with a one-command way
+    # out (`--rotate` carries it to a successor), so it gets its own actionable footnote.
+    HEAVY_ERROR = ("session 'e1' is heavy — its live context is 178k tokens, past the 150k nudge — "
+                   "every turn re-sends all of it. That's not a verdict on its work")
+
+    def test_list_prints_a_bed_footnote_for_a_queue_stuck_on_heaviness(self, relay, terms, tmp_path,
+                                                                       capsys):
+        _session(relay, tmp_path, "e1")
+        self._stuck_queue(relay, "e1", error=self.HEAVY_ERROR)
+        relay.cmd_list(SimpleNamespace(json=False, lead=None, all=True, closed=False))
+        out = capsys.readouterr().out
+        assert "🛏 e1: not auto-closed earlier" in out
+        assert "queue stuck: 1 packet undeliverable (heavy)" in out
+        assert "--rotate` carries it to a successor" in out
+
+    def test_the_heavy_footnote_replaces_the_generic_one(self, relay, terms, tmp_path, capsys):
+        """One footnote per stuck session, not two saying the same thing twice."""
+        _session(relay, tmp_path, "e1")
+        self._stuck_queue(relay, "e1", error=self.HEAVY_ERROR)
+        relay.cmd_list(SimpleNamespace(json=False, lead=None, all=True, closed=False))
+        assert "could not be delivered" not in capsys.readouterr().out
 
     def test_check_prints_the_red_footnote_too(self, relay, terms, tmp_path, capsys):
         _session(relay, tmp_path, "e1")

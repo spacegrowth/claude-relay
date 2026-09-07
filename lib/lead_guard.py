@@ -1501,7 +1501,7 @@ def promote_pending(state_root, lead_sid):
     return keys
 
 
-def carry_forward_surfaced(state_root, from_sid, to_sid):
+def carry_forward_surfaced(state_root, from_sid, to_sid, only_executors=None):
     """Row 67: copy `from_sid`'s surfaced_reports.json + pending_wakes.json onto `to_sid`'s —
     `cmd_handoff`'s successor otherwise starts with NEITHER file, so a report the predecessor had
     already reviewed and committed (surfaced) or was mid-retry announcing (pending) looked brand
@@ -1512,12 +1512,22 @@ def carry_forward_surfaced(state_root, from_sid, to_sid):
     while the predecessor's dir still exists (before `clear_lead` deletes it). Merges onto whatever
     `to_sid` already has rather than clobbering — harmless here (a freshly pre-armed successor has
     neither file yet) and safer if a future caller ever calls this onto a non-empty target.
-    Best-effort; never raises into a caller."""
+
+    Row 70 item 4: `only_executors` scopes the copy to those executor ids — the shape an ADOPTION
+    needs, where ONE executor changes hands (`_maybe_adopt` / `_reparent_executors`) and importing
+    the old owner's whole history onto the new one would be wrong. Keys are "<executor>:<packet>",
+    so the scoping is a prefix match on the key's executor half. None (the handoff case) copies
+    everything, unchanged. Best-effort; never raises into a caller."""
     try:
-        surfaced = load_surfaced(state_root, from_sid)
+        wanted = None if only_executors is None else {str(e) for e in only_executors}
+
+        def keep(key):
+            return wanted is None or str(key).rsplit(":", 1)[0] in wanted
+
+        surfaced = {k for k in load_surfaced(state_root, from_sid) if keep(k)}
         if surfaced:
             mark_surfaced(state_root, to_sid, surfaced)
-        pending = load_pending(state_root, from_sid)
+        pending = {k: v for k, v in load_pending(state_root, from_sid).items() if keep(k)}
         if pending:
             cur = load_pending(state_root, to_sid)
             cur.update(pending)
@@ -1716,6 +1726,62 @@ def new_reports_for(state_root, lead_sid):
         if key not in surfaced:
             fresh.append((key, sid, packet, path))
     return fresh
+
+
+def git_dirty_paths(worktree):
+    """Paths with ANY working-tree/index change (staged, modified, untracked, renamed-to) — what
+    "this executor's work is still sitting here" looks like. None on any git failure, which callers
+    must read as UNKNOWN (never as clean); an empty set means a genuinely clean worktree.
+
+    Lives here rather than in bin/relay so the auto-close sweep (`bin/relay _git_dirty_paths`, a
+    thin wrapper over this) and the Stop hook's wake (`report_landed` below, which a hook script
+    can import) can never disagree about what "landed" means."""
+    if not worktree:
+        return None
+    try:
+        r = subprocess.run(["git", "-C", str(worktree), "status", "--porcelain",
+                            "--untracked-files=all"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        out = set()
+        for line in r.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            path = line[3:]
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            out.add(path.strip().strip('"'))
+        return out
+    except Exception:
+        return None
+
+
+def report_landed(state_root, exec_sid, report_path):
+    """Row 70 item 4, belt-and-braces half: has this executor's report ALREADY landed — is every
+    path it claims under "What changed" clean in its worktree? Exactly the test auto-close's
+    `landed` reason applies, asked here so the Stop-hook wake can skip a report the previous owner
+    already reviewed and committed instead of re-announcing it as "review needed" (the incident in
+    `relay-issues/03-surfaced-not-carried-on-adopt.md`, which cost the successor a turn per stale
+    report and invited a re-review of committed work).
+
+    Conservative by construction — False for everything it cannot PROVE: no recorded worktree, git
+    unreadable, or a report that claims no paths at all (an ops report claims none, and "no claims"
+    is not evidence of landing). A wake wrongly skipped is a silent report, which is worse than a
+    wake wrongly fired, so every uncertainty resolves towards waking."""
+    try:
+        import report_verify
+        worktree = read_session_json(state_root, exec_sid).get("worktree")
+        if not worktree:
+            return False
+        claimed, _scoped = report_verify.claimed_paths(Path(report_path).read_text())
+        if not claimed:
+            return False
+        dirty = git_dirty_paths(worktree)
+        if dirty is None:
+            return False
+        return not (set(claimed) & dirty)
+    except Exception:
+        return False
 
 
 def diff_size_text(worktree):
@@ -2223,9 +2289,29 @@ def executor_agent_flags(plugin_root):
 
 AUTO_CLOSE_LANDED_GRACE_SECONDS = 120
 
+# Row 70 item 1 — the deadlock (2026-09-06 field report, `relay-issues/01-heavy-queue-deadlock.md`):
+# a heavy session with a --when-idle packet queued could neither receive it (`deliver_queued` hits
+# cmd_send's heaviness gate and puts the item back with `last_error` set) nor be parked (the sweep
+# below skipped anything with a queue). Two sessions sat `reported` for hours, work already
+# committed. The way out: a queue whose HEAD is undeliverable-for-heaviness is not "a session with
+# work in flight" — it is a session that can never run that work at all, so it reads as EMPTY for
+# the landed/idle rules and the packet is carried to a successor by hand (`send --rotate`). Only
+# heaviness: a head stuck on anything transient (tab unreachable, mid-supersede) may still deliver
+# on the next poll, and those DO keep the session open.
+QUEUE_HEAVY_REFUSAL = " is heavy — "
+
+
+def queue_stuck_on_heaviness(last_error):
+    """Whether a queued item's recorded `last_error` is cmd_send's heaviness refusal (which reads
+    "session '<sid>' is heavy — <reading>. …"). PURE, and deliberately a substring test on the one
+    phrase that gate owns: `deliver_queued` stores the refusal as free text, so this is the only
+    signal either side has."""
+    return bool(last_error) and QUEUE_HEAVY_REFUSAL in str(last_error)
+
 
 def auto_close_decision(s, *, report_age, surfaced, queued, claimed, dirty, heavy,
-                        idle_minutes, grace=AUTO_CLOSE_LANDED_GRACE_SECONDS):
+                        idle_minutes, grace=AUTO_CLOSE_LANDED_GRACE_SECONDS,
+                        queue_stuck_heavy=False, no_change=False):
     """PURE: should session record `s` be parked, and why? Returns (action, reason) with action
     "close" | "retire" (retire when `heavy`, so the successor seed is written), or None.
       report_age   seconds since its current report was written (None = no report)
@@ -2234,13 +2320,26 @@ def auto_close_decision(s, *, report_age, surfaced, queued, claimed, dirty, heav
       claimed      paths the report claims under "What changed" (empty → landed path unavailable)
       dirty        paths currently staged/modified/untracked in the worktree
       heavy        transcript past the heaviness threshold → retire instead of close
-      idle_minutes timer threshold; 0/None disables the timer path"""
+      idle_minutes timer threshold; 0/None disables the timer path
+      queue_stuck_heavy  the queue head is undeliverable for heaviness (queue_stuck_on_heaviness)
+                   → the queue does NOT count as "in use"; see QUEUE_HEAVY_REFUSAL above
+      no_change    the report is a finished OPS report that says it staged nothing
+                   (report_verify.clean_no_change_report) → see the no-change landing below"""
     if not s or s.get("keep") or s.get("status") != "reported":
         return None
-    if report_age is None or not surfaced or queued:
+    if report_age is None or not surfaced:
+        return None
+    if queued and not queue_stuck_heavy:
         return None
     reason = None
     if claimed and report_age >= grace and not (set(claimed) & set(dirty or ())):
+        reason = "landed"
+    # Row 70 item 3: an ops report claims no paths, so the rule above can never fire for it and the
+    # session used to sit out the whole idle timer having finished. It lands the moment BOTH halves
+    # agree there is nothing to review: the report says `Status: clean` + "changed nothing"
+    # (`no_change`), and the worktree really is clean. `dirty is None` means git was unreadable —
+    # that is "unknown", not "clean", and must never land.
+    elif no_change and not claimed and dirty is not None and not dirty and report_age >= grace:
         reason = "landed"
     elif idle_minutes and report_age >= float(idle_minutes) * 60:
         reason = f"idle {int(report_age // 60)}m"

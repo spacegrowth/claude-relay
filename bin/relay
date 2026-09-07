@@ -321,8 +321,14 @@ You were pre-armed by relay handoff under pinned session id {successor_sid}.
 4. REVIEWS: default to /relay:review <sid> for any inherited executor's report — the fork reads
    the whole diff every time (no blanket carve-out for relay's own gated files); read its findings,
    not the diff, and open hunks inline yourself only when a finding names a sign-off-gated path
-   (hooks/, lib/lead_guard.py, ledgers) AND the change there is more than a guard or a rename.
-"""
+   (hooks/, lib/lead_guard.py, ledgers) AND the change there is more than a guard or a rename.{pins_line}"""
+
+# Row 70 item 2, second half (lead review of packet 001): the inherited-pins warning was printed on
+# the OUTGOING lead's console only — the one console the successor never reads. A pin is invisible
+# and permanent (auto-close never parks a pinned executor), so it has to travel INTO the aftercare
+# the successor is told to read first. Same sentence, same release command, in the durable copy.
+AFTERCARE_PINS_LINE = ("5. PINNED EXECUTORS: {n} pinned executor{s} inherited: {sids} — auto-close "
+                       "will never park them; `relay keep <sid> --off` to release.\n")
 
 # The successor seed (backlog §6e-e3). Written by `relay retire` into the retired session's own dir,
 # and inlined into a fresh spawn's packet by `relay spawn --seed`. Same body+appended-section
@@ -376,15 +382,23 @@ def dropped_discipline_markers(predecessor_body, new_body):
     return [m for m in seen if m not in new_body]
 
 
-def build_handoff_copy(body, successor_sid):
+def build_handoff_copy(body, successor_sid, pins=()):
     """The relay-owned handoff.md a successor actually reads: the user's authored content
     unmodified, plus an appended SUCCESSOR AFTERCARE section — same relationship as
     build_packet/TEMPLATE_FOOTER. Written under the successor's OWN lead dir so the user's source
     file is never touched, and the seed prompt can stay a short pointer at this copy instead of
     inlining the aftercare (see cmd_handoff's truncation postmortem). Idempotent (#19): any
     aftercare section already present in `body` (from a prior handoff of this same doc) is
-    stripped before the fresh one is appended, so re-handoff never stacks a second section."""
-    return AFTERCARE_RE.sub("", body.rstrip()).rstrip() + AFTERCARE_FOOTER.format(successor_sid=successor_sid)
+    stripped before the fresh one is appended, so re-handoff never stacks a second section.
+
+    `pins` are the inherited executors auto-close will never park — named here (item 5) as well as
+    on the outgoing lead's console, because this file is the only one the successor actually reads.
+    Empty/omitted renders no item 5 at all rather than a "0 pinned" line nobody needs."""
+    pins = list(pins)
+    pins_line = "" if not pins else AFTERCARE_PINS_LINE.format(
+        n=len(pins), s="" if len(pins) == 1 else "s", sids=", ".join(pins))
+    return (AFTERCARE_RE.sub("", body.rstrip()).rstrip()
+            + AFTERCARE_FOOTER.format(successor_sid=successor_sid, pins_line=pins_line))
 
 
 def path_to_file_url(path):
@@ -818,6 +832,23 @@ def session_pid_alive(s):
         if cur and cur != recorded:
             return False
     return True
+
+
+def _transcript_stalled(s):
+    """Row 70 item 7: is this session's TRANSCRIPT provably frozen — busy longer than
+    `stall_threshold_seconds` AND no transcript write within the same window? That is row 66's
+    definition of `stalled`, asked directly here rather than through the stored `status` field,
+    which nothing recomputes unless someone happens to run `relay check`/`list`.
+
+    Deliberately a STRICT subset of row 66's verdict: where `_check_one` falls back to the
+    elapsed-only read when the transcript can't be located, this requires positive evidence that
+    the transcript is stale. Both callers (`retire`, `restart`) destroy in-flight work, so "we
+    couldn't find the transcript" must keep asking for --force, not wave the session through."""
+    elapsed = _busy_elapsed(s)
+    if elapsed is None or elapsed <= _stall_threshold_seconds():
+        return False
+    age = _transcript_age_seconds(s.get("claude_session"))
+    return age is not None and age > _stall_threshold_seconds()
 
 
 def _resume_restart_alive(s):
@@ -1291,6 +1322,10 @@ def cmd_spawn(args):
         "mcp": mcp_spec,          # resolved MCP set ("none" | "inherit" | [names]) — resume/restart
                                   # relaunch with the same set, never silently inheriting
         "keep": bool(getattr(args, "keep", False)),  # pinned: auto-close never parks it (relay keep)
+        # Same provenance stamp cmd_keep writes (row 70 item 2) — `spawn --keep` is the other way a
+        # pin is created, and an unstamped one is exactly the pin nobody ever releases.
+        "keep_by": owner_lead if getattr(args, "keep", False) else None,
+        "keep_at": now() if getattr(args, "keep", False) else None,
         "context": ctx_window,    # "1m" | "200k" — fixed for the conversation (resume keeps the model);
                                   # widen by retire + respawn, never in place
         "agent": agent_name,      # "relay-executor" when the role rides the inline agent (None = legacy
@@ -1473,6 +1508,11 @@ def _maybe_adopt(session_id, s, force=False, quiet=False):
         s["updated"] = now()
         write_session(session_id, s)
         _recolor_executor_tab(s)   # it just changed groups — its tab must change color with it
+        # Row 70 item 4: the surfaced/pending sets are per LEAD id, so an adopted executor's
+        # already-reviewed reports looked brand new to the new owner and re-woke it as "review
+        # needed". Carry THIS executor's stamps across (and only this one's).
+        if owner:
+            lead_guard.carry_forward_surfaced(STATE_ROOT, owner, caller, only_executors=[session_id])
         append_ledger("adopted", session_id=session_id, from_lead=owner, to_lead=caller, forced=bool(force))
         if not quiet:
             if owner:
@@ -1506,9 +1546,28 @@ def _reparent_executors(old_owner, new_owner, new_owner_project):
         s["updated"] = now()
         write_session(sid, s)
         _recolor_executor_tab(s)   # ownership moved, so the tab's color moves with it
+        # Row 70 item 4: same per-executor stamp carry `_maybe_adopt` does — so the carry holds
+        # wherever a re-parent is driven from, not only where cmd_handoff's wholesale copy follows.
+        lead_guard.carry_forward_surfaced(STATE_ROOT, old_owner, new_owner, only_executors=[sid])
         append_ledger("adopted", session_id=sid, from_lead=old_owner, to_lead=new_owner, forced=False)
         moved.append(sid)
     return moved
+
+
+def _inherited_pins(old_owner):
+    """The PINNED executors `old_owner` is about to hand on: exactly the non-terminal, owned-by set
+    `_reparent_executors` moves, narrowed to `keep`. Split out (rather than derived from that
+    function's return) because cmd_handoff needs the list BEFORE the re-parent runs — the
+    successor's handoff copy is written earlier, and it is the one document the successor is told
+    to read first."""
+    pins = []
+    for sid in all_session_ids():
+        s = read_session(sid)
+        if not s or s.get("owner_lead") != old_owner or s.get("status") in ("closed", "superseded"):
+            continue
+        if s.get("keep"):
+            pins.append(sid)
+    return pins
 
 
 # ── relay tidy: one lead group per stretch of tab bar (backlog row 64) ─────────────────────────
@@ -1636,18 +1695,86 @@ def _paint_group(g, cfg=None):
     return painted
 
 
+# ── backlog row 69: the post-spawn tidy loses the race with iTerm ─────────────────────────────
+# THE BUG (2026-09-06, twice, deterministic on this machine): EVERY automatic tidy fired right
+# after `relay spawn` printed "tab tidy skipped (iterm2 python api unavailable
+# (ConnectionClosedError: no close frame received or sent))", while `relay tidy` typed by hand
+# seconds later reordered fine every time. The API websocket is opened while iTerm is still
+# finishing the AppleScript tab creation, and iTerm drops it without a close frame. That is a RACE,
+# not an unavailable API — so the fix is to wait a moment and ask exactly once more.
+TIDY_RETRY_DELAY = 1.0
+
+# `iterm_pyapi.try_reorder_tabs` funnels every exception into one reason string shaped
+# "iterm2 python api unavailable (<ExcType>: <msg>)". This pulls the type name back out so the
+# retry can be decided on the CLASS of failure rather than on any failure at all.
+_TIDY_EXC_RE = re.compile(r"iterm2 python api unavailable \(([A-Za-z_][A-Za-z0-9_.]*)\s*:")
+_TIDY_RETRYABLE_EXC_RE = re.compile(r"connection|timeout|websocket|brokenpipe|oserror|eof", re.I)
+
+# The two figures try_reorder_tabs reports in its success reason, read back for the ledger so a
+# `tidy` event carries them as fields instead of only inside prose.
+_TIDY_WINDOWS_RE = re.compile(r"reordered (\d+) window")
+_TIDY_MISSING_RE = re.compile(r"(\d+) session id\(s\) had no tab")
+
+
+def _tidy_retryable(reason):
+    """Is this tidy failure the spawn RACE — worth one more ask a second later — or a real answer?
+
+    Only a CONNECTION-shaped exception qualifies (ConnectionClosedError, a timeout, a dropped
+    socket). "no iTerm tab found for any of the ordered session ids" is a genuine answer: the tabs
+    are not there, and asking again one second later gets the same answer for a second of dead
+    time. So are "nothing to order", "disabled by RELAY_NO_TIDY", and a missing `iterm2` package
+    (ModuleNotFoundError) — none of them is a race."""
+    m = _TIDY_EXC_RE.search(reason or "")
+    return bool(m and _TIDY_RETRYABLE_EXC_RE.search(m.group(1)))
+
+
+def _ledger_tidy(ok, reason, attempts):
+    """One ledger record per tidy that actually reached iTerm — `tidy` (windows reordered, ids no
+    window claimed) or `tidy_skipped` (reason, how many attempts it took to give up) — so a tab bar
+    that silently never got tidied leaves a trace, and `relay list` can say so (below) instead of
+    the evidence living only in a dim line that scrolled away.
+
+    Silent under RELAY_NO_TIDY: that kill-switch means "tidy does not exist here", and a ledger
+    full of `tidy_skipped reason=disabled by RELAY_NO_TIDY` from the test suite is noise."""
+    if os.environ.get("RELAY_NO_TIDY"):
+        return
+    fields = {"attempts": attempts, "reason": reason}
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        fields["session_id"] = sid
+    if ok:
+        w = _TIDY_WINDOWS_RE.search(reason or "")
+        m = _TIDY_MISSING_RE.search(reason or "")
+        fields["windows"] = int(w.group(1)) if w else 0
+        fields["missing"] = int(m.group(1)) if m else 0
+    try:
+        append_ledger("tidy" if ok else "tidy_skipped", **fields)
+    except Exception:
+        pass   # tidy is cosmetic end to end — it can never fail its caller, ledger included
+
+
 def _tidy_now(cfg=None):
     """Compute the order, re-color every group, apply the order. Returns (ok, reason, groups).
     Shared by `relay tidy` and the automatic post-spawn/handoff/resume tidy so both can only ever
-    do the same thing."""
+    do the same thing — which is why the row-69 retry lives HERE and not in `maybe_tidy_tabs`.
+
+    ONE retry, and only for a connection-shaped failure (`_tidy_retryable`): the observed race is
+    lost by about a second, and a second ask that also fails is a real outage, not a race. Every
+    attempt-reaching run ledgers its outcome exactly once, with the attempt count."""
     cfg = lead_guard.load_config(STATE_ROOT) if cfg is None else cfg
     groups = tidy_groups()
     for g in groups:
         _paint_group(g, cfg)
     order = tidy_order(groups)
     if not order:
-        return False, "no lead tabs to order", groups
+        return False, "no lead tabs to order", groups   # nothing was attempted → nothing to ledger
+    attempts = 1
     ok, reason = iterm_backend.reorder_tabs(order)
+    if not ok and _tidy_retryable(reason):
+        time.sleep(TIDY_RETRY_DELAY)
+        attempts = 2
+        ok, reason = iterm_backend.reorder_tabs(order)
+    _ledger_tidy(ok, reason, attempts)
     return ok, reason, groups
 
 
@@ -1710,7 +1837,10 @@ def cmd_restart(args):
     s = read_session(sid)
     if not s:
         sys.exit(f"no such session: {sid}")
-    if _resume_restart_alive(s) and not args.force:
+    # Row 70 item 7 (issue 06): the live-copy guard asks "is the process/tab still there", which a
+    # session stuck on an unanswerable prompt answers YES to forever. `_transcript_stalled` is
+    # exactly "alive but going nowhere" — and restarting THAT is the whole point of the command.
+    if _resume_restart_alive(s) and not _transcript_stalled(s) and not args.force:
         sys.exit(f"session '{sid}' still looks alive (pid {s.get('pid')}) — close it first or pass --force")
     n = s.get("current_packet", 1)
     packet_path = packets_dir(sid) / f"{n:03d}-packet.md"
@@ -1905,6 +2035,19 @@ def successor_name(sid, explicit=None):
     return f"{base}-r{n}"
 
 
+def _queue_source_key(source):
+    """A comparable identity for a queued packet's SOURCE file (row 70 item 5): the resolved
+    absolute path when it resolves, else the raw string. Used to tell "the packet being rotated is
+    the same file that's already in the queue" from two genuinely different packets — a relative and
+    an absolute spelling of one file must not read as two."""
+    if not source:
+        return None
+    try:
+        return str(Path(str(source)).expanduser().resolve())
+    except Exception:
+        return str(source)
+
+
 def _rotate_and_send(args, s, mb=None, upgrade=False):
     """retire `s` → spawn its successor (seeded, same territory, 1M window when the tier has one) with
     args.packet as packet 001. Prints the new session id; ledgers `rotated`.
@@ -1943,16 +2086,35 @@ def _rotate_and_send(args, s, mb=None, upgrade=False):
     # superseded, so nothing ever delivers those packets again. Re-enqueue each one onto the
     # successor, IN ORDER (read_queue is already oldest-first, and enqueue_packet appends), then
     # clear the retired session's own queue so it can't double-deliver if ever resumed by hand.
+    # Row 70 item 5 (issue 04): the packet being rotated is OFTEN the very one already sitting in
+    # the queue — a lead queues it with --when-idle, the session never goes idle enough to take it,
+    # and the lead reaches for --rotate. Moving it as well would hand the successor the same work
+    # twice (as packet 001 AND as a queued packet); observed live on gm-app-000221-r5 → r6.
+    # Deduped by SOURCE path, resolved, so a relative and an absolute spelling of the same file
+    # still match; an unresolvable path falls back to the string it was given rather than raising.
+    sent_source = _queue_source_key(getattr(args, "packet", None))
+    moved_count = deduped_count = 0
     for old_item in stranded_queue:
         old_body_path = Path(old_item.get("body_path") or "")
+        source = old_item.get("source", str(old_body_path))
+        if sent_source and _queue_source_key(source) == sent_source:
+            deduped_count += 1
+            append_ledger("queue_deduped", session_id=sid, successor=new_sid,
+                          queue_id=old_item.get("id"), source=source)
+            continue
         body_text = old_body_path.read_text() if old_body_path.is_file() else ""
-        new_item = enqueue_packet(new_sid, body_text, old_item.get("source", str(old_body_path)),
+        new_item = enqueue_packet(new_sid, body_text, source,
                                   heavy_override=old_item.get("heavy_override"))
+        moved_count += 1
         append_ledger("queue_moved", session_id=sid, successor=new_sid,
                       queue_id=old_item.get("id"), new_queue_id=new_item["id"])
     if stranded_queue:
         write_queue(sid, [])
-        print(f"  moved {len(stranded_queue)} queued packet(s) from '{sid}' to '{new_sid}'")
+        if moved_count:
+            print(f"  moved {moved_count} queued packet(s) from '{sid}' to '{new_sid}'")
+        if deduped_count:
+            print(f"  {deduped_count} queued packet(s) already being sent — dropped instead of "
+                  f"moved, so '{new_sid}' can't run the same packet twice")
     append_ledger("rotated", session_id=sid, successor=new_sid, model=model, widened=widened,
                   mb=round(mb, 1) if mb else None, upgrade=bool(upgrade), from_tier=from_tier)
     print(f"{'upgraded' if upgrade else 'rotated'}: '{sid}' retired, '{new_sid}' spawned with this packet (seed inherited)")
@@ -2273,6 +2435,19 @@ def _queue_delivery_failure_note(session_id):
     return None
 
 
+def _queue_stuck_heavy_note(session_id):
+    """Row 70 item 1: the subset of `_queue_delivery_failure_note` that is the heaviness DEADLOCK
+    — `(sid, N-still-queued, head-body-path)` when the head item's recorded failure is cmd_send's
+    heaviness refusal, else None. Split out because this shape is the only stuck queue with a
+    one-command way out (`send --rotate` retires the session and carries the packet to the
+    successor), so `relay list` answers "why is this still open, and what do I run" instead of
+    only repeating the refusal text."""
+    items = read_queue(session_id)
+    if items and lead_guard.queue_stuck_on_heaviness(items[0].get("last_error")):
+        return session_id, len(items), items[0].get("body_path") or "<packet>"
+    return None
+
+
 def cmd_deliver_queued(args):
     """Internal: the executor-side delivery trigger, invoked by hooks/executor_escalation.py when
     an executor goes idle with its report written. Fail-open like everything else that hook calls —
@@ -2535,25 +2710,12 @@ def _force_color(text, *styles):
 
 def _git_dirty_paths(worktree):
     """Paths with ANY working-tree/index change (staged, modified, untracked, renamed-to) — what
-    "this executor's work is still sitting here" looks like. Empty on any git failure (a non-repo
-    worktree must not read as 'landed' — it reads as 'claimed paths are dirty = unknown' instead,
-    so callers treat a failure as NOT landed; see auto_close_sweep)."""
-    try:
-        r = subprocess.run(["git", "-C", str(worktree), "status", "--porcelain", "--untracked-files=all"],
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            return None
-        out = set()
-        for line in r.stdout.splitlines():
-            if len(line) < 4:
-                continue
-            path = line[3:]
-            if " -> " in path:
-                path = path.split(" -> ", 1)[1]
-            out.add(path.strip().strip('"'))
-        return out
-    except Exception:
-        return None
+    "this executor's work is still sitting here" looks like. None on any git failure (a non-repo
+    worktree must not read as 'landed' — it reads as 'unknown' instead, so callers treat a failure
+    as NOT landed; see auto_close_sweep). Thin wrapper over lead_guard.git_dirty_paths (row 70 item
+    4 moved the body there) so the sweep here and the Stop hook's own landed test — which imports
+    lead_guard, not this file — can never drift apart."""
+    return lead_guard.git_dirty_paths(worktree)
 
 
 def record_landed_if_clean(sid, s, packet_n, trigger):
@@ -2632,8 +2794,16 @@ def auto_close_sweep(trigger, sids=None, lead_sid=None):
                     continue
                 report_age = time.time() - report.stat().st_mtime
                 surfaced = f"{sid}:{n}" in lead_guard.load_surfaced(STATE_ROOT, owner)
-                queued = len(read_queue(sid))
-                claimed, _scoped = report_verify.claimed_paths(report.read_text())
+                queue_items = read_queue(sid)
+                queued = len(queue_items)
+                # Row 70 item 1: a queue whose head the heaviness gate keeps refusing is a
+                # DEADLOCK, not work in flight — see lead_guard.QUEUE_HEAVY_REFUSAL.
+                queue_stuck_heavy = bool(queue_items) and lead_guard.queue_stuck_on_heaviness(
+                    queue_items[0].get("last_error"))
+                report_text = report.read_text()
+                claimed, _scoped = report_verify.claimed_paths(report_text)
+                # Row 70 item 3: a finished OPS report claims nothing ON PURPOSE and says so.
+                no_change = report_verify.clean_no_change_report(report_text)
                 dirty = _git_dirty_paths(s.get("worktree") or "")
                 if dirty is None:
                     claimed = []  # git unreadable → the landed path is unavailable, timer only
@@ -2641,12 +2811,24 @@ def auto_close_sweep(trigger, sids=None, lead_sid=None):
                                   token_threshold, mb_threshold)
                 decision = lead_guard.auto_close_decision(
                     s, report_age=report_age, surfaced=surfaced, queued=queued, claimed=claimed,
-                    dirty=dirty, heavy=heavy, idle_minutes=idle_minutes)
+                    dirty=dirty, heavy=heavy, idle_minutes=idle_minutes,
+                    queue_stuck_heavy=queue_stuck_heavy, no_change=no_change)
                 if not decision:
                     continue
                 action, reason = decision
                 if reason == "landed":
                     record_landed_if_clean(sid, s, n, trigger)
+                # Parking a session whose queue is deadlocked would strand that queue on a closed
+                # session, invisible. Cancel it HERE (before the teardown) and ledger every item by
+                # its SOURCE path, so the packet that was never delivered is recoverable from
+                # history rather than silently gone.
+                if queue_stuck_heavy:
+                    write_queue(sid, [])
+                    for i in queue_items:
+                        append_ledger("queue_cancelled_on_park", session_id=sid,
+                                      queue_id=i.get("id"), source=i.get("source"),
+                                      body_path=i.get("body_path"), action=action, reason=reason,
+                                      trigger=trigger)
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     if action == "retire":
@@ -3439,9 +3621,15 @@ def cmd_keep(args):
     if not s:
         sys.exit(f"no such session: {args.session_id}")
     s["keep"] = not args.off
+    # Row 70 item 2: a pin outlives the lead that set it (it survives every handoff and auto-close
+    # never touches it), so it must carry its own provenance — WHO pinned it and WHEN. Without the
+    # stamp `relay list` can only show a bare 📌, and nobody can tell "I pinned this ten minutes
+    # ago" from "a lead three handoffs back pinned this last week"; the pin then never gets released.
+    s["keep_by"] = (os.environ.get("CLAUDE_CODE_SESSION_ID") or None) if s["keep"] else None
+    s["keep_at"] = now() if s["keep"] else None
     s["updated"] = now()
     write_session(args.session_id, s)
-    append_ledger("keep", session_id=args.session_id, keep=s["keep"])
+    append_ledger("keep", session_id=args.session_id, keep=s["keep"], keep_by=s["keep_by"])
     print(f"{'pinned' if s['keep'] else 'unpinned'} '{args.session_id}' — auto-close will "
           f"{'leave it alone' if s['keep'] else 'park it once finished'}")
 
@@ -4119,10 +4307,70 @@ def _heavy_reading_text(usage, mb):
     return lead_guard.heavy_reading_text(usage, mb)
 
 
+def _lead_liveness_verdict(m):
+    """One liveness verdict per lead marker, for `relay list`'s LIVE column and its footnotes.
+    A broken marker (D2) short-circuits to "broken": it carries no tab/cwd identity to run the
+    is_alive probe against, and it isn't a real "how stale is this lead" question. Packet-002 item
+    3: a TOMBSTONED marker whose tab still probes alive is not an ordinary "live" lead — a genuinely
+    paused/resumable exit doesn't leave its own tab running (the process exited), so a live tab plus
+    an ended marker is the hijack/silent-tombstone shape that whole packet exists to surface —
+    overridden to "ended_but_alive" ("ended?", red) rather than the reassuring green "live"."""
+    if m.get("broken"):
+        return "broken"
+    verdict = _lead_liveness(m)
+    if verdict == "live" and lead_guard.is_tombstoned(m):
+        return "ended_but_alive"
+    return verdict
+
+
+def _lead_project_key(project):
+    """Comparable project identity for the lead-scoping filter — slugified so `Vigie` and `vigie`,
+    or a cwd basename and the marker's own recorded project, don't read as two projects."""
+    return slugify(str(project or "")).lower()
+
+
+def _collapse_foreign_stale_leads(leads, liveness_by_sid, reference_project):
+    """Row 70 item 8 (issue 07-list-prints-ghost-leads.md): (kept, hidden) leads for the LEADS
+    table. Hidden = leads that are ghost or paused (tombstoned) AND belong to a project other than
+    `reference_project`.
+
+    Field data: every `relay list --lead <sid>` printed 18 lead rows, 16 of them ghost/paused leads
+    from other projects up to 28 days old — then named them all AGAIN in the "↪ migrated from" and
+    "⚠ LIVE=ghost" footnotes. ~2k tokens per call, and not one line of it actionable from the lead
+    that ran the command. Deliberately narrow: only DEAD weight collapses. A live (or unreachable,
+    or broken) lead on another project is current information and is never hidden, and neither is a
+    ghost on the SAME project — that one you might still resume or prune."""
+    if not reference_project:
+        return list(leads), []
+    kept, hidden = [], []
+    for m in leads:
+        # "ghost" alone is the right test for BOTH shapes the field report named: a paused
+        # (tombstoned) lead whose stamp has gone stale probes not-alive and reads ghost too. A
+        # paused lead that is still FRESH reads `unreachable`, and one whose tab is somehow still
+        # running reads `ended_but_alive` (the hijack shape) — neither is dead weight, and neither
+        # may ever be collapsed out of sight.
+        stale = liveness_by_sid.get(m.get("session_id")) == "ghost"
+        foreign = _lead_project_key(m.get("project")) != reference_project
+        (hidden if (stale and foreign) else kept).append(m)
+    return kept, hidden
+
+
+def _print_hidden_leads(hidden):
+    """Row 70 item 8's one dim line standing in for every collapsed lead row — the whole point is
+    that it names a COUNT and two commands, never the leads themselves (naming them is what the
+    18-row wall did)."""
+    if not hidden:
+        return
+    print(c(f"  {len(hidden)} ghost/paused leads in other projects hidden — "
+            f"`relay list --all-leads` shows them, `relay prune` clears them", "dim"))
+
+
 def cmd_list(args):
-    # LEADS are ALWAYS shown in full — you always want to see/restore any project, regardless of
-    # which lead is asking. Executor scoping is separate (below).
+    # LEADS: every lead is a candidate row — you generally want to see/restore any project. The one
+    # exception is row 70 item 8's dead weight (ghost/paused leads on OTHER projects), collapsed
+    # below. Executor scoping is separate (further down).
     leads = lead_guard.list_leads(STATE_ROOT)
+    all_leads = leads                      # unfiltered — the report/pin lookups below need it
 
     lead_sid = getattr(args, "lead", None)
     # --all (or no --lead at all) → every executor (back-compat). --lead <sid> → only executors
@@ -4161,6 +4409,26 @@ def cmd_list(args):
     orphans = [s for s in rows if s["status"] not in ("closed", "superseded", "dead", LAUNCH_FAILED)
                and s.get("owner_lead") and not lead_guard.read_marker(STATE_ROOT, s["owner_lead"])]
 
+    # Row 70 item 8: collapse other projects' ghost/paused leads. The reference project is the
+    # `--lead` marker's own when a lead identity was given, else the cwd's basename — a bare
+    # `relay list` run inside a project is still asking about THAT project. Computed here (before
+    # the table and every lead footnote) so a hidden lead is hidden from all of them at once, which
+    # was most of the cost: each dead lead was named three times.
+    hidden_leads = []
+    if not getattr(args, "all_leads", False) and not args.json:
+        if lead_sid:
+            reference = _lead_project_key(
+                (lead_guard.read_marker(STATE_ROOT, lead_sid) or {}).get("project"))
+        else:
+            # No lead identity to scope by, so the cwd's basename stands in — but ONLY when it
+            # actually names a project relay knows a lead for. Otherwise there is no "our project"
+            # to be other than, and collapsing on a guess would hide rows for no reason.
+            reference = _lead_project_key(os.path.basename(os.getcwd()))
+            if reference not in {_lead_project_key(m.get("project")) for m in leads}:
+                reference = None
+        liveness_all = {m.get("session_id"): _lead_liveness_verdict(m) for m in leads}
+        leads, hidden_leads = _collapse_foreign_stale_leads(leads, liveness_all, reference)
+
     if args.json:
         # --json: fully unfiltered (programmatic surface, filtering is human-display concern)
         for r in rows:
@@ -4188,6 +4456,10 @@ def cmd_list(args):
         rows = live_rows
         hidden_terminal_count = len(terminal_rows)
 
+    if not leads and hidden_leads:
+        print(c("LEADS", "bold"))
+        _print_hidden_leads(hidden_leads)
+        print()
     if leads:
         print(c("LEADS", "bold"))
         # WAKE: is each lead's background wake poller safe from an early harness kill? Read from the
@@ -4368,6 +4640,21 @@ def cmd_list(args):
             if liveness_by_sid[m.get("session_id")] == "ended_but_alive":
                 print(c(f"  ⚠ {m.get('session_id')}: marker ended but the tab is alive — hijack or "
                         f"silent tombstone; run /relay:mode in that tab", "red"))
+        # Row 69: the dim "tab tidy skipped" line is printed once, mid-spawn, and scrolls away —
+        # so a tab bar that has silently stopped being tidied for this lead is invisible minutes
+        # later. `_tidy_now` ledgers every attempt; say so here when the LAST one for this lead
+        # gave up. Cosmetic, hence dim: nothing is broken, the tabs are just out of order.
+        tidy_last = {}
+        for lsid, evs in _ledger_by_session().items():
+            for e in evs:
+                if e.get("event") in ("tidy", "tidy_skipped"):
+                    tidy_last[lsid] = e
+        for m in leads:
+            e = tidy_last.get(m.get("session_id"))
+            if e and e.get("event") == "tidy_skipped":
+                print(c(f"  · {m.get('session_id')}: last tab tidy skipped after "
+                        f"{e.get('attempts', 1)} attempt(s) ({e.get('reason')}) — the tab bar is "
+                        f"out of order; `{RELAY_BIN} tidy` retries it", "dim"))
         if any(st == "stuck" for st in wake_states.values()):
             print(c("  ⚠ WAKE=stuck: a dead watcher's lock is blocking wakes for this lead — it "
                     "will self-heal on the lead's next turn (the lock is now auto-broken), and any "
@@ -4405,6 +4692,7 @@ def cmd_list(args):
                         f"than the installed {plugin_version()}, so /reload-plugins did NOT re-point "
                         f"that session's hooks. Restart it (a manual /relay:mode re-stamp only hides "
                         f"this warning).", "red"))
+        _print_hidden_leads(hidden_leads)
         print()
 
     print(c("EXECUTORS", "bold"))
@@ -4524,11 +4812,38 @@ def cmd_list(args):
                 f"<sid>` and a fresh spawn keeps the next packet's context cheap; `relay send "
                 f"--heavy-override \"<reason>\"` keeps going in this one.", "yellow"))
 
+    # Row 70 item 2: one line per pinned executor, naming WHO pinned it (by project, the name a
+    # human recognises) and HOW LONG AGO — the two facts that turn "there is a 📌 here" into a
+    # decision. Same "say it in words, not just a column" rule as every footnote above; the 📌 in
+    # the STATUS cell stays, this is what makes it actionable.
+    pinned = [s for s in rows if s.get("keep")]
+    if pinned:
+        lead_project = {m.get("session_id"): m.get("project") for m in all_leads}
+        for s in pinned:
+            sid = s["session_id"]
+            by = (lead_project.get(s.get("keep_by")) or s.get("owner_project")
+                  or (s.get("keep_by") or "?")[:8])
+            age = _relative_age(s.get("keep_at"))
+            # A pin created before relay recorded `keep_at` has no age to show — say that, rather
+            # than rendering `_relative_age`'s bare "-" into the middle of the sentence.
+            when = f" {age}" if age != "-" else " (when: unrecorded)"
+            print(c(f"  📌 {sid}: pinned by {by}{when} — auto-close leaves it alone; "
+                    f"`relay keep {sid} --off` releases it", "dim"))
+
     # Lead-found gap: a queue_delivery_failed ledger event used to be invisible short of reading
     # the ledger by hand — say it in words here too, the same "footnote, not just a column" rule
     # every other silent-failure signal above already follows. Persists until the head item is
     # either delivered or cancelled (relay queue --cancel), same as _queue_delivery_failure_note.
     for s in rows:
+        # Row 70 item 1: the heaviness deadlock gets the actionable 🛏 line INSTEAD of the generic
+        # red one — one footnote per stuck session, and this one names the way out.
+        heavy_note = _queue_stuck_heavy_note(s["session_id"])
+        if heavy_note:
+            sid, pending, body_path = heavy_note
+            print(c(f"  🛏 {sid}: not auto-closed earlier — queue stuck: {pending} packet"
+                    f"{'' if pending == 1 else 's'} undeliverable (heavy) — `relay send {sid} "
+                    f"{body_path} --rotate` carries it to a successor", "yellow"))
+            continue
         note = _queue_delivery_failure_note(s["session_id"])
         if note:
             sid, pending, error = note
@@ -4541,9 +4856,15 @@ def cmd_list(args):
     # new_reports_for is the same ownership-scoped "not proven surfaced" set the wake itself uses,
     # so this line and the wake can never disagree about what counts as unannounced.
     unannounced = []
-    for m in leads:
-        lsid = m.get("session_id")
+    for m in all_leads:                    # never the row 70 item-8 filtered list: an unannounced
+        lsid = m.get("session_id")         # report must surface even from a collapsed lead
         for key, exsid, packet, _path in lead_guard.new_reports_for(STATE_ROOT, lsid):
+            # Lead review of packet 001: the wake skips a report whose claimed files are already
+            # clean at HEAD (it LANDED — somebody reviewed and committed it). This line must apply
+            # the SAME filter, or `relay list` goes on demanding delivery of work that is already
+            # in main. Same helper as the wake, so the two can never disagree.
+            if lead_guard.report_landed(STATE_ROOT, exsid, _path):
+                continue
             # Item 4: diff size travels next to the report here too — same reasoning as cmd_check.
             dsize = lead_guard.diff_size_text(lead_guard.read_session_json(STATE_ROOT, exsid).get("worktree"))
             unannounced.append(f"{exsid} (packet {packet:03d})" + (f" {dsize}" if dsize else ""))
@@ -4754,6 +5075,10 @@ def cmd_verify(args):
         # while English prose that merely contains a slash ("bulleted/ornamented") does not get
         # mistaken for a path — see report_verify.plausible_claims.
         "repo_entries": set(_git_lines(worktree, "ls-tree", "--name-only", "HEAD")),
+        # Row 70 item 6: every tracked file, so a claim that names a REAL repo path is never
+        # re-pointed at a deeper staged one by the suffix resolver — see
+        # report_verify.resolve_claim_suffixes.
+        "repo_files": set(_git_lines(worktree, "ls-files")),
         # Advisory only (see report_verify): a reused session's LEAD legitimately commits earlier
         # packets, so this can never be a hard finding.
         "commits_since": len(_git_lines(worktree, "log", "--format=%h",
@@ -4989,7 +5314,6 @@ def cmd_retire(args):
     s = read_session(args.session_id)
     if not s:
         sys.exit(f"no such session: {args.session_id}")
-
     seed_path = session_dir(args.session_id) / SEED_FILENAME
     if s.get("superseded_by") == SEED_RETIRED_BY_SEED:
         sys.exit(f"session '{args.session_id}' is already retired — its seed is at {seed_path}\n"
@@ -5001,7 +5325,10 @@ def cmd_retire(args):
     # about to be lost — this is the one moment a lead can still choose to wait for the report.
     n = s.get("current_packet")
     unreported = n is not None and not (packets_dir(args.session_id) / f"{n:03d}-report.md").exists()
-    if s.get("status") == "busy" and unreported and not args.force:
+    # Row 70 item 7: `_transcript_stalled` is the escape hatch. A session stuck on an unanswerable
+    # prompt stays `busy` on disk forever (nothing recomputes it unless someone runs check/list), so
+    # this guard used to demand --force for a session that was provably going nowhere.
+    if s.get("status") == "busy" and unreported and not args.force and not _transcript_stalled(s):
         sys.exit(f"retire: '{args.session_id}' is still busy on packet {n:03d} and has not reported "
                  f"— retiring now kills that work unreported, and the seed cannot summarise a report "
                  f"that was never written.\n"
@@ -5350,8 +5677,12 @@ def cmd_handoff(args):
     # Writing it is treated exactly like a failed spawn below: it must NOT leave the pre-written
     # successor marker behind as an unreachable ghost, and must NOT step the caller down.
     handoff_copy_path = lead_guard.lead_dir(STATE_ROOT, successor_sid) / "handoff.md"
+    # Computed here, before `_reparent_executors` below has moved anything, because the aftercare
+    # in this copy must name the pins too — the console line further down reaches only the OUTGOING
+    # lead. Same set either way: the re-parent moves exactly these sessions.
+    pins = _inherited_pins(caller)
     try:
-        handoff_copy_path.write_text(build_handoff_copy(new_body, successor_sid))
+        handoff_copy_path.write_text(build_handoff_copy(new_body, successor_sid, pins=pins))
     except Exception as e:
         lead_guard.clear_lead(STATE_ROOT, successor_sid)  # best-effort — drop the pre-written ghost
         sys.exit(f"handoff: failed to write successor's handoff copy ({e}) — this session remains "
@@ -5402,6 +5733,14 @@ def cmd_handoff(args):
     # is stepped down — see _reparent_executors' docstring for the race this closes (a report that
     # lands before the successor's first send/resume used to wake nobody).
     _reparent_executors(caller, successor_sid, project)
+    # Row 70 item 2: a pin is invisible and permanent — auto-close never parks a pinned executor, so
+    # a successor that doesn't know it inherited three of them will carry them forever. Name them
+    # once, here, with the release command — and again, durably, in the successor's own handoff copy
+    # (`pins` above), which is the only one of the two the successor will ever read.
+    if pins:
+        print(c(f"  📌 {len(pins)} pinned executor{'' if len(pins) == 1 else 's'} inherited: "
+                f"{', '.join(pins)} — auto-close will never park them; `relay keep <sid> --off` "
+                f"to release", "yellow"))
 
     # Row 67: carry the predecessor's surfaced/pending stamps forward BEFORE its lead dir is
     # deleted below — otherwise a report the predecessor already reviewed and committed re-wakes
@@ -6001,9 +6340,11 @@ def main():
     ls.add_argument("--closed", action="store_true", help="show closed/superseded/dead sessions "
                     "(capped at 15 most recent)")
     ls.add_argument("--lead", help="scope EXECUTORS to this lead's project (its owned executors "
-                    "plus unowned ones); LEADS are always shown in full")
+                    "plus unowned ones), and take its project as the reference for --all-leads")
     ls.add_argument("--all", action="store_true", help="show every executor regardless of owner "
                     "(the default when --lead is absent)")
+    ls.add_argument("--all-leads", action="store_true", help="show every LEAD row, including the "
+                    "ghost/paused leads of other projects that are otherwise collapsed to one line")
     ls.set_defaults(func=cmd_list)
 
     cl = sub.add_parser("close")
