@@ -309,6 +309,20 @@ staged diff stays the real check.** A verifier that displaces that judgement mak
 safe, because it trades the thing that caught the real problems for the thing that catches lint
 misses. That is also why a zero exit code is not, by itself, permission to commit.
 
+**By default, that judgement runs through a fork, not your own context.** `/relay:review <sid>`
+launches a same-model `Agent(subagent_type: "fork")` with a fixed prompt: it runs this verify
+command and quotes the verdict, quotes the report's TL;DR, reads the FULL staged diff against the
+packet's goal and acceptance criteria, runs the acceptance commands, and returns numbered findings
+plus a one-line recommendation — under 40 lines, in the fork's own context, not yours. The fork
+reads the whole diff every time — that applies to every project relay leads, with no blanket
+carve-out for relay's own gated files. Read the findings, not the diff; open hunks inline yourself
+only when a finding names a sign-off-gated path (`hooks/`, `lib/lead_guard.py`, ledgers) AND the
+change there is more than a guard clause or a rename — a second look at those hunks, never a
+blanket re-read. One 15-file review used to cost a lead ~40k tokens reading the diff inline; the
+fork keeps that in its own disposable context and hands back a few thousand tokens of findings
+instead. `relay check`'s output and `relay list`'s report footnote both show `(diff: N files
++A/-D)` next to a ready report, so you can see up front how big the fork's read will be.
+
 ## Autonomous mode
 
 Sometimes you're confident about the plan and the approval round-trips are pure ceremony. `/relay:auto
@@ -340,16 +354,19 @@ these hold**:
 2. the report's TL;DR is `Status: clean`, `Risk flags: none`, `UNVERIFIED: none` — **`clean-with-caveats` stops**;
 3. the packet was in the approved plan;
 4. nothing sign-off-gated is touched — core logic, ledgers, parity/golden tests, migrations, deploys (and, for relay's own repo, `hooks/`, `lib/lead_guard.py`, ledger formats);
-5. **the lead has actually read the staged diff.**
+5. **the diff has been reviewed** — by default via [`/relay:review`](#verifying-a-report-and-why-it-cant-tell-you-the-report-is-true)'s fork, which reads the whole diff every time with no blanket carve-out for relay's own gated files; hunks opened inline only when a finding names a sign-off-gated path AND the change there is more than a guard clause or a rename.
 
 ```
-relay verify <session_id> --for-autocommit --in-plan --diff-reviewed
+relay verify <session_id> --for-autocommit --in-plan --diff-reviewed --findings <path>
 ```
 
-prints `AUTO-COMMIT: CLEARED` or `AUTO-COMMIT: NOT-CLEARED-BECAUSE-<reason>`, exits 0 only when
-cleared, and records an `auto_commit` ledger event with the verdict and diff stat. Conditions 3 and
-5 are not machine-knowable — they are **the lead's explicit attestations**; without both flags the
-answer is always NOT-CLEARED, and every NOT-CLEARED path falls back to stopping and asking.
+`<path>` is wherever the fork's returned findings were saved — verify copies it into the session's
+packets dir as a durable record and ledgers the finding count. Omit `--findings` (keep bare
+`--diff-reviewed`) only when the diff was read inline instead. This prints `AUTO-COMMIT: CLEARED` or
+`AUTO-COMMIT: NOT-CLEARED-BECAUSE-<reason>`, exits 0 only when cleared, and records an `auto_commit`
+ledger event with the verdict and diff stat. Conditions 3 and 5 are not machine-knowable — they are
+**the lead's explicit attestations**; without both flags the answer is always NOT-CLEARED, and every
+NOT-CLEARED path falls back to stopping and asking.
 
 This is the one place the verifier's own caveat matters most — see
 [Verifying a report](#verifying-a-report-and-why-it-cant-tell-you-the-report-is-true) for why `COUNTS-MATCH` is never truth and condition 5 exists regardless.
@@ -590,7 +607,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_fallback_model` | unset | A concrete model id (or list, tried in order) that overloaded executors fall back to — e.g. `"claude-opus-4-8"`. A bare string is accepted and wrapped into a one-element list — Claude Code's `--settings` file requires `fallbackModel` to be a list, not a string, so passing a single id straight through failed every spawn's settings validation. A fallback equal to the executor's own launch model (compared with any `[1m]` suffix stripped) is dropped, with a spawn-time warning, since falling back to the model already running would just spin in place. Delivered via each executor's per-launch `--settings` file (`fallbackModel` — the `--fallback-model` flag is print-mode-only; the settings key works interactively), so if capacity fallback happens it goes where YOU chose, with the CLI's visible notice. Unset = no configured fallback (the documented default) |
 | `executor_escalation` | true | Arm every spawned executor with the second-layer one-shot push (see [Auto-wake and notifications](#auto-wake-and-notifications)) |
 | `autonomous_mode` | false | Posture a newly-armed lead holds. false = wait for you on every approval beat (safe default). true = new leads start in autonomous mode. `/relay:auto on\|off` flips it mid-session either way (see [Autonomous mode](#autonomous-mode)) |
-| `stall_threshold_seconds` | 2700 | How long an executor can be `busy` with no report before `stalled` — kept independent of `poll_seconds` so the two don't flip at the same instant |
+| `stall_threshold_seconds` | 2700 | How long an executor can be `busy` with no transcript activity for before `stalled` — a long `busy` packet whose transcript is still being written stays `busy` (e.g. `busy 3h20m`) instead of misreading as stalled; kept independent of `poll_seconds` so the two don't flip at the same instant |
 | `usage_limit_pattern` | built-in | Regex (case-insensitive, matched against the START of an executor's last assistant message) that marks it `paused (limit)` in `relay list`/`check` instead of an ordinary `stalled`. The built-in wording is a reasonable guess, not confirmed against a real Claude Code usage-limit message — override this only if the CLI's actual wording differs |
 
 `poll_seconds` must stay under the `Stop` hook's `timeout` in `hooks/hooks.json` (currently 1900s) — the harness kills the hook's background poller at that timeout regardless of `poll_seconds`, so raising one without the other silently breaks auto-wake (see [async-rewake-findings.md](docs/async-rewake-findings.md#addendum-silent-auto-wake-death-2026-07-10)).

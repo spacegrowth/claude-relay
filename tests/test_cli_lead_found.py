@@ -325,16 +325,24 @@ class TestQueueDeliveryFailedFootnote:
 
 # ── (d) a usage-limit hit reads as `paused`, not `stalled` ───────────────────────────────────────
 
-def _write_transcript(relay, monkeypatch, tmp_path, claude_session, text):
+def _write_transcript(relay, monkeypatch, tmp_path, claude_session, text, age_seconds=None):
     """A minimal, real-shaped Claude Code transcript: one assistant turn whose text content is
     `text` — enough for `_last_assistant_text` to find it. Same CLAUDE_CONFIG_DIR-env technique
-    tests/test_relay.py's own transcript fixtures use."""
+    tests/test_relay.py's own transcript fixtures use. `age_seconds`, when given, backdates the
+    file's mtime — row 66: `_check_one`'s stall decision now reads TRANSCRIPT activity, not just
+    `busy_since`, so a test that means "genuinely stale" (not merely "a paused check happened to
+    run against an old busy_since") must backdate the transcript too, or a freshly-written file
+    (mtime "now", from the act of writing this fixture) reads as active and never stalls."""
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
     d = tmp_path / "cfg" / "projects" / "-p"
     d.mkdir(parents=True, exist_ok=True)
     line = json.dumps({"type": "assistant", "message": {"id": "m1",
         "content": [{"type": "text", "text": text}]}})
-    (d / f"{claude_session}.jsonl").write_text(line + "\n")
+    p = d / f"{claude_session}.jsonl"
+    p.write_text(line + "\n")
+    if age_seconds is not None:
+        mtime = time.time() - age_seconds
+        os.utime(p, (mtime, mtime))
 
 
 class TestUsageLimitPause:
@@ -421,9 +429,12 @@ class TestUsageLimitPause:
 
     def test_an_ordinary_long_running_turn_still_stalls(self, relay, terms, monkeypatch, tmp_path):
         """The pause path must not swallow the EXISTING stall detection for a session that is
-        simply slow, not rate-limited."""
+        simply slow, not rate-limited — genuinely stalled here means BOTH busy_since and the
+        transcript itself are stale (row 66: a fresh transcript write would legitimately stay
+        busy instead, which is exactly the behavior this is NOT testing)."""
         self._busy_exec(relay, tmp_path)
-        _write_transcript(relay, monkeypatch, tmp_path, "cs-e", "Still working on it...")
+        _write_transcript(relay, monkeypatch, tmp_path, "cs-e", "Still working on it...",
+                         age_seconds=relay.STALL_THRESHOLD_SECONDS + 60)
         with mock.patch.object(relay, "session_pid_alive", return_value=True):
             s = relay._check_one("e1")
         assert s["status"] == "stalled"

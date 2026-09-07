@@ -158,20 +158,30 @@ asking **only when ALL FIVE of these hold**:
 4. **Nothing sign-off-gated is touched** — core logic, ledgers, parity/golden tests, migrations,
    deploys. When working on relay itself, that also means `hooks/`, `lib/lead_guard.py`, and ledger
    formats: the wake and gate paths autonomy itself rides on.
-5. **You have ACTUALLY READ the staged diff.** Not skimmed the report — read the diff, with
-   `/relay:diff <sid>`. The verifier gates the *automation*; it never replaces this step.
+5. **The diff has been reviewed.** By default that means delegated to a same-model fork —
+   `/relay:review <sid>` — and you have read ITS FINDINGS. Not skimmed the report instead of the
+   diff: the fork reads the whole diff every time, with no blanket exception for relay's own
+   gated files — but that rule never lifts — reading only the report's own words is still the
+   mistake it exists to catch. Open hunks inline yourself only when a finding names a
+   sign-off-gated path (`hooks/`, `lib/lead_guard.py`, ledgers) AND the change there is more than
+   a guard clause or a rename — a second look at those hunks, never a blanket re-read. The
+   verifier gates the *automation*; it never replaces this step.
 
 Check it, don't eyeball it:
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/relay verify <session_id> --for-autocommit --in-plan --diff-reviewed
+${CLAUDE_PLUGIN_ROOT}/bin/relay verify <session_id> --for-autocommit --in-plan --diff-reviewed --findings <path>
 ```
+
+`<path>` is wherever you saved `/relay:review`'s returned findings — verify copies it into the
+session's packets dir and ledgers the finding count as the recorded attestation. Omit `--findings`
+(keep bare `--diff-reviewed`) only on the rarer path where you read the diff inline yourself.
 
 It prints `AUTO-COMMIT: CLEARED` or `AUTO-COMMIT: NOT-CLEARED-BECAUSE-<reason>`, and exits 0 only
 when cleared. Conditions 3 and 5 are **your attestations** — the tool cannot check them, so it
 refuses to clear unless you pass those flags. **Pass them only if they are actually true.** Passing
-`--diff-reviewed` without having read the diff is not a shortcut, it is a false statement in the
-ledger, and it defeats the only condition that was ever protecting the work.
+`--diff-reviewed` without having reviewed the diff — by fork or inline — is not a shortcut, it is a
+false statement in the ledger, and it defeats the only condition that was ever protecting the work.
 
 **On `NOT-CLEARED`: fall back to today's behaviour — stop and ask the user, naming the failed
 condition.** On `CLEARED`: commit, then announce with what you would have asked *and* the verify
@@ -231,9 +241,17 @@ A lead message with no `🚦 [relay]` marker should be the exception, not the ru
    and script-checkable, sonnet = the workhorse, opus = where a wrong-but-plausible result would
    survive your review); pass tier aliases, never version ids from memory. Only spawn fresh for genuinely new work, a dead/stalled session, or a model upgrade
    (spawn new + `/relay:close --supersede`, since a session's model can't change mid-flight).
-3. **Review**: when `/relay:check`/`/relay:list` shows `reported`, read the staged diff + report
-   yourself, verify with evidence, then either commit it yourself (executors never commit) or
-   send a fix-list packet. Watch for weakened tests, silent scope creep, unverified claims.
+3. **Review**: when `/relay:check`/`/relay:list` shows `reported` — and its `(diff: N files +A/-D)`
+   figure tells you upfront whether an inline read is even affordable — run `/relay:review <sid>`
+   by default. It launches a same-model fork that verifies, reads the FULL staged diff against the
+   packet's goal/acceptance, runs the acceptance commands, and returns numbered findings plus a
+   recommendation. **Read the findings, not the diff — never skim the report instead of the diff
+   either way** (the fork reads the whole diff every time, but reading only the report's own words
+   is still the mistake this rule exists to catch); open hunks inline yourself only when a finding
+   names a sign-off-gated path (`hooks/`, `lib/lead_guard.py`, ledgers) AND the change there is
+   more than a guard clause or a rename — a second look at those hunks, never a blanket re-read.
+   Then either commit it yourself (executors never commit) or send a fix-list packet. Watch for
+   weakened tests, silent scope creep, unverified claims.
    **Closing is automatic.** Once you've committed (or discarded) an executor's work, relay parks
    it on its own — the next `/relay:check`, `/relay:list`, or your own turn-end sweeps finished
    executors whose report you've already seen and whose claimed files are clean in the worktree

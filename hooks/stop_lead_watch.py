@@ -111,11 +111,16 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg, kind="syn
             "flags: none, UNVERIFIED: none — clean-with-caveats STOPS; (3) the packet was in the "
             "approved plan; (4) nothing sign-off-gated is touched (core logic, ledgers, "
             "parity/golden tests, migrations, deploys — and in this repo hooks/, lib/lead_guard.py, "
-            "ledger formats); (5) you have ACTUALLY READ the staged diff. Run `relay verify "
-            "<sid> --for-autocommit --in-plan --diff-reviewed` and pass the last two flags only if "
+            "ledger formats); (5) the diff has been REVIEWED — by default via `/relay:review <sid>` "
+            "(a same-model fork reads the whole diff every time, no blanket carve-out for this "
+            "repo's own gated files; you read its findings), hunks opened inline only when a "
+            "finding names a sign-off-gated path AND the change there is more than a guard or a "
+            "rename. Run `relay verify <sid> "
+            "--for-autocommit --in-plan --diff-reviewed --findings <path>` (the saved findings path; "
+            "omit --findings only if you read the diff inline) and pass the attestation flags only if "
             "they are TRUE — it prints CLEARED or NOT-CLEARED-BECAUSE-<reason>. On NOT-CLEARED, "
             "stop and ask, naming the condition. The verifier gates the AUTOMATION; it never "
-            "replaces your reading of the diff, and COUNTS-MATCH never means the report is true.\n")
+            "replaces reviewing the diff, and COUNTS-MATCH never means the report is true.\n")
     else:
         instruction = (
             "\n\nOpen your reply with the marker '🚦 [relay] — review needed:', surface these to the "
@@ -159,7 +164,10 @@ def _report_lines(lg, sid):
     lines, keys = [], []
     for key, exsid, packet, path in lg.new_reports_for(STATE_ROOT, sid):
         brief = _report_brief(path)
-        head = f"  ✅ executor '{exsid}' reported (packet {packet:03d})"
+        # Item 4 (lead-context-burn note): diff size travels next to the report here too, so the
+        # very first thing the lead sees says whether an inline read is affordable.
+        dsize = lg.diff_size_text(lg.read_session_json(STATE_ROOT, exsid).get("worktree"))
+        head = f"  ✅ executor '{exsid}' reported (packet {packet:03d})" + (f" {dsize}" if dsize else "")
         lines.append(f"{head} — {brief}\n       report: {path}" if brief
                      else f"{head} — report at {path}")
         keys.append(key)

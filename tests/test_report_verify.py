@@ -525,6 +525,31 @@ class TestClearanceConditions:
         assert [c["n"] for c in clr["conditions"]] == [1, 2, 3, 4, 5]
 
 
+class TestCountFindings:
+    """skills/review/SKILL.md's fixed prompt: 'numbered findings, each `file:line —
+    blocker|should-fix|note — one sentence`'. Pure line-count feeding `report_reviewed`'s ledger
+    event — not a format validator."""
+
+    def test_counts_numbered_lines(self):
+        text = ("1. src/app.py:12 — blocker — off-by-one on the last page.\n"
+                "2. lib/x.py:4 — should-fix — dead branch.\n"
+                "3. lib/y.py:9 — note — could be a one-liner.\n")
+        assert rv.count_findings(text) == 3
+
+    def test_recommendation_line_is_not_a_finding(self):
+        text = "1. a.py:1 — note — fine.\n\nRecommendation: commit.\n"
+        assert rv.count_findings(text) == 1
+
+    def test_no_findings_is_zero(self):
+        assert rv.count_findings("No findings. Recommendation: commit.\n") == 0
+
+    def test_empty_text_is_zero(self):
+        assert rv.count_findings("") == 0
+
+    def test_indented_numbered_lines_still_count(self):
+        assert rv.count_findings("  1. a.py:1 — note — fine.\n") == 1
+
+
 class TestSignoffGating:
     """Condition 4. Blunt substring matching on purpose: a false 'sign-off needed' costs one
     question, a false clearance costs trust."""

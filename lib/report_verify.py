@@ -581,6 +581,18 @@ def render_clearance(clr):
     return L
 
 
+# ── fork-review findings (skills/review/SKILL.md, condition-5 attestation) ──────────────────────
+_FINDING_LINE_RE = re.compile(r"^\s*\d+\.\s+\S")
+
+
+def count_findings(text):
+    """Count numbered finding lines in a `/relay:review` fork's returned findings text (the skill's
+    fixed prompt: 'numbered findings, each `file:line — blocker|should-fix|note — one sentence`').
+    A plain line-count, not a format validator — a fork's exact formatting can vary a little; this
+    only needs to give `report_reviewed`'s ledger event a useful count, never to gate on shape."""
+    return sum(1 for line in text.splitlines() if _FINDING_LINE_RE.match(line))
+
+
 # ── rendering ─────────────────────────────────────────────────────────────────────────────────
 # Returns (text, styles) pairs so bin/relay can colour without this module importing a terminal
 # layer — and so tests can assert on the text of every line, including the caveat.

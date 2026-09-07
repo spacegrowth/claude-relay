@@ -319,6 +319,10 @@ You were pre-armed by relay handoff under pinned session id {successor_sid}.
 2. THE PREDECESSOR'S TAB: its identity is recorded in your marker. ASK the user whether to close
    it; on their go run: relay close-predecessor . Never close it unasked.
 3. Your first send/resume of an inherited executor adopts it automatically.
+4. REVIEWS: default to /relay:review <sid> for any inherited executor's report — the fork reads
+   the whole diff every time (no blanket carve-out for relay's own gated files); read its findings,
+   not the diff, and open hunks inline yourself only when a finding names a sign-off-gated path
+   (hooks/, lib/lead_guard.py, ledgers) AND the change there is more than a guard or a rename.
 """
 
 # The successor seed (backlog §6e-e3). Written by `relay retire` into the retired session's own dir,
@@ -2466,8 +2470,18 @@ def _check_one(session_id):
                     s["status"] = "busy"
                     s.pop("pause_text", None)
                 if s["status"] == "busy" and elapsed is not None and elapsed > _stall_threshold_seconds():
-                    s["status"] = "stalled"
-                    append_ledger("stalled", session_id=session_id, packet=n, reason=f"busy {int(elapsed/60)}min, no report")
+                    # Row 66: `stalled` means no TRANSCRIPT activity, not merely "busy a long time" —
+                    # a 3h20m packet with a transcript write 3s ago is legitimately still working.
+                    # `elapsed` (busy_since) only decides whether to even ask; the transcript's own
+                    # mtime decides the verdict. Unlocatable (no claude_session / no file on disk)
+                    # falls back to the old elapsed-only read — a signal we can't confirm is fresh
+                    # must not read as fresh, either.
+                    transcript_age = _transcript_age_seconds(s.get("claude_session"))
+                    if transcript_age is None or transcript_age > _stall_threshold_seconds():
+                        s["status"] = "stalled"
+                        append_ledger("stalled", session_id=session_id, packet=n, reason=f"busy {int(elapsed/60)}min, no report")
+                    # else: transcript still fresh within the threshold → stays busy despite the
+                    # long elapsed time (the "busy 3h20m" case row 66 names explicitly).
                 # else: process alive, hasn't reported yet → still busy, no change.
         else:
             # Process is genuinely gone and left no report. Distinguish stalled vs dead by whether
@@ -3381,6 +3395,12 @@ def cmd_check(args):
         reported = (packets_dir(s["session_id"]) / f"{n:03d}-report.md").exists()
         status_c = c(s["status"], *_STATUS_STYLE.get(s["status"], ()))
         rep_c = c("✅ report ready", "green", "bold") if reported else c("not yet", "dim")
+        if reported:
+            # Item 4 (lead-context-burn note): the diff's size travels next to the report itself,
+            # so the lead can see whether an inline read is affordable BEFORE opening it.
+            dsize = lead_guard.diff_size_text(s.get("worktree"))
+            if dsize:
+                rep_c += c(f" {dsize}", "dim")
         q = s.get("queued") or 0
         q_c = c(f" 📥 {q} queued", "yellow") if q else ""
         u = _usage_for_session(s)
@@ -3738,6 +3758,25 @@ def _find_transcript_path(claude_session):
         if p.exists():
             return p
     return None
+
+
+def _transcript_age_seconds(claude_session):
+    """Seconds since `claude_session`'s transcript file was last written, or None when unlocatable
+    (no session id, unreadable projects root, no matching file) — row 66: `_check_one` must call
+    `stalled` on TRANSCRIPT INACTIVITY, not on how long `busy_since` has elapsed. A long-running
+    packet with a transcript write seconds ago is still busy, not stalled; `elapsed` alone can't
+    tell the two apart. Callers must fall back to `elapsed` (never treat None as fresh OR stale)
+    when the transcript can't be located at all — this is a refinement of that coarser signal, not
+    a replacement for it in the unknowable case."""
+    if not claude_session:
+        return None
+    path = _find_transcript_path(claude_session)
+    if not path:
+        return None
+    try:
+        return time.time() - path.stat().st_mtime
+    except OSError:
+        return None
 
 
 def _transcript_mb_for(claude_session):
@@ -4337,7 +4376,9 @@ def cmd_list(args):
     for m in leads:
         lsid = m.get("session_id")
         for key, exsid, packet, _path in lead_guard.new_reports_for(STATE_ROOT, lsid):
-            unannounced.append(f"{exsid} (packet {packet:03d})")
+            # Item 4: diff size travels next to the report here too — same reasoning as cmd_check.
+            dsize = lead_guard.diff_size_text(lead_guard.read_session_json(STATE_ROOT, exsid).get("worktree"))
+            unannounced.append(f"{exsid} (packet {packet:03d})" + (f" {dsize}" if dsize else ""))
     if unannounced:
         print(c(f"  🚦 {len(unannounced)} report(s) NOT yet proven delivered to their lead: "
                 f"{', '.join(unannounced)} — read with `relay report <sid>`; the wake will retry, "
@@ -4515,7 +4556,16 @@ def cmd_verify(args):
     lead's own attestations (`--in-plan`, `--diff-reviewed`) because they are not machine-knowable;
     without them the answer is NOT-CLEARED, so a bare invocation can never accidentally clear.
     Nothing in this command commits anything — the commit stays the lead's action in its own
-    session."""
+    session.
+
+    `--diff-reviewed --findings <path>` (skills/review/SKILL.md, the default fork-based review):
+    `<path>` is the file the lead saved the fork's returned findings to. Verify copies it to
+    `<session>/packets/NNN-review.md` (a durable record of what the fork actually found, alongside
+    the packet/report it reviewed) and ledgers `report_reviewed` with that path and the finding
+    count — the artifact BEHIND the condition-5 attestation, not a new condition. `--diff-reviewed`
+    alone (no `--findings`) still works exactly as before — the lead read the diff itself inline —
+    but the ledger event records `mode: inline` instead of a path/count, so the two attestation
+    styles stay distinguishable in the ledger after the fact."""
     s = read_session(args.session_id)
     if not s:
         sys.exit(f"no such session: {args.session_id}")
@@ -4555,6 +4605,26 @@ def cmd_verify(args):
     append_ledger("report_verify", session_id=args.session_id, packet=n,
                   verdict=result["verdict"], rerun=bool(args.rerun),
                   mismatches=len([f for f in result["findings"] if f["level"] == "mismatch"]))
+
+    # skills/review/SKILL.md: `--diff-reviewed --findings <path>` records the ARTIFACT behind the
+    # condition-5 attestation — the fork's own findings — rather than just a bare boolean. `--findings`
+    # only does anything alongside `--diff-reviewed`; on its own (no attestation) it's a no-op, since
+    # the skill always pairs them and a findings file with no attestation attached asserts nothing.
+    diff_reviewed = bool(getattr(args, "diff_reviewed", False))
+    findings_arg = getattr(args, "findings", None)
+    if diff_reviewed:
+        if findings_arg:
+            fp = Path(findings_arg).expanduser()
+            if not fp.is_file():
+                sys.exit(f"verify: --findings file '{findings_arg}' doesn't exist")
+            findings_text = fp.read_text()
+            review_path = packets_dir(args.session_id) / f"{n:03d}-review.md"
+            review_path.write_text(findings_text)
+            findings_count = report_verify.count_findings(findings_text)
+            append_ledger("report_reviewed", session_id=args.session_id, packet=n, mode="fork",
+                          path=str(review_path), findings=findings_count)
+        else:
+            append_ledger("report_reviewed", session_id=args.session_id, packet=n, mode="inline")
 
     if not getattr(args, "for_autocommit", False):
         sys.exit(report_verify.EXIT_CODES[result["verdict"]])
@@ -5164,6 +5234,11 @@ def cmd_handoff(args):
     # lands before the successor's first send/resume used to wake nobody).
     _reparent_executors(caller, successor_sid, project)
 
+    # Row 67: carry the predecessor's surfaced/pending stamps forward BEFORE its lead dir is
+    # deleted below — otherwise a report the predecessor already reviewed and committed re-wakes
+    # the successor as brand new (see carry_forward_surfaced's docstring for the incident).
+    lead_guard.carry_forward_surfaced(STATE_ROOT, caller, successor_sid)
+
     # Step the caller down — the FINAL act, only after the spawn call has returned successfully.
     lead_guard.clear_lead(STATE_ROOT, caller)
     append_ledger("lead_handoff", from_lead=caller, to_lead=successor_sid, project=project,
@@ -5307,9 +5382,13 @@ def cmd_auto(args):
               f"  COMMITTING an executor's work now has its own gate (#16 phase 2) rather than always "
               f"stopping: it is permitted without asking ONLY when all five hold — (1) verify says "
               f"COUNTS-MATCH, (2) TL;DR is clean/none/none, (3) the packet was in the approved plan, "
-              f"(4) nothing sign-off-gated is touched, (5) you have READ the staged diff. Check it "
-              f"with: relay verify <sid> --for-autocommit --in-plan --diff-reviewed  (pass the last "
-              f"two only if true). Anything else → stop and ask, naming the condition.\n"
+              f"(4) nothing sign-off-gated is touched, (5) the diff has been reviewed — by default via "
+              f"/relay:review's fork, which reads the whole diff every time with no blanket carve-out "
+              f"for relay's own gated files (hunks opened inline only when a finding names a "
+              f"sign-off-gated path AND the change is more than a guard or a rename). Check it with: "
+              f"relay verify <sid> --for-autocommit --in-plan "
+              f"--diff-reviewed --findings <path>  (pass the attestation flags only if true). "
+              f"Anything else → stop and ask, naming the condition.\n"
               f"  `relay auto off` reverts; a fresh `/relay:mode` arm resets to config.")
     else:
         print(f"autonomous mode OFF for lead '{project}' — back to announce-and-wait on every "
@@ -5834,6 +5913,12 @@ def main():
     vf.add_argument("--diff-reviewed", dest="diff_reviewed", action="store_true",
                     help="lead's attestation (condition 5): the lead has READ the staged diff. "
                          "Not machine-knowable — without it, clearance is refused")
+    vf.add_argument("--findings", metavar="PATH",
+                    help="alongside --diff-reviewed: the file the lead saved a /relay:review fork's "
+                         "findings to. Copied to <session>/packets/NNN-review.md and ledgered as "
+                         "report_reviewed with the finding count — the artifact behind the "
+                         "condition-5 attestation. --diff-reviewed without --findings still works "
+                         "(inline read), ledgered as mode: inline")
     vf.set_defaults(func=cmd_verify)
 
     fc = sub.add_parser("focus")

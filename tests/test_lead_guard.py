@@ -1399,7 +1399,7 @@ class TestAutonomousPosture:
         assert "clean-with-caveats STOPS" in err           # 2
         assert "approved plan" in err                      # 3
         assert "sign-off-gated" in err                     # 4
-        assert "ACTUALLY READ the staged diff" in err      # 5
+        assert "the diff has been REVIEWED" in err          # 5
 
     def test_wake_names_the_clearance_command_and_the_not_cleared_fallback(
             self, relay, root, monkeypatch, capsys):
@@ -1419,7 +1419,7 @@ class TestAutonomousPosture:
         self._auto(relay, "on")
         err = self._wake_text(root, "sess-1", monkeypatch, capsys)
         assert "gates the AUTOMATION" in err
-        assert "never replaces your reading of the diff" in err
+        assert "never replaces reviewing the diff" in err
         assert "COUNTS-MATCH never means the report is true" in err
 
     def test_manual_wake_is_unchanged_by_the_auto_commit_gate(
@@ -2110,6 +2110,50 @@ class TestCommitSurfacing:
         self._git(repo, "init", "-q")
         self._commit(repo, "a", "first")
         assert lg.new_commits(repo, "") == []  # no baseline → nothing to diff
+
+
+class TestDiffSizeText:
+    """diff_size_text — item 4 (lead-context-burn note): '(diff: N files +A/-D)' next to every
+    report so the lead can see whether an inline read is affordable BEFORE opening it."""
+
+    def _git(self, repo, *args):
+        import subprocess
+        subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+    def _repo(self, tmp_path):
+        repo = tmp_path / "r"; repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / "a.py").write_text("one\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "init")
+        return repo
+
+    def test_none_worktree_is_none(self):
+        assert lg.diff_size_text(None) is None
+
+    def test_non_repo_worktree_is_none(self, tmp_path):
+        assert lg.diff_size_text(str(tmp_path)) is None
+
+    def test_empty_staged_diff_is_none(self, tmp_path):
+        repo = self._repo(tmp_path)
+        assert lg.diff_size_text(str(repo)) is None
+
+    def test_staged_diff_reports_files_and_line_counts(self, tmp_path):
+        repo = self._repo(tmp_path)
+        (repo / "a.py").write_text("ONE\ntwo\n")   # whole-line replace: -"one", +"ONE", +"two" → +2/-1
+        (repo / "b.py").write_text("new file\n")   # a wholly new file → +1/-0
+        self._git(repo, "add", "-A")
+        text = lg.diff_size_text(str(repo))
+        assert text == "(diff: 2 files +3/-1)"
+
+    def test_binary_file_counts_toward_files_only(self, tmp_path):
+        repo = self._repo(tmp_path)
+        (repo / "bin.dat").write_bytes(b"\x00\x01\x02")
+        self._git(repo, "add", "-A")
+        text = lg.diff_size_text(str(repo))
+        assert text == "(diff: 1 files +0/-0)"
 
 
 class TestNotifyFallback:

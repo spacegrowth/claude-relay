@@ -198,6 +198,29 @@ class TestStopHookReportWake:
         run = drv(STOP, stop_payload(tmp_path), tmp_path)
         assert "x" * 200 in run.stderr and "x" * 201 not in run.stderr
 
+    def _git(self, repo, *args):
+        import subprocess
+        subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_wake_line_carries_the_diff_size(self, drv, tmp_path):
+        """Item 4 (lead-context-burn note): the diff's size travels next to the report in the wake
+        line too — the very first thing a woken lead sees."""
+        armed(tmp_path)
+        repo = tmp_path / "repo"; repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / "a.py").write_text("one\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "init")
+        (repo / "a.py").write_text("changed\n")
+        self._git(repo, "add", "a.py")
+        H.make_executor(tmp_path, report="Fixed it.\n", worktree=str(repo))
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert run.returncode == WAKE
+        assert "(diff: 1 files +1/-1)" in run.stderr
+
     @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
     def test_several_reports_are_all_surfaced_in_one_wake(self, drv, tmp_path):
         armed(tmp_path)

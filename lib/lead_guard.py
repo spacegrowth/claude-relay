@@ -1469,6 +1469,31 @@ def promote_pending(state_root, lead_sid):
     return keys
 
 
+def carry_forward_surfaced(state_root, from_sid, to_sid):
+    """Row 67: copy `from_sid`'s surfaced_reports.json + pending_wakes.json onto `to_sid`'s —
+    `cmd_handoff`'s successor otherwise starts with NEITHER file, so a report the predecessor had
+    already reviewed and committed (surfaced) or was mid-retry announcing (pending) looked brand
+    new again and re-woke the successor as "NOT yet proven delivered" (the incident this row names:
+    gm-signin-114240 packet 001, committed before the handoff, re-announced right after). Distinct
+    from `migrate_lead`'s copy of the same two files: that one moves them for an id migration of
+    the SAME lead (resume-by-tab); this one is for a handoff's genuinely NEW successor id, called
+    while the predecessor's dir still exists (before `clear_lead` deletes it). Merges onto whatever
+    `to_sid` already has rather than clobbering — harmless here (a freshly pre-armed successor has
+    neither file yet) and safer if a future caller ever calls this onto a non-empty target.
+    Best-effort; never raises into a caller."""
+    try:
+        surfaced = load_surfaced(state_root, from_sid)
+        if surfaced:
+            mark_surfaced(state_root, to_sid, surfaced)
+        pending = load_pending(state_root, from_sid)
+        if pending:
+            cur = load_pending(state_root, to_sid)
+            cur.update(pending)
+            _save_pending(state_root, to_sid, cur)
+    except Exception:
+        pass
+
+
 # ---- #23: WHOSE continuation is this? (relay's own delivery receipt) ---------------------------
 # Field incident 2026-07-22 (~/.relay-tasks/incident-wake-miss-2026-07-22.md — diagnosis by the
 # field lead, credited): #22 above read the harness's GLOBAL `stop_hook_active` flag as proof that
@@ -1659,6 +1684,39 @@ def new_reports_for(state_root, lead_sid):
         if key not in surfaced:
             fresh.append((key, sid, packet, path))
     return fresh
+
+
+def diff_size_text(worktree):
+    """'(diff: N files +A/-D)' for the staged diff in `worktree`, or None when there's nothing to
+    show (no worktree, non-repo, or nothing staged) — row 65 item 4: the diff's size travels next
+    to every report (`relay check`, `relay list`'s reported footnote, the Stop hook's wake line) so
+    a reader can see whether inline reading is affordable BEFORE opening it (the lead-context-burn
+    incident this whole feature exists for). Uses `git diff --cached --numstat` so it never has to
+    materialize the diff text itself — same one-line-per-file shape bin/relay's own `_diff_stat`
+    reads for the auto_commit ledger event, just formatted for display here. Shared here (rather
+    than living only in bin/relay) so this hook script — which has no .py extension and isn't a
+    normal import target — can print the same figure in the wake line. Never raises; a git failure
+    degrades to None like every other git-reading helper in this module."""
+    if not worktree:
+        return None
+    try:
+        r = subprocess.run(["git", "-C", str(worktree), "diff", "--cached", "--numstat"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        files = insertions = deletions = 0
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            files += 1
+            if parts[0].isdigit():
+                insertions += int(parts[0])
+            if parts[1].isdigit():
+                deletions += int(parts[1])
+        return f"(diff: {files} files +{insertions}/-{deletions})" if files else None
+    except Exception:
+        return None
 
 
 def _head_path(state_root, lead_sid):

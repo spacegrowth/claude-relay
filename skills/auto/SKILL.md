@@ -41,9 +41,13 @@ here on. Use the `🚦 [relay]` marker like every other lead message.
   (1) `relay verify` says `COUNTS-MATCH`; (2) the report's TL;DR is `Status: clean`, `Risk flags:
   none`, `UNVERIFIED: none` — `clean-with-caveats` stops; (3) the packet was in the approved plan;
   (4) nothing sign-off-gated is touched (core logic, ledgers, parity/golden tests, migrations,
-  deploys — and for relay itself, `hooks/`, `lib/lead_guard.py`, ledger formats); (5) you have
-  ACTUALLY READ the staged diff. Check it with
-  `${CLAUDE_PLUGIN_ROOT}/bin/relay verify <sid> --for-autocommit --in-plan --diff-reviewed` —
+  deploys — and for relay itself, `hooks/`, `lib/lead_guard.py`, ledger formats); (5) the diff has
+  been REVIEWED — by default via `/relay:review <sid>` (a same-model fork reads the whole diff
+  every time, with no blanket carve-out for relay's own gated files; you read its findings), hunks
+  opened inline only when a finding names a sign-off-gated path AND the change there is more than
+  a guard clause or a rename.
+  Check it with
+  `${CLAUDE_PLUGIN_ROOT}/bin/relay verify <sid> --for-autocommit --in-plan --diff-reviewed --findings <path>` —
   it prints `CLEARED` or `NOT-CLEARED-BECAUSE-<reason>`. Conditions 3 and 5 are *your* attestations;
   pass those flags only if they are true. Anything not cleared → stop and ask, naming the condition.
 - The posture is **scoped to this session and this plan**: it resets to the config default the next

@@ -513,6 +513,19 @@ class TestHandoff:
                  self._doc(tmp_path, "# Handoff\n\n[ops-not-lead-work] still true.\n"))
         assert "discipline markers dropped" not in capsys.readouterr().out
 
+    def test_surfaced_and_pending_stamps_carry_forward_to_the_successor(self, relay, terms, tmp_path,
+                                                                        outgoing):
+        """Row 67: a report the predecessor already proved-delivered (surfaced_reports.json) or was
+        mid-retry announcing (pending_wakes.json) must not look brand new to the successor — the
+        gm-signin-114240 incident (a predecessor-reviewed-and-committed report re-woke the successor
+        as "NOT yet proven delivered")."""
+        relay.lead_guard.mark_surfaced(relay.STATE_ROOT, "lead-old", ["e1:1"])
+        relay.lead_guard.mark_pending(relay.STATE_ROOT, "lead-old", ["e2:1"])
+        run_main(relay, "handoff", self._doc(tmp_path))
+        sid = self._successor(relay)
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, sid) == {"e1:1"}
+        assert "e2:1" in relay.lead_guard.load_pending(relay.STATE_ROOT, sid)
+
     def test_a_non_lead_caller_is_refused(self, relay, terms, tmp_path, monkeypatch):
         monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "not-a-lead")
         with pytest.raises(SystemExit) as e:

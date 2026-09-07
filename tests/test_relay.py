@@ -176,7 +176,7 @@ class TestCheckTransitions:
     """_check_one drives busy -> reported/stalled/dead. These are monkeypatched against
     iterm.is_alive so no real AppleScript/iTerm call happens."""
 
-    def _make_session(self, relay, session_id, status="busy", pid=None, busy_since=None):
+    def _make_session(self, relay, session_id, status="busy", pid=None, busy_since=None, claude_session=None):
         relay.session_dir(session_id).mkdir(parents=True)
         relay.packets_dir(session_id).mkdir(parents=True)
         relay.write_session(session_id, {
@@ -187,6 +187,7 @@ class TestCheckTransitions:
             "tab_label": f"relay-{session_id}",
             "model": None,
             "pid": pid,
+            "claude_session": claude_session,
             "status": status,
             "current_packet": 1,
             "busy_since": busy_since or relay.now(),
@@ -194,6 +195,18 @@ class TestCheckTransitions:
             "created": relay.now(),
             "updated": relay.now(),
         })
+
+    def _write_transcript(self, relay, tmp_path, monkeypatch, claude_session, age_seconds):
+        """A fake `<config-dir>/projects/<slug>/<claude_session>.jsonl` whose mtime is
+        `age_seconds` in the past — row 66's fixture: the stall decision now reads the
+        TRANSCRIPT's mtime, not just `busy_since`."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        proj = tmp_path / "cfg" / "projects" / "-w"
+        proj.mkdir(parents=True, exist_ok=True)
+        f = proj / f"{claude_session}.jsonl"
+        f.write_text("{}")
+        mtime = time.time() - age_seconds
+        os.utime(f, (mtime, mtime))
 
     def test_busy_with_report_becomes_reported(self, relay):
         self._make_session(relay, "s1", pid=os.getpid())
@@ -259,12 +272,34 @@ class TestCheckTransitions:
             result = relay._check_one("s4")
         assert result["status"] == "busy"
 
-    def test_stale_busy_past_threshold_becomes_stalled(self, relay):
+    def test_stale_busy_past_threshold_becomes_stalled(self, relay, tmp_path, monkeypatch):
+        # Row 66: stalled requires the TRANSCRIPT to be stale too, not just an old busy_since — so
+        # this fixture must give it a transcript whose mtime is ALSO past the stall threshold.
         old_time = "2020-01-01T00:00:00"
-        self._make_session(relay, "s5", pid=os.getpid(), busy_since=old_time)
+        self._make_session(relay, "s5", pid=os.getpid(), busy_since=old_time, claude_session="cs5")
+        self._write_transcript(relay, tmp_path, monkeypatch, "cs5", age_seconds=relay.STALL_THRESHOLD_SECONDS + 60)
         with mock.patch.object(relay.iterm, "is_alive", return_value=True):
             result = relay._check_one("s5")
         assert result["status"] == "stalled"
+
+    def test_stale_busy_with_no_locatable_transcript_still_becomes_stalled(self, relay):
+        # Fallback case: no claude_session at all (or an unlocatable one) → can't confirm freshness,
+        # so this keeps the old elapsed-only behavior rather than silently never stalling.
+        old_time = "2020-01-01T00:00:00"
+        self._make_session(relay, "s5b", pid=os.getpid(), busy_since=old_time)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            result = relay._check_one("s5b")
+        assert result["status"] == "stalled"
+
+    def test_long_busy_with_fresh_transcript_stays_busy(self, relay, tmp_path, monkeypatch):
+        # Row 66's headline case: busy 3h20m (busy_since way past the threshold) but the transcript
+        # was written 3s ago → still genuinely working, must stay `busy`, never `stalled`.
+        old_time = "2020-01-01T00:00:00"
+        self._make_session(relay, "s5c", pid=os.getpid(), busy_since=old_time, claude_session="cs5c")
+        self._write_transcript(relay, tmp_path, monkeypatch, "cs5c", age_seconds=3)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            result = relay._check_one("s5c")
+        assert result["status"] == "busy"
 
     def test_closed_session_is_not_touched(self, relay):
         self._make_session(relay, "s6", status="closed")
@@ -3342,6 +3377,29 @@ class TestVerify:
         assert self._run(relay, "e1") == 1  # claims a file nothing can confirm → MISMATCH, no crash
 
 
+class TestCheckDiffSize:
+    """Item 4 (lead-context-burn note): `relay check`'s human output shows the staged diff's size
+    next to a ready report, so the lead can see whether an inline read is affordable."""
+
+    def test_reported_session_shows_diff_size(self, relay, tmp_path, capsys):
+        tv = TestVerify()
+        repo = tv._repo(tmp_path)
+        tv._mk(relay, "e1", repo, tv.REPORT)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=False))
+        out = capsys.readouterr().out
+        assert "(diff: 1 files +1/-1)" in out
+
+    def test_unreported_session_shows_no_diff_size(self, relay, tmp_path, capsys):
+        tv = TestVerify()
+        repo = tv._repo(tmp_path)
+        tv._mk(relay, "e1", repo, None)
+        relay.write_session("e1", {**relay.read_session("e1"), "status": "busy", "pid": os.getpid()})
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=False))
+        assert "diff:" not in capsys.readouterr().out
+
+
 class TestVerifyForAutocommit:
     """`relay verify <sid> --for-autocommit` (#16 phase 2) — the CLI seam of the auto-commit gate.
     The clearance LOGIC is unit-tested in tests/test_report_verify.py; this pins the wiring: the
@@ -3443,6 +3501,88 @@ class TestVerifyForAutocommit:
         out = capsys.readouterr().out
         assert 'must NEVER be read as "the report is true"' in out
         assert "clears the AUTOMATION only" in out
+
+
+class TestVerifyFindings:
+    """`relay verify <sid> --diff-reviewed --findings <path>` (skills/review/SKILL.md) — the fork's
+    returned findings become the recorded artifact behind the condition-5 attestation instead of a
+    bare boolean. `--diff-reviewed` alone keeps working (ledgered `mode: inline`)."""
+
+    def _run(self, relay, sid, **flags):
+        args = SimpleNamespace(session_id=sid, packet=None, rerun=False, for_autocommit=False,
+                               in_plan=False, diff_reviewed=flags.get("diff_reviewed", False),
+                               findings=flags.get("findings"))
+        with pytest.raises(SystemExit) as e:
+            relay.cmd_verify(args)
+        return e.value.code
+
+    def _events(self, relay, name):
+        return [json.loads(l) for l in relay.LEDGER.read_text().splitlines()
+                if json.loads(l)["event"] == name]
+
+    def _setup(self, relay, tmp_path):
+        tv = TestVerify()
+        repo = tv._repo(tmp_path)
+        tv._mk(relay, "e1", repo, tv.REPORT)
+        return repo
+
+    def test_findings_file_is_copied_to_the_packets_dir(self, relay, tmp_path):
+        self._setup(relay, tmp_path)
+        findings = tmp_path / "findings.md"
+        findings.write_text("1. src.py:1 — note — looks fine.\n2. other.py:4 — should-fix — trim it.\n")
+        self._run(relay, "e1", diff_reviewed=True, findings=str(findings))
+        review_path = relay.packets_dir("e1") / "001-review.md"
+        assert review_path.exists()
+        assert review_path.read_text() == findings.read_text()
+
+    def test_findings_ledgers_report_reviewed_with_path_and_count(self, relay, tmp_path):
+        self._setup(relay, tmp_path)
+        findings = tmp_path / "findings.md"
+        findings.write_text("1. a.py:1 — note — x.\n2. b.py:2 — blocker — y.\n3. c.py:3 — note — z.\n")
+        self._run(relay, "e1", diff_reviewed=True, findings=str(findings))
+        rec = self._events(relay, "report_reviewed")[-1]
+        assert rec["session_id"] == "e1" and rec["packet"] == 1
+        assert rec["mode"] == "fork" and rec["findings"] == 3
+        assert rec["path"] == str(relay.packets_dir("e1") / "001-review.md")
+
+    def test_diff_reviewed_without_findings_ledgers_inline(self, relay, tmp_path):
+        self._setup(relay, tmp_path)
+        self._run(relay, "e1", diff_reviewed=True)
+        rec = self._events(relay, "report_reviewed")[-1]
+        assert rec["mode"] == "inline"
+        assert "path" not in rec and "findings" not in rec
+        assert not (relay.packets_dir("e1") / "001-review.md").exists()
+
+    def test_findings_without_diff_reviewed_is_a_silent_no_op(self, relay, tmp_path):
+        """The skill always pairs the two flags; --findings alone asserts nothing, so it must not
+        fabricate an attestation record."""
+        self._setup(relay, tmp_path)
+        findings = tmp_path / "findings.md"
+        findings.write_text("1. a.py:1 — note — x.\n")
+        self._run(relay, "e1", findings=str(findings))
+        assert not self._events(relay, "report_reviewed")
+        assert not (relay.packets_dir("e1") / "001-review.md").exists()
+
+    def test_missing_findings_file_is_a_clean_refusal(self, relay, tmp_path):
+        self._setup(relay, tmp_path)
+        with pytest.raises(SystemExit) as e:
+            relay.cmd_verify(SimpleNamespace(session_id="e1", packet=None, rerun=False,
+                                             for_autocommit=False, in_plan=False,
+                                             diff_reviewed=True, findings=str(tmp_path / "nope.md")))
+        assert "doesn't exist" in str(e.value.code)
+
+    def test_findings_feed_the_for_autocommit_clearance_too(self, relay, tmp_path, capsys):
+        """The example invocation in the skill: --for-autocommit --in-plan --diff-reviewed
+        --findings <file> — condition 5 clears exactly as a bare --diff-reviewed would."""
+        self._setup(relay, tmp_path)
+        findings = tmp_path / "findings.md"
+        findings.write_text("1. src.py:1 — note — fine.\n")
+        args = SimpleNamespace(session_id="e1", packet=None, rerun=False, for_autocommit=True,
+                               in_plan=True, diff_reviewed=True, findings=str(findings))
+        with pytest.raises(SystemExit) as e:
+            relay.cmd_verify(args)
+        assert e.value.code == 0
+        assert "AUTO-COMMIT: CLEARED" in capsys.readouterr().out
 
 
 class TestSurfacedDedupOnReview:
@@ -3991,6 +4131,19 @@ class TestAdoption:
         relay.cmd_list(SimpleNamespace(json=False, lead=None, all=False, closed=False))
         out = capsys.readouterr().out
         assert "NOT yet proven delivered" in out and "e1 (packet 001)" in out
+
+    def test_list_footnote_shows_the_diff_size(self, relay, tmp_path, capsys, monkeypatch):
+        """Item 4: the unannounced-report footnote also carries the staged diff's size."""
+        monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        tv = TestVerify()
+        repo = tv._repo(tmp_path)
+        self._mk(relay, owner_lead="lead-1", status="reported")
+        s = relay.read_session("e1"); s["worktree"] = str(repo); relay.write_session("e1", s)
+        relay.cmd_list(SimpleNamespace(json=False, lead=None, all=False, closed=False))
+        out = capsys.readouterr().out
+        assert "NOT yet proven delivered" in out
+        assert "(diff: 1 files +1/-1)" in out
 
     def test_list_stays_quiet_once_the_wake_is_proven(self, relay, capsys, monkeypatch):
         monkeypatch.setattr(relay, "pid_alive", lambda pid: True)
