@@ -331,7 +331,7 @@ without a cache        ≈ 5.2M</pre>
       </div>
     </div>
     <div>
-      <p><strong>The lead.</strong> It grows too, more slowly, because it reads reports and diffs instead of code — a lead's line is 300k on a 1M window (150k when its window is 200k), because a lead's handoff costs more than an executor's rotation and its context grows slowly once diffs are reviewed by a fork (slide 7). Past it relay nudges once: hand off. The lead writes a note of where things stand, and a fresh lead picks up from the note. Every executor keeps running.</p>
+      <p><strong>The lead.</strong> It grows too, more slowly, because it reads reports and diffs instead of code — a lead's line is 300k on a 1M window (150k when its window is 200k), because an executor is a stateless worker (the packet and the seed carry everything, so replacing it is cheap) while a lead is the stateful judge (its context IS the project's decisions), so it earns twice the room before a handoff pays off; and it grows slowly once diffs are reviewed by a fork (slide 7). Past it relay nudges once: hand off. The lead writes a note of where things stand, and a fresh lead picks up from the note. Every executor keeps running.</p>
       <p class="step">Transcript size is the second signal: 5 MB on disk means several compactions, so the plan in its head is a summary of summaries.</p>
       <div class="step" style="margin-top:2.4vh">
         <p class="small muted" style="margin-bottom:.6vh">the lead that wrote this deck: live context against the 300k line (1M window)</p>
@@ -341,7 +341,7 @@ without a cache        ≈ 5.2M</pre>
     </div>
   </div>
   <p class="foot">The first session the 150k gate ever caught was the executor that built it. Why reuse is cheap and size is a tax: caching, a few slides on.</p>
-  <aside class="notes">Same idea at two speeds. Executors churn in an afternoon; a lead lasts days. Rotate = retire plus a seeded successor, one step, the lead does it. Handoff = a note plus a fresh lead, and it's the one thing agent teams can't do at all. The 321k / 4.5 MB pair is real: the lead building this deck. MB said "getting close"; tokens said "twice past the line". That's why the nudge went token-first in 0.3.49. Why 300k and not 800k: per-turn memory cost is ~10% of live context at the cached rate, and a cold cache rewrites the whole prefix, so past ~300k the memory bill exceeds a ~15k handoff.</aside>
+  <aside class="notes">Same idea at two speeds, and two prices. Executors are stateless workers: the packet and the seed carry everything, so rotating one is cheap and the line sits at 150k. A lead is the stateful judge: its context is the project's decisions, and a handoff means a note, a new tab and re-adoption, so it earns 300k before the memory tax outweighs that. Not higher, because past a few hundred thousand tokens every turn is slower and attention drops, exactly where review and routing calls live. Executors churn in an afternoon; a lead lasts days. Rotate = retire plus a seeded successor, one step, the lead does it. Handoff = a note plus a fresh lead, and it's the one thing agent teams can't do at all. The 321k / 4.5 MB pair is real: the lead building this deck. MB said "getting close"; tokens said "twice past the line". That's why the nudge went token-first in 0.3.49. Why 300k and not 800k: per-turn memory cost is ~10% of live context at the cached rate, and a cold cache rewrites the whole prefix, so past ~300k the memory bill exceeds a ~15k handoff.</aside>
 </section>
 <section class="slide">
   <p class="eyebrow">lifecycle</p>
