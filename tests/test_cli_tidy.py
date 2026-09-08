@@ -14,8 +14,10 @@ Run: pytest tests/test_cli_tidy.py -q
 import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -214,10 +216,35 @@ def terms(relay):
 
 
 @pytest.fixture
-def tidy_on(monkeypatch):
+def tidy_on(relay, monkeypatch):
     """Let the AUTOMATIC tidy actually run in a test. Safe only because `terms` has already
     stubbed `reorder_tabs` and `tty_by_id` on every backend module — the same bargain
-    tests/conftest.py describes for RELAY_NO_NOTIFY."""
+    tests/conftest.py describes for RELAY_NO_NOTIFY.
+
+    Row 73: the automatic tidy now shells out to `<relay> tidy --quiet --lead <sid>` as a FRESH
+    SUBPROCESS. A test must never let that reach a real interpreter — it would load the REAL
+    bin/relay, unpatched, and could touch the human's actual iTerm. So this stubs `subprocess.run`
+    at the module seam `maybe_tidy_tabs` calls through: instead of launching a process, it re-enters
+    this SAME already-patched module's `main()` in-process with the given argv. The "child" sees
+    the identical FakeTerm and ledger file the parent does — exactly what a real subprocess would
+    see on disk — and its stdout is captured instead of printed, exactly as `capture_output=True`
+    would capture a real child's stdout."""
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, **kw):
+        argv = list(cmd[2:])   # cmd is [sys.executable, RELAY_BIN, "tidy", ...]
+        buf = io.StringIO()
+        old_argv = sys.argv
+        sys.argv = ["relay", *argv]
+        code = 0
+        try:
+            with contextlib.redirect_stdout(buf):
+                try:
+                    relay.main()
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        finally:
+            sys.argv = old_argv
+        return subprocess.CompletedProcess(cmd, code, stdout=buf.getvalue(), stderr="")
+    monkeypatch.setattr(relay.subprocess, "run", fake_run)
     monkeypatch.delenv("RELAY_NO_TIDY", raising=False)
 
 
@@ -482,6 +509,58 @@ class TestTidyCommand:
         assert not Path(terms.ttys["w0t0p0:A"]).exists()   # never opened, so never written
         assert terms.reorders                              # ordering is independent of coloring
 
+    # ── row 73: --quiet and --lead, the flags the subprocess boundary is built on ──────────────
+
+    def test_quiet_suppresses_the_listing_and_success_line_but_still_tidies(self, relay, terms,
+                                                                            capsys):
+        two_leads(relay)
+        with pytest.raises(SystemExit) as ei:
+            run_main(relay, "tidy", "--quiet")
+        assert ei.value.code == 0
+        assert capsys.readouterr().out == ""
+        assert terms.reorders   # it still actually ran, just said nothing about it
+
+    def test_quiet_on_failure_prints_exactly_one_plain_line_and_exits_1(self, relay, terms,
+                                                                        capsys):
+        two_leads(relay)
+        terms.reorder_result = (False, "iterm2 python api unavailable (ImportError: no iterm2)")
+        with pytest.raises(SystemExit) as ei:
+            run_main(relay, "tidy", "--quiet")
+        assert ei.value.code == 1
+        assert capsys.readouterr().out.strip() == \
+            "iterm2 python api unavailable (ImportError: no iterm2)"
+
+    def test_quiet_with_nothing_to_order_reports_that_reason_and_exits_1(self, relay, terms,
+                                                                         capsys):
+        with pytest.raises(SystemExit) as ei:
+            run_main(relay, "tidy", "--quiet")
+        assert ei.value.code == 1
+        assert capsys.readouterr().out.strip() == "no lead tabs to order"
+
+    def test_dry_run_with_quiet_prints_nothing_and_still_moves_nothing(self, relay, terms, capsys):
+        two_leads(relay)
+        run_main(relay, "tidy", "--dry-run", "--quiet")   # never exits — dry-run returns plainly
+        assert capsys.readouterr().out == ""
+        assert terms.reorders == []
+
+    def test_the_lead_flag_parses_and_is_a_grouping_no_op(self, relay, terms):
+        """`tidy_groups()` already spans every armed lead in one pass — `--lead` is accepted for
+        bookkeeping/future scoping and changes nothing about which tabs get ordered."""
+        two_leads(relay)
+        run_main(relay, "tidy", "--lead", "lead-a")
+        assert terms.reorders == [["w0t0p0:A", "w0t3p0:A1", "w0t4p0:A2",
+                                   "w0t9p0:B", "w0t7p0:B1", "w0t8p0:B2"]]
+
+    def test_dry_run_alone_is_unchanged(self, relay, terms, capsys):
+        """Acceptance: `relay tidy --dry-run` behaves exactly as it did before --quiet/--lead
+        existed — this just re-confirms the plain-dry-run test above still holds post-change."""
+        two_leads(relay)
+        run_main(relay, "tidy", "--dry-run")
+        out = capsys.readouterr().out
+        assert out.index("[Exec] a-one") < out.index("[Lead] beta") < out.index("[Exec] b-one")
+        assert "nothing moved" in out
+        assert terms.reorders == []
+
 
 # ── the automatic tidy ──────────────────────────────────────────────────────────────────────────
 
@@ -541,6 +620,102 @@ class TestAutomaticTidy:
         terms.alive = False
         run_main(relay, "restart", "e1")
         assert terms.reorders
+
+
+# ── backlog row 73: the automatic tidy always failed with tidy_skipped attempts=2 ───────────────
+
+class TestAutomaticTidyRunsAsAFreshSubprocess:
+    """The retry added in row 69 never helped, because both attempts fail the SAME way: the
+    spawning process already holds one iTerm2 Python API connection (that's how it captured the
+    new tab), and a second connection from that same process fails outright with a
+    connection-shaped error. `relay tidy` by hand, in a fresh process, always works. So the
+    automatic path now shells out to `<relay> tidy --quiet --lead <sid>` as a subprocess of its
+    own, instead of calling `_tidy_now` in-process — these tests stub `subprocess.run` directly
+    (no FakeTerm needed) to prove the boundary itself, independent of the tab-ordering tests
+    above, which exercise it through the `tidy_on` fixture's in-process stand-in."""
+
+    def test_it_spawns_a_subprocess_instead_of_calling_tidy_now_in_process(self, relay, monkeypatch):
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w0t0p0:A", started="2020-01-01T00:00:00")
+        monkeypatch.delenv("RELAY_NO_TIDY", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-a")
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append((cmd, kw))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch.object(relay.subprocess, "run", fake_run), \
+             mock.patch.object(relay, "_tidy_now") as spy:
+            ok = relay.maybe_tidy_tabs("spawn")
+        assert ok is True
+        spy.assert_not_called()                      # the in-process call path is NOT taken
+        assert len(calls) == 1
+        cmd, kw = calls[0]
+        assert cmd == [sys.executable, relay.RELAY_BIN, "tidy", "--quiet", "--lead", "lead-a"]
+        assert kw.get("timeout")                      # bounded, so a hung iTerm API can't wedge a spawn
+
+    def test_no_caller_lead_id_omits_the_lead_flag(self, relay, monkeypatch):
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w0t0p0:A", started="2020-01-01T00:00:00")
+        monkeypatch.delenv("RELAY_NO_TIDY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch.object(relay.subprocess, "run", fake_run):
+            relay.maybe_tidy_tabs("spawn")
+        assert calls == [[sys.executable, relay.RELAY_BIN, "tidy", "--quiet"]]
+
+    def test_a_failing_exit_degrades_to_one_dim_line_and_never_raises(self, relay, capsys,
+                                                                       monkeypatch):
+        monkeypatch.delenv("RELAY_NO_TIDY", raising=False)
+
+        def fake_run(cmd, **kw):
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="no iTerm tab found for any of the ordered session ids", stderr="")
+
+        with mock.patch.object(relay.subprocess, "run", fake_run):
+            ok = relay.maybe_tidy_tabs("spawn")     # must not raise
+        assert ok is False
+        out = capsys.readouterr().out
+        assert out.count("tab tidy skipped") == 1
+        assert "no iTerm tab found" in out
+
+    def test_a_timeout_degrades_to_one_dim_line_and_never_raises(self, relay, capsys, monkeypatch):
+        monkeypatch.delenv("RELAY_NO_TIDY", raising=False)
+
+        def fake_run(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+        with mock.patch.object(relay.subprocess, "run", fake_run):
+            ok = relay.maybe_tidy_tabs("spawn")     # must not raise
+        assert ok is False
+        assert capsys.readouterr().out.count("tab tidy skipped") == 1
+
+    def test_a_missing_relay_binary_degrades_to_one_dim_line_and_never_raises(self, relay, capsys,
+                                                                              monkeypatch):
+        monkeypatch.delenv("RELAY_NO_TIDY", raising=False)
+
+        def fake_run(cmd, **kw):
+            raise FileNotFoundError(2, "No such file or directory")
+
+        with mock.patch.object(relay.subprocess, "run", fake_run):
+            ok = relay.maybe_tidy_tabs("spawn")     # must not raise
+        assert ok is False
+        assert capsys.readouterr().out.count("tab tidy skipped") == 1
+
+    def test_relay_no_tidy_short_circuits_before_any_subprocess_is_spawned(self, relay,
+                                                                           monkeypatch):
+        monkeypatch.setenv("RELAY_NO_TIDY", "1")
+
+        def fail_if_called(*a, **kw):
+            raise AssertionError("subprocess.run should never be called")
+
+        with mock.patch.object(relay.subprocess, "run", fail_if_called):
+            ok = relay.maybe_tidy_tabs("spawn")
+        assert ok is False
 
 
 # ── one color per lead group, always ────────────────────────────────────────────────────────────

@@ -1715,6 +1715,17 @@ _TIDY_RETRYABLE_EXC_RE = re.compile(r"connection|timeout|websocket|brokenpipe|os
 _TIDY_WINDOWS_RE = re.compile(r"reordered (\d+) window")
 _TIDY_MISSING_RE = re.compile(r"(\d+) session id\(s\) had no tab")
 
+# ── backlog row 73: the automatic tidy always failed with tidy_skipped attempts=2 ──────────────
+# THE BUG (2026-09-07, twice, deterministic): NOT a race — both attempts of the row-69 retry fail
+# the SAME way, every time, with "ConnectionClosedError: no close frame received or sent". The
+# spawning process already opened one iTerm2 Python API connection earlier in the SAME process
+# (that is how it created and captured the new tab); a second connection from that same process
+# fails outright. `relay tidy` typed by hand, in a fresh process, always works — that is the tell.
+# Fix: the AUTOMATIC path (only) now shells out to `<RELAY_BIN> tidy --quiet --lead <sid>` as a
+# fresh subprocess, which opens its own first-and-only iTerm2 connection. The explicit `relay tidy`
+# command and the subprocess it spawns still call `_tidy_now` in-process, retry included.
+TIDY_SUBPROCESS_TIMEOUT = 8.0
+
 
 def _tidy_retryable(reason):
     """Is this tidy failure the spawn RACE — worth one more ask a second later — or a real answer?
@@ -1755,8 +1766,9 @@ def _ledger_tidy(ok, reason, attempts):
 
 def _tidy_now(cfg=None):
     """Compute the order, re-color every group, apply the order. Returns (ok, reason, groups).
-    Shared by `relay tidy` and the automatic post-spawn/handoff/resume tidy so both can only ever
-    do the same thing — which is why the row-69 retry lives HERE and not in `maybe_tidy_tabs`.
+    Shared by `relay tidy` and, since row 73, the SUBPROCESS `maybe_tidy_tabs` shells out to for
+    the automatic post-spawn/handoff/resume tidy — both can only ever do the same thing, which is
+    why the row-69 retry lives HERE and not in `maybe_tidy_tabs`.
 
     ONE retry, and only for a connection-shaped failure (`_tidy_retryable`): the observed race is
     lost by about a second, and a second ask that also fails is a real outage, not a race. Every
@@ -1783,17 +1795,34 @@ def maybe_tidy_tabs(after):
     (spawn — which also covers `send --rotate/--upgrade`, since that spawns the successor —
     handoff, close-predecessor, resume and restart).
 
+    Row 73: this process already holds one iTerm2 Python API connection (that is how it just
+    created/captured the tab it's tidying around), and a second connection from the SAME process
+    fails outright — deterministically, not a race — with a connection-shaped error. So the
+    automatic path runs `_tidy_now` in a FRESH SUBPROCESS instead of in-process; the subprocess
+    opens its own first connection and ledgers its own outcome exactly once.
+
     Cosmetic by definition, so it can never fail its caller: config `tidy_tabs: false` turns it off
-    silently, RELAY_NO_TIDY (the test-suite kill-switch) skips it entirely, and every other failure
-    — API off, package missing, no matching tab, an unexpected exception — degrades to ONE dim
-    line. Returns True only when tabs were actually reordered."""
+    silently, RELAY_NO_TIDY (the test-suite kill-switch) skips it before any subprocess is spawned,
+    and every other failure — non-zero exit, a timeout, a missing `relay` binary, an unexpected
+    exception — degrades to the SAME ONE dim line this always printed. Returns True only when tabs
+    were actually reordered."""
     if os.environ.get("RELAY_NO_TIDY"):
         return False
     try:
         cfg = lead_guard.load_config(STATE_ROOT)
         if not cfg.get("tidy_tabs", True):
             return False
-        ok, reason, _ = _tidy_now(cfg)
+        cmd = [sys.executable, RELAY_BIN, "tidy", "--quiet"]
+        sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if sid:
+            cmd += ["--lead", sid]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIDY_SUBPROCESS_TIMEOUT)
+        ok = r.returncode == 0
+        reason = (r.stdout.strip() or r.stderr.strip()) if not ok else ""
+        if not ok and not reason:
+            reason = f"`relay tidy` subprocess exited {r.returncode}"
+    except subprocess.TimeoutExpired:
+        ok, reason = False, f"tidy subprocess timed out after {TIDY_SUBPROCESS_TIMEOUT:g}s"
     except Exception as e:
         ok, reason = False, f"{type(e).__name__}: {e}"
     if not ok:
@@ -1803,29 +1832,46 @@ def maybe_tidy_tabs(after):
 
 
 def cmd_tidy(args):
-    """`relay tidy [--dry-run]` — put the tab bar back into [Lead] [Exec 1] [Exec 2] … [Lead 2]
-    [Exec 2.1] … order and re-apply each lead's color to its own group.
+    """`relay tidy [--dry-run] [--quiet] [--lead SID]` — put the tab bar back into [Lead] [Exec 1]
+    [Exec 2] … [Lead 2] [Exec 2.1] … order and re-apply each lead's color to its own group.
 
     Explicit, so it runs regardless of the `tidy_tabs` config key (that key governs only the
     AUTOMATIC tidy after spawn/handoff/resume/restart). `--dry-run` prints the order it would apply
-    and touches nothing — including the colors."""
+    and touches nothing — including the colors.
+
+    Row 73: `--quiet` is how `maybe_tidy_tabs` now runs this as a FRESH SUBPROCESS (a second iTerm2
+    Python API connection from the SAME process that just opened the first one fails outright, so
+    the automatic tidy needs a process of its own). It suppresses the per-group listing and the
+    success line, printing at most one plain line — the failure reason, nothing on success — so the
+    parent can read it back and fold it into the SAME single dim line it always printed, and exits
+    0/1 for the parent to read instead of parsing output.
+
+    `--lead SID` names the calling lead. `tidy_groups()` already spans every armed lead in one
+    pass, so this is accepted for bookkeeping/future scoping and is otherwise a no-op today —
+    grouping is unchanged whether it's given or omitted."""
     groups = tidy_groups()
-    if not groups:
+    if not groups and not args.quiet:
         print("tidy: no armed lead with a captured iTerm tab — nothing to order.")
         return
-    for g in groups:
-        color = g.get("color")
-        color_note = f"  color {','.join(str(int(v)) for v in color)}" if _color_ok(color) else "  color -"
-        print(c(f"[Lead] {g['project'] or '-'}  ({(g['lead'] or '?')[:8]}…){color_note}", "bold"))
-        for i, e in enumerate(g["executors"], 1):
-            print(f"  {i}. {e['label']}")
-        for sid in g["elsewhere"]:
-            print(c(f"  · {sid} — another window, left where it is", "dim"))
+    if not args.quiet:
+        for g in groups:
+            color = g.get("color")
+            color_note = f"  color {','.join(str(int(v)) for v in color)}" if _color_ok(color) else "  color -"
+            print(c(f"[Lead] {g['project'] or '-'}  ({(g['lead'] or '?')[:8]}…){color_note}", "bold"))
+            for i, e in enumerate(g["executors"], 1):
+                print(f"  {i}. {e['label']}")
+            for sid in g["elsewhere"]:
+                print(c(f"  · {sid} — another window, left where it is", "dim"))
     if args.dry_run:
-        print(c(f"dry run — {len(tidy_order(groups))} tab(s) would be reordered; nothing moved.",
-                "dim"))
+        if not args.quiet:
+            print(c(f"dry run — {len(tidy_order(groups))} tab(s) would be reordered; nothing "
+                    f"moved.", "dim"))
         return
     ok, reason, _ = _tidy_now()
+    if args.quiet:
+        if not ok:
+            print(reason)
+        sys.exit(0 if ok else 1)
     print(f"tidy: {reason}" if ok else c(f"tidy: not applied — {reason}", "red"))
 
 
@@ -6501,6 +6547,13 @@ def main():
     td = sub.add_parser("tidy", help="re-order every lead's tabs into [Lead] [Exec 1] [Exec 2] … "
                                      "[Lead 2] … and re-apply each lead's color to its group")
     td.add_argument("--dry-run", action="store_true", help="print the order it would apply, move nothing")
+    td.add_argument("--quiet", action="store_true",
+                    help="suppress the per-group listing and success line; print at most one line, "
+                         "only on failure (this is how the automatic post-spawn/handoff/resume "
+                         "tidy runs it, as a fresh subprocess)")
+    td.add_argument("--lead", metavar="SID",
+                    help="the calling lead's session id, for bookkeeping/future scoping — "
+                         "currently a no-op, since tidy_groups() already covers every armed lead")
     td.set_defaults(func=cmd_tidy)
 
     cp = sub.add_parser("close-predecessor")
