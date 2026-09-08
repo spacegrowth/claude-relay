@@ -228,8 +228,23 @@ def tidy_on(relay, monkeypatch):
     this SAME already-patched module's `main()` in-process with the given argv. The "child" sees
     the identical FakeTerm and ledger file the parent does — exactly what a real subprocess would
     see on disk — and its stdout is captured instead of printed, exactly as `capture_output=True`
-    would capture a real child's stdout."""
-    def fake_run(cmd, capture_output=True, text=True, timeout=None, **kw):
+    would capture a real child's stdout.
+
+    Bug fixed after row 73 landed: `relay.subprocess` IS the shared stdlib `subprocess` module
+    (`lead_guard.subprocess is subprocess` is True — it is not a relay-local alias), so patching
+    `.run` here used to replace it PROCESS-WIDE for the life of every `tidy_on` test — hijacking
+    every unrelated `subprocess.run` call (`lead_guard`'s `ps -o lstart=` pid-staleness check,
+    `git rev-parse`, `open`, `claude --version`, ...), silently re-interpreting each one as a
+    `relay <argv>` invocation and feeding the calling code a bogus exit-2 result. `fake_run` below
+    now recognizes ONLY the exact tidy invocation `maybe_tidy_tabs` builds — a cmd list whose first
+    three elements are `[sys.executable, RELAY_BIN, "tidy"]` — and delegates every other call,
+    args and kwargs untouched, to the REAL `subprocess.run` captured before the patch is applied."""
+    real_run = relay.subprocess.run
+
+    def fake_run(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get("args")
+        if list(cmd[:3]) != [sys.executable, relay.RELAY_BIN, "tidy"]:
+            return real_run(*args, **kwargs)   # not a tidy call — untouched, real subprocess.run
         argv = list(cmd[2:])   # cmd is [sys.executable, RELAY_BIN, "tidy", ...]
         buf = io.StringIO()
         old_argv = sys.argv
@@ -718,6 +733,66 @@ class TestAutomaticTidyRunsAsAFreshSubprocess:
         assert ok is False
 
 
+class TestASpawnLedgersExactlyOneTidyEvent:
+    """Acceptance #4: before row 73's fix, the automatic tidy called `_tidy_now` IN-PROCESS, which
+    ledgers its own outcome — so if a parent-side call were ever reintroduced alongside the
+    subprocess this now shells out to (which ledgers its OWN outcome via its own `cmd_tidy` run),
+    one spawn would write TWO ledger events instead of one. A test that only checks "an event
+    exists" cannot see that regression; this asserts the COUNT.
+
+    `tidy_on` stands the subprocess in with a re-entrant `relay.main()` call under argv rewritten
+    to the `tidy` invocation (see its docstring) — so a ledger write's `sys.argv` at call time
+    tells the subprocess's call apart from a hypothetical direct call in `maybe_tidy_tabs`'s own
+    frame, which would fire while `sys.argv` still read the `spawn` the test issued."""
+
+    def _ledger_spy(self, relay, monkeypatch):
+        """Wrap `_ledger_tidy` (not replace it) so every real write still happens, while recording
+        `sys.argv` at each call — one entry per event ledgered, in order."""
+        seen = []
+        orig = relay._ledger_tidy
+
+        def spy(*a, **kw):
+            seen.append(list(sys.argv))
+            return orig(*a, **kw)
+
+        monkeypatch.setattr(relay, "_ledger_tidy", spy)
+        return seen
+
+    def test_a_successful_spawn_tidy_ledgers_exactly_one_tidy_event(self, relay, terms, tidy_on,
+                                                                    tmp_path, monkeypatch):
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w0t0p0:A", started="2020-01-01T00:00:00")
+        seen = self._ledger_spy(relay, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-a")
+        run_main(relay, "spawn", str(tmp_path), "topic", write_packet(tmp_path), "--name", "e1")
+        assert len(seen) == 1                          # not two — no parent-side ledger call
+        assert seen[0][:2] == ["relay", "tidy"]         # fired from the subprocess's argv, not spawn's
+        assert len(ledger_events(relay, "tidy")) == 1
+        assert ledger_events(relay, "tidy_skipped") == []
+
+    def test_a_failing_spawn_tidy_ledgers_exactly_one_tidy_skipped_event(self, relay, terms,
+                                                                         tidy_on, tmp_path,
+                                                                         monkeypatch):
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w0t0p0:A", started="2020-01-01T00:00:00")
+        terms.reorder_result = (False, "iterm2 python api unavailable (ImportError: no iterm2)")
+        seen = self._ledger_spy(relay, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-a")
+        run_main(relay, "spawn", str(tmp_path), "topic", write_packet(tmp_path), "--name", "e1")
+        assert len(seen) == 1                          # not two
+        assert seen[0][:2] == ["relay", "tidy"]
+        assert len(ledger_events(relay, "tidy_skipped")) == 1
+        assert ledger_events(relay, "tidy") == []
+
+    def test_relay_no_tidy_ledgers_no_event_for_a_spawn(self, relay, terms, tmp_path, monkeypatch):
+        """RELAY_NO_TIDY (set suite-wide by tests/conftest.py, deliberately NOT lifted here) short-
+        circuits `maybe_tidy_tabs` before any subprocess is spawned — no `tidy`, no `tidy_skipped`,
+        nothing at all."""
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w0t0p0:A", started="2020-01-01T00:00:00")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-a")
+        run_main(relay, "spawn", str(tmp_path), "topic", write_packet(tmp_path), "--name", "e1")
+        assert ledger_events(relay, "tidy") == []
+        assert ledger_events(relay, "tidy_skipped") == []
+
+
 # ── one color per lead group, always ────────────────────────────────────────────────────────────
 
 class TestExecutorColorFollowsItsOwner:
@@ -940,3 +1015,32 @@ class TestListNamesALeadWhoseTidyKeepsBeingSkipped:
         two_leads(relay)
         run_main(relay, "list")
         assert "last tab tidy skipped" not in capsys.readouterr().out
+
+
+# ── the `tidy_on` fixture must not hijack unrelated subprocess.run calls ───────────────────────
+
+class TestTidyOnFixtureDoesNotHijackOtherSubprocessCalls:
+    """Permanent guard for the bug `tidy_on`'s docstring describes: `relay.subprocess` IS the
+    shared stdlib `subprocess` module, so a `fake_run` that doesn't check `cmd` before acting
+    replaces `.run` PROCESS-WIDE for the life of the test — silently re-interpreting every
+    unrelated call (`lead_guard`'s `ps -o lstart=`, `git rev-parse`, `open`, `claude --version`,
+    ...) as a `relay <argv>` invocation and feeding the caller a bogus result.
+
+    Before the fix, this went undetected because every `tidy_on` test only ever drove the exact
+    tidy invocation through `relay.subprocess.run` — nothing in the suite exercised a NON-tidy
+    call while the patch was active, so the suite stayed green under the unconditionally-
+    intercepting fixture (proven by the fork reviewer with a temporary probe, then deleted). This
+    test IS that probe, kept.
+
+    A cheap, real, side-effect-free command is driven straight through `relay.subprocess.run` —
+    the exact seam `tidy_on` patches — and checked against evidence only the REAL implementation
+    could produce. Exit 0 alone would not be enough: the pre-fix fake also happened to build a
+    `SystemExit` from `relay.main()` called with no argv, and coincidence aside, a differently-
+    broken fake could return 0 too. So this also pins the real stdout, which the fake can't
+    fabricate."""
+
+    def test_a_non_tidy_call_reaches_the_real_subprocess_run(self, relay, terms, tidy_on):
+        result = relay.subprocess.run(["/bin/echo", "not-a-tidy-call-7f2c"],
+                                       capture_output=True, text=True)
+        assert result.returncode == 0                              # real exit 0, not the fake's exit 2
+        assert result.stdout.strip() == "not-a-tidy-call-7f2c"     # only the real /bin/echo emits this
