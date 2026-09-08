@@ -214,8 +214,9 @@ reveals, capped at 15). `relay report <sid>` prints a finished report in a green
 prune [--days N] [--dry-run]` clears old closed/dead state and stale lead markers (a lead you're
 actively using is never pruned). `relay diff <sid> [--open] [--all]` renders an executor's `git diff
 --staged` to a self-contained, offline HTML page (vendored, checksummed diff2html with a stdlib
-fallback — see [VENDOR.md](VENDOR.md)) so you review diffs in one click; its output (and every
-executor's closing line) includes a cmd+clickable `file://` URL.
+fallback — see [VENDOR.md](VENDOR.md)) so you review diffs in one click, with the report's outcome
+sentence and status at the top; its output (and every executor's closing line) includes a
+cmd+clickable `file://` URL.
 
 Type them, or just describe what you want ("check on my sessions") — the lead invokes the right one.
 

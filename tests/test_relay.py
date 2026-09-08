@@ -3238,6 +3238,73 @@ class TestDiff:
         unquoted = urllib.parse.unquote(url_encoded_path)
         assert unquoted == str(expected_path)
 
+    # ── the header gist: report outcome + status (+ risk), reusing report_verify.parse_tldr ────
+    FULL_REPORT = ("Fixed the login bug; suite green, staged.\n\n"
+                   "Status: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: a.py\n\n"
+                   "## What changed\n- a.py:1 — fixed it.\n")
+
+    RISKY_REPORT = ("Landed the migration; one thing needs a follow-up.\n\n"
+                    "Status: clean-with-caveats\nRisk flags: touches the ledger\n"
+                    "UNVERIFIED: none\nChanged: a.py\n")
+
+    def test_wellformed_report_populates_gist_and_status(self, relay, tmp_path):
+        repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a"})
+        self._mk_session(relay, "e1", repo, report_text=self.FULL_REPORT)
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=False))
+        out = (relay.packets_dir("e1") / "001-diff.html").read_text()
+        assert "Fixed the login bug; suite green, staged." in out
+        assert "Status: clean" in out
+        assert '<span class="gist-risk">' not in out
+
+    def test_risky_report_adds_the_risk_chip(self, relay, tmp_path):
+        repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a"})
+        self._mk_session(relay, "e1", repo, report_text=self.RISKY_REPORT)
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=False))
+        out = (relay.packets_dir("e1") / "001-diff.html").read_text()
+        assert "Status: clean-with-caveats" in out
+        # packet #002 item 1: the chip carries the REAL risk text, not a static "risk" label.
+        assert '<span class="gist-risk">touches the ledger</span>' in out
+
+    HEADING_REPORT = ("# Bug hunt report\n\n"
+                      "Status: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: a.py\n")
+
+    def test_heading_first_line_drops_the_gist_but_keeps_status(self, relay, tmp_path):
+        """packet #002 item 2 / review finding 1 (bin/relay:4992): a report whose first line is a
+        heading is flagged by parse_tldr's `problems` as not a real outcome sentence — cmd_diff
+        must not promote that heading text to the gist, but Status must still render."""
+        repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a"})
+        self._mk_session(relay, "e1", repo, report_text=self.HEADING_REPORT)
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=False))
+        out = (relay.packets_dir("e1") / "001-diff.html").read_text()
+        assert "Bug hunt report" not in out
+        assert '<div class="gist-line">' in out
+        assert "Status: clean" in out
+
+    def test_relay_diff_all_still_shows_the_same_gist(self, relay, tmp_path):
+        repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a", "b.py": "b"})
+        self._mk_session(relay, "e1", repo, report_text=self.FULL_REPORT)
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=True))
+        out = (relay.packets_dir("e1") / "001-diff.html").read_text()
+        assert "Fixed the login bug; suite green, staged." in out
+        assert "Status: clean" in out
+
+    def test_report_without_tldr_block_omits_the_gist_line(self, relay, tmp_path):
+        """The existing free-text report shape (no Status:/Risk flags:/... block) is
+        unparsable-as-TL;DR — the header must omit the gist, never guess one from prose."""
+        repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a"})
+        self._mk_session(relay, "e1", repo,
+                         report_text="Touched a.py:1 — the rest is unrelated to this change.")
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=False))
+        out = (relay.packets_dir("e1") / "001-diff.html").read_text()
+        assert '<div class="gist-line">' not in out
+
+    def test_missing_report_omits_the_gist_line_and_does_not_raise(self, relay, tmp_path):
+        repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a"})
+        self._mk_session(relay, "e1", repo, report_text=None)
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=False))
+        out = (relay.packets_dir("e1") / "001-diff.html").read_text()
+        assert '<div class="gist-line">' not in out
+
 
 class TestVerify:
     """`relay verify <sid> [--packet N] [--rerun]` (backlog §6b / #7) — the CLI seam only: real git

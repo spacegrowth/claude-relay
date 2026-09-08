@@ -4956,6 +4956,13 @@ def cmd_diff(args):
     report_path = packets_dir(args.session_id) / f"{n:03d}-report.md"
     _mark_report_surfaced(s)  # the lead is reviewing this report's diff — dedup it (§5b)
 
+    report_text = None
+    if report_path.exists():
+        try:
+            report_text = report_path.read_text()
+        except OSError:
+            report_text = None
+
     staged = subprocess.run(["git", "-C", worktree, "diff", "--staged", "--name-only"],
                             capture_output=True, text=True)
     staged_names = [ln.strip() for ln in staged.stdout.splitlines() if ln.strip()]
@@ -4963,8 +4970,8 @@ def cmd_diff(args):
     scope_note = ""
     scope_files = None
     if not args.all:
-        if report_path.exists():
-            mentioned = set(diff_render.parse_report_mentions(report_path.read_text()))
+        if report_text is not None:
+            mentioned = set(diff_render.parse_report_mentions(report_text))
             scope_files = [f for f in staged_names if f in mentioned]
             if not scope_files:
                 scope_note = "unfiltered — report not found/parsable"
@@ -4977,6 +4984,26 @@ def cmd_diff(args):
     diff_text = subprocess.run(diff_cmd, capture_output=True, text=True).stdout
 
     meta = {"session_id": args.session_id, "packet": n, "scope_note": scope_note}
+    # The header's one-line gist — the report's own outcome sentence + Status (+ a risk chip when
+    # non-empty/non-"none") — reuses report_verify's TL;DR parser rather than a second one (§ packet
+    # relay-diffgist). A missing report, or one whose status can't be parsed, simply omits
+    # `status`/`gist` from meta — _render_header treats that as "no gist line", never guesses.
+    if report_text:
+        tldr = report_verify.parse_tldr(report_text)
+        # relay-diffgist #002 finding 1 (bin/relay:4992): parse_tldr still returns SOME text as
+        # `outcome` even when it's flagged as not a real outcome sentence — a report heading, a
+        # stray TL;DR field, a "Report:"/"Summary:" label — every such problem's text starts with
+        # "first line" (see parse_tldr's docstring/problems). Don't write a second parser for this:
+        # just read the problems list it already returns and refuse to promote that text to gist.
+        outcome_ok = bool(tldr.get("outcome")) and not any(
+            p.startswith("first line") for p in tldr.get("problems", []))
+        if tldr.get("status"):
+            meta["status"] = tldr["status"]
+            if outcome_ok:
+                meta["gist"] = tldr["outcome"]
+            risk_flags = tldr.get("risk_flags")
+            if risk_flags and not report_verify.is_none_value(risk_flags):
+                meta["risk"] = risk_flags
     page = diff_render.generate_page(diff_text, meta)
 
     out_path = packets_dir(args.session_id) / f"{n:03d}-diff.html"

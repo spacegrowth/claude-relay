@@ -162,6 +162,103 @@ class TestDiffPageEscaping:
         assert "No changes." in html and "0 files changed" in html
 
 
+# ── the header gist line: report outcome + status (+ risk), never the full report ──────────────
+class TestGistHeader:
+    """relay-diffgist packet: 'directly under the h1 and above the stats' — the report's own
+    outcome sentence plus `Status: ...` and, only when non-empty/non-'none', a red risk chip.
+    Nothing else from the report. `_render_header` is shared by both render paths (module
+    docstring), so it's exercised directly here rather than duplicated per-path."""
+
+    def test_gist_and_status_render_between_h1_and_stats(self):
+        html_out = dr._render_header(
+            {"session_id": "e1", "packet": 1, "gist": "Fixed the login bug.", "status": "clean"},
+            1, 2, 0)
+        h1_pos = html_out.index("<h1>")
+        gist_pos = html_out.index("gist-line")
+        stats_pos = html_out.index('class="stats"')
+        assert h1_pos < gist_pos < stats_pos
+        assert "Fixed the login bug." in html_out
+        assert "Status: clean" in html_out
+
+    def test_clean_with_caveats_status_shows_the_risk_chip(self):
+        html_out = dr._render_header(
+            {"session_id": "e1", "packet": 1, "gist": "Landed the thing.",
+             "status": "clean-with-caveats", "risk": "touches the ledger"}, 1, 1, 0)
+        assert "Status: clean-with-caveats" in html_out
+        assert "gist-risk" in html_out
+
+    def test_risk_chip_carries_the_real_risk_text_not_a_static_label(self):
+        """packet relay-diffgist #002 item 1: 'the answer is the actual text, truncated' — a chip
+        that only said the static word 'risk' made the reader open the report anyway."""
+        html_out = dr._render_header(
+            {"session_id": "e1", "packet": 1, "gist": "Landed the thing.",
+             "status": "clean-with-caveats", "risk": "touches the ledger"}, 1, 1, 0)
+        assert '<span class="gist-risk">touches the ledger</span>' in html_out
+
+    def test_risk_chip_text_is_escaped(self):
+        html_out = dr._render_header(
+            {"session_id": "e1", "packet": 1, "gist": "Landed the thing.",
+             "status": "clean-with-caveats", "risk": "<b>ledger</b> risk"}, 1, 1, 0)
+        assert "<b>ledger</b>" not in html_out
+        assert "&lt;b&gt;ledger&lt;/b&gt;" in html_out
+
+    def test_risk_chip_text_is_truncated_on_its_own_shorter_budget(self):
+        """The risk text rides the same line as the (up to 200-char) gist and Status, so it gets
+        its own smaller cap (_RISK_MAX_LEN) — same truncation mechanism (`_truncate`), a shorter
+        budget, per the packet's 'truncate to a shorter budget of its own' instruction."""
+        risk = "y" * 200
+        html_out = dr._render_header(
+            {"session_id": "e1", "packet": 1, "gist": "Landed the thing.",
+             "status": "clean-with-caveats", "risk": risk}, 1, 1, 0)
+        assert risk not in html_out
+        assert "y" * (dr._RISK_MAX_LEN - 1) + "…" in html_out
+        assert "y" * dr._RISK_MAX_LEN not in html_out
+
+    def test_no_risk_key_means_no_chip(self):
+        html_out = dr._render_header(
+            {"session_id": "e1", "packet": 1, "gist": "All clean.", "status": "clean"}, 1, 0, 0)
+        assert "gist-risk" not in html_out
+
+    def test_missing_report_omits_the_gist_line_without_raising(self):
+        """No `gist`/`status` in meta (the bin/relay side of a missing/unparsable report) →
+        no gist line at all — never a half-rendered one, never a raise."""
+        html_out = dr._render_header({"session_id": "e1", "packet": 1}, 1, 0, 0)
+        assert '<div class="gist-line">' not in html_out
+        page = dr.render_stdlib_html("", {"session_id": "e1", "packet": 1})
+        assert '<div class="gist-line">' not in page
+
+    def test_gist_without_status_is_also_omitted(self):
+        """Half a pair is still unparsable — omit, don't guess a status."""
+        html_out = dr._render_header({"session_id": "e1", "packet": 1, "gist": "Did a thing."},
+                                     1, 0, 0)
+        assert '<div class="gist-line">' not in html_out
+
+    def test_status_without_gist_still_renders_status_and_risk(self):
+        """packet relay-diffgist #002 item 2: bin/relay drops `gist` alone (a heading/mislabeled
+        outcome) while `status` parsed fine — the line must still show Status/risk, just without
+        an outcome sentence in front of it."""
+        html_out = dr._render_header(
+            {"session_id": "e1", "packet": 1, "status": "clean-with-caveats",
+             "risk": "touches the ledger"}, 1, 0, 0)
+        assert '<div class="gist-line">' in html_out
+        assert "Status: clean-with-caveats" in html_out
+        assert '<span class="gist-risk">touches the ledger</span>' in html_out
+
+    def test_a_long_sentence_is_truncated_with_an_ellipsis(self):
+        sentence = "x" * 300
+        html_out = dr._render_header(
+            {"session_id": "e1", "packet": 1, "gist": sentence, "status": "clean"}, 1, 0, 0)
+        assert ("x" * 300) not in html_out
+        assert "x" * 199 + "…" in html_out
+
+    def test_html_in_the_gist_sentence_is_escaped(self):
+        html_out = dr._render_header(
+            {"session_id": "e1", "packet": 1, "gist": "<script>alert(1)</script> done.",
+             "status": "clean"}, 1, 0, 0)
+        assert "<script>alert(1)</script>" not in html_out
+        assert "&lt;script&gt;" in html_out
+
+
 # ── the vendor integrity gate (VENDOR.md ↔ assets/vendor) ──────────────────────────────────────
 class TestVendorIntegrity:
     def _vendor(self, tmp_path, js=b"JS", css=b"CSS", js_hash=None, css_hash=None):

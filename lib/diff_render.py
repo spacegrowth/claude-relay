@@ -188,6 +188,12 @@ body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 header.diffmeta { margin-bottom: 20px; }
 header.diffmeta h1 { font-size: 18px; margin: 0 0 6px; }
+header.diffmeta .gist-line { font-size: 13px; opacity: 0.85; margin: 0 0 8px;
+  overflow-wrap: anywhere; }
+header.diffmeta .gist-status { font-weight: 600; opacity: 0.8; margin-left: 6px; }
+header.diffmeta .gist-risk { display: inline-block; margin-left: 6px; padding: 1px 7px;
+  border-radius: 9px; background: #cf222e; color: #fff; font-size: 13px; font-weight: 700;
+  vertical-align: middle; }
 header.diffmeta .stats { font-size: 13px; opacity: 0.75; }
 header.diffmeta .scope-note { display: inline-block; margin-top: 8px; padding: 4px 10px;
   border-radius: 4px; background: #fff3cd; color: #664d03; font-size: 12.5px; }
@@ -196,14 +202,46 @@ header.diffmeta .scope-note { display: inline-block; margin-top: 8px; padding: 4
 }
 """
 
+# The gist line is a GIST, never the report: both the outcome sentence and the risk text are
+# capped hard so neither can turn the header into a second body. Truncation happens here (render
+# time), not at the bin/relay call site, so both render paths (diff2html + stdlib) and every caller
+# get it for free. The risk budget is much smaller than the gist's: it rides on the SAME line as
+# the (already up to 200-char) outcome sentence and Status, so giving it the full 200 too would
+# regularly blow the line past "one line, wraps" — 80 chars keeps a chip-worth of the real risk
+# text (packet relay-diffgist #002: "the actual text, truncated") without dominating the line.
+_GIST_MAX_LEN = 200
+_RISK_MAX_LEN = 80
+
+
+def _truncate(text, max_len):
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 1].rstrip() + "…"
+
 
 def _render_header(meta, files_count, additions, deletions):
     scope_html = (f'<div class="scope-note">{html.escape(meta.get("scope_note", ""))}</div>'
                   if meta.get("scope_note") else "")
+    gist_html = ""
+    status = meta.get("status")
+    # The line is anchored on Status, not on the pair (gist, status): bin/relay drops `gist` alone
+    # (never sets it) when parse_tldr flags the outcome line itself as a contract violation — e.g.
+    # a report heading like "# Bug hunt report" — while `status` parsed just fine. That must still
+    # show Status/risk, just without the bad outcome text standing in as the gist (packet
+    # relay-diffgist #002 item 2). No `status` at all still means "missing/unparsable" → no line.
+    if status:
+        gist = meta.get("gist")
+        gist_part = f'{html.escape(_truncate(gist, _GIST_MAX_LEN))} ' if gist else ""
+        status_html = f'<span class="gist-status">Status: {html.escape(status)}</span>'
+        risk = meta.get("risk")
+        risk_html = (f' <span class="gist-risk">{html.escape(_truncate(risk, _RISK_MAX_LEN))}</span>'
+                     if risk else "")
+        gist_html = f'<div class="gist-line">{gist_part}{status_html}{risk_html}</div>'
     return (
         '<header class="diffmeta">'
         f'<h1>{html.escape(meta.get("session_id", ""))} '
         f'&middot; packet {html.escape(str(meta.get("packet", "")))}</h1>'
+        f'{gist_html}'
         f'<div class="stats">{files_count} file{"s" if files_count != 1 else ""} changed &middot; '
         f'<span style="color:#2da44e">+{additions}</span> '
         f'<span style="color:#cf222e">-{deletions}</span></div>'
