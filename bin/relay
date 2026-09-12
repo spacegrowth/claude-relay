@@ -4424,11 +4424,18 @@ def cmd_list(args):
     show_all = getattr(args, "all", False) or not lead_sid
 
     rows = []
+    broken_sids = []
     for sid in all_session_ids():
         # Refresh REAL liveness (same mechanism as `relay check`) — list is the decision-informing
         # and crash-recovery surface, so a dead/stalled executor must not keep showing stored `busy`.
         s = _check_one(sid)
         if "error" in s:
+            # `all_session_ids()` only yields dirs where session.json EXISTS, so an "error" here
+            # (read_session's only failure shape) always means "present but unreadable" — never
+            # "no such session". That's the executor-side sibling of D2 (lead_guard.list_leads'
+            # broken-marker case): a bad file must not just vanish from the one surface that exists
+            # to show state, so it's surfaced as a distinct broken row below instead of skipped.
+            broken_sids.append(sid)
             continue
         n = s["current_packet"]
         report = packets_dir(sid) / f"{n:03d}-report.md"
@@ -4480,7 +4487,11 @@ def cmd_list(args):
         for r in rows:
             r["usage"] = _usage_for_session(r)
             r["launch"] = lead_guard.launch_cell(r)
-        print(json.dumps({"leads": leads, "executors": rows}, indent=2))
+        # Broken executors get the same {"session_id", "broken": true} shape list_leads uses for a
+        # broken lead marker — so a scripted consumer (the board included) sees the same truth the
+        # human table does, instead of the row just disappearing from --json too.
+        broken_rows = [{"session_id": sid, "broken": True} for sid in broken_sids]
+        print(json.dumps({"leads": leads, "executors": rows + broken_rows}, indent=2))
         return
 
     # Separate live and terminal rows for filtering
@@ -4743,7 +4754,7 @@ def cmd_list(args):
 
     print(c("EXECUTORS", "bold"))
     _print_auto_closed(acted)
-    if not rows:
+    if not rows and not broken_sids:
         print("(no executor sessions)")
         return
     # Build rendered status strings once to use both in width calc and row rendering.
@@ -4786,7 +4797,9 @@ def cmd_list(args):
 
     # Calculate dynamic widths for EXECUTORS table with per-column caps.
     exec_cols = [
-        ("SESSION", 36, [s["session_id"] for s in rows]),
+        # broken_sids folded into the width sample (not the row list) so a long broken dir name
+        # doesn't throw off SESSION column alignment once its row is printed below.
+        ("SESSION", 36, [s["session_id"] for s in rows] + broken_sids),
         # cap fits the longest status verbatim — a truncated "launch-fai" (or "paused (limit,
         # resets…") defeats the point of showing the reset time at all.
         ("STATUS", max(len(LAUNCH_FAILED), len("paused (limit, resets 4:20pm)")), rendered_statuses),
@@ -4808,6 +4821,17 @@ def cmd_list(args):
     # Header row with dynamic widths
     header_parts = [cell(name, exec_widths[name]) for name, _, _ in exec_cols]
     print(" ".join(header_parts))
+    # Broken rows FIRST — a session.json that exists but can't be read carries no topic/scope/
+    # model/anything else to show, so every column but SESSION and STATUS is an honest "-" (never
+    # guessed, never crashed on a KeyError from the fields below that a real row always has). Sorted
+    # to the top of the table, ahead of every real row, since there is no usable status to sort it
+    # by otherwise and it's the row most needing a human's attention.
+    for bsid in broken_sids:
+        row_parts = [
+            cell(bsid, exec_widths["SESSION"]),
+            c(cell("broken", exec_widths["STATUS"]), "red", "bold"),
+        ] + [cell("-", exec_widths[name]) for name, _, _ in exec_cols[2:]]
+        print(" ".join(row_parts))
     # Data rows
     for i, s in enumerate(rows):
         base = s["status"]
@@ -4843,6 +4867,17 @@ def cmd_list(args):
         max_prompt = (usage_by_sid[sid] or {}).get("max_prompt") or 0
         print(c(f"  ⚠ {sid}: ran a {lead_guard.human_tokens(max_prompt)} request while stamped 200k "
                 f"— the context stamp is wrong; check `relay doctor`", "red"))
+    # Executor-side sibling of the LEADS D2 broken-marker footnote — same "say it in words, not
+    # just a cell" rule the LIVE=ghost footnote above (lead_guard reference) already follows.
+    # Aggregated into one line (not one per sid) since a broken row has nothing else — no project,
+    # no topic — to tell two apart by; `relay close`/`relay prune` don't touch it (they read the
+    # same session.json and skip it exactly like this table used to), so the honest fix is manual.
+    if broken_sids:
+        names = ", ".join(broken_sids)
+        print(c(f"  ⚠ broken: {names} — session.json exists but can't be read (JSON error, empty "
+                f"file, or not a dict). Inspect ~/.relay-tasks/<sid>/session.json directly; `relay "
+                f"close`/`relay prune` skip it like every other command does, so remove the "
+                f"directory yourself once you're sure the tab/process is gone.", "red"))
 
     # heavy footnote (§6e e1's "warning-stamp" shape, ver?/stale-hooks style — say it in words, not
     # just a skimmable column) — NUDGE wording per §9: state the fact and the alternative, never

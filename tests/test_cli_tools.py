@@ -995,6 +995,64 @@ class TestCorruptSessionJson:
         corrupt_session(relay, "half-written", text="")
         assert relay.read_session("half-written") is None
 
+    def test_list_shows_a_broken_row_for_an_unreadable_session(self, relay, terms, capsys):
+        """The executor-side sibling of D2 (lead_guard.list_leads' broken-marker case, backlog row
+        53): a session.json `all_session_ids()` finds but `read_session()` can't parse used to just
+        `continue` out of cmd_list's row loop — invisible, not merely unreadable. It must now show
+        up as its own `broken` row, named by the dir, alongside every readable session."""
+        make_session(relay, "good")
+        corrupt_session(relay, "broken-1")
+        run_main(relay, "list", "--all")
+        execs = capsys.readouterr().out.split("EXECUTORS")[1]
+        assert "good" in execs
+        assert "broken-1" in execs
+        assert "broken" in execs
+        # the footnote: named by sid, under the table, in the same "say it in words" style as the
+        # LEADS-side ⚠ footnotes.
+        assert "⚠ broken: broken-1" in execs
+
+    def test_list_shows_the_broken_row_even_when_no_readable_session_exists(self, relay, terms,
+                                                                             capsys):
+        """`cmd_list` used to short-circuit to "(no executor sessions)" whenever the readable-rows
+        list was empty — which would have hidden a broken row too, the exact case a lone corrupt
+        session.json produces."""
+        corrupt_session(relay, "only-broken")
+        run_main(relay, "list", "--all")
+        execs = capsys.readouterr().out.split("EXECUTORS")[1]
+        assert "only-broken" in execs
+        assert "(no executor sessions)" not in execs
+
+    def test_list_json_carries_the_broken_row(self, relay, terms, capsys):
+        """`relay list --json`'s executors must carry the same {"session_id", "broken": true} shape
+        `list_leads` already gives a broken lead marker, so a scripted consumer (the board included)
+        sees the same truth the human table does."""
+        make_session(relay, "good")
+        corrupt_session(relay, "broken-1")
+        run_main(relay, "list", "--json")
+        data = json.loads(capsys.readouterr().out)
+        broken = [e for e in data["executors"] if e.get("session_id") == "broken-1"]
+        assert broken == [{"session_id": "broken-1", "broken": True}]
+        good = next(e for e in data["executors"] if e.get("session_id") == "good")
+        assert "broken" not in good
+
+    def test_an_empty_session_json_shows_as_broken_too(self, relay, terms, capsys):
+        """The half-written case (O_TRUNC window of a non-atomic write) is the same hazard as a
+        hand-edited file — it must render identically as a broken row, not disappear."""
+        corrupt_session(relay, "half-written", text="")
+        run_main(relay, "list", "--all")
+        execs = capsys.readouterr().out.split("EXECUTORS")[1]
+        assert "half-written" in execs
+        assert "⚠ broken: half-written" in execs
+
+    def test_a_session_dir_with_no_session_json_stays_unlisted(self, relay, terms, capsys):
+        """A dir with no session.json at all (e.g. only a packets/ subdir) is invisible to
+        `all_session_ids()` itself — never reaches cmd_list's loop, so it must NOT start showing up
+        as broken now; only a PRESENT-but-unreadable file does."""
+        relay.packets_dir("no-file").mkdir(parents=True, exist_ok=True)
+        assert "no-file" not in relay.all_session_ids()
+        run_main(relay, "list", "--all")
+        assert "no-file" not in capsys.readouterr().out
+
     def test_a_corrupt_queue_file_really_does_read_as_empty(self, relay, terms):
         """The contract read_queue DOES honour — quoted above — for contrast with session.json."""
         make_session(relay, "e1")
