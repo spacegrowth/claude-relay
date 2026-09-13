@@ -289,9 +289,32 @@ lead-appropriate work (a ~2-minute grace window). Small review-class fixes pass 
 files are exempt — writing packets is the lead's job. Every block and retain is logged to
 `~/.relay-tasks/sessions.jsonl`.
 
-Honest limits: it does **not** gate `Bash` (`git commit`, `sed -i`, heredocs pass ungated — that
-discipline stays on the lead), and it only acts in `/relay:mode` sessions — every other session on
-the machine is untouched (the hook fast-exits, fail-open).
+Honest limits: it only acts in `/relay:mode` sessions — every other session on the machine is
+untouched (the hook fast-exits, fail-open) — and the Bash vector below only sees the write shapes
+it can parse.
+
+### The Bash vector
+
+A lead can write a file without Edit/Write — `cat > bin/relay <<EOF`, `sed -i`, `tee`, `cp`/`mv`,
+`python3 - <<EOF` that `open()`s a path for writing. The Bash hook parses those shapes
+(`lib/bash_writes.py`) and applies **the same rule** as the Edit gate: a new file is gated
+(`block_on_new_file`); a write whose size is known — the line count of the heredoc feeding it — at
+or over `edit_line_threshold` is gated; a write of unknown size (`sed -i`, `echo x > f`, `cp`) into
+an existing file is allowed. `/relay:route retain` opens the same grace window for it.
+
+`bash_write_gate` picks what happens on a hit:
+
+| Mode | Effect |
+|---|---|
+| `log` (default) | Allow, and ledger `would_have_blocked` with `vector: "bash"`, the target and its size |
+| `deny` | Block with the Edit gate's deny shape, naming the target and the `/relay:route retain` escape; ledger `blocked` |
+| `off` | Skip the check |
+
+Only targets **inside the session's cwd** that git **tracks** (or new files under a tracked
+directory) count. Exempt: packet files (`*-packet.md`), anything under `~/.relay-tasks`, any path
+with a `_staging/` component, untracked scratch files, and everything outside a git repo. A
+command shape the parser doesn't recognise — variables or globs in the path, `bash -c`, `dd`,
+`perl -i` — **always allows**. Git's own writes (`git merge`, `git checkout`) are not modelled.
 
 ## Verifying a report (and why it can't tell you the report is true)
 
@@ -723,6 +746,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 |---------|---------|------|
 | `edit_line_threshold` | 40 | Block routing a single edit to executors if it adds this many lines or more |
 | `block_on_new_file` | true | Block routing to executors when creating a new file |
+| `bash_write_gate` | "log" | "deny" \| "log" \| "off" — what the lead's Bash hook does with a file-writing command that trips the Edit gate's rule (see [The Bash vector](#the-bash-vector)) |
 | `grace_seconds` | 120 | Grace period (seconds) when lead uses `/relay:route retain` to bypass the gate |
 | `auto_wake` | true | Wake idle lead when an executor reports |
 | `surface_commits` | false | Wake idle lead to surface commits it made this turn (off by default; opt in if desired) |

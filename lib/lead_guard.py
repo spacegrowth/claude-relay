@@ -192,6 +192,12 @@ LEAD_DEFAULTS = {
                                   # block). Default True because logging has no user-visible effect —
                                   # same "safe to default on" reasoning as auto_wake. Flip off to
                                   # silence the ledger without a release.
+    "bash_write_gate": "log",    # backlog row 59: the lead's Bash WRITE vector (redirects, tee, sed -i,
+                                  # cp/mv, python open(..., "w")) against tracked files in the cwd,
+                                  # sized by the Edit gate's own edit_line_threshold/block_on_new_file
+                                  # rule. "deny" blocks like the Edit gate, "log" ledgers
+                                  # `would_have_blocked` (vector "bash") and allows, "off" skips it.
+                                  # Parsing lives in lib/bash_writes.py; unknown shapes always allow.
     "usage_limit_pattern": (      # bin/relay's `relay list`/`check` pause detection (lead-found gap
                                   # (d), packet 0a153c7): a regex, matched case-insensitively against
                                   # the START of an executor's last assistant text, that marks it
