@@ -198,6 +198,50 @@ class TestClaimedPaths:
         assert "src/app.py" in paths
 
 
+# ── row 82: a sentence's trailing punctuation is not part of the filename ──────────────────────
+class TestClaimTrailingPunctuation:
+    """`_CLAIM_RE`'s path branch allows `.` inside a segment (it has to, for a real extension), so
+    a sentence ending "...tests/test_x.py." used to harvest the trailing full stop as part of the
+    match — a claim that was never staged even when the real file was, tripping a false MISMATCH
+    (backlog row 82, observed on prune-paused-225903 packet 001, 2026-09-12)."""
+
+    def test_trailing_period_is_stripped_before_the_staged_check(self):
+        text = ("Did the thing; staged, not committed.\n\nStatus: clean\nRisk flags: none\n"
+                "UNVERIFIED: none\nChanged: prune-paused fix\n\n"
+                "## What changed\n- Changed tests/test_cli_close_retire_prune.py.\n")
+        result = rv.verify(text, reality(staged=["tests/test_cli_close_retire_prune.py"]))
+        assert result["verdict"] == rv.COUNTS_MATCH
+        assert result["claimed_missing"] == []
+
+    @pytest.mark.parametrize("trailer", [",", ";"])
+    def test_trailing_comma_or_semicolon_is_stripped_too(self, trailer):
+        text = ("Did the thing; staged, not committed.\n\nStatus: clean\nRisk flags: none\n"
+                "UNVERIFIED: none\nChanged: prune-paused fix\n\n"
+                f"## What changed\n- Changed tests/test_cli_close_retire_prune.py{trailer} done.\n")
+        result = rv.verify(text, reality(staged=["tests/test_cli_close_retire_prune.py"]))
+        assert result["verdict"] == rv.COUNTS_MATCH
+        assert result["claimed_missing"] == []
+
+    def test_a_line_ref_still_scrapes_as_the_bare_path(self):
+        """A trailing `:digit` line ref must not be confused with, or eaten by, the trailing-`:`
+        strip — it is matched by `_CLAIM_RE`'s own separate suffix group, outside the path capture,
+        so `lib/report_verify.py:833` still scrapes as `lib/report_verify.py`."""
+        paths, _ = rv.claimed_paths("## What changed\n- lib/report_verify.py:833 — the fix.\n")
+        assert paths == ["lib/report_verify.py"]
+
+    def test_a_genuinely_unstaged_path_still_mismatches_on_the_stripped_name(self):
+        """The accusation must name the real path (`foo/bar.py`), never the punctuated fragment
+        (`foo/bar.py.`) — a mismatch that named the wrong string would be its own false claim."""
+        text = ("Did the thing; staged, not committed.\n\nStatus: clean\nRisk flags: none\n"
+                "UNVERIFIED: none\nChanged: prune-paused fix\n\n"
+                "## What changed\n- Changed foo/bar.py.\n")
+        result = rv.verify(text, reality(staged=["tests/test_cli_close_retire_prune.py"]))
+        assert result["verdict"] == rv.MISMATCH
+        assert result["claimed_missing"] == ["foo/bar.py"]
+        assert "foo/bar.py." not in rendered(result)
+        assert "foo/bar.py" in rendered(result)
+
+
 class TestClaimFalsePositives:
     """The strictness that keeps this tool from manufacturing accusations. diff_render's mention
     regex is permissive on purpose (it intersects with staged files afterwards); here a false
@@ -916,6 +960,17 @@ class TestSignoffGating:
 
     def test_ordinary_paths_unaffected_by_configured_paths(self):
         assert rv.signoff_hits(["src/app.py"], configured_paths=["billing/"]) == []
+
+    def test_none_configured_paths_behaves_as_empty_and_does_not_raise(self):
+        """Unreachable via bin/relay today (it validates the config) — but the pure function must
+        still defend itself: `None` used to raise a TypeError in the list-comprehension."""
+        assert rv.signoff_hits(["hooks/x.py"]) == rv.signoff_hits(["hooks/x.py"], configured_paths=None)
+        assert rv.signoff_hits(["src/app.py"], configured_paths=None) == []
+
+    def test_blank_configured_entries_gate_nothing_extra(self):
+        """A blank/`None` entry must gate NOTHING — `"" in path` is True for every staged path, so
+        an empty-string entry used to match everything instead of nothing."""
+        assert rv.signoff_hits(["README.md"], configured_paths=["", None, "  "]) == []
 
     def test_clearance_accepts_and_uses_signoff_paths(self):
         # Same reasoning as test_signoff_gated_paths_stop_clearance: both the TL;DR `Changed:`

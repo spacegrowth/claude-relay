@@ -463,6 +463,24 @@ def _claim_reject_reason(p):
     return None
 
 
+# Row 82 (docs/post-0.3.27-backlog.md): `_CLAIM_RE`'s path branch allows `.` inside a segment (it
+# has to, for a real extension), so a sentence ending "...tests/test_x.py." harvests the trailing
+# full stop as part of the match — `tests/test_x.py.` is never staged even when `tests/test_x.py`
+# is, so this used to accuse a report of a MISMATCH on work it actually did. `:` `,` `;` are struck
+# too even though the regex's own character classes already exclude them from group(1) (a
+# `:digit` line ref is matched by the SEPARATE `(?::\d+(?:-\d+)?)?` suffix outside group 1, so it
+# was never part of `p` to begin with, and `,`/`;` are already excluded mid-path) — kept for
+# symmetry with the packet's required punctuation set and as a defensive no-op if that ever
+# changes. Repeats so a doubled/mixed trailer (`foo.py.,`) reduces fully.
+_TRAILING_PUNCT_RE = re.compile(r"[.,;:]+$")
+
+
+def _strip_trailing_punctuation(p):
+    """`p` with any trailing run of `.` `,` `;` `:` removed — sentence punctuation that rode along
+    with a `_CLAIM_RE` match is not part of the path (row 82)."""
+    return _TRAILING_PUNCT_RE.sub("", p)
+
+
 def _scrape_claims(body):
     """Every `_CLAIM_RE` match in `body`, as (path, kept, reason) in first-seen-in-text order —
     `_scrape_claims_positions` without the match offsets, for callers that only need the verdict."""
@@ -479,6 +497,7 @@ def _scrape_claims_positions(body):
     for m in _CLAIM_RE.finditer(body):
         p = m.group(1)
         start = m.start(1)
+        p = _strip_trailing_punctuation(p)
         reject_reason = _claim_reject_reason(p)
         if reject_reason:
             out.append((p, start, False, reject_reason))
@@ -839,8 +858,16 @@ def signoff_hits(staged, staged_diff="", configured_paths=()):
     never replacing them, so the built-ins can never be configured away. A hit against a
     configured marker names its source as `CONFIGURED_SIGNOFF_WHY` rather than the built-in's own
     text, so the NOT-CLEARED detail line always says WHERE a marker came from. Pure: the caller
-    (bin/relay) loads and validates the config; this never reads a file."""
-    markers = list(SIGNOFF_PATH_MARKERS) + [(m, CONFIGURED_SIGNOFF_WHY) for m in configured_paths]
+    (bin/relay) loads and validates the config; this never reads a file.
+
+    `configured_paths=None` behaves as `()` (defends this pure function even though `bin/relay`
+    already validates the config before calling it). A `None` or whitespace-only entry in the list
+    is skipped rather than raising (`None`) or matching every staged path (`""` / `"  "`, since
+    `"" in path` is True for any `path`) — a blank/missing config entry must gate NOTHING, never
+    everything."""
+    markers = list(SIGNOFF_PATH_MARKERS) + [
+        (m, CONFIGURED_SIGNOFF_WHY) for m in (configured_paths or ()) if m and m.strip()
+    ]
     hits = []
     for path in staged:
         for marker, why in markers:
