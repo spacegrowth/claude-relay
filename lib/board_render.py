@@ -274,6 +274,30 @@ def _rail_item(ex):
             f'{flag}<span class="sub num">{_e(sub)}</span></div>')
 
 
+_BROKEN_NOTE = "session.json unreadable — see `relay list`"
+
+
+def _rail_item_broken(ex):
+    """A present-but-unreadable session.json (backlog row 78) — board_data hands these over with
+    almost nothing but a session_id, so this stays deliberately thin: no status/topic/model to
+    read, just the sid, the `broken` label, and the SAME red/bad treatment `.lv-bad` already gives
+    a lead with bad liveness — never the silent drop the board used to do."""
+    sid = ex.get("session_id") or "?"
+    return (f'<div class="item" data-target="ex-{_e(sid)}" data-hay="{_e(sid)} broken">'
+            f'<span class="sdot dead"></span>'
+            f'<span class="nm lv-bad" title="{_e(sid)}">{_e(sid)}</span>'
+            f'<span class="sub">broken</span></div>')
+
+
+def _broken_panel(ex, show=False):
+    sid = ex.get("session_id") or "?"
+    return (f'<section class="panel{" show" if show else ""}" id="ex-{_e(sid)}">'
+            f'<span class="crumb" data-target="home">← overview</span>'
+            f'<div class="exhead"><h1>{_e(sid)}</h1><span class="pill dead">broken</span></div>'
+            f'<div class="banner bad"><span class="ic">⛔</span><span>{_e(_BROKEN_NOTE)}</span></div>'
+            "</section>")
+
+
 def _chips(ex):
     out = []
     if ex.get("model"):
@@ -431,7 +455,13 @@ def _updated_badge(data, refresh_seconds):
 def render(data, live=False, refresh_seconds=10):
     relay_bin = data.get("relay_bin") or "relay"
     leads = data.get("leads") or []
-    execs = data.get("executors") or []
+    all_execs = data.get("executors") or []
+    # Broken entries (backlog row 78: session.json present but unparseable — board_data hands them
+    # over as {"session_id", "broken": true}, same shape `list --json` uses) carry almost no other
+    # field, so they're split out BEFORE any of the computations below that assume a real row's
+    # shape (status/owner_lead/tokens/…) — rendered separately, further down, instead.
+    broken_execs = [e for e in all_execs if e.get("broken")]
+    execs = [e for e in all_execs if not e.get("broken")]
     by_lead = {}
     for ex in execs:
         by_lead.setdefault(ex.get("owner_lead"), []).append(ex)
@@ -485,6 +515,10 @@ def render(data, live=False, refresh_seconds=10):
         rail.append('<details class="grp" open><summary><span class="cdot" style="background:var(--bad)"></span>'
                     f'<span class="gl">Unowned / orphaned</span><span class="count num">{len(other)}</span></summary>'
                     + "".join(_rail_item(e) for e in other) + "</details>")
+    if broken_execs:
+        rail.append('<details class="grp" open><summary><span class="cdot" style="background:var(--bad)"></span>'
+                    f'<span class="gl lv-bad">Broken</span><span class="count num">{len(broken_execs)}</span></summary>'
+                    + "".join(_rail_item_broken(e) for e in broken_execs) + "</details>")
     if closed:
         rail.append('<details class="grp"><summary><span class="cdot" style="background:var(--dim)"></span>'
                     f'<span class="gl">Closed</span><span class="count num">{len(closed)}</span></summary>'
@@ -514,12 +548,13 @@ def render(data, live=False, refresh_seconds=10):
                         f'<span class="oc">{_e(oc or e.get("topic"))}</span>'
                         f'<span class="chip">{_e(e.get("tokens") or "")}</span></div>')
         home.append("</div>")
-    if not execs:
+    if not all_execs:
         home.append('<div class="empty">no executor sessions yet — <span class="mono">relay spawn …</span></div>')
     home.append("</section>")
 
-    panels = "".join(_exec_panel(e, relay_bin, lead_names.get(e.get("owner_lead"), "unowned"),
-                                 show=(f'ex-{e["session_id"]}' == default_id)) for e in execs)
+    panels = ("".join(_exec_panel(e, relay_bin, lead_names.get(e.get("owner_lead"), "unowned"),
+                                  show=(f'ex-{e["session_id"]}' == default_id)) for e in execs)
+              + "".join(_broken_panel(e) for e in broken_execs))
 
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             + meta_refresh +

@@ -3506,9 +3506,17 @@ def board_data(include_all=True, lead_sid=None, sweep=True):
                       "ctx": lead_guard.human_tokens(usage.get("last_prompt")) if usage else "-",
                       "heavy": heavy, "heavy_reading": heavy_reading})
     rows = []
+    broken_sids = []
     for sid in all_session_ids():
         s = _check_one(sid)
         if "error" in s:
+            # Same D2 case cmd_list's `broken_sids` handles: `all_session_ids()` only yields dirs
+            # where session.json EXISTS, so an "error" here always means "present but unreadable".
+            # Surfaced as its own broken entry (below, once past every per-row computation that
+            # assumes real fields) instead of silently vanishing from the one surface that exists
+            # to show state (backlog row 78) — kept OUT of `rows` so it never trips the sweep or
+            # the owner_lead filter, both of which key off that list.
+            broken_sids.append(sid)
             continue
         n = s.get("current_packet")
         rows.append({**s, "reported": (packets_dir(sid) / f"{n:03d}-report.md").exists()})
@@ -3584,6 +3592,14 @@ def board_data(include_all=True, lead_sid=None, sweep=True):
         warnings.append({"level": "bad", "text": f"wake STALE/stuck on: {', '.join(stale)} — see README Troubleshooting"})
     for sid, action, reason in acted:
         warnings.append({"level": "info", "text": f"🛏 auto-{'retired' if action == 'retire' else 'closed'} '{sid}' ({reason}) just now"})
+    if broken_sids:
+        # Executor-side sibling of `relay list`'s own broken-marker footnote — added to `execs`
+        # only now, AFTER every computation above that key-accesses fields (orphan, heavy, …) a
+        # real row always has but a broken entry never does. Same `{"session_id", "broken": true}`
+        # shape `list --json` uses, so a scripted consumer of board.json sees the same truth.
+        warnings.append({"level": "bad", "text": f"⚠ {len(broken_sids)} executor(s) broken: "
+                         f"{', '.join(broken_sids)} — session.json exists but can't be read; see `relay list`"})
+        execs.extend({"session_id": sid, "broken": True} for sid in broken_sids)
     ledger_tail = []
     try:
         lines = LEDGER.read_text().splitlines()[-40:]

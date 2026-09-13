@@ -354,6 +354,57 @@ class TestEndedButAliveOnBoard:
         assert board_render.render(data).count('class="gl lv-bad"') >= 1
 
 
+class TestBrokenExecutorOnBoard:
+    """Backlog row 78: `relay list` already surfaces a present-but-unreadable executor
+    session.json as a red `broken` row instead of silently dropping it (D2's executor-side
+    sibling); the board used to do `if "error" in s: continue` and just lose the session. Now
+    board_data hands it over as the SAME `{"session_id", "broken": true}` shape `list --json`
+    uses, and board_render draws it with the same red treatment bad lead liveness already gets."""
+
+    def test_board_data_includes_broken_session_and_normal_row_is_unaffected(self, relay, tmp_path):
+        _write_lead(relay, tmp_path, sid="lead-1")
+        _write_exec(relay, tmp_path, sid="e1", owner="lead-1", status="reported")
+        relay.session_dir("broke1").mkdir(parents=True, exist_ok=True)
+        (relay.session_dir("broke1") / "session.json").write_text("{not json")
+        with mock.patch.object(relay, "_lead_liveness", return_value="live"), \
+             mock.patch.object(relay, "session_pid_alive", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            data = relay.board_data(sweep=False)  # must not raise on the unreadable session.json
+        execs = {e["session_id"]: e for e in data["executors"]}
+        assert execs["e1"]["status"] == "reported" and execs["e1"]["reported"] is True  # regression: normal row unaffected
+        assert execs["broke1"] == {"session_id": "broke1", "broken": True}
+        assert any("broke1" in w["text"] and w["level"] == "bad" for w in data["warnings"])
+
+    def test_broken_session_excluded_from_sweep_and_survives_owner_lead_filter(self, relay, tmp_path, monkeypatch):
+        _write_lead(relay, tmp_path, sid="lead-1")
+        _write_exec(relay, tmp_path, sid="e1", owner="lead-1", status="busy")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-1")
+        relay.session_dir("broke1").mkdir(parents=True, exist_ok=True)
+        (relay.session_dir("broke1") / "session.json").write_text("nope, not json")
+        with mock.patch.object(relay, "_lead_liveness", return_value="live"), \
+             mock.patch.object(relay, "session_pid_alive", return_value=True), \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay, "auto_close_sweep", return_value=[]) as sweep_mock:
+            data = relay.board_data(lead_sid="some-other-lead")  # scoped to a lead that owns neither row
+        sids = [e.get("session_id") for e in data["executors"]]
+        assert "e1" not in sids                                  # a real row owned by a DIFFERENT lead IS filtered
+        assert "broke1" in sids                                  # but "no owner known" must never be filtered out
+        _, kwargs = sweep_mock.call_args
+        assert kwargs["sids"] == ["e1"] and "broke1" not in kwargs["sids"]  # broken never handed to the auto-close sweep
+
+    def test_render_shows_broken_label_session_id_and_bad_class(self):
+        html = board_render.render({"leads": [], "executors": [{"session_id": "broke1", "broken": True}]})
+        assert "broke1" in html and ">broken<" in html
+        assert 'class="gl lv-bad"' in html and 'class="nm lv-bad"' in html   # same red treatment as bad lead liveness
+        assert "session.json unreadable" in html
+
+    def test_render_broken_row_does_not_crash_normal_rows_still_render(self):
+        ex = {"session_id": "e1", "owner_lead": "L", "status": "busy", "topic": "t"}
+        html = board_render.render({"leads": [{"session_id": "L", "project": "proj"}],
+                                    "executors": [ex, {"session_id": "broke1", "broken": True}]})
+        assert 'data-target="ex-e1"' in html and 'data-target="ex-broke1"' in html
+
+
 class TestCmdBoard:
     def _seed(self, relay, tmp_path):
         relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="proj", cwd=str(tmp_path), tab_label="[Lead] proj")
