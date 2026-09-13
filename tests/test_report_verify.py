@@ -240,6 +240,213 @@ class TestClaimFalsePositives:
         assert paths == ["lib/report_verify.py", "README.md", "bin/relay"]
 
 
+# ── row 76: a mention is not a claim ─────────────────────────────────────────────────────────
+class TestClaimNegationAndTemplateFilters:
+    """The three real shapes that produced four false MISMATCH gate-blocks (backlog row 76,
+    2026-09-07/12). All three text snippets below are the ACTUAL wording from the field reports."""
+
+    def test_shape_1_disclaimer_is_not_a_claim(self):
+        text = ("## What changed\n"
+                "- grepped `tests/test_diff_render.py` and deliberately did NOT change it\n")
+        paths, _ = rv.claimed_paths(text)
+        assert "tests/test_diff_render.py" not in paths
+
+    def test_shape_2_negated_mention_is_not_a_claim(self):
+        text = "## What changed\n- `bin/relay` untouched — confirmed empty diff\n"
+        paths, _ = rv.claimed_paths(text)
+        assert "bin/relay" not in paths
+
+    def test_shape_3_path_template_is_not_a_claim(self):
+        text = ("## What changed\n"
+                "- the marker lives at `~/.relay-tasks/<sid>/session.json`, per the footnote\n")
+        paths, _ = rv.claimed_paths(text)
+        assert not any("<" in p or ">" in p for p in paths)
+        assert "sid>/session.json" not in paths
+
+    def test_positive_control_a_genuine_prose_claim_still_harvests(self):
+        """The filters must not go blind: an honest claim in ordinary prose is still a claim."""
+        text = "## What changed\n- modified `lib/foo.py` to fix the off-by-one.\n"
+        paths, _ = rv.claimed_paths(text)
+        assert "lib/foo.py" in paths
+
+    @pytest.mark.parametrize("cue,claim", [
+        ("bin/relay is unchanged this round", "bin/relay"),
+        ("we only read lib/other.py, nothing written", "lib/other.py"),
+        ("no changes to docs/spec.md", "docs/spec.md"),
+        ("lib/x.py was left alone", "lib/x.py"),
+        ("read-only pass over bin/relay", "bin/relay"),
+    ])
+    def test_each_negation_cue_suppresses_its_claim(self, cue, claim):
+        paths, _ = rv.claimed_paths(f"## What changed\n- {cue}\n")
+        assert claim not in paths
+
+    def test_dropped_claims_are_visible_not_silent(self):
+        """Rule 4: a drop must be explainable, not magic."""
+        text = ("## What changed\n"
+                "- grepped `tests/test_diff_render.py` and deliberately did NOT change it\n")
+        dropped = dict(rv.ignored_claims(text))
+        assert "tests/test_diff_render.py" in dropped
+        assert "not a claim" in dropped["tests/test_diff_render.py"]
+
+    def test_ignored_claims_omits_a_path_genuinely_claimed_elsewhere(self):
+        """A path dropped in one spot but claimed for real elsewhere is not 'ignored' — it IS a
+        claim, just not from that mention."""
+        text = ("## What changed\n"
+                "- bin/relay untouched here\n"
+                "- modified `bin/relay` to add a flag\n")
+        paths, _ = rv.claimed_paths(text)
+        assert "bin/relay" in paths
+        assert "bin/relay" not in dict(rv.ignored_claims(text))
+
+    def test_verify_renders_the_advisory_line_for_a_dropped_mention(self):
+        text = (GOOD_REPORT.replace(
+            "## What changed\n- src/app.py:2 — appended the new line.\n",
+            "## What changed\n- src/app.py:2 — appended the new line.\n"
+            "- grepped `tests/test_diff_render.py` and deliberately did NOT change it\n"))
+        result = rv.verify(text, reality())
+        assert result["verdict"] == rv.COUNTS_MATCH
+        out = rendered(result)
+        assert "ignored as a non-claim: tests/test_diff_render.py" in out
+
+
+# ── gate-171051-r2 fix 1: a negation cue is scoped to its CLAUSE, not the whole line/bullet ─────
+class TestNegationClauseScoping:
+    """Reviewer should-fix on the row-76 negation filter: one cue anywhere on a line/bullet used to
+    forgive EVERY path on it. These are the reviewer's own three reproductions — each must now
+    yield the genuinely-claimed path instead of forgiving it too."""
+
+    def test_but_does_not_carry_a_cue_across_to_the_next_claim(self):
+        text = "## What changed\n- did not change a.py, but modified b.py\n"
+        paths, _ = rv.claimed_paths(text)
+        assert "b.py" in paths
+        assert "a.py" not in paths
+
+    def test_then_does_not_carry_a_cue_across_to_the_next_claim(self):
+        text = "## What changed\n- grepped for callers, then modified lib/x.py\n"
+        paths, _ = rv.claimed_paths(text)
+        assert "lib/x.py" in paths
+
+    def test_a_wrapped_continuation_clause_does_not_reach_back_to_the_first_line(self):
+        text = ("## What changed\n"
+                "- modified lib/x.py to fix the bug\n"
+                "  (left lib/y.py unchanged)\n")
+        paths, _ = rv.claimed_paths(text)
+        assert "lib/x.py" in paths
+        assert "lib/y.py" not in paths  # its own clause still carries "unchanged" — separately
+
+
+# ── row 76 rule 1: the TL;DR Changed: line is the primary claim source ────────────────────────
+class TestChangedLineIsPrimarySource:
+    def test_changed_line_paths_are_claimed_even_when_what_changed_prose_differs(self):
+        text = ("Did the thing.\n\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\n"
+                "Changed: lib/foo.py\n\n"
+                "## What changed\nSee lib/foo.py for the fix; the rest of this bullet is just "
+                "prose with no other file mentioned.\n")
+        paths, scoped = rv.claimed_paths(text)
+        assert paths == ["lib/foo.py"]
+        assert scoped is True
+
+    def test_changed_line_is_primary_prose_only_adds_genuine_claims(self):
+        """gate-171051-r2 rule 2: a prose addition needs a claiming verb in its OWN clause — so
+        this uses `modified`, one of `_CLAIM_VERBS`, rather than an arbitrary synonym."""
+        text = ("Did the thing.\n\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\n"
+                "Changed: lib/foo.py\n\n"
+                "## What changed\n"
+                "- lib/foo.py:1 — the fix.\n"
+                "- also modified lib/bar.py for a helper.\n"
+                "- bin/relay untouched — confirmed empty diff.\n")
+        paths, scoped = rv.claimed_paths(text)
+        assert paths == ["lib/foo.py", "lib/bar.py"]
+        assert scoped is True
+
+    def test_a_negated_changed_line_contributes_no_claim(self):
+        text = ("Did the thing.\n\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\n"
+                "Changed: bin/relay untouched, confirmed empty diff\n\n"
+                "## What changed\n- lib/foo.py:1 — the fix.\n")
+        paths, _ = rv.claimed_paths(text)
+        assert "bin/relay" not in paths
+        assert paths == ["lib/foo.py"]
+
+    def test_no_changed_line_falls_back_to_what_changed_section(self):
+        """Unaffected pre-existing behaviour when there is no TL;DR at all."""
+        text = "intro\n\n## What changed\n- bin/relay:10 — thing\n"
+        paths, scoped = rv.claimed_paths(text)
+        assert scoped is True
+        assert paths == ["bin/relay"]
+
+
+# ── gate-171051-r2 fix 2: Changed: is primary, prose only ADDS clearly-claiming paths ───────────
+class TestChangedLinePrimaryProseNeedsAClaimingVerb:
+    """The 001 report's own should-fix: `claimed_paths` used to merge Changed-line paths with
+    EVERY prose path unconditionally, so the structured field never actually narrowed anything —
+    including this session's own 001 report, which quoted a fixture VALUE (`src/app.py`, the
+    fixture's own `Changed:` text) in a "What changed" bullet describing a test fixture, and had
+    that quoting read back as a second, false claim on `src/app.py`."""
+
+    def test_a_quoted_fixture_value_is_not_a_claim(self):
+        """The actual gate-171051 001 shape, reproduced at report scale: real work is the
+        `Changed:` line's path; a later bullet quotes an unrelated fixture's old `Changed:` text
+        (which happens to name `src/app.py`) purely to explain what the fixture used to say."""
+        text = ("Fixed the claim scraper; staged.\n\n"
+                "Status: clean\nRisk flags: none\nUNVERIFIED: none\n"
+                "Changed: lib/report_verify.py\n\n"
+                "## What changed\n"
+                "- lib/report_verify.py:5 — added the clause-scoping helper.\n"
+                "- the test fixture's `Changed:` line said `src/app.py`, but that was only the "
+                "fixture's stale text.\n")
+        paths, scoped = rv.claimed_paths(text)
+        assert paths == ["lib/report_verify.py"]
+        assert "src/app.py" not in paths
+        assert scoped is True
+        dropped = dict(rv.ignored_claims(text))
+        assert dropped["src/app.py"] == "not in Changed: line and no claiming verb"
+
+    def test_positive_control_a_claiming_verb_still_adds_the_path(self):
+        """Once a `Changed:` line is primary, a prose path is NOT forever locked out — a real
+        claiming verb in its own clause still adds it (see also
+        `TestChangedLineIsPrimarySource.test_changed_line_is_primary_prose_only_adds_genuine_claims`,
+        which pins the same rule end to end)."""
+        text = ("Did the thing.\n\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\n"
+                "Changed: lib/foo.py\n\n"
+                "## What changed\n"
+                "- lib/foo.py:1 — the fix.\n"
+                "- created lib/newfile.py for the shared helper.\n")
+        paths, _ = rv.claimed_paths(text)
+        assert paths == ["lib/foo.py", "lib/newfile.py"]
+
+    def test_positive_control_no_changed_line_still_harvests_plain_prose(self):
+        """Rule 2 only ever narrows prose ADDED alongside a primary `Changed:` line. With no
+        `Changed:` line at all, a plain prose mention — no claiming verb needed — is still a claim,
+        exactly as before this rule existed."""
+        text = "## What changed\n- src/app.py:2 — appended the new line.\n"
+        paths, scoped = rv.claimed_paths(text)
+        assert paths == ["src/app.py"]
+        assert scoped is True
+
+
+class TestAbsolutePathRejectReason:
+    """Reviewer finding 4 on the row-76 fix: rejecting EVERY leading `/` (rather than only a path
+    that would resolve outside the repo) is kept — the simpler, non-accusing direction — but now
+    carries its OWN reason (`absolute path`) instead of sharing the path-template one, so a dropped
+    absolute path is legible in `ignored_claims` rather than reading as an unrelated `<sid>`-style
+    template match.
+
+    `_CLAIM_RE` cannot itself produce a match starting with `/` — its lookbehind refuses a match
+    immediately after a `/`, and no branch's character class allows `/` as a first character — so
+    this is a direct unit test of the reject-reason helper rather than an end-to-end
+    `claimed_paths`/`ignored_claims` case; there is no report text that reaches this branch through
+    the real scraper today."""
+
+    def test_absolute_path_gets_its_own_reason(self):
+        assert rv._claim_reject_reason("/README.md") == "absolute path"
+
+    def test_template_and_home_paths_keep_the_template_reason(self):
+        assert rv._claim_reject_reason("sid>/session.json") == \
+            "path template or filesystem reference, not a repo path"
+        assert rv._claim_reject_reason("~/.relay-tasks/x") == \
+            "path template or filesystem reference, not a repo path"
+
+
 # ── staged reality ────────────────────────────────────────────────────────────────────────────
 class TestStagedReality:
     def test_truthful_report_counts_match(self):
@@ -657,7 +864,13 @@ class TestSignoffGating:
         "hooks/stop_lead_watch.py", "lib/lead_guard.py", "db/migrations/001.sql",
         "tests/test_parity.py", "tests/golden/out.json", "schema/user.sql", "deploy/run.sh"])
     def test_signoff_gated_paths_stop_clearance(self, path):
-        report = GOOD_REPORT.replace("- src/app.py:2 — appended the new line.",
+        # Both the TL;DR `Changed:` line and the body must name `path` — leaving the TL;DR line
+        # saying `src/app.py` (row 76's structured source, now claimed_paths' primary source)
+        # would itself claim a file this test never stages, tripping condition 1 before condition
+        # 4 ever gets evaluated.
+        report = GOOD_REPORT.replace("Changed: one line appended to src/app.py",
+                                     f"Changed: one line appended to {path}") \
+                            .replace("- src/app.py:2 — appended the new line.",
                                      f"- {path}:1 — changed it.")
         clr = clr_for(report=report, staged=[path])
         assert clr["cleared"] is False

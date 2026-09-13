@@ -304,20 +304,275 @@ def what_changed_section(text):
     return "\n".join(body) if "\n".join(body).strip() else None
 
 
+# ── row 76: a mention is not a claim ──────────────────────────────────────────────────────────
+# Four gate-blocks on correct work (2026-09-07 and 2026-09-12, docs/post-0.3.27-backlog.md row 76)
+# came from `_CLAIM_RE`-shaped matches that were never a claim at all:
+#   1. a disclaimer   — "grepped tests/test_diff_render.py and deliberately did NOT change it"
+#   2. a negated aside — "bin/relay untouched — confirmed empty diff"
+#   3. a path template — "~/.relay-tasks/<sid>/session.json" quoted in prose, whose `<`/`>` let
+#      `_CLAIM_RE` harvest the fragment `sid>/session.json` as a claimed file.
+# Two independent filters below fix this WITHOUT touching `_CLAIM_RE` itself (over-matching there
+# is still fine; it is what runs the match through these filters that must get stricter):
+#   - `_claim_reject_reason` rejects the match on its own text, no context needed;
+#   - `_negated_context` rejects it based on the CLAUSE it sits in (see `_clause_span`).
+# A genuine claim elsewhere in the report is unaffected — `plausible_claims`'s repo-existence
+# check (below) is a separate, already-existing filter and stays exactly as it was.
+#
+# Reviewer should-fix on the row-76 fix (gate-171051 review): `_negated_context` used to scope a
+# cue to the whole LINE/BULLET, which forgave every path on it — "did not change a.py, but
+# modified b.py" wrongly forgave `b.py` too, and a wrapped bullet's continuation clause could
+# forgive a path named on an earlier, unrelated clause. `_clause_span` narrows the window one step
+# further, to the CLAUSE containing the match: split on `,` `;`, the connectives `but` / `then` /
+# `and then` / `while`, and a physical line break (a wrapped bullet's continuation reads as its own
+# clause, never sharing a cue with the line before it). A path is a non-claim only when a cue sits
+# in ITS clause.
+#
+# The reviewer's suggested split set also named the em/en dash (`—`/`–`); this deliberately drops
+# them. Nearly every "What changed" bullet in this codebase (and this file's own fixtures) is
+# written `path — verb-based description` ("src/app.py:2 — appended the new line."). `_clause_span`
+# is shared with `_has_claiming_verb` (rule 2 below), whose whole job is finding a claiming verb in
+# the SAME clause as the path it might add — splitting on the dash would put that path in one
+# clause and its own describing verb in the next, breaking the single most common way a real claim
+# is written. None of the three reproduction cases below need the dash to pass.
+
+# At minimum these cues (case-insensitive substring match). Kept as a module-level tuple so a
+# fifth field report with a new disclaiming phrase is a one-line addition, not a re-design.
+_CLAIM_NEGATION_CUES = (
+    "not changed", "did not change", "didn't change", "unchanged", "untouched",
+    "not modified", "did not touch", "left alone", "only read", "grepped",
+    "read-only", "no changes to", "confirmed empty diff",
+)
+
+# Row 76-fix rule 2 (gate-171051-r2): once a TL;DR `Changed:` line names a real claim, it becomes
+# the PRIMARY source (see `claimed_paths`) and a prose path is added to it only when its own clause
+# carries one of these clear claiming verbs — a path merely mentioned, read, or quoted as an
+# example/fixture value never qualifies just because it sits near a real claim. Kept as a module
+# tuple, next to the negation cues above, for the same one-line-addition reason.
+_CLAIM_VERBS = (
+    "added", "modified", "changed", "edited", "rewrote", "extended", "created",
+    "renamed", "removed", "deleted", "updated",
+)
+# Word-bounded, and never when the word is immediately followed by `:` — found while testing this
+# very fix: a report quoting the TL;DR field name itself ("the fixture's `Changed:` line said
+# `src/app.py`") contains the literal substring "changed", which a bare substring check would
+# misread as the claiming VERB "changed" and wrongly add `src/app.py` right back — the exact
+# fixture-value shape this rule exists to stop. `\b...\b` alone can't tell "Changed:" the field
+# label from "changed" the verb (both are the standalone word "changed"); the `(?!:)` guard is
+# what does — a verb is never immediately followed by a colon. `\b` also means "changed" never
+# fires from inside "unchanged" or "exchanged" (no word boundary between run-together letters).
+_CLAIM_VERB_RE = re.compile(r"\b(?:" + "|".join(_CLAIM_VERBS) + r")\b(?!:)", re.IGNORECASE)
+
+_BULLET_OPEN_RE = re.compile(r"^\s*[-*]\s")
+# Clause boundaries within a line/bullet window: `,` `;`, the listed connectives (word-bounded via
+# lookaround so "then" doesn't match inside another word, and "and then" tried before bare "then"
+# so it matches whole), plus a bare newline — a wrapped continuation line is its own clause even
+# with no punctuation of its own. Deliberately excludes the em/en dash — see the comment above
+# `_CLAIM_NEGATION_CUES` for why (see the docstring above `_clause_span`).
+_CLAUSE_BREAK_RE = re.compile(
+    r"[,;\n]|(?<!\w)(?:and\s+then|but|then|while)(?!\w)", re.IGNORECASE)
+
+
+def _line_or_bullet_span(body, start):
+    """(span, span_start) — the physical line containing offset `start` (a `_CLAIM_RE` match can't
+    itself span a newline — its character class excludes whitespace — so the match's start alone
+    locates it), extended to the rest of its bullet item when that line is itself bulleted or is a
+    wrapped continuation of one — rule 2's "same line (or the same bullet)" window. A blank line or
+    the next bullet opener ends the item either direction. `span_start` is `span`'s offset into
+    `body`, so a caller can translate `start` into an offset relative to `span` (see
+    `_clause_span`)."""
+    lines = body.splitlines(keepends=True)
+    offsets = [0]
+    for ln in lines:
+        offsets.append(offsets[-1] + len(ln))
+    idx = len(lines) - 1
+    for i, ln in enumerate(lines):
+        if offsets[i] <= start < offsets[i] + len(ln):
+            idx = i
+            break
+
+    # Walk back to this item's bullet opener, if the current line isn't one itself — stop once a
+    # bulleted line is included, or at a blank line (a paragraph break; there is no bullet here).
+    lo = idx
+    while lo > 0 and not _BULLET_OPEN_RE.match(lines[lo]) and lines[lo - 1].strip():
+        lo -= 1
+
+    # Walk forward through continuation lines of the SAME item — stops at the next bullet opener
+    # or a blank line.
+    hi = idx
+    while hi + 1 < len(lines) and lines[hi + 1].strip() and not _BULLET_OPEN_RE.match(lines[hi + 1]):
+        hi += 1
+    return "".join(lines[lo:hi + 1]), offsets[lo]
+
+
+def _clause_span(body, start):
+    """The CLAUSE of `body` containing offset `start` — its line/bullet window (`_line_or_bullet_
+    span`) narrowed further to the segment between the nearest enclosing `_CLAUSE_BREAK_RE`
+    boundaries. This is what makes a negation cue or a claiming verb apply to ONE clause instead of
+    an entire line/bullet: "did not change a.py, but modified b.py" puts `a.py` and `b.py` in two
+    different clauses, so the cue in the first never reaches the claim in the second; a wrapped
+    bullet's continuation line ("(left lib/y.py unchanged)") is its own clause too, so it can't
+    reach back and forgive a path named on the line before it."""
+    span, span_start = _line_or_bullet_span(body, start)
+    rel = start - span_start
+    breaks = [(m.start(), m.end()) for m in _CLAUSE_BREAK_RE.finditer(span)]
+    lo = 0
+    for s, e in breaks:
+        if e <= rel:
+            lo = e
+        else:
+            break
+    hi = len(span)
+    for s, e in breaks:
+        if s >= rel:
+            hi = s
+            break
+    return span[lo:hi]
+
+
+def _negated_context(body, start):
+    """True when the match starting at `start` sits in a CLAUSE (see `_clause_span`) carrying one
+    of `_CLAIM_NEGATION_CUES` — a disclaimer or read-only aside, never a claim (row 76 shapes
+    1-2)."""
+    return any(cue in _clause_span(body, start).lower() for cue in _CLAIM_NEGATION_CUES)
+
+
+def _has_claiming_verb(body, start):
+    """True when the match starting at `start` sits in a CLAUSE (see `_clause_span`) carrying one
+    of `_CLAIM_VERBS` as a whole word (see `_CLAIM_VERB_RE`). Used only to decide whether a PROSE
+    path may be ADDED alongside a `Changed:` line's own claims (row 76-fix rule 2, `claimed_paths`)
+    — a path just mentioned, read, or quoted as an example/fixture value does not qualify."""
+    return bool(_CLAIM_VERB_RE.search(_clause_span(body, start)))
+
+
+def _claim_reject_reason(p):
+    """None when a `_CLAIM_RE` match `p` could be a real repo-relative claim; otherwise the reason
+    it can never be one, checked before any clause-context filter. Covers:
+      - a path TEMPLATE (row 76 shape 3: `<`/`>` survive the regex's character class, e.g. the
+        harvested fragment `sid>/session.json` from `~/.relay-tasks/<sid>/session.json`) or a
+        home-relative (`~`) filesystem reference — neither is a path this repo can stage;
+      - an ABSOLUTE path (leading `/`). Reviewer finding 4 on the row-76 fix: this rejects every
+        leading `/` rather than only the ones that would resolve outside the repo (the packet's
+        original ask) — kept as the simpler, non-accusing direction (a real absolute path is
+        vanishingly rare in a report and never stageable either way), but given its OWN reason
+        here instead of sharing the template one, so a dropped absolute path reads as what it is
+        in `ignored_claims` rather than looking like an unrelated `<sid>`-style template match."""
+    if "<" in p or ">" in p or p.startswith("~"):
+        return "path template or filesystem reference, not a repo path"
+    if p.startswith("/"):
+        return "absolute path"
+    return None
+
+
+def _scrape_claims(body):
+    """Every `_CLAIM_RE` match in `body`, as (path, kept, reason) in first-seen-in-text order —
+    `_scrape_claims_positions` without the match offsets, for callers that only need the verdict."""
+    return [(p, kept, reason) for p, _start, kept, reason in _scrape_claims_positions(body)]
+
+
+def _scrape_claims_positions(body):
+    """Every `_CLAIM_RE` match in `body`, as (path, start, kept, reason) in first-seen-in-text
+    order. `kept` is False for a template/filesystem/absolute-path fragment or a negated/read-only
+    mention — the row-76 filters — with `reason` naming which one fired, for the advisory line in
+    `render()`. `start` is the match's offset in `body`, kept so a caller can run a further
+    clause-scoped check (`_has_claiming_verb`) without re-searching for the match."""
+    out = []
+    for m in _CLAIM_RE.finditer(body):
+        p = m.group(1)
+        start = m.start(1)
+        reject_reason = _claim_reject_reason(p)
+        if reject_reason:
+            out.append((p, start, False, reject_reason))
+        elif _negated_context(body, start):
+            out.append((p, start, False, "disclaimed/read-only mention, not a claim"))
+        else:
+            out.append((p, start, True, None))
+    return out
+
+
+def _dedup_kept(scraped):
+    seen = []
+    for p, kept, _ in scraped:
+        if kept and p not in seen:
+            seen.append(p)
+    return seen
+
+
 def claimed_paths(text):
     """(paths, scoped) — repo-relative paths the report CLAIMS it changed, first-seen order.
 
-    `scoped` is True when they came from a "What changed" section (trustworthy enough to accuse
-    on) and False when the whole report was scanned (a mention there may be a file merely read, so
-    the caller must downgrade)."""
+    `scoped` is True when the claim set is trustworthy enough to accuse on — either the TL;DR
+    `Changed:` line named at least one path (rule 1: the structured field is the PRIMARY source),
+    or there is a "What changed" section — and False when neither exists and the whole report had
+    to be scanned (a mention there may be a file merely read, so the caller must downgrade).
+
+    Rule 1 (row 76): when the `Changed:` line yields at least one real claim, that set is PRIMARY.
+    Rule 2 (reviewer should-fix on the row-76 fix, gate-171051-r2): once that primary set exists, a
+    prose path — from "What changed", or the whole report when there is no such section — is ADDED
+    to it only when the SAME CLAUSE naming the path also carries a clear claiming verb
+    (`_has_claiming_verb`). A path merely mentioned, read, or quoted as an example/fixture value
+    (the fourth row-76 shape: a report's own `Changed:`-line fixture text, echoed in its prose,
+    used to read back as a second claim on the fixture path) is not a claim just for sitting near a
+    real one. `ignored_claims` names every prose path this drops.
+
+    When the `Changed:` line is absent, empty, `none`, or yields no path at all, behaviour is
+    UNCHANGED from before this rule: the full prose harvest — still passed through
+    `_scrape_claims`'s template/absolute-path/negated-clause filters (row 76) — is the claim set."""
+    tldr = parse_tldr(text)
     section = what_changed_section(text)
     body, scoped = (section, True) if section is not None else (text, False)
-    seen = []
-    for m in _CLAIM_RE.finditer(body):
-        p = m.group(1)
-        if p not in seen:
-            seen.append(p)
-    return seen, scoped
+
+    changed_line = tldr.get("changed")
+    if changed_line and not is_none_value(changed_line):
+        line_claims = _dedup_kept(_scrape_claims(changed_line))
+        if line_claims:
+            merged = list(line_claims)
+            for p, start, kept, _reason in _scrape_claims_positions(body):
+                if kept and p not in merged and _has_claiming_verb(body, start):
+                    merged.append(p)
+            return merged, True
+
+    return _dedup_kept(_scrape_claims(body)), scoped
+
+
+def ignored_claims(text):
+    """[(path, reason)] for every path-shaped match `claimed_paths` found but did NOT treat as a
+    claim. Advisory only: `render()` surfaces these so a dropped mention is visible, not silently
+    absorbed (rule 4). A path dropped in one spot but genuinely claimed elsewhere (and so present
+    in `claimed_paths`' result) is not listed here — it was not, in the end, ignored.
+
+    Two sources of a drop: `_scrape_claims`'s own filters (template/absolute-path/negated-clause,
+    row 76), and — once the `Changed:` line is the primary claim source (rule 1) — a prose path
+    that clears those filters but carries no claiming verb in its own clause (rule 2, reason `not
+    in Changed: line and no claiming verb`): it survived row 76's filters, but a structured field
+    now exists and mere prose proximity no longer claims it."""
+    tldr = parse_tldr(text)
+    section = what_changed_section(text)
+    body = section if section is not None else text
+    changed_line = tldr.get("changed")
+
+    kept, _ = claimed_paths(text)
+    kept_set = set(kept)
+    out = []
+
+    def add(p, reason):
+        if p not in kept_set and p not in {x for x, _ in out}:
+            out.append((p, reason))
+
+    changed_line_claims = []
+    if changed_line and not is_none_value(changed_line):
+        for p, _start, was_kept, reason in _scrape_claims_positions(changed_line):
+            if was_kept:
+                changed_line_claims.append(p)
+            else:
+                add(p, reason)
+    primary_mode = bool(changed_line_claims)
+
+    for p, start, was_kept, reason in _scrape_claims_positions(body):
+        if not was_kept:
+            add(p, reason)
+        elif primary_mode and not _has_claiming_verb(body, start):
+            add(p, "not in Changed: line and no claiming verb")
+    return out
 
 
 # ── declared tests ────────────────────────────────────────────────────────────────────────────
@@ -429,6 +684,7 @@ def verify(report_text, reality):
     staged = list(reality.get("staged") or [])
     modified = set(reality.get("modified") or [])
     claims, scoped = claimed_paths(report_text)
+    ignored = ignored_claims(report_text)
     claims = plausible_claims(claims, reality.get("repo_entries") or (), staged)
     resolved, ambiguous = resolve_claim_suffixes(claims, staged, reality.get("repo_files"))
     findings = []
@@ -532,6 +788,7 @@ def verify(report_text, reality):
     return {"verdict": verdict, "tldr": tldr, "findings": findings, "claims": claims,
             "claims_scoped": scoped, "claimed_staged": claimed_staged,
             "claimed_missing": claimed_missing, "unclaimed": unclaimed, "staged": staged,
+            "ignored_claims": ignored,
             "declared_counts": declared_counts(report_text),
             "declared_commands": declared_commands(report_text), "rerun": rerun}
 
@@ -725,15 +982,17 @@ def render(result, session_id, packet):
     add()
 
     add("  STAGED REALITY", "bold")
-    scope = ("\"What changed\" section" if result["claims_scoped"]
-             else "whole report (no \"What changed\" section — claims can't be scoped, so "
-                  "claimed-not-staged is advisory below)")
+    scope = ("the `Changed:` TL;DR line and/or \"What changed\" section" if result["claims_scoped"]
+             else "whole report (no `Changed:` line or \"What changed\" section — claims can't be "
+                  "scoped, so claimed-not-staged is advisory below)")
     add(f"    claim scope: {scope}", "dim")
     add(f"    claimed and staged:   {len(result['claimed_staged'])}", "dim")
     add(f"    claimed, NOT staged:  {len(result['claimed_missing'])}",
         *(("red",) if result["claimed_missing"] and result["claims_scoped"] else ("dim",)))
     add(f"    staged, not claimed:  {len(result['unclaimed'])} (advisory — reports summarise)", "dim")
     add(f"    index: {len(result['staged'])} file(s) staged and uncommitted", "dim")
+    for p, reason in result.get("ignored_claims") or []:
+        add(f"    ignored as a non-claim: {p} ({reason})", "dim")
     add()
 
     add("  DECLARED TESTS", "bold")
