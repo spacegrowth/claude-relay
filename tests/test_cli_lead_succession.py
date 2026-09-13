@@ -803,6 +803,69 @@ class TestSuccessorTitleNeverCollides:
         assert terms.focuses[-1] == {"label": expected, "handle": "w0t0p0:STUB", "pid": None}
 
 
+class TestResumeLeadKeepsTheDisambiguatedTitle:
+    """Backlog row 75's leftover: `relay resume-lead` recomputed the bare `[Lead] X`, so a suffixed
+    successor resumed while its predecessor's tab was still open re-collided — and its marker's
+    tab_label no longer matched the real tab. The resuming lead's OWN tab is dead in every test
+    (FakeTerm.alive False, so the refuse-if-alive guard passes); OTHER leads' liveness is pinned
+    per session id through `_lead_liveness`."""
+
+    def _resume(self, relay, terms, sid, live=()):
+        terms.alive = False
+        with mock.patch.object(relay, "_lead_liveness",
+                               side_effect=lambda m, *a, **k: "live" if m.get("session_id") in live
+                               else "ghost"):
+            relay.cmd_resume_lead(sid)
+        return terms.spawns[-1]["label"], \
+            relay.lead_guard.read_marker(relay.STATE_ROOT, sid)["tab_label"]
+
+    def test_a_recorded_suffixed_label_is_kept_verbatim(self, relay, terms):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "ab12cdef", project="proj", cwd="/tmp",
+                                      tab_label="[Lead] proj ·ab12")
+        arm_lead(relay, "lead-pred", "proj")          # the predecessor, still open under the bare title
+        assert self._resume(relay, terms, "ab12cdef", live={"lead-pred"}) \
+            == ("[Lead] proj ·ab12", "[Lead] proj ·ab12")
+
+    def test_a_recorded_label_is_preferred_over_the_recomputed_one(self, relay, terms):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "ab12cdef", project="proj", cwd="/tmp",
+                                      tab_label="[Lead] proj ·ab12")
+        assert self._resume(relay, terms, "ab12cdef") == ("[Lead] proj ·ab12", "[Lead] proj ·ab12")
+
+    def test_no_recorded_label_and_no_collision_resumes_bare(self, relay, terms):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "ab12cdef", project="proj", cwd="/tmp")
+        arm_lead(relay, "lead-dead", "proj")          # wears the title, but its tab is gone
+        assert self._resume(relay, terms, "ab12cdef") == ("[Lead] proj", "[Lead] proj")
+
+    def test_no_recorded_label_while_another_live_lead_wears_it_is_suffixed(self, relay, terms):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "ab12cdef", project="proj", cwd="/tmp")
+        arm_lead(relay, "lead-other", "proj")
+        assert self._resume(relay, terms, "ab12cdef", live={"lead-other"}) \
+            == ("[Lead] proj ·ab12", "[Lead] proj ·ab12")
+
+    def test_a_recorded_bare_label_another_live_lead_wears_is_suffixed(self, relay, terms):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "ab12cdef", project="proj", cwd="/tmp",
+                                      tab_label="[Lead] proj")
+        arm_lead(relay, "lead-other", "proj")
+        assert self._resume(relay, terms, "ab12cdef", live={"lead-other"}) \
+            == ("[Lead] proj ·ab12", "[Lead] proj ·ab12")
+
+    def test_an_already_suffixed_label_is_never_suffixed_again(self, relay, terms):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "ab12cdef", project="proj", cwd="/tmp",
+                                      tab_label="[Lead] proj ·ab12")
+        # Even a live lead wearing the exact suffixed title does not stack a second suffix.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-other", project="proj", cwd="/tmp",
+                                      tab_label="[Lead] proj ·ab12")
+        assert self._resume(relay, terms, "ab12cdef", live={"lead-other"}) \
+            == ("[Lead] proj ·ab12", "[Lead] proj ·ab12")
+        assert relay._resume_lead_label("[Lead] proj ·ab12", "ab12cdef") == "[Lead] proj ·ab12"
+
+    def test_its_own_marker_never_counts_as_the_collision(self, relay, terms):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "ab12cdef", project="proj", cwd="/tmp",
+                                      tab_label="[Lead] proj")
+        assert self._resume(relay, terms, "ab12cdef", live={"ab12cdef"}) \
+            == ("[Lead] proj", "[Lead] proj")
+
+
 class TestClosePredecessor:
     """cmd_close_predecessor: "reads it back, closes the tab, and clears the field so the offer
     can't repeat. Never invoked automatically"."""

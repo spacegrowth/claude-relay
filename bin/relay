@@ -1922,6 +1922,17 @@ def cmd_restart(args):
     print(f"restarted '{sid}' (tab '{label}', pid {pid}) — re-running packet {n:03d} as a fresh session")
 
 
+def _resume_lead_label(base, sid):
+    """The title a resumed lead reopens under: `base` unless a DIFFERENT live lead already wears it,
+    else `base` plus this lead's own deterministic suffix — `_distinct_lead_label`'s collision rule,
+    with the resuming lead itself as neither caller nor competitor (its own tab is closed, or the
+    refuse-if-alive guard already decided otherwise). A label already ending in this sid's own
+    suffix is returned as is, so a resume never stacks a second one."""
+    if base.endswith(_successor_label_suffix(sid)):
+        return base
+    return _distinct_lead_label(base, sid, {"session_id": sid})
+
+
 def cmd_resume_lead(sid, force=False):
     """Restore a crashed LEAD by reopening its OWN Claude Code conversation via `claude --resume
     <sid>` (a lead's session_id IS its Claude session id). The marker survived the crash on disk;
@@ -1935,9 +1946,13 @@ def cmd_resume_lead(sid, force=False):
     project = marker.get("project")
     cwd = marker.get("cwd") or os.getcwd()
     model = marker.get("model")
-    # Same label scheme as lead-start — the marker's tab_label must match the actual tab title or
-    # `relay focus <lead>` breaks after a restore.
-    label = f"[Lead] {slugify(project)}" if project else f"[Lead] {sid}"
+    # The marker's tab_label must match the actual tab title or `relay focus <lead>` and tidy break
+    # after a restore. Prefer the RECORDED label: it is relay-controlled and may already carry a
+    # handoff's disambiguating suffix (`[Lead] X ·<id4>`, backlog row 75) — recomputing the bare
+    # `[Lead] X` re-collided with a still-open predecessor tab. The bare lead-start scheme is only
+    # the fallback for a marker that recorded none. Either way, a title some OTHER live lead already
+    # wears gets this lead's own suffix (_resume_lead_label), and it is written back below.
+    label = marker.get("tab_label") or (f"[Lead] {slugify(project)}" if project else f"[Lead] {sid}")
     # Refuse to open a SECOND live copy of the same conversation (mirrors the executor guard).
     # Aliveness: a pid recorded by a previous restore, else the marker's relay-controlled tab title.
     lead_pid_file = lead_guard.lead_dir(STATE_ROOT, sid) / "pid"
@@ -1956,6 +1971,7 @@ def cmd_resume_lead(sid, force=False):
     if alive and not force:
         sys.exit(f"lead '{sid}' still looks alive — close its tab first or pass --force "
                  f"(two live copies of one conversation stomp on each other)")
+    label = _resume_lead_label(label, sid)
     relay_bin = str(Path(__file__).resolve())
     proj_flag = f" --project {shlex.quote(project)}" if project else ""
     nudge = (f"You are the resumed lead for project '{project}'. FIRST verify arming: run "
