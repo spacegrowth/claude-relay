@@ -496,6 +496,17 @@ class TestTierEnforcement:
         new = relay.read_session("e1-r2")
         assert new is not None and relay.lead_guard.model_tier(new["model"]) == "opus"
 
+    def test_plain_send_with_model_warns_and_ignores_it(self, relay, terms, tmp_path, capsys):
+        """`--model` is a successor's model; on a plain send there is no successor, so it must be
+        SAID to be ignored — silently dropping it lets a lead believe an upgrade happened."""
+        self._lead(relay, "lead-1")
+        make_session(relay, "e1", status="reported", owner_lead="lead-1", model="claude-sonnet-5")
+        run_main(relay, "send", "e1", write_packet(tmp_path), "--model", "opus")
+        out = capsys.readouterr().out
+        assert "--model opus ignored" in out and "--rotate/--upgrade" in out
+        assert relay.read_session("e1")["model"] == "claude-sonnet-5"   # unchanged
+        assert relay.read_session("e1-r2") is None                        # no successor
+
     # ---- lead: spawn --------------------------------------------------------------------------
 
     def test_lead_spawn_without_model_resolves_to_the_leads_class(self, relay, terms, tmp_path):

@@ -2207,6 +2207,12 @@ def cmd_send(args):
     s = read_session(args.session_id)
     if not s:
         sys.exit(f"no such session: {args.session_id}")
+    # `--model` only means something when a successor is spawned (--rotate/--upgrade); a plain send
+    # types into the existing session, whose model was fixed at launch. Say so instead of silently
+    # dropping it — otherwise a lead who meant `--rotate --model opus` thinks the upgrade happened.
+    if getattr(args, "model", None) and not (getattr(args, "rotate", False) or getattr(args, "upgrade", False)):
+        print(c(f"  · --model {args.model} ignored: it only applies with --rotate/--upgrade — a plain "
+                f"send reuses '{args.session_id}' at its launch model", "dim"))
     # (A) Refresh REAL liveness before the guard. s["status"] is the STORED value — set to `busy`
     # at spawn and only ever recomputed when `relay check`/`list` runs _check_one. So a session
     # that has already reported still reads `busy` on disk and would be falsely refused. Recompute
