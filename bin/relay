@@ -5639,6 +5639,11 @@ def cmd_lead_start(args):
     # and notification click-through can land on it. Rename via /rename into the lead's OWN session,
     # matched by its iTerm id. Best-effort — if it doesn't take, focus just won't find the lead tab.
     tab_label = f"[Lead] {slugify(project)}"
+    # Row 75: a handoff successor whose title was disambiguated (`[Lead] X ·70e2`, see
+    # _distinct_lead_label) keeps it through its aftercare /relay:mode re-arm — renaming it back to
+    # the bare title here would recreate the very collision the handoff avoided.
+    if existing.get("tab_label") == f"{tab_label}{_successor_label_suffix(args.session_id)}":
+        tab_label = existing["tab_label"]
     if not getattr(args, "no_rename", False):
         iterm.rename_by_id(iterm_session, tab_label)
     # Stable per-lead tab color; this lead's executors inherit it at spawn so its tabs group
@@ -5685,6 +5690,30 @@ def cmd_lead_start(args):
               "routine in-plan steps instead of waiting. `relay auto off` reverts it for this session.")
 
 
+def _successor_label_suffix(sid):
+    """The deterministic disambiguator a handoff appends to a colliding successor title. The mark
+    lives in scripts/iterm.py (SUCCESSOR_LABEL_MARK) with the matcher invariant it must satisfy."""
+    return f"{iterm_backend.SUCCESSOR_LABEL_MARK}{str(sid)[:4]}"
+
+
+def _distinct_lead_label(base, successor_sid, caller_marker):
+    """`base` unless a LIVE lead already wears exactly that title, else `base` plus a short suffix
+    derived from the successor's id (`[Lead] claude-relay-2 ·70e2`). The caller (the outgoing lead,
+    still armed and its tab still open during the handoff) always counts as live — it is the
+    collision this exists for — so it is never probed; any OTHER lead is probed for liveness only
+    when its title actually matches, so a handoff costs no extra tab probes in the common case."""
+    taken = caller_marker.get("tab_label") == base
+    if not taken:
+        caller = caller_marker.get("session_id")
+        for m in lead_guard.list_leads(STATE_ROOT):
+            if m.get("broken") or m.get("session_id") in (caller, successor_sid):
+                continue
+            if m.get("tab_label") == base and _lead_liveness(m) == "live":
+                taken = True
+                break
+    return f"{base}{_successor_label_suffix(successor_sid)}" if taken else base
+
+
 def cmd_handoff(args):
     """One-command lead succession: spawn a successor lead tab PRE-ARMED (its marker written for a
     pinned session id before its first turn — same trick `cmd_spawn` already uses to pin an
@@ -5715,7 +5744,11 @@ def cmd_handoff(args):
     cwd = caller_marker.get("cwd") or os.getcwd()
     model = args.model or caller_marker.get("model")
     successor_sid = str(uuid.uuid4())  # pinned — this IS the successor's session id
-    tab_label = f"[Lead] {slugify(project)}"
+    # Row 75: never open the successor under a title a LIVE lead already wears. At this moment the
+    # caller is still armed and still titled `[Lead] <project>` — the `[ex-Lead]` retitle below
+    # only happens at step-down, and only if its handle resolves — so without this the handoff
+    # window always has two identical `[Lead] X` tabs (the 2026-09-07 close-predecessor incident).
+    tab_label = _distinct_lead_label(f"[Lead] {slugify(project)}", successor_sid, caller_marker)
     cfg = lead_guard.load_config(STATE_ROOT)
     # The successor INHERITS the outgoing lead's tab color (backlog row 63). A handoff transfers a
     # lead's identity, and its executors are re-parented (not respawned) a few lines below — picking
@@ -5862,9 +5895,9 @@ def cmd_handoff(args):
 
     # …and one more final act (§4): retitle the husk so the tab bar stops showing two `[Lead] X`.
     # Addressed by the handle captured above, so it can only ever hit the predecessor's own tab —
-    # the successor's identically-titled tab is untouchable by construction. When it takes, the
-    # recorded predecessor label is updated to match, or `relay close-predecessor`'s label FALLBACK
-    # (used when the handle lookup misses) would later search for a title that no longer exists.
+    # the successor's tab is untouchable by construction. When it takes, the recorded predecessor
+    # label is updated to match, so the record reads true (close-predecessor itself addresses the
+    # husk by handle only — row 74 — and never searches by this label).
     ex_title = f"[ex-Lead] {project}"
     pred_bk = backend.by_name(caller_marker.get("backend")) or iterm
     if retitle_tab(pred_bk, predecessor.get("iterm_session"), ex_title):
@@ -5881,6 +5914,27 @@ def cmd_handoff(args):
           f"pre-armed; this session has stepped down (gate + auto-wake off here).")
 
 
+def _tab_identity(handle):
+    """The stable part of a recorded tab handle, for "is this the same tab" comparisons: the UUID
+    of an iTerm "w#t#p#:UUID" (the w#t#p# prefix shifts as tabs move), a Terminal "twid:N" as-is.
+    None for an empty handle."""
+    h = str(handle or "").strip()
+    if not h:
+        return None
+    return h if h.startswith("twid:") else h.split(":")[-1]
+
+
+def _handle_resolves(bk, handle):
+    """Whether `handle` resolves to a live tab on backend `bk` BY ID ALONE — never a title match.
+    Never raises (a failed probe reads as unresolved, which callers treat as "refuse")."""
+    if not handle or not hasattr(bk, "exists_by_id"):
+        return False
+    try:
+        return bool(bk.exists_by_id(handle))
+    except Exception:
+        return False
+
+
 def cmd_close_predecessor(args):
     """Close the zombie tab a handoff leaves behind: the outgoing lead steps down (its marker is
     deleted) but its tab stays open with nothing on disk pointing at it. cmd_handoff records that
@@ -5891,7 +5945,11 @@ def cmd_close_predecessor(args):
     Addresses the predecessor's OWN recorded backend (`_lead_tab_target`'s invariant — "both from
     the marker rather than from the caller's ambient state"), never this invocation's selected
     `iterm`: a cross-backend handoff (predecessor under Terminal.app, successor under iTerm, or
-    vice versa) must still find and close the right tab — Defect A's failure mode, repeated."""
+    vice versa) must still find and close the right tab — Defect A's failure mode, repeated.
+
+    Row 74: the tab is addressed by its recorded HANDLE ONLY (the backend's id-only `exists_by_id` /
+    `close_by_id` / `tty_by_id`) — never by title. A missing or unresolvable handle, or a handle
+    that is the caller's OWN tab, is a refusal that closes and kills nothing."""
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if not caller or not lead_guard.is_lead(STATE_ROOT, caller):
         sys.exit("close-predecessor: caller isn't an armed lead — run /relay:mode first")
@@ -5904,16 +5962,42 @@ def cmd_close_predecessor(args):
     if pred_sid and lead_guard.is_lead(STATE_ROOT, pred_sid):
         sys.exit(f"close-predecessor: predecessor {pred_sid[:8]}… is still an armed lead — not "
                  f"closing a live lead's tab; ask them to /relay:stop first.")
+    # Row 74 (live incident 2026-09-07 16:10): this used to call `close(tab_label, handle)`, whose
+    # TITLE fallback — taken whenever the handle didn't resolve — closed the CALLER's own tab, since
+    # a handoff pair can share `[Lead] <project>` byte-for-byte. Same rule `retitle_tab` states for
+    # this exact moment: by recorded HANDLE only, never by label. No resolvable handle → refuse,
+    # close nothing, keep `predecessor` so the user can retry. Every backend call below is id-only.
+    pred_handle = pred.get("iterm_session")
+
+    def refuse_unresolved():
+        # `predecessor_closed` already carries `tab_closed`, so the refusal is ledgered on it (no new
+        # event name or field); the marker's `predecessor` is deliberately left in place for a retry.
+        append_ledger("predecessor_closed", session_id=caller, predecessor=pred_sid, tab_closed=False)
+        sys.exit(f"close-predecessor: predecessor tab handle {pred_handle or '(none recorded)'} not "
+                 f"found — not guessing by title; close it by hand")
+
+    if not pred_handle:
+        refuse_unresolved()
+    # Belt and braces: never the caller's own tab, whatever else says yes. A HARD stop, checked
+    # before any backend call — compared on the tab's stable identity (the iTerm UUID / Terminal
+    # window id), against both the caller's recorded handle and the tab it is running in right now.
+    own = {_tab_identity(h) for h in (marker.get("iterm_session"), os.environ.get("TERM_SESSION_ID"))
+           if _tab_identity(h)}
+    if _tab_identity(pred_handle) in own:
+        sys.exit(f"close-predecessor: REFUSING — predecessor tab handle {pred_handle} is THIS "
+                 f"lead's own tab; nothing closed. Close the predecessor's tab by hand.")
     pred_bk = (backend.by_name(pred.get("backend"))
-               or _probe_backend_for_tab(pred.get("tab_label"), pred.get("iterm_session"))
+               or _probe_backend_for_tab(pred.get("tab_label"), pred_handle)
                or iterm)
+    if not _handle_resolves(pred_bk, pred_handle):
+        refuse_unresolved()
     # Kill the predecessor's claude process BEFORE closing the tab — iTerm's `close` docstring:
     # without this, iTerm pops a 'confirm close running process' dialog that blocks osascript.
-    # There's no recorded pid for a lead (unlike executors), so find it live via the tab's tty.
-    # Best-effort throughout: a lookup miss at any step still falls through to attempting the
-    # close, and a backend with no tty/pid introspection (e.g. Terminal.app) just skips this.
-    pred_tty = (pred_bk.tty_by_id(pred.get("iterm_session"))
-                if pred.get("iterm_session") and hasattr(pred_bk, "tty_by_id") else None)
+    # There's no recorded pid for a lead (unlike executors), so find it live via the tab's tty —
+    # looked up by the SAME handle that just resolved (tty_by_id is id-only), never by title.
+    # Best-effort: a lookup miss still falls through to the close, and a backend with no tty/pid
+    # introspection (e.g. Terminal.app) just skips this.
+    pred_tty = pred_bk.tty_by_id(pred_handle) if hasattr(pred_bk, "tty_by_id") else None
     pred_pid = (pred_bk.pid_on_tty(pred_tty)
                 if pred_tty and hasattr(pred_bk, "pid_on_tty") else None)
     if pred_pid:
@@ -5922,10 +6006,10 @@ def cmd_close_predecessor(args):
             time.sleep(0.3)
         except Exception:
             pass
-    closed = pred_bk.close(pred.get("tab_label") or "", pred.get("iterm_session"), None)
+    closed = pred_bk.close_by_id(pred_handle)
     if closed:
         tab_note = "closed its tab"
-    elif not pred_bk.is_alive(pred.get("tab_label") or "", pred.get("iterm_session")):
+    elif not _handle_resolves(pred_bk, pred_handle):
         tab_note = "tab closed itself"
     else:
         tab_note = "tab not auto-closed — Cmd-W it if it lingers"

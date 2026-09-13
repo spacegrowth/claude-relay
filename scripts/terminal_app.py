@@ -136,6 +136,17 @@ def close(label, handle=None, pid=None):
     return r.returncode == 0 and r.stdout.strip().lower() == "true"
 
 
+def exists_by_id(handle):
+    """HANDLE-ONLY liveness (shared backend surface, see iterm.exists_by_id). Terminal.app already
+    addresses by window id only, so this is is_alive with no label."""
+    return is_alive("", handle)
+
+
+def close_by_id(handle):
+    """HANDLE-ONLY close (shared backend surface, see iterm.close_by_id) — close() by window id."""
+    return close("", handle)
+
+
 def focus(label, handle=None, pid=None):
     """Bring the session's window to the front."""
     wid = _wid(handle)

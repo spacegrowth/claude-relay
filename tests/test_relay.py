@@ -5336,9 +5336,16 @@ class TestClosePredecessor:
         relay.lead_guard.write_marker(relay.STATE_ROOT, "new-lead", project="webapp", cwd=str(tmp_path),
                                        predecessor=predecessor)
         self._env(monkeypatch, "new-lead")
-        with mock.patch.object(relay.iterm, "close", return_value=True) as close_mock:
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+        # Row 74 (DELIBERATE spec change): the predecessor tab is closed by its recorded HANDLE ONLY
+        # — the old `close(tab_label, handle)` title fallback closed the caller's own tab live.
+        with mock.patch.object(relay.iterm, "exists_by_id", return_value=True), \
+             mock.patch.object(relay.iterm, "tty_by_id", return_value=None), \
+             mock.patch.object(relay.iterm, "close") as title_close, \
+             mock.patch.object(relay.iterm, "close_by_id", return_value=True) as close_mock:
             relay.cmd_close_predecessor(SimpleNamespace())
-        close_mock.assert_called_once_with("[Lead] webapp", "w1t1p0:OLD", None)
+        close_mock.assert_called_once_with("w1t1p0:OLD")
+        title_close.assert_not_called()
         marker = relay.lead_guard.read_marker(relay.STATE_ROOT, "new-lead")
         assert "predecessor" not in marker or not marker["predecessor"]
         events = self._ledger_events(relay)

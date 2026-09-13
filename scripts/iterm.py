@@ -24,6 +24,12 @@ CLAUDE_BIN = "claude"
 # space, which a terminal renders indistinguishably from a normal space -- do not "simplify" this
 # to a plain space again, it silently breaks every title match).
 TAB_TITLE_SEP = " —"
+# The mark `relay handoff` puts between a lead label and its successor disambiguator
+# (`[Lead] X ·70e2`, bin/relay _successor_label_suffix). INVARIANT: a title that is a label followed by
+# this mark belongs to a DIFFERENT lead, so neither title matcher may read it as that bare label —
+# title_is_live's `label + " "` clause excludes it explicitly, and _match_session_block has no bare-
+# space clause at all. Change the mark here only, never at the generating site.
+SUCCESSOR_LABEL_MARK = " ·"
 
 
 def run_osascript(script, timeout=None):
@@ -81,11 +87,12 @@ def live_session_names():
 
 def title_is_live(label, live_names):
     """Bounded match: label is live if some tab title equals it, starts/ends with it at a
-    label boundary, or has it followed by the status-separator (Claude's own suffix)."""
+    label boundary, or has it followed by the status-separator (Claude's own suffix). A title that
+    is `label` + SUCCESSOR_LABEL_MARK is a different lead's (a handoff successor) and never matches."""
     for title in live_names:
         if (
             title == label
-            or title.startswith(label + " ")
+            or (title.startswith(label + " ") and not title.startswith(label + SUCCESSOR_LABEL_MARK))
             or title.endswith(" " + label)
             or (label + TAB_TITLE_SEP) in title
             or title.startswith(label + TAB_TITLE_SEP)
@@ -761,6 +768,24 @@ def rename_by_id(iterm_id, new_name):
     return r.returncode == 0 and r.stdout.strip().lower() == "true"
 
 
+def exists_by_id(handle):
+    """HANDLE-ONLY liveness: True only when an id lookup ran and found the session. Unlike
+    is_alive() there is NO title fallback — for callers that must never mistake a same-titled tab
+    for the one they mean (backlog row 74: close-predecessor closed the caller's own tab that way)."""
+    return _session_exists_by_id(handle) is True
+
+
+def close_by_id(handle):
+    """HANDLE-ONLY close: closes the session whose iTerm id matches `handle`, or nothing. No title
+    fallback (see exists_by_id). Returns True only if a session matched and the close ran."""
+    if not handle:
+        return False
+    uuid = handle.split(":")[-1]
+    script = _for_session_by_id(uuid, "          tell s to close\n          return true\n") + "return false"
+    r = run_osascript(script, timeout=5)
+    return r.returncode == 0 and r.stdout.strip().lower() == "true"
+
+
 def close(label, handle=None, pid=None):
     """Close the iTerm tab/session matched by `handle` (unique iTerm session id) when given, else by
     `label` (bounded title match). id-based matching first because a title CAN be shared by two live
@@ -772,12 +797,8 @@ def close(label, handle=None, pid=None):
     process' dialog (which would block osascript). The executor's report is already on disk, so
     closing loses nothing. Returns True if a session matched and the close command ran.
     pid: shared backend signature, unused here (iTerm addresses by title/id, not pid)."""
-    if handle:
-        uuid = handle.split(":")[-1]
-        script = _for_session_by_id(uuid, "          tell s to close\n          return true\n") + "return false"
-        r = run_osascript(script, timeout=5)
-        if r.returncode == 0 and r.stdout.strip().lower() == "true":
-            return True
+    if handle and close_by_id(handle):
+        return True
     action = "          tell s to close\n"
     script = (
         "set matched to false\n"

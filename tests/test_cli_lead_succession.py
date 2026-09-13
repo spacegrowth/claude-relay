@@ -52,7 +52,8 @@ def load_relay_module(state_root):
 
 
 BACKEND_ENTRY_POINTS = ("spawn", "send", "close", "focus", "is_alive", "rename_by_id",
-                        "tty_by_id", "pid_on_tty", "title_by_id", "live_session_names")
+                        "tty_by_id", "pid_on_tty", "title_by_id", "live_session_names",
+                        "exists_by_id", "close_by_id")
 
 
 @pytest.fixture(autouse=True)
@@ -121,6 +122,9 @@ class FakeTerm:
         self.alive_by = {}     # backend name -> is_alive override, for cross-backend tests
         self.spawn_error = None
         self.titles = {}
+        self.dead_handles = set()   # handles the id-only lookups (exists_by_id) report as gone
+        self.gone_after_failed_close = False   # a close_by_id that fails still leaves no tab
+        self.tty_lookups = []  # every tty_by_id handle — the pid-kill path's only way in
         self._name = None      # which backend module the CURRENT call came through
 
     @contextlib.contextmanager
@@ -181,7 +185,21 @@ class FakeTerm:
         self.renames.append({"handle": handle, "name": new_name})
         return True
 
+    def exists_by_id(self, handle):
+        self.ops.append(("exists_by_id", self._name))
+        if not handle or handle in self.dead_handles:
+            return False
+        return self.alive_by.get(self._name, self.alive)
+
+    def close_by_id(self, handle):
+        self.ops.append(("close", self._name))
+        self.closes.append({"label": None, "handle": handle, "pid": None, "by_id": True})
+        if self.close_ok or self.gone_after_failed_close:
+            self.dead_handles.add(handle)
+        return self.close_ok
+
     def tty_by_id(self, handle):
+        self.tty_lookups.append(handle)
         return None
 
     def pid_on_tty(self, tty, binary_suffix=None):
@@ -683,6 +701,108 @@ class TestHandoff:
 
 # ── close-predecessor ───────────────────────────────────────────────────────────────────────────
 
+class TestSuccessorTitleNeverCollides:
+    """Backlog row 75: the handoff gave the successor the predecessor's exact title
+    (`[Lead] claude-relay-2`) while the predecessor's tab was still open — the ambiguity row 74's
+    close-predecessor then mis-resolved. The `[ex-Lead]` retitle only lands at step-down, so the
+    collision window is the handoff itself."""
+
+    @pytest.fixture
+    def outgoing(self, relay, monkeypatch):
+        arm_lead(relay, "lead-old", "webapp", iterm_session="w0t0p0:OLD", backend="iterm",
+                 started="2020-01-01T00:00:00")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-old")
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+        return "lead-old"
+
+    def _handoff(self, relay, tmp_path):
+        doc = tmp_path / "handoff.md"
+        doc.write_text("# Handoff\n\nIn flight: nothing.\n")
+        run_main(relay, "handoff", str(doc))
+        return next(m["session_id"] for m in relay.lead_guard.list_leads(relay.STATE_ROOT)
+                    if m["session_id"] != "lead-other")
+
+    def test_the_successor_is_disambiguated_from_its_still_open_predecessor(self, relay, terms,
+                                                                            tmp_path, outgoing):
+        sid = self._handoff(relay, tmp_path)
+        expected = f"[Lead] webapp ·{sid[:4]}"
+        assert terms.spawns[0]["label"] == expected                   # the tab opens under it
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, sid)["tab_label"] == expected
+
+    def test_the_suffix_is_deterministic_from_the_successor_id(self, relay):
+        assert relay._distinct_lead_label("[Lead] x", "70e2abcd-1111", {"tab_label": "[Lead] x"}) \
+            == "[Lead] x ·70e2"
+
+    def test_no_live_lead_wearing_the_title_keeps_it_bare(self, relay, terms, tmp_path, outgoing):
+        relay.lead_guard.update_marker(relay.STATE_ROOT, "lead-old", tab_label="[Lead] renamed")
+        sid = self._handoff(relay, tmp_path)
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, sid)["tab_label"] == "[Lead] webapp"
+
+    def test_another_live_lead_wearing_the_title_also_disambiguates(self, relay, terms, tmp_path,
+                                                                    outgoing):
+        relay.lead_guard.update_marker(relay.STATE_ROOT, "lead-old", tab_label="[Lead] renamed")
+        arm_lead(relay, "lead-other", "webapp", iterm_session="w0t5p0:OTHER", backend="iterm")
+        sid = self._handoff(relay, tmp_path)
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, sid)["tab_label"] \
+            == f"[Lead] webapp ·{sid[:4]}"
+
+    def test_a_dead_lead_wearing_the_title_does_not_count(self, relay, terms, tmp_path, outgoing):
+        relay.lead_guard.update_marker(relay.STATE_ROOT, "lead-old", tab_label="[Lead] renamed")
+        arm_lead(relay, "lead-other", "webapp", iterm_session="w0t5p0:OTHER", backend="iterm")
+        terms.alive = False           # its tab is gone — a ghost holds no title
+        sid = self._handoff(relay, tmp_path)
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, sid)["tab_label"] == "[Lead] webapp"
+
+    def test_a_dead_predecessor_is_not_live_while_its_suffixed_successor_is_open(self, relay):
+        """Through the REAL iterm.is_alive/title_is_live (only the two osascript probes are faked,
+        no FakeTerm): the predecessor's handle is gone and the only tab carrying its title stem is
+        the successor's `[Lead] webapp ·70e2` — `_lead_liveness` must not read it as live."""
+        m = {"session_id": "lead-old", "tab_label": "[Lead] webapp", "iterm_session": "w0t0p0:OLD",
+             "backend": "iterm", "last_active": "2000-01-01T00:00:00"}
+        it = relay.iterm_backend
+        with mock.patch.object(it, "_session_exists_by_id", return_value=False), \
+             mock.patch.object(it, "running", return_value=True), \
+             mock.patch.object(it, "live_session_names", return_value={"[Lead] webapp ·70e2"}):
+            assert relay.backend.by_name("iterm") is it
+            assert relay._lead_liveness(m) == "ghost"
+            succ = dict(m, session_id="70e2abcd", tab_label="[Lead] webapp ·70e2",
+                        iterm_session="w0t1p0:NEW")
+            assert relay._lead_liveness(succ) == "live"
+
+    def test_the_aftercare_re_arm_keeps_the_disambiguated_title(self, relay, terms, tmp_path,
+                                                                outgoing, monkeypatch):
+        """The aftercare tells the successor to run /relay:mode, whose lead-start renames the tab —
+        back to the bare, colliding title unless it keeps the handoff's exact label."""
+        sid = self._handoff(relay, tmp_path)
+        expected = f"[Lead] webapp ·{sid[:4]}"
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+        monkeypatch.setenv("TERM_SESSION_ID", "w0t0p0:STUB")
+        terms.renames.clear()
+        run_main(relay, "lead-start", sid, "--project", "webapp")
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, sid)["tab_label"] == expected
+        assert terms.renames == [{"handle": "w0t0p0:STUB", "name": expected}]
+
+    def test_an_unrelated_label_is_not_preserved_by_a_re_arm(self, relay, terms, monkeypatch):
+        """Only the handoff's own deterministic form survives a re-arm; anything else is re-derived."""
+        arm_lead(relay, "lead-x", "webapp")
+        relay.lead_guard.update_marker(relay.STATE_ROOT, "lead-x", tab_label="[Lead] webapp ·zzzz")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-x")
+        run_main(relay, "lead-start", "lead-x", "--project", "webapp", "--no-rename")
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-x")["tab_label"] == "[Lead] webapp"
+
+    def test_tidy_list_and_focus_still_find_the_suffixed_successor(self, relay, terms, tmp_path,
+                                                                   outgoing, capsys):
+        sid = self._handoff(relay, tmp_path)
+        expected = f"[Lead] webapp ·{sid[:4]}"
+        groups = relay.tidy_groups()                  # grouped by marker + handle, not title
+        assert [(g["lead"], g["handle"]) for g in groups] == [(sid, "w0t0p0:STUB")]
+        capsys.readouterr()
+        run_main(relay, "list")
+        assert "webapp" in capsys.readouterr().out
+        run_main(relay, "focus", "webapp")
+        assert terms.focuses[-1] == {"label": expected, "handle": "w0t0p0:STUB", "pid": None}
+
+
 class TestClosePredecessor:
     """cmd_close_predecessor: "reads it back, closes the tab, and clears the field so the offer
     can't repeat. Never invoked automatically"."""
@@ -691,8 +811,10 @@ class TestClosePredecessor:
         pred = {"session_id": "lead-old", "tab_label": "[ex-Lead] webapp",
                 "iterm_session": "w0t0p0:OLD"}
         pred.update(pred_over)
-        arm_lead(relay, "lead-new", "webapp", predecessor=pred, backend="iterm")
+        arm_lead(relay, "lead-new", "webapp", predecessor=pred, backend="iterm",
+                 iterm_session="w0t1p0:NEW")
         monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-new")
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)   # the runner's own tab is not in play
         return pred
 
     def test_it_closes_the_predecessors_tab_by_its_recorded_handle(self, relay, terms, monkeypatch,
@@ -743,7 +865,7 @@ class TestClosePredecessor:
                                                                     capsys):
         self._armed_with_pred(relay, monkeypatch)
         terms.close_ok = False
-        terms.alive = False
+        terms.gone_after_failed_close = True    # the handle resolved, then the tab went on its own
         run_main(relay, "close-predecessor")
         assert "tab closed itself" in capsys.readouterr().out
 
@@ -770,9 +892,110 @@ class TestClosePredecessor:
         arm_lead(relay, "lead-new", "webapp", predecessor=pred, backend="iterm")
         monkeypatch.setattr(relay, "iterm", relay.backend.by_name("iterm"))
         monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-new")
-        terms.close_ok = False       # so the is_alive branch is exercised too
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+        terms.close_ok = False       # so the post-close liveness branch is exercised too
         run_main(relay, "close-predecessor")
-        assert [n for op, n in terms.ops if op in ("close", "is_alive")] == ["terminal"]
+        tab_ops = [(op, n) for op, n in terms.ops if op in ("close", "is_alive", "exists_by_id")]
+        # resolve, close, re-check — every one of them through the predecessor's own backend
+        assert [op for op, _ in tab_ops] == ["exists_by_id", "close", "exists_by_id"]
+        assert {n for _, n in tab_ops} == {"terminal"}
+
+    # ── row 74: never the caller's own tab ──────────────────────────────────────────────────────
+
+    def _incident(self, relay, monkeypatch, **pred_over):
+        """The 2026-09-07 16:10 shape: successor and predecessor BOTH titled `[Lead] claude-relay-2`
+        (the predecessor's `[ex-Lead]` retitle never took), the successor's marker records the
+        predecessor, and the predecessor's recorded handle no longer resolves."""
+        pred = {"session_id": "4dff0f10-old", "tab_label": "[Lead] claude-relay-2",
+                "iterm_session": "w0t0p0:OLD", "backend": "iterm"}
+        pred.update(pred_over)
+        arm_lead(relay, "lead-new", "claude-relay-2", predecessor=pred, backend="iterm",
+                 iterm_session="w0t1p0:NEW")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-new")
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+        return pred
+
+    def _assert_nothing_touched(self, relay, terms, pred):
+        assert terms.closes == []                               # no close of ANY kind — by id or title
+        assert not [op for op, _ in terms.ops if op == "close"]
+        assert terms.tty_lookups == []                          # the pid-kill path was never entered
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-new")["predecessor"] == pred
+
+    def test_an_unresolvable_handle_refuses_instead_of_matching_the_shared_title(
+            self, relay, terms, monkeypatch):
+        """Backlog row 74: `close(tab_label, handle)` fell back to a TITLE match when the handle
+        missed, and both leads wore `[Lead] claude-relay-2` — so it closed the caller's own tab.
+        `retitle_tab`'s rule for this exact moment: "ALWAYS by recorded HANDLE, never by label
+        match … No handle → no-op, never a guess"."""
+        pred = self._incident(relay, monkeypatch)
+        terms.dead_handles.add("w0t0p0:OLD")
+        terms.titles = {"w0t1p0:NEW": "[Lead] claude-relay-2"}   # the caller's tab: same title
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "close-predecessor")
+        assert str(e.value) == ("close-predecessor: predecessor tab handle w0t0p0:OLD not found — "
+                                "not guessing by title; close it by hand")
+        self._assert_nothing_touched(relay, terms, pred)
+        rec = ledger_events(relay, "predecessor_closed")
+        assert len(rec) == 1 and rec[0]["tab_closed"] is False
+
+    def test_a_missing_handle_refuses_without_touching_any_tab(self, relay, terms, monkeypatch):
+        pred = self._incident(relay, monkeypatch, iterm_session=None)
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "close-predecessor")
+        assert "predecessor tab handle (none recorded) not found — not guessing by title" in str(e.value)
+        self._assert_nothing_touched(relay, terms, pred)
+        assert not [op for op, _ in terms.ops if op in ("exists_by_id", "is_alive")]
+
+    def test_a_refusal_can_be_retried_once_the_handle_resolves(self, relay, terms, monkeypatch,
+                                                             capsys):
+        """The field is kept precisely so the user can retry after fixing."""
+        self._incident(relay, monkeypatch)
+        terms.dead_handles.add("w0t0p0:OLD")
+        with pytest.raises(SystemExit):
+            run_main(relay, "close-predecessor")
+        terms.dead_handles.clear()
+        run_main(relay, "close-predecessor")
+        assert [c["handle"] for c in terms.closes] == ["w0t0p0:OLD"]
+        assert "closed its tab" in capsys.readouterr().out
+        assert "predecessor" not in relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-new")
+
+    def test_the_callers_own_tab_is_a_hard_stop_even_when_it_resolves(self, relay, terms,
+                                                                      monkeypatch):
+        """Belt and braces: a predecessor record naming the CALLER's own tab (same iTerm session
+        UUID; the w#t#p# prefix is only a position) refuses with its own message, although every
+        other check — recorded, resolvable, predecessor stepped down — would pass."""
+        pred = self._incident(relay, monkeypatch, iterm_session="w3t4p0:NEW")
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "close-predecessor")
+        assert "is THIS lead's own tab; nothing closed" in str(e.value)
+        assert "not found" not in str(e.value)
+        self._assert_nothing_touched(relay, terms, pred)
+        assert ledger_events(relay, "predecessor_closed") == []
+
+    def test_the_tab_the_caller_runs_in_is_a_hard_stop_too(self, relay, terms, monkeypatch):
+        """Same stop when the caller's marker has no handle but the process runs in that tab."""
+        pred = {"session_id": "old", "tab_label": "[Lead] x", "iterm_session": "w0t0p0:HERE",
+                "backend": "iterm"}
+        arm_lead(relay, "lead-new", "x", predecessor=pred, backend="iterm")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-new")
+        monkeypatch.setenv("TERM_SESSION_ID", "w1t2p0:HERE")
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "close-predecessor")
+        assert "is THIS lead's own tab" in str(e.value)
+        assert terms.closes == []
+
+    def test_same_titles_with_distinct_resolvable_handles_close_only_the_predecessor(
+            self, relay, terms, monkeypatch, capsys):
+        """The happy path under the incident's titles: the predecessor's handle resolves, so it —
+        and only it — is closed, by id, and the field is cleared exactly as before."""
+        self._incident(relay, monkeypatch)
+        run_main(relay, "close-predecessor")
+        assert terms.closes == [{"label": None, "handle": "w0t0p0:OLD", "pid": None, "by_id": True}]
+        assert terms.tty_lookups == ["w0t0p0:OLD"]      # the pid lookup used the SAME handle
+        assert "closed its tab" in capsys.readouterr().out
+        assert "predecessor" not in relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-new")
+        rec = ledger_events(relay, "predecessor_closed")
+        assert len(rec) == 1 and rec[0]["tab_closed"] is True
 
 
 # ── nudge-lead ──────────────────────────────────────────────────────────────────────────────────

@@ -56,7 +56,7 @@ def load_relay_module(state_root):
 # `relay.iterm` alone would not stop a tidy from reaching the live iTerm2 Python API.
 BACKEND_ENTRY_POINTS = ("spawn", "send", "close", "focus", "is_alive", "rename_by_id",
                         "tty_by_id", "pid_on_tty", "title_by_id", "live_session_names",
-                        "reorder_tabs")
+                        "reorder_tabs", "exists_by_id", "close_by_id")
 
 
 @pytest.fixture(autouse=True)
@@ -159,6 +159,13 @@ class FakeTerm:
     def close(self, label, handle=None, pid=None):
         self.closes.append({"label": label, "handle": handle, "pid": pid})
         return self.close_ok
+
+    def close_by_id(self, handle):
+        self.closes.append({"label": None, "handle": handle, "pid": None})
+        return self.close_ok
+
+    def exists_by_id(self, handle):
+        return bool(handle) and self.alive_by.get(self._name, self.alive)
 
     def focus(self, label, handle=None, pid=None):
         self.focuses.append({"label": label, "handle": handle, "pid": pid})

@@ -183,6 +183,40 @@ class TestIdBasedClose:
         assert "name of s is equal to" in script
         assert "id of s" not in script
 
+    def test_close_by_id_never_falls_back_to_a_title_match(self):
+        """Backlog row 74: close-predecessor needs a close that can ONLY hit the recorded tab."""
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("false")) as osa_run:
+            closed = iterm.close_by_id("w1t5p0:SOME-UUID")
+        assert closed is False
+        assert osa_run.call_count == 1
+        script = osa_run.call_args[0][0]
+        assert 'id of s) is "SOME-UUID"' in script and "name of s" not in script
+
+    def test_close_by_id_without_a_handle_runs_nothing(self):
+        with mock.patch.object(iterm, "run_osascript") as osa_run:
+            assert iterm.close_by_id(None) is False
+        osa_run.assert_not_called()
+
+    def test_exists_by_id_never_falls_back_to_a_title_match(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("false")), \
+             mock.patch.object(iterm, "live_session_names", return_value={"[Lead] webapp"}) as names:
+            assert iterm.exists_by_id("w1t5p0:SOME-UUID") is False
+        names.assert_not_called()
+
+    def test_exists_by_id_treats_a_failed_lookup_as_not_found(self):
+        failed = subprocess.CompletedProcess(["osascript"], 1, "", "boom")
+        with mock.patch.object(iterm, "run_osascript", return_value=failed):
+            assert iterm.exists_by_id("w1t5p0:SOME-UUID") is False
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")):
+            assert iterm.exists_by_id("w1t5p0:SOME-UUID") is True
+
+    def test_terminal_id_only_entry_points_ignore_foreign_handles(self):
+        tapp = backend.by_name("terminal")
+        with mock.patch.object(tapp, "run_osascript") as osa_run:
+            assert tapp.exists_by_id("w1t5p0:SOME-UUID") is False
+            assert tapp.close_by_id("w1t5p0:SOME-UUID") is False
+        osa_run.assert_not_called()
+
     def test_is_alive_with_handle_short_circuits_on_id_match(self):
         with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run, \
              mock.patch.object(iterm, "title_is_live") as title_is_live:
@@ -204,6 +238,46 @@ class TestIdBasedClose:
             alive = iterm.is_alive("[Lead] webapp")
         assert alive is True
         osa_run.assert_not_called()   # no id lookup attempted at all without a handle
+
+
+class TestTitleIsLiveSuccessorSuffix:
+    """Row 75 follow-up: the REAL bounded matcher (no fake) must not read a bare `[Lead] X` label as
+    live when the only matching tab is the suffixed handoff successor `[Lead] X ·70e2` — that made a
+    dead predecessor read as live in `relay list` for as long as its successor's tab was open."""
+
+    SEP = iterm.TAB_TITLE_SEP
+
+    def test_a_bare_label_does_not_match_the_suffixed_successor(self):
+        assert iterm.title_is_live("[Lead] claude-relay-2", {"[Lead] claude-relay-2 ·70e2"}) is False
+        assert iterm.title_is_live("[Lead] claude-relay-2",
+                                   {f"[Lead] claude-relay-2 ·70e2{self.SEP} working"}) is False
+
+    def test_the_suffixed_label_matches_its_own_title(self):
+        assert iterm.title_is_live("[Lead] claude-relay-2 ·70e2", {"[Lead] claude-relay-2 ·70e2"})
+        assert iterm.title_is_live("[Lead] claude-relay-2 ·70e2",
+                                   {f"[Lead] claude-relay-2 ·70e2{self.SEP} working"})
+
+    def test_a_bare_label_still_matches_its_own_title(self):
+        assert iterm.title_is_live("[Lead] claude-relay-2", {"[Lead] claude-relay-2"})
+        assert iterm.title_is_live("[Lead] claude-relay-2",
+                                   {"[Lead] claude-relay-2 ·70e2", "[Lead] claude-relay-2"})
+
+    def test_the_pre_existing_bounded_cases_still_hold(self):
+        assert iterm.title_is_live("[Exec] a", {f"[Exec] a{self.SEP} Thinking"})
+        assert iterm.title_is_live("[Exec] a", {"[Exec] a (claude)"})       # label + " "
+        assert iterm.title_is_live("[Exec] a", {"✳ [Exec] a"})              # " " + label
+        assert iterm.title_is_live("[Exec] a", {f"✳ [Exec] a{self.SEP} x"})
+        assert not iterm.title_is_live("[Exec] a", {"[Exec] ab"})
+        assert not iterm.title_is_live("[Exec] a", set())
+
+    def test_the_generated_suffix_uses_the_shared_mark(self):
+        assert iterm.SUCCESSOR_LABEL_MARK == " ·"
+
+    def test_the_applescript_matcher_agrees(self):
+        """_match_session_block has no bare `label + " "` clause, so the suffixed title is
+        already out of reach there; pin that so the two matchers cannot drift apart."""
+        block = iterm._match_session_block("[Lead] X", "")
+        assert 'starts with "[Lead] X "' not in block and 'contains " [Lead] X "' not in block
 
 
 class TestIdBasedSend:
