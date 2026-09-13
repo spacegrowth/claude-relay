@@ -493,7 +493,8 @@ class TestStats:
         data = json.loads(capsys.readouterr().out)
         assert data["rows"] == [{"session_id": "e1", "packet": "001", "model": "sonnet",
                                  "effort": "high", "rounds": "-", "verdict": "-",
-                                 "status": "clean"}]
+                                 "status": "clean", "tokens_prompt": None, "tokens_output": None,
+                                 "tokens_estimated": False}]
 
     def test_closed_and_superseded_sessions_are_included(self, relay, terms, capsys):
         for sid, status in (("e1", "closed"), ("e2", "superseded"), ("e3", "dead")):
@@ -653,6 +654,141 @@ class TestStats:
         run_main(relay, "stats", "--lead", "webapp", "--json")
         assert [r["session_id"] for r in json.loads(capsys.readouterr().out)["rows"]] == ["mine"]
 
+
+class TestStatsPerPacketTokens:
+    """Backlog row 58 / README "relay stats": the executor's billed usage is snapshotted on every
+    hand-off ledger event (`spawned`/`packet_sent`/`queue_delivered`) and on `report_seen`; a row's
+    TOKENS is `report_seen.usage − hand-off.usage`, falling back to the per-session average (`~`)
+    when either snapshot is missing."""
+
+    def _usage(self, prompt, output, requests=1):
+        return {"prompt": prompt, "output": output, "requests": requests}
+
+    def test_hand_off_and_report_snapshots_give_the_delta_not_the_average(self, relay, terms,
+                                                                          capsys, monkeypatch):
+        make_session(relay, "e1", current_packet=2, report=False)
+        for n in (1, 2):
+            (relay.packets_dir("e1") / f"{n:03d}-report.md").write_text("Did it.\nStatus: clean\n")
+        relay.append_ledger("packet_sent", session_id="e1", packet=1, usage=self._usage(0, 0, 0))
+        relay.append_ledger("report_seen", session_id="e1", packet=1, usage=self._usage(9000, 1000))
+        relay.append_ledger("packet_sent", session_id="e1", packet=2, usage=self._usage(9500, 1100))
+        relay.append_ledger("report_seen", session_id="e1", packet=2, usage=self._usage(10500, 1200))
+        # Session total 20k → the old average would be 10k/pkt for BOTH packets.
+        monkeypatch.setattr(relay, "_usage_for_session",
+                            lambda s: {"prompt": 18000, "output": 2000, "requests": 9})
+        run_main(relay, "stats", "--json")
+        data = json.loads(capsys.readouterr().out)
+        rows = {r["packet"]: r for r in data["rows"]}
+        assert (rows["001"]["tokens_prompt"], rows["001"]["tokens_output"]) == (9000, 1000)
+        assert (rows["002"]["tokens_prompt"], rows["002"]["tokens_output"]) == (1000, 100)
+        assert rows["001"]["tokens_estimated"] is False and rows["002"]["tokens_estimated"] is False
+        # SUMMARY's avg is the mean of the REAL figures: (10000 + 1100) / 2, not 20000 / 2.
+        assert data["summary"][0]["avg_tok_per_pkt"] == 5550
+        assert data["summary"][0]["avg_tok_estimated"] is False
+        run_main(relay, "stats")
+        out = capsys.readouterr().out
+        assert "TOKENS" in out
+        row_lines = [l for l in out.splitlines() if l.startswith("e1 ")]
+        assert "10k" in row_lines[0] and "1.1k" in row_lines[1]
+        assert "~" not in row_lines[0] and "~" not in row_lines[1]
+
+    def test_no_snapshots_falls_back_to_the_marked_average(self, relay, terms, capsys, monkeypatch):
+        make_session(relay, "e1", current_packet=2, report=False)
+        relay.append_ledger("packet_sent", session_id="e1", packet=1)      # pre-row-58 shape
+        relay.append_ledger("packet_sent", session_id="e1", packet=2)
+        monkeypatch.setattr(relay, "_usage_for_session",
+                            lambda s: {"prompt": 18000, "output": 2000, "requests": 9})
+        run_main(relay, "stats", "--json")
+        data = json.loads(capsys.readouterr().out)
+        for r in data["rows"]:
+            assert (r["tokens_prompt"], r["tokens_output"], r["tokens_estimated"]) == (9000, 1000, True)
+        assert data["summary"][0]["avg_tok_per_pkt"] == 10000
+        assert data["summary"][0]["avg_tok_estimated"] is True
+        run_main(relay, "stats")
+        out = capsys.readouterr().out
+        assert all("~10k" in l for l in out.splitlines() if l.startswith("e1 "))
+        assert "~10k" in out.split("SUMMARY (by model, effort)")[1]
+
+    def test_a_negative_delta_is_not_a_real_figure(self, relay, terms, capsys, monkeypatch):
+        """A report snapshot from a younger conversation (a cold `relay restart`) can't be subtracted
+        from the old one's hand-off — it falls back to the average instead of a fabricated number."""
+        make_session(relay, "e1", report=False)
+        relay.append_ledger("packet_sent", session_id="e1", packet=1, usage=self._usage(50000, 5000))
+        relay.append_ledger("report_seen", session_id="e1", packet=1, usage=self._usage(3000, 300))
+        monkeypatch.setattr(relay, "_usage_for_session", lambda s: {"prompt": 3000, "output": 300})
+        run_main(relay, "stats", "--json")
+        r = json.loads(capsys.readouterr().out)["rows"][0]
+        assert (r["tokens_prompt"], r["tokens_output"], r["tokens_estimated"]) == (3000, 300, True)
+
+    def test_report_seen_is_emitted_exactly_once_per_packet(self, relay, terms, monkeypatch):
+        make_session(relay, "e1", current_packet=2, report=False)
+        monkeypatch.setattr(relay, "_usage_for_session",
+                            lambda s: {"prompt": 4200, "output": 420, "requests": 3})
+        (relay.packets_dir("e1") / "002-report.md").write_text(DEFAULT_REPORT)
+        for _ in range(3):
+            relay._check_one("e1")
+        # A session file that lost its fast-path marker still doesn't re-emit (the ledger guard).
+        s = relay.read_session("e1")
+        s.pop("report_seen_packet", None)
+        relay.write_session("e1", s)
+        relay._check_one("e1")
+        seen = ledger_events(relay, "report_seen")
+        assert len(seen) == 1
+        assert seen[0]["session_id"] == "e1" and seen[0]["packet"] == 2
+        assert seen[0]["usage"] == {"prompt": 4200, "output": 420, "requests": 3}
+
+    def test_spawn_snapshots_zero_usage(self, relay, terms, tmp_path, live_pid):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        run_main(relay, "spawn", str(wt), "topic", write_packet(tmp_path), "--name", "e1")
+        zero = {"prompt": 0, "output": 0, "requests": 0}
+        assert ledger_events(relay, "spawned")[0]["usage"] == zero
+        assert ledger_events(relay, "packet_sent")[0]["usage"] == zero
+
+    def test_send_snapshots_usage_before_delivery(self, relay, terms, tmp_path, monkeypatch):
+        make_session(relay, "e1")
+        monkeypatch.setattr(relay, "_usage_for_session",
+                            lambda s: {"prompt": 7000, "output": 700, "requests": 5})
+        run_main(relay, "send", "e1", write_packet(tmp_path))
+        sent = [e for e in ledger_events(relay, "packet_sent") if e.get("packet") == 2]
+        assert sent and sent[0]["usage"] == {"prompt": 7000, "output": 700, "requests": 5}
+
+    def test_unreadable_usage_writes_null_and_the_send_still_succeeds(self, relay, terms, tmp_path,
+                                                                     capsys, monkeypatch):
+        """Unreadable = `_usage_for_session` → None (it swallows its own parse/stat errors); the
+        snapshot helper additionally never lets a raise escape into a send/check."""
+        make_session(relay, "e1")
+        monkeypatch.setattr(relay, "_usage_for_session", lambda s: None)
+        run_main(relay, "send", "e1", write_packet(tmp_path))
+        assert "sent packet 002" in capsys.readouterr().out
+        assert relay.read_session("e1")["status"] == "busy"
+        sent = [e for e in ledger_events(relay, "packet_sent") if e.get("packet") == 2]
+        assert len(sent) == 1 and "usage" in sent[0] and sent[0]["usage"] is None
+
+        def boom(s):
+            raise RuntimeError("transcript unreadable")
+        monkeypatch.setattr(relay, "_usage_for_session", boom)
+        assert relay._usage_snapshot(relay.read_session("e1")) is None
+
+    def test_queue_delivered_carries_the_hand_off_snapshot(self, relay, terms, tmp_path, monkeypatch,
+                                                          live_pid):
+        make_session(relay, "e1", status="busy", pid=live_pid, pid_started=None)
+        monkeypatch.setattr(relay, "_usage_for_session",
+                            lambda s: {"prompt": 7000, "output": 700, "requests": 5})
+        run_main(relay, "send", "e1", write_packet(tmp_path), "--when-idle")
+        assert len(relay.read_queue("e1")) == 1
+        mark_reported(relay, "e1")
+        assert relay.deliver_queued("e1", "test") is not None
+        delivered = ledger_events(relay, "queue_delivered")
+        assert len(delivered) == 1
+        assert delivered[0]["usage"] == {"prompt": 7000, "output": 700, "requests": 5}
+
+    def test_json_rows_carry_the_token_fields(self, relay, terms, capsys):
+        make_session(relay, "e1", report=False)
+        run_main(relay, "stats", "--json")
+        row = json.loads(capsys.readouterr().out)["rows"][0]
+        assert {"tokens_prompt", "tokens_output", "tokens_estimated"} <= set(row)
+        assert isinstance(row["tokens_estimated"], bool)
 
 # ── relay doctor ────────────────────────────────────────────────────────────────────────────────
 
@@ -914,7 +1050,9 @@ class TestLedgerIntegrity:
             assert set(rec) >= {"ts", "event"}
             assert relay._ts_epoch(rec["ts"]) is not None
         events = [json.loads(l)["event"] for l in relay.LEDGER.read_text().splitlines()]
-        assert events[:3] == ["spawned", "packet_sent", "packet_sent"]
+        # send's _check_one first observes packet 1's report → `report_seen` (row 58) lands
+        # between the two hand-offs.
+        assert events[:4] == ["spawned", "packet_sent", "report_seen", "packet_sent"]
         assert "keep" in events and "retired" in events
 
     def test_concurrent_writers_never_interleave_a_line(self, relay):

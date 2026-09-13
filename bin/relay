@@ -1378,8 +1378,9 @@ def cmd_spawn(args):
         "updated": now(),
     })
     append_ledger("spawned", session_id=session_id, worktree=worktree, topic=args.topic, tab_label=label,
-                  source=_ledger_packet_source(args))
-    append_ledger("packet_sent", session_id=session_id, packet=n, source=_ledger_packet_source(args))
+                  source=_ledger_packet_source(args), usage=dict(ZERO_USAGE_SNAPSHOT))
+    append_ledger("packet_sent", session_id=session_id, packet=n, source=_ledger_packet_source(args),
+                  usage=dict(ZERO_USAGE_SNAPSHOT))  # fresh conversation → nothing billed yet
     refresh_live_board()  # `spawn` is a state-change moment (see refresh_live_board) — no-op unless live
     if launch_failed:
         append_ledger("launch_failed", session_id=session_id, attempts=2)
@@ -2420,6 +2421,9 @@ def cmd_send(args):
                                         agent=bool(s.get("agent"))))
 
     pointer = build_pointer_message(str(packet_path), packet_summary(body))
+    # Row 58: snapshot billed usage BEFORE the pointer lands, so none of this packet's own turns
+    # leak into the hand-off baseline. None (→ `usage: null`) when unreadable; never fails the send.
+    handoff_usage = _usage_snapshot(s)
     ok = False if (tab_gone or mcp_relaunch) else term_backend(s).send(s["tab_label"], pointer,
                                                                        s.get("iterm_session"), s.get("pid"))
     if not ok:
@@ -2441,7 +2445,7 @@ def cmd_send(args):
             write_session(args.session_id, s)
             append_ledger("packet_sent", session_id=args.session_id, packet=n,
                           via="resume" + ("-mcp" if mcp_relaunch else ""),
-                          source=_ledger_packet_source(args))
+                          source=_ledger_packet_source(args), usage=handoff_usage)
             note = (f"session '{args.session_id}' was {prev_status}"
                     if prev_status in ("closed", "dead")
                     else (f"MCP set widened to {lead_guard.mcp_spec_label(s.get('mcp'))}" if mcp_relaunch
@@ -2462,7 +2466,8 @@ def cmd_send(args):
     s["busy_since_epoch"] = time.time()
     s["updated"] = now()
     write_session(args.session_id, s)
-    append_ledger("packet_sent", session_id=args.session_id, packet=n, source=_ledger_packet_source(args))
+    append_ledger("packet_sent", session_id=args.session_id, packet=n, source=_ledger_packet_source(args),
+                  usage=handoff_usage)
     print(f"sent packet {n:03d} to session '{args.session_id}' (existing tab)")
     refresh_live_board()  # `send` is a state-change moment — no-op unless live
 
@@ -2543,8 +2548,11 @@ def deliver_queued(session_id, trigger):
                               queue_id=item["id"], trigger=trigger, error=err[:300])
             return None
         n = read_session(session_id).get("current_packet")
+        # Row 58: the packet_sent cmd_send just wrote carries the pre-delivery snapshot; reuse it
+        # rather than re-reading the transcript after the pointer already landed.
+        qusage = _ledger_handoff_usage(session_id, n)
         append_ledger("queue_delivered", session_id=session_id, queue_id=item["id"],
-                      packet=n, trigger=trigger, remaining=len(rest))
+                      packet=n, trigger=trigger, remaining=len(rest), usage=qusage)
         print(f"delivered queued packet (queue #{item['id']}) to '{session_id}' as packet "
               f"{n:03d} — triggered by {trigger}"
               + (f"; {len(rest)} still queued" if rest else ""))
@@ -2763,6 +2771,7 @@ def _check_one(session_id):
             if s["status"] != "reported":
                 append_ledger("reported", session_id=session_id, packet=n)
             s["status"] = "reported"
+            record_report_seen(session_id, s, n)
             record_landed_if_clean(session_id, s, n, "check")
         elif proc_alive:
             elapsed = _busy_elapsed(s)
@@ -2859,6 +2868,25 @@ def _git_dirty_paths(worktree):
     4 moved the body there) so the sweep here and the Stop hook's own landed test — which imports
     lead_guard, not this file — can never drift apart."""
     return lead_guard.git_dirty_paths(worktree)
+
+
+def record_report_seen(sid, s, packet_n):
+    """Backlog row 58: ledger `report_seen` (with the executor's billed-usage snapshot) the FIRST
+    time relay observes (sid, packet_n)'s report — `relay stats` subtracts the packet's hand-off
+    snapshot from it. Idempotent the way `landed` is (an existing `report_seen` for this pair on the
+    ledger is a no-op) and best-effort: any failure is swallowed, a stats signal never breaks a check.
+    Fast path: `s["report_seen_packet"]` (persisted by _check_one's write_session) skips the ledger
+    scan — the ledger is tens of thousands of lines and `list`/`check` poll every reported session;
+    the scan then runs once per packet, and still guards a session file that lost the marker."""
+    if s.get("report_seen_packet") == packet_n:
+        return
+    try:
+        events = _ledger_by_session().get(sid, [])
+        if not any(e.get("event") == "report_seen" and e.get("packet") == packet_n for e in events):
+            append_ledger("report_seen", session_id=sid, packet=packet_n, usage=_usage_snapshot(s))
+        s["report_seen_packet"] = packet_n
+    except Exception:
+        pass
 
 
 def record_landed_if_clean(sid, s, packet_n, trigger):
@@ -3795,6 +3823,52 @@ def _packet_send_ts(events, packet_n):
     return None
 
 
+def _packet_handoff_usage(events, packet_n):
+    """Row 58: the FIRST hand-off (`packet_sent` / `queue_delivered`) for this packet that carries a
+    non-null `usage` snapshot, else None (pre-row-58 ledger, or usage was unreadable at send time).
+    `spawned` carries the same zero snapshot as the spawn's own `packet_sent`, and has no `packet`."""
+    for e in events:
+        if (e.get("event") in ("packet_sent", "queue_delivered") and e.get("packet") == packet_n
+                and isinstance(e.get("usage"), dict)):
+            return e["usage"]
+    return None
+
+
+def _packet_report_usage(events, packet_n):
+    """Row 58: the `report_seen` usage snapshot for this packet, else None."""
+    for e in events:
+        if e.get("event") == "report_seen" and e.get("packet") == packet_n and isinstance(e.get("usage"), dict):
+            return e["usage"]
+    return None
+
+
+def _packet_real_tokens(events, packet_n):
+    """(prompt, output) billed while this packet was in flight = report_seen.usage − hand-off.usage,
+    or None when either snapshot is missing OR the delta goes negative (the report snapshot came from
+    a different, younger conversation — e.g. `relay restart` re-ran the packet cold — so the two
+    totals aren't the same counter and subtracting them would fabricate a number)."""
+    start, end = _packet_handoff_usage(events, packet_n), _packet_report_usage(events, packet_n)
+    if start is None or end is None:
+        return None
+    try:
+        dp = int(end.get("prompt") or 0) - int(start.get("prompt") or 0)
+        do = int(end.get("output") or 0) - int(start.get("output") or 0)
+    except (TypeError, ValueError):
+        return None
+    if dp < 0 or do < 0:
+        return None
+    return dp, do
+
+
+def _ledger_handoff_usage(session_id, packet_n):
+    """The hand-off usage snapshot already on the ledger for (session_id, packet_n) — what
+    deliver_queued copies onto `queue_delivered`. None on any failure."""
+    try:
+        return _packet_handoff_usage(_ledger_by_session().get(session_id, []), packet_n)
+    except Exception:
+        return None
+
+
 def _packet_verdict(events, packet_n):
     """DEFINITIONS 'Verdict': the LAST report_verify ledger event for this packet, else None (→ '-').
     (The ledger event name is `report_verify`, not `verify` — see the `verify` CLI subcommand that
@@ -3840,8 +3914,9 @@ def _ts_epoch(ts):
 def stats_data(lead_sid=None, since_days=None):
     """The `relay stats` data: one row per packet ever sent to any session — INCLUDING closed/
     superseded/dead ones, that's the history — joining (model, effort) to outcome (rounds, verify
-    verdict, report status), plus a per-session token trailer and a SUMMARY grouped by (model,
-    effort). Pure read: never touches session state, writes the ledger, or bypasses the existing
+    verdict, report status, per-packet tokens — row 58: report_seen.usage − hand-off.usage, else the
+    `tokens_estimated` session average), plus a per-session token trailer and a SUMMARY grouped by
+    (model, effort). Pure read: never touches session state, writes the ledger, or bypasses the existing
     usage.json cache path (_usage_for_session)."""
     by_sid = _ledger_by_session()
     cutoff = (time.time() - float(since_days) * 86400) if since_days else None
@@ -3869,8 +3944,12 @@ def stats_data(lead_sid=None, since_days=None):
             verdict = _packet_verdict(events, n) or "-"
             status = (e.get("tldr") or {}).get("status") or "-"
             rounds = _packet_rounds(events, n, sent_ts)
+            real = _packet_real_tokens(events, n)
             row = {"session_id": sid, "packet": e["n"], "model": model, "effort": effort,
-                   "rounds": rounds if rounds is not None else "-", "verdict": verdict, "status": status}
+                   "rounds": rounds if rounds is not None else "-", "verdict": verdict, "status": status,
+                   "tokens_prompt": real[0] if real else None,
+                   "tokens_output": real[1] if real else None,
+                   "tokens_estimated": False}
             rows.append(row)
             session_rows.append(row)
         if not session_rows:
@@ -3880,6 +3959,13 @@ def stats_data(lead_sid=None, since_days=None):
         prompt = usage["prompt"] if usage else None
         output = usage["output"] if usage else None
         tok_per_pkt = (prompt + output) / pkt_count if usage else None
+        for row in session_rows:
+            # No hand-off/report snapshot pair (older sessions) → today's per-session average, marked
+            # estimated (rendered `~`). No usage at all → stays None (rendered `-`), not estimated.
+            if row["tokens_prompt"] is None and usage:
+                row["tokens_prompt"] = round(prompt / pkt_count)
+                row["tokens_output"] = round(output / pkt_count)
+                row["tokens_estimated"] = True
         sessions.append({"session_id": sid, "model": model, "effort": effort, "packets": pkt_count,
                          "prompt": prompt, "output": output, "tok_per_pkt": tok_per_pkt})
 
@@ -3887,8 +3973,12 @@ def stats_data(lead_sid=None, since_days=None):
     for r in rows:
         key = (r["model"], r["effort"])
         g = groups.setdefault(key, {"model": r["model"], "effort": r["effort"], "packets": 0,
-                                    "rounds_sum": 0, "rounds_n": 0, "counts_match": 0, "clean": 0})
+                                    "rounds_sum": 0, "rounds_n": 0, "counts_match": 0, "clean": 0,
+                                    "real_tok_sum": 0, "real_tok_n": 0})
         g["packets"] += 1
+        if r["tokens_prompt"] is not None and not r["tokens_estimated"]:
+            g["real_tok_sum"] += r["tokens_prompt"] + r["tokens_output"]
+            g["real_tok_n"] += 1
         if r["rounds"] != "-":
             g["rounds_sum"] += r["rounds"]
             g["rounds_n"] += 1
@@ -3909,15 +3999,29 @@ def stats_data(lead_sid=None, since_days=None):
     for key in sorted(groups):
         g = groups[key]
         tg = tok_by_group.get(key)
-        avg_tok = (tg["tokens"] / tg["packets"]) if tg and tg["known"] and tg["packets"] else None
+        if g["real_tok_n"]:
+            # Row 58: the mean of the REAL per-packet figures wherever any are known.
+            avg_tok, avg_est = g["real_tok_sum"] / g["real_tok_n"], False
+        else:
+            avg_tok = (tg["tokens"] / tg["packets"]) if tg and tg["known"] and tg["packets"] else None
+            avg_est = avg_tok is not None
         summary.append({
             "model": g["model"], "effort": g["effort"], "packets": g["packets"],
             "mean_rounds": (g["rounds_sum"] / g["rounds_n"]) if g["rounds_n"] else None,
             "pct_counts_match": round(100.0 * g["counts_match"] / g["packets"], 1),
             "pct_clean": round(100.0 * g["clean"] / g["packets"], 1),
             "avg_tok_per_pkt": avg_tok,
+            "avg_tok_estimated": avg_est,
         })
     return {"rows": rows, "sessions": sessions, "summary": summary}
+
+
+def _stats_tokens_cell(prompt, output, estimated):
+    """TOKENS cell: human_tokens(prompt+output), `~`-prefixed when it's the session average, `-`
+    when unknown."""
+    if prompt is None or output is None:
+        return "-"
+    return ("~" if estimated else "") + lead_guard.human_tokens(prompt + output)
 
 
 def cmd_stats(args):
@@ -3929,15 +4033,17 @@ def cmd_stats(args):
     if not rows:
         print("(no packets recorded)")
         return
-    row_cols = ["session_id", "packet", "model", "effort", "rounds", "verdict", "status"]
-    headers = ["SESSION", "PKT", "MODEL", "EFFORT", "ROUNDS", "VERDICT", "STATUS"]
-    caps = [36, 4, 8, 8, 6, 14, 22]
-    widths = {h: min(cap, max(len(h), max((len(str(r[k])) for r in data["rows"]), default=0)))
+    row_cols = ["session_id", "packet", "model", "effort", "rounds", "verdict", "status", "tokens"]
+    headers = ["SESSION", "PKT", "MODEL", "EFFORT", "ROUNDS", "VERDICT", "STATUS", "TOKENS"]
+    caps = [36, 4, 8, 8, 6, 14, 22, 8]
+    table = [dict(r, tokens=_stats_tokens_cell(r["tokens_prompt"], r["tokens_output"], r["tokens_estimated"]))
+             for r in data["rows"]]
+    widths = {h: min(cap, max(len(h), max((len(str(r[k])) for r in table), default=0)))
               for h, cap, k in zip(headers, caps, row_cols)}
     print(c(" ".join(cell(h, widths[h]) for h in headers), "bold"))
     sess_by_id = {s["session_id"]: s for s in rows}
     seen = set()
-    for r in data["rows"]:
+    for r in table:
         print(" ".join(cell(r[k], widths[h]) for h, k in zip(headers, row_cols)))
         sid = r["session_id"]
         if sid in seen:
@@ -3963,7 +4069,8 @@ def cmd_stats(args):
             "mean_rounds": f"{g['mean_rounds']:.1f}" if g["mean_rounds"] is not None else "-",
             "pct_counts_match": f"{g['pct_counts_match']:.0f}%",
             "pct_clean": f"{g['pct_clean']:.0f}%",
-            "avg_tok_per_pkt": lead_guard.human_tokens(g["avg_tok_per_pkt"]) if g["avg_tok_per_pkt"] is not None else "-",
+            "avg_tok_per_pkt": (("~" if g["avg_tok_estimated"] else "") + lead_guard.human_tokens(g["avg_tok_per_pkt"])
+                                if g["avg_tok_per_pkt"] is not None else "-"),
         })
     swidths = {h: min(cap, max(len(h), max((len(row[k]) for row in srender), default=0)))
                for h, cap, k in zip(sheaders, scaps, scols)}
@@ -4511,6 +4618,26 @@ def _usage_for_session(s):
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps({"key": key, "usage": usage}))
         return usage
+    except Exception:
+        return None
+
+
+# Backlog row 58: the additive `usage` field on every hand-off ledger event (`spawned`/`packet_sent`/
+# `queue_delivered`) and on `report_seen` — `relay stats` subtracts the hand-off snapshot from the
+# report-time one for real per-packet tokens.
+ZERO_USAGE_SNAPSHOT = {"prompt": 0, "output": 0, "requests": 0}  # a fresh spawn's conversation
+
+
+def _usage_snapshot(s):
+    """{"prompt", "output", "requests"} from the executor's live billed totals right now, or None
+    when unreadable (no pinned conversation, no transcript yet, parse failure). Never raises — a
+    ledger stats signal must never fail a send/check."""
+    try:
+        u = _usage_for_session(s)
+        if not u:
+            return None
+        return {"prompt": int(u.get("prompt") or 0), "output": int(u.get("output") or 0),
+                "requests": int(u.get("requests") or 0)}
     except Exception:
         return None
 

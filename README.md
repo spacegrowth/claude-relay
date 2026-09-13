@@ -616,14 +616,19 @@ reports, `relay list`'s usage cache) — writes nothing. Definitions:
   linkage directly, so this is the fallback, and it renders `-` when neither event follows.
 - **Verdict** = the last `report_verify` event for that session+packet (`COUNTS-MATCH` / `MISMATCH` /
   `MALFORMED` / `INCONCLUSIVE`, see [Verifying a report](#verifying-a-report-and-why-it-cant-tell-you-the-report-is-true)), else `-`.
-- **Tokens**: per-packet spend isn't recorded, only per-SESSION prompt/output; `relay stats` reports
-  that total plus packet count, so `tok/pkt (avg)` is an honest average, not a per-packet measurement.
+- **Tokens** = real per-packet spend: every hand-off ledger event (`spawned`, `packet_sent`,
+  `queue_delivered`) snapshots the executor's billed usage (`usage: {prompt, output, requests}`,
+  `null` when unreadable), and the first time relay sees the packet's report it ledgers
+  `report_seen` with another snapshot — a packet's TOKENS is the difference. Older sessions (or a
+  missing/inconsistent snapshot) fall back to the session total ÷ packet count, marked `~`.
 
-The table is one row per packet (SESSION, PKT, MODEL, EFFORT, ROUNDS, VERDICT, STATUS), a
-per-session token trailer, then a SUMMARY grouped by (MODEL, EFFORT): packet count, mean rounds, %
-`COUNTS-MATCH`, % exactly `Status: clean`, avg tok/pkt — closed/dead sessions included, that's where
-the history is. `--lead <sid>` scopes to that lead (+ unowned); `--since DAYS` filters on send time;
-`--json` emits `{rows, sessions, summary}`.
+The table is one row per packet (SESSION, PKT, MODEL, EFFORT, ROUNDS, VERDICT, STATUS, TOKENS —
+prompt+output, `~` when averaged), a per-session token trailer, then a SUMMARY grouped by (MODEL,
+EFFORT): packet count, mean rounds, % `COUNTS-MATCH`, % exactly `Status: clean`, tok/pkt (the mean
+of the real per-packet figures where any are known, else the `~` session average) — closed/dead
+sessions included, that's where the history is. `--lead <sid>` scopes to that lead (+ unowned);
+`--since DAYS` filters on send time; `--json` emits `{rows, sessions, summary}`, each row carrying
+`tokens_prompt`, `tokens_output`, `tokens_estimated`.
 
 ### Auto-close: finished executors park themselves
 
