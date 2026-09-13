@@ -419,6 +419,168 @@ class TestSpawnModelResolution:
         assert relay.read_session("e1")["model"] == "claude-sonnet-5"
 
 
+# ── relay tier: manual/lead posture enforcement on spawn and send --rotate/--upgrade ─────────────
+
+class TestTierEnforcement:
+    """`relay tier manual|lead` (bin/relay's `_owner_tier`/`_tier_manual_block`/`_lead_model_class`):
+    spawn and send --rotate/--upgrade honour the OWNING lead's tier posture. `auto` (the default)
+    changes nothing — covered implicitly by every other test in this file, none of which arms a
+    lead marker at all. Model resolution mocked exactly like TestSpawnModelResolution above."""
+
+    def _lead(self, relay, sid, tier="auto", model=None):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, sid, model=model, tier=tier, project=sid)
+
+    # ---- manual: spawn ---------------------------------------------------------------------------
+
+    def test_manual_spawn_without_model_refuses_with_the_exact_message(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="manual")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        pkt = write_packet(tmp_path)
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "spawn", str(tmp_path), "t", pkt, "--name", "e1", "--lead", "lead-1")
+        assert str(e.value) == (f"tier is manual — no model chosen. Run: relay tier ask --session "
+                                f"lead-1 --packet {pkt}, then pass the answer as --model.")
+        assert relay.read_session("e1") is None
+        assert terms.spawns == []
+
+    def test_manual_spawn_with_model_proceeds(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="manual")
+        cfg_write(relay, executor_default_context="200k")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        run_main(relay, "spawn", str(tmp_path), "t", write_packet(tmp_path),
+                 "--name", "e1", "--lead", "lead-1", "--model", "sonnet")
+        assert relay.read_session("e1")["model"] == "claude-sonnet-5"
+
+    def test_manual_zero_availability_refuses_with_the_doctor_line(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="manual")
+        relay._probe_model = lambda alias: (None, "offline")
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "spawn", str(tmp_path), "t", write_packet(tmp_path),
+                     "--name", "e1", "--lead", "lead-1")
+        assert "no executor model resolves on this machine — run relay doctor" in str(e.value)
+
+    # ---- manual: send --rotate / --upgrade ---------------------------------------------------------
+
+    def test_manual_rotate_without_model_refuses(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="manual")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        make_session(relay, "e1", status="reported", owner_lead="lead-1")
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "send", "e1", write_packet(tmp_path), "--rotate")
+        assert "tier is manual — no model chosen" in str(e.value)
+        assert relay.read_session("e1")["status"] == "reported"   # nothing retired
+        assert relay.read_session("e1-r2") is None
+
+    def test_manual_rotate_with_model_proceeds(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="manual")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        make_session(relay, "e1", status="reported", owner_lead="lead-1", model="claude-sonnet-5")
+        run_main(relay, "send", "e1", write_packet(tmp_path), "--rotate", "--model", "opus")
+        new = relay.read_session("e1-r2")
+        assert new is not None and relay.lead_guard.model_tier(new["model"]) == "opus"
+
+    def test_manual_upgrade_without_model_refuses(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="manual")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        make_session(relay, "e1", status="reported", owner_lead="lead-1", model="claude-sonnet-5")
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "send", "e1", write_packet(tmp_path), "--upgrade")
+        assert "tier is manual — no model chosen" in str(e.value)
+        assert relay.read_session("e1")["status"] == "reported"
+
+    def test_manual_upgrade_with_model_proceeds(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="manual")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        make_session(relay, "e1", status="reported", owner_lead="lead-1", model="claude-sonnet-5")
+        run_main(relay, "send", "e1", write_packet(tmp_path), "--upgrade", "--model", "opus")
+        new = relay.read_session("e1-r2")
+        assert new is not None and relay.lead_guard.model_tier(new["model"]) == "opus"
+
+    # ---- lead: spawn --------------------------------------------------------------------------
+
+    def test_lead_spawn_without_model_resolves_to_the_leads_class(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="lead", model="opus")
+        cfg_write(relay, executor_default_context="200k")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        run_main(relay, "spawn", str(tmp_path), "t", write_packet(tmp_path),
+                 "--name", "e1", "--lead", "lead-1")
+        assert relay.read_session("e1")["model"] == "claude-opus-5"
+
+    def test_lead_spawn_ceiling_still_applies(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="lead", model="opus")
+        cfg_write(relay, executor_model_ceiling="sonnet")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "spawn", str(tmp_path), "t", write_packet(tmp_path),
+                     "--name", "e1", "--lead", "lead-1")
+        assert "above the configured ceiling" in str(e.value)
+        assert relay.read_session("e1") is None
+
+    def test_lead_spawn_explicit_model_still_wins(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="lead", model="opus")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        run_main(relay, "spawn", str(tmp_path), "t", write_packet(tmp_path),
+                 "--name", "e1", "--lead", "lead-1", "--model", "haiku")
+        assert relay.read_session("e1")["model"] == "claude-haiku-5"
+
+    def test_lead_spawn_without_a_recorded_model_refuses(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="lead", model=None)
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "spawn", str(tmp_path), "t", write_packet(tmp_path),
+                     "--name", "e1", "--lead", "lead-1")
+        assert "tier is lead" in str(e.value)
+        assert relay.read_session("e1") is None
+
+    # ---- lead: the live transcript signal ------------------------------------------------------
+
+    def _write_lead_transcript(self, relay, monkeypatch, tmp_path, sid, model):
+        """A minimal, real-shaped Claude Code transcript for lead `sid` whose one assistant turn
+        used `model` — enough for `_lead_live_model`'s tail scan to find it. Same
+        CLAUDE_CONFIG_DIR-env technique tests/test_cli_lead_found.py's own transcript fixture uses;
+        a lead's `claude_session` IS its `session_id` (lead_guard "_lead_usage_for" convention)."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        d = tmp_path / "cfg" / "projects" / "-p"
+        d.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"type": "assistant", "message": {"id": "m1", "model": model,
+            "content": [{"type": "text", "text": "ok"}]}})
+        (d / f"{sid}.jsonl").write_text(line + "\n")
+
+    def test_lead_spawn_prefers_the_live_transcript_model_over_the_stale_marker(
+            self, relay, terms, tmp_path, monkeypatch):
+        """"the lead's own class" (relay tier's `lead` posture) — "if the lead runs `/model`
+        mid-session, executors follow at the next spawn": the marker's arm-time model ("sonnet")
+        is stale; the transcript's LAST turn ("claude-opus-5") is what a mid-session `/model opus`
+        would actually leave behind, and that is what a subsequent spawn must mirror."""
+        self._lead(relay, "lead-1", tier="lead", model="sonnet")
+        self._write_lead_transcript(relay, monkeypatch, tmp_path, "lead-1", "claude-opus-5")
+        cfg_write(relay, executor_default_context="200k")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        run_main(relay, "spawn", str(tmp_path), "t", write_packet(tmp_path),
+                 "--name", "e1", "--lead", "lead-1")
+        assert relay.read_session("e1")["model"] == "claude-opus-5"
+
+    def test_lead_spawn_falls_back_to_the_marker_with_no_transcript(self, relay, terms, tmp_path):
+        """No live signal to read (unlocatable transcript) → the marker's own model still applies —
+        proven separately from test_lead_spawn_without_model_resolves_to_the_leads_class above by
+        NOT writing any transcript at all here."""
+        self._lead(relay, "lead-1", tier="lead", model="haiku")
+        cfg_write(relay, executor_default_context="200k")
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        run_main(relay, "spawn", str(tmp_path), "t", write_packet(tmp_path),
+                 "--name", "e1", "--lead", "lead-1")
+        assert relay.read_session("e1")["model"] == "claude-haiku-5"
+
+    # ---- auto: unchanged ------------------------------------------------------------------------
+
+    def test_auto_tier_changes_nothing(self, relay, terms, tmp_path):
+        self._lead(relay, "lead-1", tier="auto", model="opus")
+        cfg_write(relay, executor_default_model="haiku")
+        run_main(relay, "spawn", str(tmp_path), "t", write_packet(tmp_path),
+                 "--name", "e1", "--lead", "lead-1")
+        assert relay.read_session("e1")["model"] == "haiku"
+
+
 # ── spawn: context window ───────────────────────────────────────────────────────────────────────
 
 class TestSpawnContextWindow:

@@ -708,6 +708,19 @@ class TestDoctor:
         assert checks["plugin hooks present"]["status"] == "PASS"
         assert relay.lead_guard.EXECUTOR_AGENT_FILE in checks["executor agent file"]["detail"]
 
+    def test_prints_the_effective_tier_layering(self, relay, terms, probes, capsys):
+        """relay tier: "`relay doctor` prints the effective tier layering in one line" — a static,
+        always-PASS informational row (same style as "config loads" and "sign-off gate")."""
+        p = relay.lead_guard.config_path(relay.STATE_ROOT)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"executor_default_model": "haiku", "executor_model_ceiling": "sonnet"}))
+        run_main(relay, "doctor", "--offline", "--json")
+        checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)}
+        detail = checks["model-tier layering"]["detail"]
+        assert checks["model-tier layering"]["status"] == "PASS"
+        assert "haiku" in detail and "ceiling sonnet" in detail
+        assert "relay tier" in detail and "--model" in detail
+
     def test_an_unwritable_state_root_fails_and_exits_1(self, relay, terms, probes, monkeypatch):
         monkeypatch.setattr(relay.Path, "write_text",
                             lambda self, *a, **k: (_ for _ in ()).throw(OSError("read-only")))

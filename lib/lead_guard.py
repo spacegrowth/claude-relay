@@ -615,7 +615,8 @@ def _atomic_write_json(path, obj):
 def write_marker(state_root, session_id, model=None, iterm_session=None, project=None, cwd=None,
                  tab_label=None, color=None, plugin_version=None, stop_hook_timeout=None,
                  predecessor=None, started=None, backend=None, autonomous=False,
-                 autonomous_source="config", lineage_started=None):
+                 autonomous_source="config", lineage_started=None, tier="auto",
+                 tier_source="config"):
     d = lead_dir(state_root, session_id)
     d.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(marker_path(state_root, session_id), {
@@ -662,6 +663,15 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
         # tell the human which it is rather than just the boolean.
         "autonomous": bool(autonomous),
         "autonomous_source": autonomous_source,
+        # Model-tier posture (`relay tier`) — who decides which model an executor runs on: "auto"
+        # (the lead decides per packet, today's behaviour), "manual" (the human decides at every
+        # spawn/rotate/upgrade), or "lead" (executors mirror this lead's own model class). Same
+        # arm-time-reset contract as `autonomous` right above it — deliberately written on EVERY
+        # arm, never preserved, so a fresh `lead-start` always resets to "auto" rather than letting
+        # a posture silently outlive the plan it was scoped to. Unlike `autonomous` there is no
+        # config-level default to inherit: every arm starts "auto"/"config" plain.
+        "tier": tier if tier in ("auto", "manual", "lead") else "auto",
+        "tier_source": tier_source,
     })
 
 
@@ -704,6 +714,39 @@ def set_autonomous(state_root, session_id, on):
         return False
     m["autonomous"] = bool(on)
     m["autonomous_source"] = "command"
+    m["last_active"] = now()
+    marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
+    return True
+
+
+TIER_POSTURES = ("auto", "manual", "lead")
+
+
+def tier_state(marker):
+    """This lead's model-tier posture as `(tier, source)` — `(str, "config" | "command")`. Mirrors
+    `autonomous_state` exactly: read from the marker alone (write_marker's own default is the single
+    source of truth an arm starts from), so a lead armed before this feature existed, or any
+    unrecognized/missing value, reads as `("auto", "config")` — the same posture a fresh arm
+    stamps, never a crash."""
+    if not isinstance(marker, dict):
+        return ("auto", "config")
+    t = marker.get("tier")
+    src = marker.get("tier_source")
+    return (t if t in TIER_POSTURES else "auto",
+            src if src in ("config", "command") else "config")
+
+
+def set_tier(state_root, session_id, tier):
+    """Flip a lead's model-tier posture (read-modify-write, preserving every other marker field) and
+    stamp its source as "command" — the `set_autonomous` sibling for `relay tier`. Returns True when
+    the marker was updated, False when there is no marker to update."""
+    if tier not in TIER_POSTURES:
+        return False
+    m = read_marker(state_root, session_id)
+    if not isinstance(m, dict) or not m:
+        return False
+    m["tier"] = tier
+    m["tier_source"] = "command"
     m["last_active"] = now()
     marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
     return True

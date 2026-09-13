@@ -1433,6 +1433,320 @@ class TestAutonomousPosture:
         assert "WAIT for their direction" in err
 
 
+class TestTierPosture:
+    """`/relay:tier auto|manual|lead|status`: a per-lead-session posture for WHO decides an
+    executor's model, mirroring TestAutonomousPosture's own structure exactly (same arm-time-reset
+    contract, same list-column/footnote visibility pattern) — see lib/lead_guard.py's tier_state/
+    set_tier and bin/relay's cmd_tier. `ask` and the spawn/send enforcement it drives are covered
+    separately (TestTierAsk below; enforcement in tests/test_cli_spawn_send.py)."""
+
+    @pytest.fixture(autouse=True)
+    def _armable(self, relay, monkeypatch):
+        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: "/x/terminal-notifier")
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+        monkeypatch.setattr(relay.iterm, "rename_by_id", lambda *a, **k: True)
+
+    def _arm(self, relay, sid="sess-1", project="webapp"):
+        relay.cmd_lead_start(SimpleNamespace(session_id=sid, model=None, project=project))
+
+    def _tier(self, relay, action, sid="sess-1"):
+        relay.cmd_tier(SimpleNamespace(action=action, session=sid, packet=None, json=False))
+
+    # ---- marker state --------------------------------------------------------------------------
+
+    def test_fresh_arm_defaults_to_auto(self, relay, root):
+        self._arm(relay)
+        m = lg.read_marker(root, "sess-1")
+        assert m["tier"] == "auto"
+        assert lg.tier_state(m) == ("auto", "config")
+
+    def test_missing_key_reads_as_auto(self, root):
+        # A lead armed before this feature existed has no key at all → the same safe default a
+        # fresh arm stamps, never a crash.
+        assert lg.tier_state({"session_id": "old"}) == ("auto", "config")
+
+    def test_tier_state_is_defensive(self):
+        assert lg.tier_state(None) == ("auto", "config")
+        assert lg.tier_state({}) == ("auto", "config")
+        assert lg.tier_state({"tier": "manual", "tier_source": "bogus"}) == ("manual", "config")
+        assert lg.tier_state({"tier": "not-a-real-tier"}) == ("auto", "config")
+
+    # ---- the command: round-trip each posture ---------------------------------------------------
+
+    @pytest.mark.parametrize("want", ["auto", "manual", "lead"])
+    def test_round_trips_through_tier_and_status(self, relay, root, want):
+        self._arm(relay)
+        self._tier(relay, want)
+        assert lg.tier_state(lg.read_marker(root, "sess-1")) == (want, "command")
+
+    def test_status_does_not_change_the_posture(self, relay, root):
+        self._arm(relay)
+        self._tier(relay, "manual")
+        self._tier(relay, "status")
+        assert lg.tier_state(lg.read_marker(root, "sess-1")) == ("manual", "command")
+
+    def test_status_reports_posture_and_origin(self, relay, root, capsys):
+        self._arm(relay)
+        capsys.readouterr()
+        self._tier(relay, "status")
+        out = capsys.readouterr().out
+        assert "AUTO" in out and "arm-time default" in out
+        self._tier(relay, "lead")
+        capsys.readouterr()
+        self._tier(relay, "status")
+        out = capsys.readouterr().out
+        assert "LEAD" in out and "relay tier" in out
+
+    def test_flip_preserves_every_other_marker_field(self, relay, root):
+        self._arm(relay, project="webapp")
+        before = lg.read_marker(root, "sess-1")
+        self._tier(relay, "manual")
+        after = lg.read_marker(root, "sess-1")
+        for k in ("session_id", "project", "cwd", "tab_label", "color", "started",
+                  "plugin_version", "stop_hook_timeout", "backend", "autonomous"):
+            assert after[k] == before[k], f"`tier manual` clobbered marker field {k!r}"
+
+    def test_tier_refuses_non_lead(self, relay):
+        with pytest.raises(SystemExit):
+            self._tier(relay, "manual", sid="never-a-lead")
+
+    def test_tier_refuses_empty_session(self, relay):
+        with pytest.raises(SystemExit):
+            relay.cmd_tier(SimpleNamespace(action="manual", session="", packet=None, json=False))
+
+    def test_non_lead_caller_gets_the_same_shaped_error_as_auto(self, relay):
+        """Acceptance (g): a non-lead caller gets the same error `cmd_auto` gives — same message
+        shape, "tier" substituted for "auto"."""
+        with pytest.raises(SystemExit) as e_tier:
+            self._tier(relay, "manual", sid="ghost")
+        with pytest.raises(SystemExit) as e_auto:
+            relay.cmd_auto(SimpleNamespace(action="on", session="ghost"))
+        assert str(e_tier.value) == str(e_auto.value).replace("auto:", "tier:")
+
+    def test_set_tier_returns_false_without_a_marker(self, root):
+        assert lg.set_tier(root, "no-such-lead", "manual") is False
+
+    # ---- reset on re-arm -----------------------------------------------------------------------
+
+    def test_rearm_resets_a_manual_tier_to_auto(self, relay, root):
+        # THE headline invariant, mirroring TestAutonomousPosture's own: a re-arm must clear a
+        # posture the command set, exactly like `autonomous` resets.
+        self._arm(relay)
+        self._tier(relay, "manual")
+        assert lg.tier_state(lg.read_marker(root, "sess-1"))[0] == "manual"
+        self._arm(relay)
+        assert lg.tier_state(lg.read_marker(root, "sess-1")) == ("auto", "config")
+
+    def test_rearm_resets_a_lead_tier_to_auto(self, relay, root):
+        self._arm(relay)
+        self._tier(relay, "lead")
+        self._arm(relay)
+        assert lg.tier_state(lg.read_marker(root, "sess-1")) == ("auto", "config")
+
+    def test_rearm_still_preserves_started_and_predecessor(self, relay, root):
+        self._arm(relay)
+        self._tier(relay, "manual")
+        m = lg.read_marker(root, "sess-1")
+        m["predecessor"] = {"session_id": "old-lead"}
+        lg.marker_path(root, "sess-1").write_text(json.dumps(m))
+        started = m["started"]
+        self._arm(relay)
+        after = lg.read_marker(root, "sess-1")
+        assert after["started"] == started
+        assert after["predecessor"] == {"session_id": "old-lead"}
+
+    def test_heartbeat_preserves_the_posture(self, relay, root):
+        self._arm(relay)
+        self._tier(relay, "manual")
+        lg.touch_lead(root, "sess-1")
+        assert lg.tier_state(lg.read_marker(root, "sess-1")) == ("manual", "command")
+
+    def test_autonomous_reset_and_tier_reset_are_independent(self, relay, root):
+        """A lead can hold auto+manual, manual+auto, or any other combination — the two postures
+        answer different questions and must not leak into each other."""
+        relay.cmd_lead_start(SimpleNamespace(session_id="sess-1", model=None, project="webapp"))
+        relay.cmd_auto(SimpleNamespace(action="on", session="sess-1"))
+        self._tier(relay, "manual")
+        m = lg.read_marker(root, "sess-1")
+        assert lg.autonomous_state(m) == (True, "command")
+        assert lg.tier_state(m) == ("manual", "command")
+        self._arm(relay)
+        m = lg.read_marker(root, "sess-1")
+        assert lg.autonomous_state(m) == (False, "config")
+        assert lg.tier_state(m) == ("auto", "config")
+
+    # ---- ledger: deliberately NOT touched -------------------------------------------------------
+
+    def _events(self, root):
+        return [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+
+    def test_tier_flip_is_not_ledgered(self, relay, root):
+        """The packet is explicit: reusing cmd_auto's auto_mode_on/auto_mode_off would misrepresent
+        a three-way field as a boolean toggle, and relay's ledger format/event names are off-limits
+        for this feature — so a tier flip logs nothing new. `lead_started` (arm) still does."""
+        self._arm(relay)
+        before = len(self._events(root)) if (root / "sessions.jsonl").exists() else 0
+        self._tier(relay, "manual")
+        self._tier(relay, "lead")
+        self._tier(relay, "auto")
+        after = self._events(root)
+        assert len(after) == before, "relay tier must not add a ledger event"
+
+    def test_status_logs_nothing(self, relay, root):
+        self._arm(relay)
+        before = len(self._events(root))
+        self._tier(relay, "status")
+        assert len(self._events(root)) == before
+
+    # ---- relay list visibility -------------------------------------------------------------------
+
+    def test_list_shows_tier_column_and_manual_leads_are_bold(self, relay, root, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "all_session_ids", lambda: [])
+        self._arm(relay, sid="lead-auto", project="webapp")
+        self._arm(relay, sid="lead-manual", project="datapipe")
+        relay.cmd_tier(SimpleNamespace(action="manual", session="lead-manual", packet=None, json=False))
+        capsys.readouterr()
+        relay.cmd_list(SimpleNamespace(json=False, closed=False, lead=None, all=True))
+        out = capsys.readouterr().out
+        assert "TIER" in out                      # the column exists
+        assert "auto" in out and "manual" in out   # both postures render
+
+    def test_auto_footnote_gains_the_manual_clause_when_both_apply(self, relay, root, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "all_session_ids", lambda: [])
+        self._arm(relay, sid="lead-1", project="datapipe")
+        relay.cmd_auto(SimpleNamespace(action="on", session="lead-1"))
+        relay.cmd_tier(SimpleNamespace(action="manual", session="lead-1", packet=None, json=False))
+        capsys.readouterr()
+        relay.cmd_list(SimpleNamespace(json=False, closed=False, lead=None, all=True))
+        out = capsys.readouterr().out
+        footnote = [l for l in out.splitlines() if "proceeding without asking" in l]
+        assert footnote, "no AUTO footnote"
+        assert "tier: manual" in footnote[0] and "even in autonomous mode" in footnote[0]
+
+    def test_auto_footnote_has_no_manual_clause_when_tier_is_auto(self, relay, root, capsys, monkeypatch):
+        monkeypatch.setattr(relay, "all_session_ids", lambda: [])
+        self._arm(relay, sid="lead-1", project="datapipe")
+        relay.cmd_auto(SimpleNamespace(action="on", session="lead-1"))
+        capsys.readouterr()
+        relay.cmd_list(SimpleNamespace(json=False, closed=False, lead=None, all=True))
+        out = capsys.readouterr().out
+        footnote = [l for l in out.splitlines() if "proceeding without asking" in l]
+        assert footnote and "tier: manual" not in footnote[0]
+
+
+class TestTierAsk:
+    """`relay tier ask` — the fixed manual-question block `tier=manual` needs at every spawn/
+    rotate/upgrade (bin/relay's `tier_ask_data`). Model resolution is mocked exactly like
+    TestSpawnModelResolution in tests/test_cli_spawn_send.py: `_probe_model` never touches a real
+    `claude` binary, and `shutil.which` is pinned so the provenance line is machine-independent."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_resolution(self, relay, monkeypatch):
+        relay._probe_model = lambda alias: (f"claude-{alias}-5", None)
+        relay._cli_version = lambda: "test"
+        monkeypatch.setattr(relay.shutil, "which", lambda name: "/usr/local/bin/claude")
+        # Same isolation TestTierPosture/TestAutonomousPosture use, needed only by the one test
+        # below that arms a lead to give it a recorded model.
+        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: "/x/terminal-notifier")
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+        monkeypatch.setattr(relay.iterm, "rename_by_id", lambda *a, **k: True)
+
+    def _cfg(self, root, **kv):
+        p = lg.config_path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(kv))
+
+    def _ask(self, relay, session="sess-1", packet=None, as_json=False):
+        relay.cmd_tier(SimpleNamespace(action="ask", session=session, packet=packet, json=as_json))
+
+    def _opus_packet(self, tmp_path, name="p.md"):
+        p = tmp_path / name
+        p.write_text("GOAL — investigate why the cache invalidation sometimes drops entries; "
+                     "root cause unknown, no known trigger.\n")
+        return str(p)
+
+    GOLDEN = "\n".join([
+        "Executor model for p.md?",
+        "",
+        "  opus → claude-opus-5 — judgment where a wrong-but-plausible result survives review (Recommended)",
+        "  haiku → claude-haiku-5 — mechanical",
+        "  sonnet → claude-sonnet-5 — workhorse default",
+        "  fable — above ceiling (opus); not offered",
+        "",
+        "resolved via /usr/local/bin/claude, 3 classes available, ceiling opus",
+    ])
+
+    def test_golden_human_block(self, relay, root, tmp_path, capsys):
+        """Locks the exact human block for one mocked resolution — stable across future edits
+        unless someone deliberately changes this golden (packet's own requirement)."""
+        pkt = self._opus_packet(tmp_path)
+        self._ask(relay, packet=pkt)
+        out = capsys.readouterr().out.rstrip("\n")
+        assert out == self.GOLDEN
+
+    def test_byte_stable_across_two_runs(self, relay, root, tmp_path, capsys):
+        pkt = self._opus_packet(tmp_path)
+        self._ask(relay, packet=pkt)
+        first = capsys.readouterr().out
+        self._ask(relay, packet=pkt)
+        second = capsys.readouterr().out
+        assert first == second
+
+    def test_no_packet_defaults_header_and_recommendation_to_sonnet(self, relay, root, capsys):
+        self._ask(relay, packet=None)
+        out = capsys.readouterr().out
+        assert "Executor model for this spawn?" in out
+        assert "sonnet → claude-sonnet-5 — workhorse default (Recommended)" in out
+
+    def test_lists_only_resolvable_classes(self, relay, root, capsys):
+        relay._probe_model = lambda alias: (None, "timeout") if alias == "haiku" else (f"claude-{alias}-5", None)
+        self._ask(relay)
+        out = capsys.readouterr().out
+        assert "haiku" not in out          # its probe failed — never listed, silently dropped
+        assert "sonnet →" in out and "opus →" in out
+
+    def test_omits_above_ceiling_with_a_dim_line(self, relay, root, capsys):
+        self._cfg(root, executor_model_ceiling="sonnet")
+        self._ask(relay)
+        out = capsys.readouterr().out
+        assert "opus — above ceiling (sonnet); not offered" in out
+        assert "fable — above ceiling (sonnet); not offered" in out
+        assert "opus →" not in out  # not offered as an option
+
+    def test_recommendation_is_listed_first(self, relay, root, tmp_path, capsys):
+        pkt = self._opus_packet(tmp_path)
+        self._ask(relay, packet=pkt)
+        out = capsys.readouterr().out
+        option_lines = [l for l in out.splitlines() if "→" in l]
+        assert option_lines[0].strip().startswith("opus →")
+        assert "(Recommended)" in option_lines[0]
+
+    def test_leads_own_class_is_marked(self, relay, root, capsys):
+        relay.cmd_lead_start(SimpleNamespace(session_id="sess-1", model="opus", project="webapp"))
+        self._ask(relay, session="sess-1")
+        out = capsys.readouterr().out
+        opus_line = [l for l in out.splitlines() if l.strip().startswith("opus")][0]
+        assert "lead's tier" in opus_line
+
+    def test_zero_availability_refuses_instead_of_an_empty_question(self, relay, root):
+        relay._probe_model = lambda alias: (None, "offline")
+        with pytest.raises(SystemExit) as e:
+            self._ask(relay)
+        assert "no executor model resolves on this machine — run relay doctor" in str(e.value)
+
+    def test_json_round_trips(self, relay, root, tmp_path, capsys):
+        pkt = self._opus_packet(tmp_path)
+        self._ask(relay, packet=pkt, as_json=True)
+        data = json.loads(capsys.readouterr().out)
+        assert data["header"] == "Executor model for p.md?"
+        opts = {o["alias"]: o for o in data["options"]}
+        assert opts["opus"]["recommended"] is True
+        assert opts["haiku"]["recommended"] is False
+        assert data["omitted_above_ceiling"] == ["fable"]
+        assert data["provenance"] == {"claude_binary": "/usr/local/bin/claude", "available": 3,
+                                      "ceiling": "opus"}
+
+
 class TestWakeHookState:
     """lead_guard.wake_hook_state: is a lead's background wake poller safe from an early harness
     kill, judged from the Stop-hook timeout stamped in its marker vs the configured poll window."""

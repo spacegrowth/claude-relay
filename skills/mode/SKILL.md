@@ -128,7 +128,11 @@ Code's own theme; never swap the emoji per stage):
    `/relay:send` over spawning fresh. Model per packet by `/relay:spawn`'s rubric (haiku =
    mechanical, sonnet = workhorse, opus = where a wrong-but-plausible result would survive review)
    — tier aliases, never version ids from memory. Spawn fresh only for new work, a dead/stalled
-   session, or a model upgrade (+ `close --supersede`).
+   session, or a model upgrade (+ `close --supersede`). **`/relay:tier`** changes WHO makes that
+   call: `auto` (above, default) leaves it to you per packet; `manual` makes the human decide at
+   every spawn/rotate/upgrade instead — the one posture that ADDS a stop, never relaxed by
+   autonomous mode; `lead` makes executors mirror your own model class. Resets to `auto` on every
+   arm, exactly like the autonomous posture.
 3. **Review**: `reported` in `/relay:check`/`list` (`(diff: N files +A/-D)` shows if an inline read
    is affordable) → `/relay:review <sid>` by default. **Never `cat` a report, transcript or ledger
    yourself** — for diagnosis ("why stalled", "what's it doing", "did the wake fire") use

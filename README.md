@@ -412,6 +412,17 @@ The posture lives in that lead's own marker, so it's per-session and **resets on
 scoped it to. Set `autonomous_mode: true` if you always work this way; the command still overrides it
 either direction.
 
+A separate posture, `/relay:tier`, governs a different question — not *whether* the lead proceeds,
+but *who picks an executor's model* when
+`/relay:spawn` (or `relay send --rotate`/`--upgrade`) doesn't say. `auto` (default) leaves that
+decision to the lead's own rubric, same as today; `manual` moves it to the human at every one of
+those calls — **the one posture that ADDS a stop, and it is never relaxed by autonomous mode**, so
+turning autonomous mode on does not let a manual-tier lead skip asking about a model; `lead` makes
+executors mirror the lead's own model class instead. Layering: config `executor_default_model` /
+`executor_model_ceiling` (machine default, and the ceiling on everything below it) < `relay tier`
+(this lead session, resets to `auto` on every fresh arm exactly like the autonomous posture) <
+`--model` on one spawn (always wins).
+
 ## Auto-wake and notifications
 
 While the lead sits idle, a Stop hook watches in the background. When an executor's report lands,

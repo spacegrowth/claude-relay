@@ -1135,6 +1135,27 @@ def cmd_spawn(args):
     # accidentally (or silently) spawn an executor on the top-tier model without a deliberate,
     # ledgered reason.
     cfg = lead_guard.load_config(STATE_ROOT)
+    # Stamp this executor with the lead that spawned it. --lead wins; else the calling lead's own
+    # session id from the env; else unowned (None). Resolved HERE (earlier than the packet build
+    # below strictly needs) because `relay tier`'s posture — manual refuses, lead substitutes this
+    # owner's own class — has to be checked before a model is even chosen.
+    owner_lead = getattr(args, "lead", None) or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    # `relay tier` (mirrors `relay auto`): who decides an executor's model when --model is omitted.
+    # manual refuses outright (even in autonomous mode — the one posture that adds a stop); lead
+    # substitutes this owner's own model class for the ordinary executor_default_model fallback;
+    # auto changes nothing. An explicit --model always wins and skips this block entirely.
+    if not args.model:
+        tier, owner_marker = _owner_tier(owner_lead)
+        refusal = _tier_manual_block(owner_lead, tier, args.packet, cfg.get("executor_model_ceiling", "opus"))
+        if refusal:
+            sys.exit(refusal)
+        if tier == "lead":
+            lead_class = _lead_model_class(owner_lead, owner_marker)
+            if lead_class is None:
+                sys.exit(f"tier is lead — but lead '{owner_lead}' has no recorded/live model to "
+                         f"mirror (relay lead-start ran without --model, and its transcript is "
+                         f"unlocatable or has no turn yet). Pass --model explicitly.")
+            args.model = lead_class
     resolved_model = args.model or cfg.get("executor_default_model", "sonnet")
     # Context window (lead_guard "executor context window"): explicit `[1m]` on --model wins; else
     # the packet's `CONTEXT:` line; else the size of what the packet tells the executor to read;
@@ -1224,10 +1245,8 @@ def cmd_spawn(args):
     diff_url = path_to_file_url(diff_path)
     packet_path = d / f"{n:03d}-packet.md"
 
-    # Stamp this executor with the lead that spawned it. --lead wins; else the calling lead's own
-    # session id from the env; else unowned (None). Resolved HERE, before the packet is built, because
-    # the transport-v2 step has to address that lead; the marker lookups it feeds stay below.
-    owner_lead = getattr(args, "lead", None) or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    # owner_lead is already resolved above (before model resolution, for `relay tier`'s sake) —
+    # nothing to recompute here; the marker lookups it feeds (tab color, project name) are below.
 
     # The executor ROLE travels as an inline agent (lead_guard "executor agent"): GATES + REPORT
     # FORMAT in the system prompt, Agent tool removed, git commit/push denied at the CLI. When the
@@ -2103,22 +2122,39 @@ def _rotate_and_send(args, s, mb=None, upgrade=False):
     (executor_model_ceiling) still applies, so an upgrade past it refuses the same way a spawn would."""
     sid = args.session_id
     new_sid = successor_name(sid, getattr(args, "name", None))
+    # `relay tier`'s "explicit --model always wins" applies here exactly like spawn — even over
+    # --upgrade's own computed "one tier up" step, which is skipped entirely when --model is given
+    # (its top-tier/unrecognised-tier refusals only make sense for the auto-computed case).
+    explicit_model = getattr(args, "model", None)
     model = s.get("model") or lead_guard.load_config(STATE_ROOT).get("executor_default_model", "sonnet")
     from_tier = None
     if upgrade:
-        from_tier = lead_guard.model_tier(model)
-        if from_tier is None:
-            sys.exit(f"--upgrade: can't tell the tier of '{model}' — respawn by hand with --model")
-        idx = lead_guard.TIER_ORDER.index(from_tier)
-        if idx + 1 >= len(lead_guard.TIER_ORDER):
-            sys.exit(f"--upgrade: '{sid}' already runs {from_tier}, the top tier — nothing above it")
-        model = lead_guard.TIER_ORDER[idx + 1]
+        from_tier = lead_guard.model_tier(model)  # informational (print/ledger) even when overridden
+        if not explicit_model:
+            if from_tier is None:
+                sys.exit(f"--upgrade: can't tell the tier of '{model}' — respawn by hand with --model")
+            idx = lead_guard.TIER_ORDER.index(from_tier)
+            if idx + 1 >= len(lead_guard.TIER_ORDER):
+                sys.exit(f"--upgrade: '{sid}' already runs {from_tier}, the top tier — nothing above it")
+            model = lead_guard.TIER_ORDER[idx + 1]
+    elif not explicit_model:
+        # plain --rotate default: `relay tier`'s "lead" posture substitutes this owner's own model
+        # class for the ordinary "same territory" default (config executor_default_model / the
+        # session's current model) — see relay tier's layering. `--upgrade`'s own "one tier up"
+        # above is deliberately NOT touched by tier posture (boundary: it stays relative to the
+        # session's current model, as today); manual posture already refused earlier in cmd_send
+        # when --model is missing, so reaching here means the posture isn't manual.
+        tier, owner_marker = _owner_tier(s.get("owner_lead"))
+        if tier == "lead":
+            model = _lead_model_class(s.get("owner_lead"), owner_marker) or model
+    if explicit_model:
+        model = explicit_model
     widened = False
     if not lead_guard.model_has_1m(model) and lead_guard.model_supports_1m(model):
         model, widened = lead_guard.model_with_context(model, "1m"), True
     mcp = s.get("mcp")
     mcp_arg = lead_guard.mcp_spec_label(mcp) if mcp is not None else None
-    print((f"upgrading '{sid}' {from_tier} → {lead_guard.model_tier(model)}" if upgrade else f"rotating '{sid}'")
+    print((f"upgrading '{sid}' {from_tier or '?'} → {lead_guard.model_tier(model)}" if upgrade else f"rotating '{sid}'")
           + (f" ({mb:.1f}MB transcript)" if mb and not upgrade else "") + f" → retire + spawn '{new_sid}' on {model}"
           + (" (widened to the 1M window)" if widened else ""))
     stranded_queue = read_queue(sid)   # captured BEFORE retire — moved onto the successor below
@@ -2237,6 +2273,18 @@ def cmd_send(args):
     # spawn a fresh executor over the same territory (same worktree/topic/scope/model/MCP, widened to
     # the 1M window when the tier has one), with this packet as its first. Works on a non-heavy
     # session too (a deliberate rotation), it just isn't suggested there.
+    if getattr(args, "upgrade", False) or getattr(args, "rotate", False):
+        # `relay tier` (mirrors spawn's own check): both verbs spawn a successor with a real model
+        # choice, so manual posture gates them here too, BEFORE `_rotate_and_send` — by the time a
+        # model reaches `cmd_spawn` (via the nested call below) it is always already resolved to
+        # something non-None, which would silently bypass cmd_spawn's own tier check.
+        if not getattr(args, "model", None):
+            tier_cfg = lead_guard.load_config(STATE_ROOT)
+            tier, _owner_marker = _owner_tier(s.get("owner_lead"))
+            refusal = _tier_manual_block(s.get("owner_lead"), tier, args.packet,
+                                         tier_cfg.get("executor_model_ceiling", "opus"))
+            if refusal:
+                sys.exit(refusal)
     if getattr(args, "upgrade", False):
         return _rotate_and_send(args, s, mb, upgrade=True)
     if getattr(args, "rotate", False):
@@ -2998,6 +3046,192 @@ def resolve_model_for_launch(model):
     return lead_guard.resolve_model(model, STATE_ROOT / "models.json", _cli_version(), _probe_model)
 
 
+# ── relay tier: which lead-side posture decides an executor's model (mirrors relay auto) ─────────
+# `auto` (default, unchanged behaviour) < `manual` (the human decides every spawn/rotate/upgrade —
+# the one posture that ADDS a stop, never overridable by autonomous mode) < `lead` (executors mirror
+# this lead's own model class). Layered under `--model` on one spawn (always wins) and under config
+# `executor_default_model`/`executor_model_ceiling` (the machine default `auto` falls back to; the
+# ceiling still caps every posture, `lead` included). See lead_guard.tier_state/set_tier for the
+# marker-side state this reads and flips, and skills/tier/SKILL.md for the manual protocol.
+
+TIER_MANUAL_ASK_MSG = ("tier is manual — no model chosen. Run: relay tier ask --session {sid} "
+                       "--packet {packet}, then pass the answer as --model.")
+TIER_ZERO_AVAILABLE_MSG = "no executor model resolves on this machine — run relay doctor"
+
+
+def _resolve_tier_classes(ceiling):
+    """(available, omitted) for `relay tier ask` and the manual-posture zero-availability refusal:
+    `available` is [(alias, resolved_id), ...] for every lead_guard.TIER_ORDER class that resolves
+    on this machine right now (same resolver `doctor`/`spawn` use) AND sits at or below `ceiling`,
+    in TIER_ORDER order; `omitted` is the TIER_ORDER aliases dropped for being above it. A class
+    whose probe genuinely fails (unrecognised, or the fail-open "unresolved: ..." source spawn would
+    still launch on) is left off `available` silently — it is never listed as an option and never
+    counted as omitted-for-ceiling, it just isn't offered. Costs one probe per class not already
+    cached (models.json), same as `doctor`'s own alias check — no new probe mechanism."""
+    available, omitted = [], []
+    for alias in lead_guard.TIER_ORDER:
+        if lead_guard.model_exceeds_ceiling(alias, ceiling):
+            omitted.append(alias)
+            continue
+        try:
+            resolved, src = resolve_model_for_launch(alias)
+        except ValueError:
+            continue
+        if src.startswith("unresolved"):
+            continue
+        available.append((alias, resolved))
+    return available, omitted
+
+
+def _owner_tier(owner_lead):
+    """(tier, marker) for whichever lead owns a spawn/rotate/upgrade. An unowned or no-longer-live
+    owner reads as `("auto", {})` — the same fail-safe default `lead_guard.tier_state({})` already
+    gives — never a refusal: ownership is optional everywhere else in relay, so a spawn with no
+    `--lead` must not suddenly require one just because tier exists."""
+    marker = lead_guard.read_marker(STATE_ROOT, owner_lead) if owner_lead else {}
+    tier, _src = lead_guard.tier_state(marker)
+    return tier, marker
+
+
+def _tier_manual_block(owner_lead, tier, packet_path, ceiling):
+    """None when manual tier doesn't block this spawn/rotate/upgrade (tier isn't "manual"); else the
+    EXACT refusal text the packet's manual posture requires — the zero-availability line when no
+    class resolves on this machine at all (a refusal, never an empty question), else the standard
+    "ask first" line naming this lead and the packet in flight."""
+    if tier != "manual":
+        return None
+    available, _omitted = _resolve_tier_classes(ceiling)
+    if not available:
+        return TIER_ZERO_AVAILABLE_MSG
+    return TIER_MANUAL_ASK_MSG.format(sid=owner_lead, packet=packet_path)
+
+
+def _lead_live_model(sid):
+    """The model of the LAST assistant turn in lead `sid`'s own transcript, or None when
+    unlocatable/unreadable/no assistant turn has recorded one yet — the live signal `tier=lead`
+    mirrors so a mid-session `/model` switch is picked up at the NEXT spawn without needing a
+    re-arm. Ground truth from the CLI's own stamped `message.model` on each turn (never the lead's
+    own self-report, which skills/mode/SKILL.md already flags as unreliable across repeated
+    switches). Same tail-only read as `_last_assistant_text` (transcripts run to tens of MB; only
+    the last turn matters) — see that function's docstring for why 256KiB is always enough."""
+    path = _find_transcript_path(sid)
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            start = max(0, size - _LAST_ASSISTANT_TAIL_BYTES)
+            f.seek(start)
+            data = f.read()
+    except OSError:
+        return None
+    lines = data.decode("utf-8", errors="replace").split("\n")
+    if start > 0:
+        lines = lines[1:]  # drop the first, possibly partial, line
+    last_model = None
+    for line in lines:
+        if '"assistant"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") != "assistant":
+            continue
+        m = (d.get("message") or {}).get("model")
+        if m:
+            last_model = m
+    return last_model
+
+
+def _lead_model_class(sid, marker=None):
+    """TIER_ORDER class of lead `sid`'s own model — `tier=lead`'s "the lead's own class". Prefers
+    the LIVE signal (`_lead_live_model`) so a mid-session `/model` switch is honoured; falls back to
+    the model recorded on its marker at arm time (the same field `relay handoff --model` and `relay
+    list`'s LEADS MODEL column already treat as "the lead's own model") when the transcript is
+    unlocatable or has no assistant turn yet. None when neither source names a recognizable class —
+    the caller decides whether that is a hard refusal (spawn/send do; `tier ask`'s "(lead's tier)"
+    annotation just omits itself)."""
+    if not sid:
+        return None
+    if marker is None:
+        marker = lead_guard.read_marker(STATE_ROOT, sid)
+    live = _lead_live_model(sid)
+    return lead_guard.model_tier(live or marker.get("model"))
+
+
+# Fixed one-phrase description per class, verbatim from the spawn model rubric (skills/spawn/
+# SKILL.md / skills/mode/SKILL.md) — `relay tier ask`'s block quotes the SAME rubric, never a
+# reinterpretation of it.
+_TIER_CLASS_DESC = {
+    "haiku": "mechanical",
+    "sonnet": "workhorse default",
+    "opus": "judgment where a wrong-but-plausible result survives review",
+    "fable": "lead's own class, maximum judgment",
+}
+
+
+def _tier_recommendation(packet_path):
+    """The rubric's recommended class for one packet, derived from the packet lint's own shape
+    hints (lead_guard.lint_packet's "shape-opus"/"shape-haiku" info codes) — read with model=None so
+    the hint fires on the packet's OWN shape, never on whatever model happens to be asked about.
+    No packet (a bare `tier ask` with nothing to look at yet) or an unreadable path → "sonnet", the
+    workhorse default."""
+    if not packet_path:
+        return "sonnet"
+    try:
+        body = Path(packet_path).read_text()
+    except OSError:
+        return "sonnet"
+    codes = {code for _level, code, _msg in lead_guard.lint_packet(body)}
+    if "shape-opus" in codes:
+        return "opus"
+    if "shape-haiku" in codes:
+        return "haiku"
+    return "sonnet"
+
+
+def tier_ask_data(packet_path, lead_class, ceiling, claude_bin):
+    """The fixed `relay tier ask` payload: (lines, data) for the human block plus its --json
+    round-trip, or (None, None) when NO class resolves at all — the caller refuses instead of
+    printing an empty question (see TIER_ZERO_AVAILABLE_MSG). Same wording/order every time: the
+    rubric's recommendation for THIS packet first (marked "(Recommended)"), then every other
+    resolvable-and-in-ceiling class in TIER_ORDER order, each `<alias> → <resolved id> — <fixed
+    description>`; the lead's own class (if any) additionally marked "(lead's tier)"; each
+    above-ceiling class as one dim line; a closing dim provenance line."""
+    available, omitted = _resolve_tier_classes(ceiling)
+    if not available:
+        return None, None
+    by_alias = dict(available)
+    recommended = _tier_recommendation(packet_path)
+    if recommended not in by_alias:
+        recommended = available[0][0]  # the rubric's pick isn't offered here — fall back to the first
+    ordered = [recommended] + [a for a, _ in available if a != recommended]
+    header_subject = Path(packet_path).name if packet_path else "this spawn"
+    header = f"Executor model for {header_subject}?"
+    lines = [header, ""]
+    options = []
+    for alias in ordered:
+        resolved = by_alias[alias]
+        tags = []
+        if alias == recommended:
+            tags.append("Recommended")
+        if alias == lead_class:
+            tags.append("lead's tier")
+        suffix = f" ({', '.join(tags)})" if tags else ""
+        lines.append(f"  {alias} → {resolved} — {_TIER_CLASS_DESC[alias]}{suffix}")
+        options.append({"alias": alias, "resolved": resolved, "description": _TIER_CLASS_DESC[alias],
+                        "recommended": alias == recommended, "lead_tier": alias == lead_class})
+    for alias in omitted:
+        lines.append(c(f"  {alias} — above ceiling ({ceiling}); not offered", "dim"))
+    lines.append("")
+    lines.append(c(f"resolved via {claude_bin}, {len(available)} classes available, ceiling {ceiling}",
+                   "dim"))
+    data = {"header": header, "options": options, "omitted_above_ceiling": omitted,
+           "provenance": {"claude_binary": claude_bin, "available": len(available), "ceiling": ceiling}}
+    return lines, data
+
+
 def _fmt_context_window(n):
     """1_000_000 -> "1M", 200_000 -> "200k" — the doctor detail text's units, not human_tokens'
     generic 1-decimal rounding (which would print "1.0M")."""
@@ -3112,6 +3346,13 @@ def cmd_doctor(args):
     cfg = lead_guard.load_config(STATE_ROOT)
     add("config loads", True, f"auto_close={cfg.get('auto_close')} escalation={cfg.get('executor_escalation')} "
         f"default_model={cfg.get('executor_default_model')} ceiling={cfg.get('executor_model_ceiling')}")
+    # relay tier's layering, spelled out once so a lead can see at a glance what decides an
+    # executor's model without reading three separate docs — always PASS/informational, mirroring
+    # the "config loads" row right above (this isn't a live probe, just the effective order).
+    add("model-tier layering", True,
+        f"config default ({cfg.get('executor_default_model', 'sonnet')}) < relay tier (per lead "
+        f"session, resets to auto on every arm) < --model (one spawn) — ceiling "
+        f"{cfg.get('executor_model_ceiling', 'opus')} caps every posture, including tier lead")
     configured_signoff = _configured_signoff_paths()
     add("sign-off gate (condition 4)", True,
         f"built-in: {', '.join(m for m, _ in report_verify.SIGNOFF_PATH_MARKERS)}"
@@ -4046,6 +4287,17 @@ def _lead_auto_cell(m):
     return ("AUTO", ("yellow", "bold")) if on else ("-", ("dim",))
 
 
+def _lead_tier_cell(m):
+    """`relay list`'s TIER cell for one lead marker: `(text, styles)`, next to AUTO. "auto" dim (the
+    ordinary, unremarked default — nothing to flag), "manual"/"lead" bold like AUTO's loud stamp:
+    both are a deliberate departure from the default that changes how an executor's model gets
+    picked, so they earn the same "more visible, not less" treatment AUTO gets."""
+    tier, _source = lead_guard.tier_state(m)
+    if tier == "auto":
+        return ("auto", ("dim",))
+    return ("manual", ("yellow", "bold")) if tier == "manual" else ("lead", ("bold",))
+
+
 def _lead_term_cell(m):
     """`relay list`'s TERM cell for one lead marker: which terminal app hosts its tab. A dim "?"
     means the marker has no recorded `backend`, so every nudge to that lead has to fall back to
@@ -4597,6 +4849,10 @@ def cmd_list(args):
             # silence — a lead acting on its own has to be MORE visible here, not less — so an auto
             # lead gets a loud stamp while the ordinary manual posture renders as a quiet dash.
             ("AUTO", 4, [_lead_auto_cell(m)[0] for m in leads]),
+            # TIER: `relay tier`'s posture — who decides an executor's model. Same loud/quiet
+            # asymmetry as AUTO: "auto" (today's behaviour) is a quiet dim word, "manual"/"lead" (a
+            # deliberate departure) get AUTO's bold stamp.
+            ("TIER", 6, [_lead_tier_cell(m)[0] for m in leads]),
             # TERM: which terminal app hosts this lead's tab, from its marker. "?" = unrecorded, so
             # nudges to it are probe-or-guess rather than addressed (§1) — the same "you can only
             # find this by reading JSON" blind spot the VER/WAKE cells already exist to remove.
@@ -4626,6 +4882,7 @@ def cmd_list(args):
         for m in leads:
             wake_text, wake_styles = _WAKE_CELL[wake_states[m.get("session_id")]]
             auto_text, auto_styles = _lead_auto_cell(m)
+            tier_text, tier_styles = _lead_tier_cell(m)
             term_text = _lead_term_cell(m)
             live_text, live_styles = _LIVENESS_CELL[liveness_by_sid[m.get("session_id")]]
             row_parts = [
@@ -4635,6 +4892,7 @@ def cmd_list(args):
                 cell(m.get("plugin_version") or "?", lead_widths["VER"]),
                 c(cell(wake_text, lead_widths["WAKE"]), *wake_styles),
                 c(cell(auto_text, lead_widths["AUTO"]), *auto_styles),
+                c(cell(tier_text, lead_widths["TIER"]), *tier_styles),
                 # A recorded backend is unremarkable; an unrecorded one is the degraded state, so
                 # only the "?" gets styling (dim — informational, not an error).
                 cell(term_text, lead_widths["TERM"]) if term_text != "?"
@@ -4685,9 +4943,16 @@ def cmd_list(args):
         auto_leads = [m for m in leads if lead_guard.autonomous_state(m)[0]]
         if auto_leads:
             names = ", ".join((m.get("project") or (m.get("session_id") or "?")[:8]) for m in auto_leads)
+            # relay tier's manual posture is the one posture that ADDS a stop even here — call it
+            # out specifically for whichever autonomous lead(s) also hold it, since "proceeding
+            # without asking" would otherwise read as covering model choice too.
+            manual_tier_names = ", ".join((m.get("project") or (m.get("session_id") or "?")[:8])
+                                          for m in auto_leads if lead_guard.tier_state(m)[0] == "manual")
+            tier_clause = (f" tier: manual for {manual_tier_names} — every spawn stops for a model "
+                          f"choice, even in autonomous mode." if manual_tier_names else "")
             print(c(f"  ⚡ AUTO: {names} — proceeding without asking on routine in-plan steps. "
-                    f"Committing executor work still stops for you. `relay auto off --session <id>` "
-                    f"reverts.", "yellow"))
+                    f"Committing executor work still stops for you.{tier_clause} `relay auto off "
+                    f"--session <id>` reverts.", "yellow"))
         # LIVE=unreachable/ghost footnotes (§3) — the same "say it in words, not just a cell" rule
         # the AUTO/WAKE warnings already follow, since a skimmed column is easy to slide past.
         unreachable_leads = [m for m in leads if liveness_by_sid[m.get("session_id")] == "unreachable"]
@@ -6114,6 +6379,70 @@ def cmd_auto(args):
               f"approval beat.")
 
 
+def cmd_tier(args):
+    """`relay tier auto|manual|lead|status|ask` (invoked by /relay:tier) — mirrors `cmd_auto` exactly
+    for the per-lead POSTURE actions (auto/manual/lead/status): which side decides an executor's
+    model, never what the lead is allowed to do otherwise. `ask` is a separate, stateless read (no
+    session-required posture check beyond locating the lead for its own-class annotation) that
+    prints the fixed manual-question block `manual` posture needs at every spawn/rotate/upgrade —
+    see `tier_ask_data`.
+
+    Unlike `cmd_auto`, a posture flip here is NOT ledgered under its `auto_mode_on`/`auto_mode_off`
+    events (reusing those would misrepresent a three-way field as a boolean toggle, and relay's own
+    ledger format/event names are off-limits for this feature) — visible only via `relay tier
+    status` / `relay list`'s TIER column, never the ledger."""
+    if args.action == "ask":
+        cfg = lead_guard.load_config(STATE_ROOT)
+        marker = lead_guard.read_marker(STATE_ROOT, args.session) if args.session else {}
+        ceiling = cfg.get("executor_model_ceiling", "opus")
+        lead_class = _lead_model_class(args.session, marker) if args.session else None
+        claude_bin = shutil.which("claude") or iterm_backend.CLAUDE_BIN
+        lines, data = tier_ask_data(getattr(args, "packet", None), lead_class, ceiling, claude_bin)
+        if lines is None:
+            sys.exit(TIER_ZERO_AVAILABLE_MSG)
+        print(json.dumps(data, indent=2) if args.json else "\n".join(lines))
+        return
+
+    if not args.session:
+        sys.exit("tier: session id is empty (is $CLAUDE_CODE_SESSION_ID set?)")
+    if not lead_guard.is_lead(STATE_ROOT, args.session):
+        sys.exit(f"tier: session '{args.session}' is not in lead mode — run /relay:mode first")
+    marker = lead_guard.read_marker(STATE_ROOT, args.session)
+    tier, source = lead_guard.tier_state(marker)
+    project = marker.get("project") or args.session
+
+    if args.action == "status":
+        origin = "set by `relay tier` this session" if source == "command" else "the arm-time default"
+        explain = {
+            "auto": "the lead decides per packet by the model rubric (today's behaviour).",
+            "manual": "the human decides at EVERY spawn/rotate/upgrade — `relay spawn`/`send "
+                     "--rotate|--upgrade` without --model refuse and point at `relay tier ask`.",
+            "lead": "executors with no explicit --model mirror this lead's own model class, "
+                   "resolved through this machine's alias resolver at spawn; the ceiling still caps it.",
+        }[tier]
+        print(f"model-tier posture is {tier.upper()} for lead '{project}' ({origin}) — {explain}")
+        return
+
+    want = args.action  # "auto" | "manual" | "lead" (argparse choices already narrow this)
+    if not lead_guard.set_tier(STATE_ROOT, args.session, want):
+        sys.exit(f"tier: no lead marker for '{args.session}' — run /relay:mode first")
+    messages = {
+        "auto": f"model-tier posture AUTO for lead '{project}' — back to the lead deciding an "
+               f"executor's model per packet by the model rubric. `relay tier manual|lead` changes "
+               f"it; a fresh `/relay:mode` arm also resets to auto.",
+        "manual": f"model-tier posture MANUAL for lead '{project}' — every `relay spawn`/`send "
+                  f"--rotate|--upgrade` without an explicit --model now REFUSES, even in autonomous "
+                  f"mode: this is the one posture that ADDS a stop. Run `relay tier ask --session "
+                  f"{args.session} --packet <p>` first, then pass the answer as --model. `relay "
+                  f"tier auto` reverts; a fresh `/relay:mode` arm also resets to auto.",
+        "lead": f"model-tier posture LEAD for lead '{project}' — executors with no explicit --model "
+               f"now mirror this lead's own model class (a mid-session `/model` switch is picked up "
+               f"at the NEXT spawn); executor_model_ceiling still caps it, and an explicit --model "
+               f"still wins. `relay tier auto` reverts; a fresh `/relay:mode` arm also resets to auto.",
+    }
+    print(messages[want])
+
+
 def cmd_focus(args):
     """Jump to a session's iTerm tab via a bounded title match on its relay label — the reliable
     ccsessions mechanism (activate + select window + select tab). Works for executors AND leads:
@@ -6471,6 +6800,10 @@ def main():
     sd.add_argument("--name", metavar="NAME",
                     help="with --rotate/--upgrade: the successor's relay name (default: the retired "
                          "session's base name with the next free -r<N> suffix)")
+    sd.add_argument("--model", metavar="NAME",
+                    help="with --rotate/--upgrade: the successor's model, overriding the ordinary "
+                         "default (same-territory model, or --upgrade's one-tier-up step) — always "
+                         "wins, and is the only way past `relay tier manual`'s refusal")
     sd.add_argument("--when-idle", dest="when_idle", action="store_true",
                     help="if the session is busy/stalled, QUEUE this packet instead of refusing; "
                          "it is delivered automatically the next time the session goes idle "
@@ -6604,6 +6937,18 @@ def main():
     at.add_argument("--session", required=True)
     at.set_defaults(func=cmd_auto)
 
+    tp = sub.add_parser("tier", help="model-tier posture for this lead: who decides which model an "
+                        "executor runs on — auto (rubric decides per packet, default), manual (the "
+                        "human decides every spawn/rotate/upgrade), lead (executors mirror this "
+                        "lead's own model class)")
+    tp.add_argument("action", choices=["auto", "manual", "lead", "status", "ask"])
+    tp.add_argument("--session", required=True)
+    tp.add_argument("--packet", help="with `ask`: the packet this spawn is for, to derive the "
+                    "rubric's recommendation from its shape hints (omit for a bare \"this spawn\")")
+    tp.add_argument("--json", action="store_true", help="with `ask`: machine-readable options for "
+                    "AskUserQuestion")
+    tp.set_defaults(func=cmd_tier)
+
     rpt = sub.add_parser("report")
     rpt.add_argument("session_id")
     rpt.add_argument("--packet", type=int)
@@ -6728,7 +7073,7 @@ def main():
         "retire": ["session_id"], "queue": ["session_id"], "_deliver-queued": ["session_id"],
         "keep": ["session_id"], "_auto-close-sweep": ["lead"],
         "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
-        "auto": ["session"],
+        "auto": ["session"], "tier": ["session"],
         "diff": ["session_id"], "verify": ["session_id"], "focus": ["session_id"],
         "restart": ["session_id"],
         "resume": ["session_id"], "spawn": ["lead"], "list": ["lead"], "board": ["lead"],
