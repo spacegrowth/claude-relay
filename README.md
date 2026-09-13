@@ -100,6 +100,21 @@ install picks up changes on the next `claude --plugin-dir …` launch.
 
 Optional, for typing bare `relay` in your own terminal:
 
+**Marketplace install** — there's no dev clone to symlink, and the cache path is versioned with
+no `latest`/`current` symlink (the version changes on every `/plugin update`), so resolve it the
+same version-agnostic way the status line does (below), once, to run `install-cli`:
+
+```bash
+$(ls -d "$HOME/.claude/plugins/cache/claude-relay/relay"/*/bin/relay | sort -V | tail -1) install-cli
+relay doctor
+```
+
+This writes a tiny wrapper at `~/.local/bin/relay` (`--dir`/`--force`/`--print` — `relay install-cli
+--help`) that re-resolves the newest installed version on every invocation, so it keeps working
+across updates with no re-linking.
+
+**Local clone:**
+
 ```
 ln -sf /path/to/claude-relay/bin/relay ~/.local/bin/relay
 ```
@@ -178,6 +193,7 @@ relay queue <session_id> [--cancel ID|all] show/cancel packets queued with --whe
 /relay:board [--open] [--out PATH] [--lead] one HTML page for everything: leads → executors → packet timelines, status, launch, tokens, warnings; light/dark toggle
 relay stats [--lead SID] [--since DAYS] [--json]   one row per packet ever sent → outcome (rounds, verdict, status) + a token trailer and a SUMMARY; see below
 relay doctor [--offline] [--quick]         prove the installed claude CLI still honours relay's launch flags + plumbing; run after every Claude Code update
+relay install-cli [--dir DIR] [--force] [--print]   write a `relay` wrapper on $PATH that survives /plugin update; see Install above
 relay lint <packet.md> [--worktree W] [--model M] [--strict]   advisory packet checks (MCP undeclared, big reading on 200K, no Preconditions, shape hints…)
 /relay:list [--all-leads]                  leads + active executors (closed hidden; --closed shows); TOKENS and LAUNCH (mcp/context/role); parks finished ones
                                             other projects' ghost/paused leads collapse to one line; --all-leads shows them

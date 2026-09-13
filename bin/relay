@@ -3423,6 +3423,18 @@ def cmd_doctor(args):
     cfg = lead_guard.load_config(STATE_ROOT)
     add("config loads", True, f"auto_close={cfg.get('auto_close')} escalation={cfg.get('executor_escalation')} "
         f"default_model={cfg.get('executor_default_model')} ceiling={cfg.get('executor_model_ceiling')}")
+    # Backlog row 60: the opt-in fallback config is easy to never discover on your own — one
+    # advisory SKIP line when it's unset, naming what it's for and where it's documented; PASS with
+    # the resolved (normalized) value(s) once it's set. Never FAILs either way — this is purely
+    # informational, same spirit as "model-tier layering" below.
+    fallback_cfg = cfg.get("executor_fallback_model")
+    if not fallback_cfg:
+        add("executor_fallback_model", False,
+            "unset — optional; set it to a concrete model id (or list) so a spawn whose alias "
+            "won't resolve falls back instead of failing; see README Config", skip=True)
+    else:
+        fallback_models, _ = lead_guard.normalize_fallback_models(fallback_cfg)
+        add("executor_fallback_model", True, ", ".join(str(m) for m in (fallback_models or [])))
     # relay tier's layering, spelled out once so a lead can see at a glance what decides an
     # executor's model without reading three separate docs — always PASS/informational, mirroring
     # the "config loads" row right above (this isn't a live probe, just the effective order).
@@ -3512,6 +3524,78 @@ def cmd_doctor(args):
                 "red" if fails else "green"))
     if any(st == "FAIL" for _, st, _, _ in checks):
         sys.exit(1)
+
+
+# ── relay install-cli: a bare `relay` on $PATH for marketplace installs (backlog row 61) ────────
+_CLI_WRAPPER_MARKER = "# relay-cli-wrapper"
+
+
+def _cli_wrapper_script():
+    """The POSIX `sh` wrapper `relay install-cli` writes. A marketplace install lands at a
+    VERSIONED cache path with no `latest`/`current` symlink, and the version changes on every
+    `/plugin update` — this wrapper re-resolves the newest installed version on every invocation
+    (same `sort -V | tail -1` resolver as the status-line integration, examples/statusline.sh), so
+    it keeps working across updates with no re-linking. `$RELAY_DEV_BIN` (a dev clone's `bin/relay`)
+    takes priority when set, for a `claude --plugin-dir` checkout. `_CLI_WRAPPER_MARKER`, the first
+    line after the shebang, is how a later `install-cli` run recognizes "this file is already a
+    relay wrapper, safe to overwrite" and lets it through without `--force`."""
+    return (
+        "#!/bin/sh\n"
+        f"{_CLI_WRAPPER_MARKER} — installed by `relay install-cli`; safe to delete, or re-run "
+        "`install-cli` to reinstall. See README \"Install\".\n"
+        "if [ -n \"$RELAY_DEV_BIN\" ]; then\n"
+        "    exec \"$RELAY_DEV_BIN\" \"$@\"\n"
+        "fi\n"
+        "relay_bin=$(ls -d \"$HOME/.claude/plugins/cache/claude-relay/relay\"/*/bin/relay "
+        "2>/dev/null \\\n"
+        "            | sort -V | tail -1)\n"
+        "if [ -z \"$relay_bin\" ]; then\n"
+        "    echo \"relay: not installed — run /plugin install relay@claude-relay (or set "
+        "RELAY_DEV_BIN to a dev clone's bin/relay)\" >&2\n"
+        "    exit 1\n"
+        "fi\n"
+        "exec \"$relay_bin\" \"$@\"\n"
+    )
+
+
+def cmd_install_cli(args):
+    """`relay install-cli [--dir DIR] [--force] [--print]` — write the wrapper above (see
+    `_cli_wrapper_script`) at DIR/relay (default `~/.local/bin`), so a marketplace-only install —
+    no dev clone to `ln -sf` — has a bare `relay` on $PATH that survives every `/plugin update`
+    (backlog row 61). `--print` writes nothing; it just prints the wrapper text to stdout.
+
+    Refuses to overwrite a file already at the target path unless it's a relay wrapper itself
+    (carries `_CLI_WRAPPER_MARKER`) or `--force` is given — never silently clobber something
+    unrelated a human already has at `~/.local/bin/relay`."""
+    script = _cli_wrapper_script()
+    if args.print:
+        sys.stdout.write(script)
+        return
+    target_dir = Path(args.dir).expanduser() if args.dir else (Path.home() / ".local" / "bin")
+    target = target_dir / "relay"
+    if target.exists() and not args.force:
+        try:
+            existing = target.read_text()
+        except Exception:
+            existing = ""
+        if _CLI_WRAPPER_MARKER not in existing:
+            print(c(f"install-cli: {target} already exists and isn't a relay wrapper — "
+                    f"rerun with --force to overwrite", "red"))
+            sys.exit(1)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target.write_text(script)
+        target.chmod(0o755)
+    except Exception as e:
+        print(c(f"install-cli: failed to write {target}: {e}", "red"))
+        sys.exit(1)
+    on_path = str(target_dir) in (os.environ.get("PATH") or "").split(os.pathsep)
+    print(c(f"wrote {target}", "green"))
+    if on_path:
+        print(c(f"✓ {target_dir} is on $PATH", "dim"))
+    else:
+        print(c(f"⚠ {target_dir} is NOT on $PATH — add it to your shell profile, e.g. "
+                f"export PATH=\"{target_dir}:$PATH\"", "yellow"))
 
 
 # ── relay board: one page for everything relay knows ─────────────────────────────────────────
@@ -7405,6 +7489,14 @@ def main():
     dr.add_argument("--model", help="model for the probes (default haiku)")
     dr.add_argument("--json", action="store_true")
     dr.set_defaults(func=cmd_doctor)
+
+    ic = sub.add_parser("install-cli", help="write a tiny `relay` wrapper on $PATH that execs the "
+                                            "newest marketplace-installed relay, surviving "
+                                            "/plugin update (backlog row 61); see README Install")
+    ic.add_argument("--dir", help="target directory (default ~/.local/bin)")
+    ic.add_argument("--force", action="store_true", help="overwrite an existing non-wrapper file at the target path")
+    ic.add_argument("--print", action="store_true", help="print the wrapper script to stdout; write nothing")
+    ic.set_defaults(func=cmd_install_cli)
 
     ln = sub.add_parser("lint", help="lint a packet file before sending it (advisory; --strict exits 1 on warnings)")
     ln.add_argument("packet")

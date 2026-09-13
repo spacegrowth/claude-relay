@@ -973,6 +973,116 @@ class TestDoctor:
         assert e.value.code == 1
         assert "✗ 1 failing: strict MCP → zero servers" in capsys.readouterr().out
 
+    def test_fallback_model_unset_is_an_advisory_skip_never_a_fail(self, relay, terms, probes,
+                                                                    capsys):
+        """Backlog row 60: unset is the common case, and must never fail doctor — just point at
+        the opt-in and where it's documented."""
+        run_main(relay, "doctor", "--offline", "--json")
+        checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)}
+        row = checks["executor_fallback_model"]
+        assert row["status"] == "SKIP"
+        assert "unset" in row["detail"] and "README Config" in row["detail"]
+
+    def test_fallback_model_set_passes_with_the_resolved_value(self, relay, terms, probes, capsys):
+        p = relay.lead_guard.config_path(relay.STATE_ROOT)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"executor_fallback_model": "claude-haiku-4-5"}))
+        run_main(relay, "doctor", "--offline", "--json")
+        checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)}
+        row = checks["executor_fallback_model"]
+        assert row["status"] == "PASS"
+        assert row["detail"] == "claude-haiku-4-5"
+
+    def test_fallback_model_list_form_passes_with_every_entry(self, relay, terms, probes, capsys):
+        p = relay.lead_guard.config_path(relay.STATE_ROOT)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"executor_fallback_model": ["claude-haiku-4-5", "claude-opus-5"]}))
+        run_main(relay, "doctor", "--offline", "--json")
+        checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)}
+        row = checks["executor_fallback_model"]
+        assert row["status"] == "PASS"
+        assert row["detail"] == "claude-haiku-4-5, claude-opus-5"
+
+
+# ── relay install-cli ──────────────────────────────────────────────────────────────────────────
+
+class TestInstallCli:
+    """Backlog row 61: a bare `relay` on $PATH for a marketplace install (no dev clone to
+    symlink), surviving `/plugin update` since there's no `latest`/`current` symlink at the
+    versioned cache path — the wrapper re-resolves the newest installed version on every call."""
+
+    def test_print_writes_the_script_to_stdout_and_touches_nothing(self, relay, terms, tmp_path,
+                                                                    capsys):
+        target_dir = tmp_path / "bin-dir"
+        run_main(relay, "install-cli", "--dir", str(target_dir), "--print")
+        out = capsys.readouterr().out
+        assert relay._CLI_WRAPPER_MARKER in out
+        assert not target_dir.exists()
+
+    def test_writes_an_executable_wrapper_carrying_the_marker(self, relay, terms, tmp_path, capsys):
+        target_dir = tmp_path / "bin-dir"
+        run_main(relay, "install-cli", "--dir", str(target_dir))
+        wrapper = target_dir / "relay"
+        assert wrapper.exists()
+        assert relay._CLI_WRAPPER_MARKER in wrapper.read_text()
+        assert os.access(wrapper, os.X_OK)
+        out = capsys.readouterr().out
+        assert str(wrapper) in out
+
+    def test_refuses_to_clobber_a_foreign_file_without_force(self, relay, terms, tmp_path, capsys):
+        target_dir = tmp_path / "bin-dir"
+        target_dir.mkdir(parents=True)
+        (target_dir / "relay").write_text("#!/bin/sh\necho not-a-relay-wrapper\n")
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "install-cli", "--dir", str(target_dir))
+        assert e.value.code == 1
+        assert "not-a-relay-wrapper" in (target_dir / "relay").read_text()
+        assert "already exists" in capsys.readouterr().out
+
+    def test_force_overwrites_the_foreign_file(self, relay, terms, tmp_path, capsys):
+        target_dir = tmp_path / "bin-dir"
+        target_dir.mkdir(parents=True)
+        (target_dir / "relay").write_text("#!/bin/sh\necho not-a-relay-wrapper\n")
+        run_main(relay, "install-cli", "--dir", str(target_dir), "--force")
+        assert relay._CLI_WRAPPER_MARKER in (target_dir / "relay").read_text()
+
+    def test_rerunning_over_its_own_wrapper_needs_no_force(self, relay, terms, tmp_path):
+        """A relay wrapper from a previous install-cli isn't "foreign" — a plain re-run (no
+        --force) must succeed, since that's exactly how you'd pick up a newer wrapper."""
+        target_dir = tmp_path / "bin-dir"
+        run_main(relay, "install-cli", "--dir", str(target_dir))
+        run_main(relay, "install-cli", "--dir", str(target_dir))  # no --force; must not raise
+        assert relay._CLI_WRAPPER_MARKER in (target_dir / "relay").read_text()
+
+    def test_wrapper_execs_the_higher_of_two_cache_versions(self, relay, terms, tmp_path):
+        """The wrapper, run with a fake HOME containing two versioned cache dirs, execs the
+        HIGHER one — `sort -V`, not lexical order, so 0.4.10 beats 0.4.9 correctly."""
+        fake_home = tmp_path / "fake-home"
+        for ver in ("0.4.2", "0.4.10"):
+            d = fake_home / ".claude" / "plugins" / "cache" / "claude-relay" / "relay" / ver / "bin"
+            d.mkdir(parents=True)
+            fake_bin = d / "relay"
+            fake_bin.write_text(f"#!/bin/sh\necho {ver}\n")
+            fake_bin.chmod(0o755)
+        target_dir = tmp_path / "bin-dir"
+        run_main(relay, "install-cli", "--dir", str(target_dir))
+        wrapper = target_dir / "relay"
+        result = subprocess.run(["sh", str(wrapper)], capture_output=True, text=True,
+                                env={**os.environ, "HOME": str(fake_home), "RELAY_DEV_BIN": ""})
+        assert result.stdout.strip() == "0.4.10"
+
+    def test_wrapper_prefers_relay_dev_bin_when_set(self, relay, terms, tmp_path):
+        dev_bin = tmp_path / "dev" / "relay"
+        dev_bin.parent.mkdir(parents=True)
+        dev_bin.write_text("#!/bin/sh\necho dev-clone\n")
+        dev_bin.chmod(0o755)
+        target_dir = tmp_path / "bin-dir"
+        run_main(relay, "install-cli", "--dir", str(target_dir))
+        wrapper = target_dir / "relay"
+        result = subprocess.run(["sh", str(wrapper)], capture_output=True, text=True,
+                                env={**os.environ, "RELAY_DEV_BIN": str(dev_bin)})
+        assert result.stdout.strip() == "dev-clone"
+
 
 # ── relay board ─────────────────────────────────────────────────────────────────────────────────
 
