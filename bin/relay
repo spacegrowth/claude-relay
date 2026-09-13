@@ -456,6 +456,18 @@ def stop_hook_timeout():
         return None
 
 
+def _ledger_packet_source(args):
+    """The absolute path of the packet file a spawn/send delivered — stamped (additively) as `source`
+    on the `spawned` / `packet_sent` ledger events so `relay plan` can bind a queued plan item to the
+    executor + packet number that picked it up. An explicit `args.source` (a --when-idle delivery,
+    whose `packet` is the queue's body copy) wins. Never raises."""
+    try:
+        src = getattr(args, "source", None) or args.packet
+        return str(Path(src).expanduser().resolve())
+    except Exception:
+        return None
+
+
 def append_ledger(event, **fields):
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     rec = {"ts": now(), "event": event, **fields}
@@ -1365,8 +1377,9 @@ def cmd_spawn(args):
         "created": now(),
         "updated": now(),
     })
-    append_ledger("spawned", session_id=session_id, worktree=worktree, topic=args.topic, tab_label=label)
-    append_ledger("packet_sent", session_id=session_id, packet=n)
+    append_ledger("spawned", session_id=session_id, worktree=worktree, topic=args.topic, tab_label=label,
+                  source=_ledger_packet_source(args))
+    append_ledger("packet_sent", session_id=session_id, packet=n, source=_ledger_packet_source(args))
     refresh_live_board()  # `spawn` is a state-change moment (see refresh_live_board) — no-op unless live
     if launch_failed:
         append_ledger("launch_failed", session_id=session_id, attempts=2)
@@ -2427,7 +2440,8 @@ def cmd_send(args):
             s["updated"] = now()
             write_session(args.session_id, s)
             append_ledger("packet_sent", session_id=args.session_id, packet=n,
-                          via="resume" + ("-mcp" if mcp_relaunch else ""))
+                          via="resume" + ("-mcp" if mcp_relaunch else ""),
+                          source=_ledger_packet_source(args))
             note = (f"session '{args.session_id}' was {prev_status}"
                     if prev_status in ("closed", "dead")
                     else (f"MCP set widened to {lead_guard.mcp_spec_label(s.get('mcp'))}" if mcp_relaunch
@@ -2448,7 +2462,7 @@ def cmd_send(args):
     s["busy_since_epoch"] = time.time()
     s["updated"] = now()
     write_session(args.session_id, s)
-    append_ledger("packet_sent", session_id=args.session_id, packet=n)
+    append_ledger("packet_sent", session_id=args.session_id, packet=n, source=_ledger_packet_source(args))
     print(f"sent packet {n:03d} to session '{args.session_id}' (existing tab)")
     refresh_live_board()  # `send` is a state-change moment — no-op unless live
 
@@ -2511,7 +2525,12 @@ def deliver_queued(session_id, trigger):
         try:                               # must not re-deliver, and the restore below covers the
                                            # recoverable failures.
             cmd_send(SimpleNamespace(session_id=session_id, packet=item["body_path"],
-                                     when_idle=False, heavy_override=item.get("heavy_override")))
+                                     when_idle=False, heavy_override=item.get("heavy_override"),
+                                     # `relay plan` matches on the ORIGINAL packet path, not the
+                                     # queue's body copy — only when it was recorded absolute
+                                     # (a relative one would resolve against the wrong cwd here).
+                                     source=(item.get("source")
+                                             if os.path.isabs(str(item.get("source") or "")) else None)))
         except SystemExit as e:            # cmd_send refuses by exiting — capture, don't die
             err = str(e) or "send refused"
             prev_error = item.get("last_error")   # BEFORE mutating: `item` IS items[0]
@@ -4793,6 +4812,15 @@ def _print_hidden_leads(hidden):
             f"`relay list --all-leads` shows them, `relay prune` clears them", "dim"))
 
 
+def _print_list_plan(args, lead_caller):
+    """`relay list --plan` (row 55): the calling lead's plan table, after EXECUTORS and its
+    footnotes. No-op without --plan or without an armed lead caller."""
+    if getattr(args, "plan", False) and lead_caller:
+        print()
+        print(c("PLAN", "bold"))
+        print_plan_table(plan_rows(lead_caller))
+
+
 def cmd_list(args):
     # LEADS: every lead is a candidate row — you generally want to see/restore any project. The one
     # exception is row 70 item 8's dead weight (ghost/paused leads on OTHER projects), collapsed
@@ -4873,7 +4901,10 @@ def cmd_list(args):
         # broken lead marker — so a scripted consumer (the board included) sees the same truth the
         # human table does, instead of the row just disappearing from --json too.
         broken_rows = [{"session_id": sid, "broken": True} for sid in broken_sids]
-        print(json.dumps({"leads": leads, "executors": rows + broken_rows}, indent=2))
+        payload = {"leads": leads, "executors": rows + broken_rows}
+        if lead_caller:                    # `relay plan`: the calling lead's queue (row 55)
+            payload["plan"] = plan_rows(lead_caller)
+        print(json.dumps(payload, indent=2))
         return
 
     # Separate live and terminal rows for filtering
@@ -5151,6 +5182,7 @@ def cmd_list(args):
     _print_auto_closed(acted)
     if not rows and not broken_sids:
         print("(no executor sessions)")
+        _print_list_plan(args, lead_caller)
         return
     # Build rendered status strings once to use both in width calc and row rendering.
     rendered_statuses = []
@@ -5371,6 +5403,8 @@ def cmd_list(args):
         print(c(f"  ⚠ {len(orphans)} executor(s) owned by retired leads (wake won't fire): {sids} — "
                 f"reclaim with relay adopt <sid> (or just relay send/resume, which adopt "
                 f"automatically).", "yellow"))
+
+    _print_list_plan(args, lead_caller)
 
     # Print footer if terminal sessions are hidden/truncated
     if getattr(args, "closed", False) and hidden_terminal_count > 0:
@@ -6322,6 +6356,13 @@ def cmd_handoff(args):
     # deleted below — otherwise a report the predecessor already reviewed and committed re-wakes
     # the successor as brand new (see carry_forward_surfaced's docstring for the incident).
     lead_guard.carry_forward_surfaced(STATE_ROOT, caller, successor_sid)
+    # Row 55: the plan queue belongs to the lineage, not the tab — copy it before the dir goes.
+    try:
+        if plan_path(caller).is_file():
+            shutil.copyfile(plan_path(caller), plan_path(successor_sid))
+    except Exception as e:
+        print(c(f"  ⚠ plan.json not carried forward ({e}) — re-add the queue with `relay plan add`",
+                "yellow"))
 
     # Step the caller down — the FINAL act, only after the spawn call has returned successfully.
     lead_guard.clear_lead(STATE_ROOT, caller)
@@ -6592,6 +6633,246 @@ def cmd_tier(args):
                f"still wins. `relay tier auto` reverts; a fresh `/relay:mode` arm also resets to auto.",
     }
     print(messages[want])
+
+
+# ── relay plan: a lead-owned ordered work queue (backlog row 55, v0) ─────────────────────────────
+# One plan.json per lead, in its lead dir. Items are stored; STATUS is derived at print time from the
+# ledger + executor state (only a hand-set `done` is ever stored). v0 NEVER sends anything — `plan
+# next` prints the command for the lead to run.
+PLAN_STATUSES = ("queued", "in-flight", "reported", "done")
+_PLAN_LIVE = ("busy", "idle", "stalled", "paused", "reported", LAUNCH_FAILED)
+
+
+def plan_path(lead_sid):
+    return lead_guard.lead_dir(STATE_ROOT, lead_sid) / "plan.json"
+
+
+def read_plan(lead_sid):
+    """The lead's plan, always in {"version": 1, "items": [...]} shape — a missing or unreadable
+    file reads as an empty plan (never raises)."""
+    try:
+        d = json.loads(plan_path(lead_sid).read_text())
+        if isinstance(d, dict) and isinstance(d.get("items"), list):
+            d.setdefault("version", 1)
+            return d
+    except Exception:
+        pass
+    return {"version": 1, "items": []}
+
+
+def write_plan(lead_sid, plan):
+    """Renumber `n` to 1..N in list order, then write atomically (tmp + replace)."""
+    for i, it in enumerate(plan["items"], 1):
+        it["n"] = i
+    p = plan_path(lead_sid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(plan, indent=2) + "\n")
+    os.replace(tmp, p)
+
+
+def _plan_lead_cwd(lead_sid):
+    return (lead_guard.read_marker(STATE_ROOT, lead_sid) or {}).get("cwd") or os.getcwd()
+
+
+def _plan_packet_abs(item, lead_cwd):
+    """An item's packet as an absolute path — relative paths resolve against the lead's cwd."""
+    p = Path(item.get("packet") or "").expanduser()
+    if not p.is_absolute():
+        p = Path(lead_cwd) / p
+    try:
+        return str(p.resolve())
+    except Exception:
+        return str(p)
+
+
+def _plan_autobind(lead_sid, plan, by_sid=None):
+    """Stamp `executor`/`packet_n` onto every unbound, not-done item whose packet path equals the
+    `source` of a `packet_sent` ledger event (spawn and send both write one) on an executor OWNED by
+    this lead, sent at or after the item was added. Each (executor, packet) binds at most one item.
+    Returns True when anything changed (caller writes the plan back)."""
+    items = plan["items"]
+    unbound = [it for it in items if not it.get("executor") and not it.get("done")]
+    if not unbound:
+        return False
+    by_sid = _ledger_by_session() if by_sid is None else by_sid
+    taken = {(it.get("executor"), it.get("packet_n")) for it in items if it.get("executor")}
+    cwd = _plan_lead_cwd(lead_sid)
+    sends = []
+    for sid, events in by_sid.items():
+        owner = None
+        for e in events:
+            if e.get("event") != "packet_sent" or not e.get("source") or e.get("packet") is None:
+                continue
+            if owner is None:
+                owner = (read_session(sid) or {}).get("owner_lead") or ""
+            if owner != lead_sid:
+                break
+            sends.append((e.get("ts") or "", sid, e["packet"], e["source"]))
+    sends.sort()
+    changed = False
+    for it in unbound:
+        want = _plan_packet_abs(it, cwd)
+        for ts, sid, n, src in sends:
+            if src == want and (sid, n) not in taken and ts >= (it.get("added") or ""):
+                it["executor"], it["packet_n"] = sid, n
+                taken.add((sid, n))
+                changed = True
+                break
+    return changed
+
+
+def _plan_item_status(item, by_sid):
+    """Derived status: done (hand-marked, or the bound packet has a `landed` event) > reported (its
+    report file exists) > in-flight (bound, executor live) > queued (unbound). A bound item whose
+    executor is closed/dead/superseded with no report shows that executor status instead — honest,
+    and still counted as in flight."""
+    if item.get("done"):
+        return "done"
+    sid, n = item.get("executor"), item.get("packet_n")
+    if not sid:
+        return "queued"
+    if n is not None and any(e.get("event") == "landed" and e.get("packet") == n
+                             for e in by_sid.get(sid, [])):
+        return "done"
+    if n is not None and (packets_dir(sid) / f"{int(n):03d}-report.md").exists():
+        return "reported"
+    st = (read_session(sid) or {}).get("status")
+    return "in-flight" if (st in _PLAN_LIVE or st is None) else st
+
+
+def plan_rows(lead_sid):
+    """Auto-bind (writing back when anything bound), then every item with its derived status and
+    absolute packet path — the one data source for `plan status`, `list --plan` and `plan next`."""
+    plan = read_plan(lead_sid)
+    by_sid = _ledger_by_session()
+    if _plan_autobind(lead_sid, plan, by_sid):
+        write_plan(lead_sid, plan)
+    cwd = _plan_lead_cwd(lead_sid)
+    return [{**it, "status": _plan_item_status(it, by_sid), "packet_path": _plan_packet_abs(it, cwd)}
+            for it in plan["items"]]
+
+
+_PLAN_STATUS_STYLE = {"queued": ("yellow",), "in-flight": ("cyan",), "reported": ("green", "bold"),
+                      "done": ("dim",)}
+
+
+def print_plan_table(rows):
+    if not rows:
+        print(c("  (plan is empty — `relay plan add <packet>`)", "dim"))
+        return
+    cols = [("#", 3, [str(r["n"]) for r in rows]),
+            ("STATUS", 10, [r["status"] for r in rows]),
+            ("PACKET", 40, [os.path.basename(r.get("packet") or "") for r in rows]),
+            ("TARGET", 36, [r.get("executor") or r.get("target") or "fresh" for r in rows]),
+            ("MODEL", 8, [r.get("model") or "-" for r in rows]),
+            ("NOTE", 50, [r.get("note") or "-" for r in rows])]
+    widths = {h: min(cap, max(len(h), max((len(v) for v in vals), default=0))) for h, cap, vals in cols}
+    print(" ".join(cell(h, widths[h]) for h, _, _ in cols).rstrip())
+    for i, r in enumerate(rows):
+        parts = []
+        for h, _, vals in cols:
+            txt = cell(vals[i], widths[h])
+            parts.append(c(txt, *_PLAN_STATUS_STYLE.get(r["status"], ())) if h == "STATUS" else txt)
+        print(" ".join(parts).rstrip())
+    counts = {k: 0 for k in PLAN_STATUSES}
+    for r in rows:
+        counts[r["status"] if r["status"] in counts else "in-flight"] += 1
+    print(c(f"  {counts['queued']} queued · {counts['in-flight']} in flight · "
+            f"{counts['reported']} reported · {counts['done']} done", "dim"))
+
+
+def _plan_item_index(plan, n):
+    if not 1 <= n <= len(plan["items"]):
+        sys.exit(f"plan: no item #{n} (the plan has {len(plan['items'])})")
+    return n - 1
+
+
+def cmd_plan(args):
+    """`relay plan [status|add|rm|done|next|bind]` (invoked by /relay:plan) — see the section header."""
+    lead = getattr(args, "session", None) or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not lead:
+        sys.exit("plan: session id is empty (is $CLAUDE_CODE_SESSION_ID set?)")
+    if not lead_guard.is_lead(STATE_ROOT, lead):
+        sys.exit(f"plan: session '{lead}' is not in lead mode — run /relay:mode first")
+    verb = getattr(args, "verb", None) or "status"
+
+    if verb == "status":
+        rows = plan_rows(lead)
+        if getattr(args, "json", False):
+            print(json.dumps({"lead": lead, "items": rows}, indent=2))
+        else:
+            print_plan_table(rows)
+        return
+
+    if verb == "next":
+        nxt = next((r for r in plan_rows(lead) if r["status"] == "queued"), None)
+        if nxt is None:
+            sys.exit(1)
+        target = nxt.get("target") or "fresh"
+        if target == "fresh":
+            topic = os.path.basename(nxt.get("packet") or "")
+            topic = topic[: -len("-packet.md")] if topic.endswith("-packet.md") else Path(topic).stem
+            model = f" --model {shlex.quote(nxt['model'])}" if nxt.get("model") else ""
+            print(f"relay spawn {shlex.quote(_plan_lead_cwd(lead))} {shlex.quote(topic)} "
+                  f"{shlex.quote(nxt['packet_path'])}{model} --lead $CLAUDE_CODE_SESSION_ID")
+        else:
+            print(f"relay send {shlex.quote(target)} {shlex.quote(nxt['packet_path'])}")
+        return
+
+    plan = read_plan(lead)
+    if verb == "add":
+        raw = args.packet
+        cwd = _plan_lead_cwd(lead)
+        rel = Path(raw).expanduser()
+        if (rel if rel.is_absolute() else Path(cwd) / rel).is_file():
+            stored = raw
+        elif Path(raw).expanduser().resolve().is_file():
+            stored = str(Path(raw).expanduser().resolve())   # found from HERE, not the lead's cwd
+        else:
+            sys.exit(f"plan add: packet '{raw}' does not exist (relative paths resolve against the "
+                     f"lead's cwd {cwd})")
+        target = args.target or "fresh"
+        if target != "fresh":
+            target = resolve_sid(target)
+            if read_session(target) is None:
+                sys.exit(f"plan add: --target '{args.target}' is neither `fresh` nor a known executor")
+        item = {"n": 0, "packet": stored, "target": target, "model": args.model, "note": args.note,
+                "executor": None, "packet_n": None, "added": now(), "done": None}
+        items = plan["items"]
+        if args.before is not None:
+            idx = _plan_item_index(plan, args.before)
+            items.insert(idx, item)
+        else:
+            items.append(item)
+        write_plan(lead, plan)
+        append_ledger("plan_add", session_id=lead, n=item["n"], packet=stored, target=target,
+                      model=args.model)
+        print(f"plan: added #{item['n']} {os.path.basename(stored)} → {target}")
+    elif verb == "rm":
+        idx = _plan_item_index(plan, args.n)
+        gone = plan["items"].pop(idx)
+        write_plan(lead, plan)
+        append_ledger("plan_rm", session_id=lead, n=args.n, packet=gone.get("packet"))
+        print(f"plan: removed #{args.n} {os.path.basename(gone.get('packet') or '')}")
+    elif verb == "done":
+        it = plan["items"][_plan_item_index(plan, args.n)]
+        it["done"] = now()
+        if args.note:
+            it["note"] = args.note
+        write_plan(lead, plan)
+        append_ledger("plan_done", session_id=lead, n=args.n, packet=it.get("packet"))
+        print(f"plan: marked #{args.n} {os.path.basename(it.get('packet') or '')} done")
+    elif verb == "bind":
+        it = plan["items"][_plan_item_index(plan, args.n)]
+        s = read_session(args.sid)
+        if s is None:
+            sys.exit(f"plan bind: no such executor session: {args.sid}")
+        it["executor"] = args.sid
+        it["packet_n"] = args.packet_n if args.packet_n is not None else s.get("current_packet")
+        write_plan(lead, plan)
+        append_ledger("plan_bind", session_id=lead, n=args.n, executor=args.sid, packet=it["packet_n"])
+        print(f"plan: bound #{args.n} to {args.sid} packet {it['packet_n']}")
 
 
 def cmd_focus(args):
@@ -7040,6 +7321,8 @@ def main():
                     "(the default when --lead is absent)")
     ls.add_argument("--all-leads", action="store_true", help="show every LEAD row, including the "
                     "ghost/paused leads of other projects that are otherwise collapsed to one line")
+    ls.add_argument("--plan", action="store_true", help="after EXECUTORS, print the calling lead's "
+                    "plan table (no-op without an armed lead)")
     ls.set_defaults(func=cmd_list)
 
     cl = sub.add_parser("close")
@@ -7099,6 +7382,37 @@ def main():
     tp.add_argument("--json", action="store_true", help="with `ask`: machine-readable options for "
                     "AskUserQuestion")
     tp.set_defaults(func=cmd_tier)
+
+    pl = sub.add_parser("plan", help="this lead's ordered work queue (plan.json): status/add/rm/done/"
+                        "next/bind — v0 never sends")
+    pl_common = argparse.ArgumentParser(add_help=False)
+    # SUPPRESS: a sub-subparser's default would otherwise overwrite a --session given before the verb
+    pl_common.add_argument("--session", default=argparse.SUPPRESS,
+                           help="the lead's session id (default: $CLAUDE_CODE_SESSION_ID)")
+    pl.add_argument("--session", default=None, help="the lead's session id (default: $CLAUDE_CODE_SESSION_ID)")
+    pl.add_argument("--json", action="store_true")
+    plsub = pl.add_subparsers(dest="verb")
+    pls = plsub.add_parser("status", parents=[pl_common], help="print the plan table (the default)")
+    pls.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    pla = plsub.add_parser("add", parents=[pl_common], help="append a packet to the plan")
+    pla.add_argument("packet")
+    pla.add_argument("--target", help="`fresh` (default) or an executor session id")
+    pla.add_argument("--model")
+    pla.add_argument("--note")
+    pla.add_argument("--before", type=int, metavar="N", help="insert before item N (renumbers)")
+    plr = plsub.add_parser("rm", parents=[pl_common], help="remove item N (renumbers)")
+    plr.add_argument("n", type=int)
+    pld = plsub.add_parser("done", parents=[pl_common], help="mark item N done by hand")
+    pld.add_argument("n", type=int)
+    pld.add_argument("--note")
+    plsub.add_parser("next", parents=[pl_common],
+                     help="print the command for the first queued item (exit 1 when none)")
+    plb = plsub.add_parser("bind", parents=[pl_common], help="tie item N to an executor")
+    plb.add_argument("n", type=int)
+    plb.add_argument("sid")
+    plb.add_argument("--packet", dest="packet_n", type=int,
+                     help="the executor's packet number (default: its current packet)")
+    pl.set_defaults(func=cmd_plan)
 
     rpt = sub.add_parser("report")
     rpt.add_argument("session_id")
@@ -7224,7 +7538,7 @@ def main():
         "retire": ["session_id"], "queue": ["session_id"], "_deliver-queued": ["session_id"],
         "keep": ["session_id"], "_auto-close-sweep": ["lead"],
         "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
-        "auto": ["session"], "tier": ["session"],
+        "auto": ["session"], "tier": ["session"], "plan": ["session", "sid"],
         "diff": ["session_id"], "verify": ["session_id"], "focus": ["session_id"],
         "restart": ["session_id"],
         "resume": ["session_id"], "spawn": ["lead"], "list": ["lead"], "board": ["lead"],

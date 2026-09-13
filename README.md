@@ -183,6 +183,8 @@ relay lint <packet.md> [--worktree W] [--model M] [--strict]   advisory packet c
                                             other projects' ghost/paused leads collapse to one line; --all-leads shows them
 /relay:close <session_id> [--supersede <new_id>]   (rarely needed — finished executors auto-close)
 relay keep <session_id> [--off]            pin/unpin an executor against auto-close
+/relay:plan [status|add|rm|done|next|bind] this lead's ordered work queue (plan.json): one table, derived status; `next` prints the command, never sends
+/relay:list --plan                         append the calling lead's plan table after EXECUTORS (`--json` carries `plan`)
 /relay:retire <session_id> [--force]       close it AND leave a successor-seed.md, so respawning fresh over the same territory is cheap
 /relay:stop                                unarm: step down from lead mode (gate + auto-wake off)
 /relay:focus <session_id>                  jump to that session's tab/pane/window (executor or lead)
@@ -533,6 +535,25 @@ inject the second mid-turn, which is the whole thing being avoided. `--when-idle
 already-idle session simply sends immediately, and it does not soften the other refusals
 (`superseded`, `launch-failed`). `relay check` shows a 📥 queued count; `relay queue <sid>` lists
 what's pending, and `relay queue <sid> --cancel <id|all>` is the cancel path.
+
+### The plan queue
+
+`relay plan` is a lead's ordered list of packets still to run — one `plan.json` in the lead's state
+dir, so "what's left" has one answer instead of a folder of loose `_staging` files. `relay plan add
+<packet.md> [--target fresh|<sid>] [--model m] [--note "…"] [--before N]` queues one (relative paths
+resolve against the lead's cwd), `rm N` / `done N` / `bind N <sid>` edit it, and `relay plan` prints
+the table (`#`, `STATUS`, `PACKET`, `TARGET`, `MODEL`, `NOTE`, footer counts). `relay list --plan`
+appends the same table; a handoff carries `plan.json` to the successor. Status is derived at print
+time, never stored (except a hand-set `done`):
+
+- **queued** — no spawn/send of this packet seen yet.
+- **in-flight** — one of this lead's executors was spawned/sent this exact packet path (matched via
+  the `source` field on the `packet_sent` ledger event and stamped onto the item) and has no report.
+- **reported** — that executor's report for the bound packet exists and it has not landed.
+- **done** — the bound packet has a `landed` ledger event, or `relay plan done N` was run by hand.
+
+v0 **never sends**: `relay plan next` prints the exact `relay spawn …` / `relay send …` command for
+the first queued item (exit 1 when nothing is queued) — running it stays the lead's call.
 
 ### Retiring a heavy executor
 
