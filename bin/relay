@@ -5764,8 +5764,10 @@ def cmd_stop(args):
 
 def cmd_prune(args):
     """Delete the state dirs of terminal-status sessions (closed/superseded/dead) whose last update
-    is older than --days, AND dead lead markers ("ghosts": tabs closed/crashed without /relay:stop,
-    so the SessionEnd hook never fired to clean up) older than the same cutoff. Nothing else is
+    is older than --days, AND dead lead markers older than the same cutoff — both dead-lead shapes:
+    ghosts (tabs closed/crashed without /relay:stop, so the SessionEnd hook never fired to clean up)
+    AND paused leads (a resumable exit whose marker is tombstoned) that have simply gone stale
+    (backlog row 77 — a paused lead is otherwise held forever, however old). Nothing else is
     touched: live sessions, live leads, and the sessions.jsonl ledger (the durable history) all
     stay. Without this, ~/.relay-tasks grows forever and every `check --all`/`list` iterates dead
     weight, and dead leads sit in the LEADS table forever with a permanent ver? warning."""
@@ -5787,17 +5789,27 @@ def cmd_prune(args):
             append_ledger("pruned", session_id=sid, status=s.get("status"))
         removed.append(f"{sid} ({s.get('status')})")
 
-    # Lead ghosts: a wrongly-dead verdict here DELETES lead state (unarms gate + wake for that
-    # session if it ever comes back), which is worse than a stale row — hence the triple guard
-    # below (never-self, liveness probe, AND staleness window). Unlike executor adoption, where
-    # fail-toward-adoptable is the right direction, none of these three conditions may be weakened.
+    # Lead ghosts AND paused leads: a wrongly-dead verdict here DELETES lead state (unarms gate +
+    # wake for that session if it ever comes back), which is worse than a stale row — hence the
+    # triple guard below (never-self, liveness probe, AND staleness window). Unlike executor
+    # adoption, where fail-toward-adoptable is the right direction, none of these three conditions
+    # may be weakened.
+    #
+    # A PAUSED lead (`lead_guard.is_tombstoned(m)` — the exact predicate `relay list`'s ⏸ rendering
+    # and `_lead_age_cell` use) is a resumable exit: the conversation process already ended, but the
+    # tab it ran in can still be sitting open (a bare shell prompt, or reused by something else), so
+    # `_lead_alive`'s iterm_session probe can keep reading it as alive forever (backlog row 77: 13
+    # such husks survived a week). The liveness probe is therefore skipped entirely for a paused
+    # lead — staleness is judged on `last_active`/`started` alone, same as a ghost — while a live
+    # (non-paused) lead still gets the full `_lead_alive` guard unchanged.
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
     removed_leads = []
     for m in lead_guard.list_leads(STATE_ROOT):
         sid = m.get("session_id")
         if not sid or sid == caller:  # never prune the calling lead, even if it somehow probes dead
             continue
-        if _lead_alive(sid):
+        paused = lead_guard.is_tombstoned(m)
+        if not paused and _lead_alive(sid):
             continue
         try:
             stamp = m.get("last_active") or m.get("started") or ""
@@ -5809,9 +5821,10 @@ def cmd_prune(args):
             continue
         if not args.dry_run:
             lead_guard.clear_lead(STATE_ROOT, sid)
-            append_ledger("lead_pruned", session_id=sid, project=m.get("project"))
+            append_ledger("lead_pruned", session_id=sid, project=m.get("project"), paused=paused)
         stale_days = int((time.time() - last_active) / 86400) if last_active else "?"
-        removed_leads.append(f"[lead] {m.get('project') or sid} ({sid[:8]}…, {stale_days}d stale)")
+        label = "[lead, paused]" if paused else "[lead]"
+        removed_leads.append(f"{label} {m.get('project') or sid} ({sid[:8]}…, {stale_days}d stale)")
 
     verb = "would prune" if args.dry_run else "pruned"
     if removed or removed_leads:

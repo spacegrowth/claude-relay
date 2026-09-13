@@ -590,6 +590,61 @@ class TestPrune:
         run_main(relay, "prune", "--days", "7")
         assert relay.lead_guard.read_marker(relay.STATE_ROOT, "recent")
 
+    def _paused_and_stale(self, relay, sid, project, live_pid=None):
+        """A tombstoned (paused) lead marker, aged past any cutoff. `live_pid`, when given, makes
+        `_lead_alive` read True purely off the pid file — the exact shape backlog row 77 names:
+        the conversation process ended (tombstoned) but something keeping the tab's PID entry alive
+        (or, in real life, the tab itself still open) means the OLD liveness guard alone would have
+        kept this lead forever."""
+        arm_lead(relay, sid, project)
+        relay.lead_guard.tombstone_lead(relay.STATE_ROOT, sid, reason="exit", notify=False)
+        relay.lead_guard.update_marker(relay.STATE_ROOT, sid, last_active="2020-01-01T00:00:00")
+        if live_pid is not None:
+            (relay.lead_guard.lead_dir(relay.STATE_ROOT, sid) / "pid").write_text(str(live_pid))
+
+    def test_a_stale_paused_lead_is_pruned_even_though_its_tab_still_probes_alive(
+            self, relay, terms, capsys, live_pid):
+        """Row 77: "`relay prune` skips paused leads at ANY age" because `_lead_alive` reads a
+        paused lead's still-open tab as alive — the tab-liveness probe must be skipped entirely for
+        a paused lead, judging staleness on the timestamp alone, same as a ghost."""
+        self._paused_and_stale(relay, "paused-old", "gone-for-good", live_pid=live_pid)
+        run_main(relay, "prune", "--days", "7")
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "paused-old") == {}
+        out = capsys.readouterr().out
+        assert "[lead, paused] gone-for-good" in out
+        events = ledger_events(relay, "lead_pruned")
+        assert len(events) == 1 and events[0]["session_id"] == "paused-old"
+        assert events[0]["paused"] is True
+
+    def test_a_paused_lead_newer_than_the_cutoff_is_kept(self, relay, terms, capsys):
+        """A paused lead is not indiscriminately swept — only one whose stamp is actually older
+        than --days loses its resumability."""
+        arm_lead(relay, "paused-fresh", "still-resumable")
+        relay.lead_guard.tombstone_lead(relay.STATE_ROOT, "paused-fresh", reason="exit",
+                                        notify=False)
+        run_main(relay, "prune", "--days", "7")
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "paused-fresh")
+        assert "[lead, paused]" not in capsys.readouterr().out
+        assert ledger_events(relay, "lead_pruned") == []
+
+    def test_dry_run_lists_a_stale_paused_lead_and_clears_nothing(self, relay, terms, capsys):
+        self._paused_and_stale(relay, "paused-old", "dry-project")
+        run_main(relay, "prune", "--days", "7", "--dry-run")
+        out = capsys.readouterr().out
+        assert "would prune" in out and "[lead, paused] dry-project" in out
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "paused-old")
+        assert ledger_events(relay, "lead_pruned") == []
+
+    def test_the_calling_lead_is_never_pruned_even_when_paused_and_stale(self, relay, terms,
+                                                                         monkeypatch):
+        """"never prune the calling lead" holds even for its own paused-and-stale marker — a
+        session cannot be both the caller AND already gone."""
+        self._paused_and_stale(relay, "me", "mine")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "me")
+        run_main(relay, "prune", "--days", "7")
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "me")
+        assert ledger_events(relay, "lead_pruned") == []
+
     def test_nothing_to_prune_says_so(self, relay, terms, capsys):
         self._aged(relay, "new", "closed", 1)
         run_main(relay, "prune", "--days", "7")

@@ -212,8 +212,11 @@ cache_read, cache_create, output, requests, models). `LAUNCH` is `mcp/context/ro
 session on full-GATES packets). `relay list` hides closed/superseded/dead by default (`--closed`
 reveals, capped at 15). `relay report <sid>` prints a finished report in a green banner; `relay
 prune [--days N] [--dry-run]` clears old closed/dead state and stale lead markers (a lead you're
-actively using is never pruned). `relay diff <sid> [--open] [--all]` renders an executor's `git diff
---staged` to a self-contained, offline HTML page (vendored, checksummed diff2html with a stdlib
+actively using is never pruned) — a **paused** lead older than `--days` is cleared too (dry-run
+lists it as `[lead, paused]` rather than the ghost's plain `[lead]`), since a resumable exit isn't
+coming back forever just because its marker is held open. `relay diff <sid> [--open] [--all]`
+renders an executor's `git diff --staged` to a self-contained, offline HTML page (vendored,
+checksummed diff2html with a stdlib
 fallback — see [VENDOR.md](VENDOR.md)) so you review diffs in one click, with the report's outcome
 sentence and status at the top; its output (and every executor's closing line) includes a
 cmd+clickable `file://` URL.
@@ -806,7 +809,8 @@ spawn ceiling still applies.
   instead of a wall of rows that also re-named each of them in the `LIVE=ghost` and `↪ migrated
   from` footnotes. The reference project comes from `--lead <sid>`'s marker, or from the cwd when a
   lead there matches it. Live, unreachable, broken and same-project leads are never hidden;
-  `--all-leads` shows everything, `relay prune` clears the dead ones for good.
+  `--all-leads` shows everything, `relay prune` clears the dead ones for good — ghosts and
+  stale-past-`--days` paused leads alike.
 - **First, `relay doctor`.** Proves the installed Claude Code still behaves the way relay's launch
   line assumes — strict MCP, the executor agent, commit-deny under skip-permissions, and each
   model tier's real context window (see [Executor context window](#executor-context-window-200k-vs-1m)
@@ -867,7 +871,9 @@ spawn ceiling still applies.
   to notice). Either signal means the same fix: re-run `/relay:mode` in that tab to re-arm.
 - **A stale row in the LEADS table with an old LAST ACTIVE** is a dead lead (tab closed/crashed
   without `/relay:stop`) — `relay prune` clears it once it's older than `--days`; a lead you're
-  actively using is never pruned.
+  actively using is never pruned. A **paused** (`⏸`) lead older than `--days` is cleared the same
+  way — a resumable exit isn't held forever just because its marker says it can come back —
+  `--dry-run` lists it as `[lead, paused]` rather than a ghost's plain `[lead]`.
 - **A brand-new worktree may ask "trust this folder"** once — relay pre-approves this when it can;
   if not, click trust once.
 - **`/plugin list` may not show relay** when loaded via `--plugin-dir` — a display quirk. If
