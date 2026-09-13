@@ -3601,6 +3601,100 @@ class TestVerifyForAutocommit:
         assert "NOT-CLEARED-BECAUSE-signoff-gated-path-touched" in out
         assert "hooks/hook.py" in out
 
+    def _write_signoff_config(self, relay, value):
+        cfg_path = relay.lead_guard.config_path(relay.STATE_ROOT)
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps({"signoff_paths": value}))
+
+    def test_configured_signoff_path_stops_the_gate_and_names_its_source(
+            self, relay, tmp_path, capsys):
+        """Config key `signoff_paths` (backlog row 56's missing piece): a per-machine ADDITION to
+        condition 4, merged with the built-ins — see `relay._configured_signoff_paths`."""
+        self._write_signoff_config(relay, ["billing/"])
+        report = TestVerify.REPORT.replace("- src.py:1 — changed it.",
+                                           "- billing/invoice.py:1 — changed it.") \
+                                  .replace("Changed: src.py", "Changed: billing/invoice.py")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        tv = TestVerify()
+        tv._git(repo, "init", "-q")
+        (repo / "billing").mkdir()
+        (repo / "billing" / "invoice.py").write_text("one\n")
+        tv._git(repo, "add", "-A")
+        tv._git(repo, "commit", "-m", "init")
+        (repo / "billing" / "invoice.py").write_text("changed\n")
+        tv._git(repo, "add", "billing/invoice.py")
+        tv._mk(relay, "e1", repo, report)
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) != 0
+        out = capsys.readouterr().out
+        assert "NOT-CLEARED-BECAUSE-signoff-gated-path-touched" in out
+        assert "billing/invoice.py" in out and "configured in signoff_paths" in out
+
+    def test_builtin_markers_still_stop_it_with_signoff_paths_configured(
+            self, relay, tmp_path, capsys):
+        self._write_signoff_config(relay, ["billing/"])
+        report = TestVerify.REPORT.replace("- src.py:1 — changed it.",
+                                           "- hooks/hook.py:1 — changed it.") \
+                                  .replace("Changed: src.py", "Changed: hooks/hook.py")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        tv = TestVerify()
+        tv._git(repo, "init", "-q")
+        (repo / "hooks").mkdir()
+        (repo / "hooks" / "hook.py").write_text("one\n")
+        tv._git(repo, "add", "-A")
+        tv._git(repo, "commit", "-m", "init")
+        (repo / "hooks" / "hook.py").write_text("changed\n")
+        tv._git(repo, "add", "hooks/hook.py")
+        tv._mk(relay, "e1", repo, report)
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) != 0
+        out = capsys.readouterr().out
+        assert "NOT-CLEARED-BECAUSE-signoff-gated-path-touched" in out
+        assert "hooks/hook.py" in out
+
+    def test_builtin_markers_still_stop_it_with_no_config_present(self, relay, tmp_path, capsys):
+        """No lead/config.json at all — the built-ins must still hold on their own."""
+        report = TestVerify.REPORT.replace("- src.py:1 — changed it.",
+                                           "- hooks/hook.py:1 — changed it.") \
+                                  .replace("Changed: src.py", "Changed: hooks/hook.py")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        tv = TestVerify()
+        tv._git(repo, "init", "-q")
+        (repo / "hooks").mkdir()
+        (repo / "hooks" / "hook.py").write_text("one\n")
+        tv._git(repo, "add", "-A")
+        tv._git(repo, "commit", "-m", "init")
+        (repo / "hooks" / "hook.py").write_text("changed\n")
+        tv._git(repo, "add", "hooks/hook.py")
+        tv._mk(relay, "e1", repo, report)
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) != 0
+        assert "NOT-CLEARED-BECAUSE-signoff-gated-path-touched" in capsys.readouterr().out
+
+    def test_empty_signoff_paths_config_changes_nothing(self, relay, tmp_path, capsys):
+        self._write_signoff_config(relay, [])
+        self._setup(relay, tmp_path)
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) == 0
+        assert "AUTO-COMMIT: CLEARED" in capsys.readouterr().out
+
+    def test_missing_signoff_paths_key_changes_nothing(self, relay, tmp_path, capsys):
+        cfg_path = relay.lead_guard.config_path(relay.STATE_ROOT)
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps({"auto_close": False}))
+        self._setup(relay, tmp_path)
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) == 0
+        assert "AUTO-COMMIT: CLEARED" in capsys.readouterr().out
+
+    def test_malformed_signoff_paths_value_falls_back_to_empty_without_crashing(
+            self, relay, tmp_path, capsys):
+        """A non-list value (a lone string, same "bad config degrades to default" contract every
+        other key gets — see `usage_limit_pattern`) must never crash the gate."""
+        self._write_signoff_config(relay, "billing/")
+        assert relay._configured_signoff_paths() == []
+        self._setup(relay, tmp_path)
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) == 0
+        assert "AUTO-COMMIT: CLEARED" in capsys.readouterr().out
+
     def test_malformed_report_blocks_the_gate(self, relay, tmp_path, capsys):
         self._setup(relay, tmp_path, report=TestVerify.REPORT.replace("UNVERIFIED: none\n", ""))
         assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) == 2
@@ -7798,6 +7892,32 @@ class TestDoctorContextWindow:
         checks = json.loads(capsys.readouterr().out)
         row = [c for c in checks if c["check"] == "model aliases + context window"][0]
         assert row["status"] == "SKIP"
+
+
+class TestDoctorSignoffGate:
+    """`relay doctor` prints condition 4's effective sign-off list (built-in + configured) — a
+    lead should see at a glance what will stop the auto-commit gate on this machine."""
+
+    def _checks(self, relay, capsys):
+        with mock.patch.object(relay, "_probe_claude"):
+            relay.cmd_doctor(SimpleNamespace(offline=True, quick=False, model=None, json=True))
+        return json.loads(capsys.readouterr().out)
+
+    def test_shows_builtins_when_nothing_configured(self, relay, capsys):
+        row = [c for c in self._checks(relay, capsys)
+               if c["check"] == "sign-off gate (condition 4)"][0]
+        assert row["status"] == "PASS"
+        assert "hooks/" in row["detail"] and "lib/lead_guard.py" in row["detail"]
+        assert "configured: (none" in row["detail"]
+
+    def test_shows_configured_entries_alongside_builtins(self, relay, capsys):
+        cfg_path = relay.lead_guard.config_path(relay.STATE_ROOT)
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps({"signoff_paths": ["billing/", "lib/pricing.py"]}))
+        row = [c for c in self._checks(relay, capsys)
+               if c["check"] == "sign-off gate (condition 4)"][0]
+        assert "hooks/" in row["detail"]  # built-ins still present
+        assert "billing/" in row["detail"] and "lib/pricing.py" in row["detail"]
 
 
 class TestDoctorExecutorEffortPinned:

@@ -392,6 +392,16 @@ NOT-CLEARED path falls back to stopping and asking.
 This is the one place the verifier's own caveat matters most — see
 [Verifying a report](#verifying-a-report-and-why-it-cant-tell-you-the-report-is-true) for why `COUNTS-MATCH` is never truth and condition 5 exists regardless.
 
+Condition 4's stop-list is per-machine extensible: config key `signoff_paths` (default `[]`) takes a
+list of repo-relative path substrings, matched exactly like the built-ins, and **merges with** them —
+it can only ever add a marker, never remove or replace one of the built-ins above. A hit against a
+configured entry names its source as `configured in signoff_paths` in the NOT-CLEARED detail line, so
+it's never mistaken for a built-in. For example, `{"signoff_paths": ["billing/", "lib/pricing.py"]}`
+in `~/.relay-tasks/lead/config.json` stops the gate on any staged change under `billing/` or to
+`lib/pricing.py` on that machine, on top of everything condition 4 already checks. `relay doctor`
+prints the effective list (built-in + configured) so a lead can see at a glance what will stop the
+gate here.
+
 Autonomy never becomes silence: every autonomous action is announced *with the round-trip it
 replaced* ("proceeded: sent packet 003 — under manual mode this would have waited for your go"),
 logged to `~/.relay-tasks/sessions.jsonl`, and stamped on the lead's row in `relay list` (an `AUTO`
@@ -686,6 +696,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `autonomous_mode` | false | Posture a newly-armed lead holds. false = wait for you on every approval beat (safe default). true = new leads start in autonomous mode. `/relay:auto on\|off` flips it mid-session either way (see [Autonomous mode](#autonomous-mode)) |
 | `stall_threshold_seconds` | 2700 | How long an executor can be `busy` with no transcript activity for before `stalled` — a long `busy` packet whose transcript is still being written stays `busy` (e.g. `busy 3h20m`) instead of misreading as stalled; kept independent of `poll_seconds` so the two don't flip at the same instant |
 | `usage_limit_pattern` | built-in | Regex (case-insensitive, matched against the START of an executor's last assistant message) that marks it `paused (limit)` in `relay list`/`check` instead of an ordinary `stalled`. The built-in wording is a reasonable guess, not confirmed against a real Claude Code usage-limit message — override this only if the CLI's actual wording differs |
+| `signoff_paths` | `[]` | Per-machine ADDITIONS to the auto-commit gate's condition 4 sign-off list (repo-relative path substrings, same blunt-substring semantics as the built-ins) — see [Autonomous mode](#autonomous-mode). Merged with the built-ins, never replacing them; shown by `relay doctor` |
 
 `poll_seconds` must stay under the `Stop` hook's `timeout` in `hooks/hooks.json` (currently 1900s) — the harness kills the hook's background poller at that timeout regardless of `poll_seconds`, so raising one without the other silently breaks auto-wake (see [async-rewake-findings.md](docs/async-rewake-findings.md#addendum-silent-auto-wake-death-2026-07-10)).
 

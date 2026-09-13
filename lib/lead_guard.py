@@ -97,6 +97,13 @@ LEAD_DEFAULTS = {
                                  # promptCacheTtl (CLAUDE_CODE_PROMPT_CACHE_TTL) is set to 1h. Set this to
                                  # match; see lead_guard.cache_state. Verified 2026-09-05 against the
                                  # Claude Code prompt-caching doc + a transcript's ephemeral_1h writes.
+    "signoff_paths": [],          # per-machine ADDITIONS to report_verify.SIGNOFF_PATH_MARKERS
+                                  # (auto-commit clearance condition 4): repo-relative path
+                                  # substrings, same semantics as the built-ins, MERGED in by
+                                  # `relay verify --for-autocommit` — never replacing them, so the
+                                  # built-in markers can't be configured away. A hit against one of
+                                  # these names its source as "configured in signoff_paths" rather
+                                  # than a built-in's own text. Default [] = built-ins only.
     "executor_default_model": "sonnet",  # model an executor launches with when --model is omitted —
                                   # relay's own policy, never the human's personal `/model` default
                                   # (see "executor model policy" section below: incident where a

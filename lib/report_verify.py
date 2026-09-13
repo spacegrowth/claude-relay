@@ -806,10 +806,13 @@ def verify(report_text, reality):
 # that #16 phase 2 was blocked on until #7 existed.
 CLEARED = "CLEARED"
 
-# Condition 4's sign-off list. The generic entries are the §6f stop-list ("core logic, ledgers,
-# parity/golden tests, migrations, deploys"); the relay/* entries are THIS repo's own dogfooding
-# instances of it, named by the packet. Substring match on the repo-relative path — deliberately
-# blunt, because a false "sign-off needed" costs one question and a false clearance costs trust.
+# Condition 4's BUILT-IN sign-off list. The generic entries are the §6f stop-list ("core logic,
+# ledgers, parity/golden tests, migrations, deploys"); the relay/* entries are THIS repo's own
+# dogfooding instances of it, named by the packet. Substring match on the repo-relative path —
+# deliberately blunt, because a false "sign-off needed" costs one question and a false clearance
+# costs trust. Fixed and unconfigurable — a per-machine ADDITION lives in config key
+# `signoff_paths` (lib/lead_guard.LEAD_DEFAULTS), merged in by `signoff_hits`'s `configured_paths`
+# param; it can only ever add markers here, never remove or replace one.
 SIGNOFF_PATH_MARKERS = [
     ("hooks/", "relay's hooks — the wake/gate paths autonomy itself rides on"),
     ("lib/lead_guard.py", "relay's lead-guard: wake, gate and marker state"),
@@ -824,12 +827,23 @@ SIGNOFF_PATH_MARKERS = [
 _LEDGER_EDIT_RE = re.compile(r"^[+-].*append_ledger\s*\(", re.MULTILINE)
 
 
-def signoff_hits(staged, staged_diff=""):
+CONFIGURED_SIGNOFF_WHY = "configured in signoff_paths"
+
+
+def signoff_hits(staged, staged_diff="", configured_paths=()):
     """[(path_or_marker, why)] for every sign-off-gated thing this staged work touches. Empty list
-    ⇒ condition 4 holds."""
+    ⇒ condition 4 holds.
+
+    `configured_paths` is the per-machine `signoff_paths` config list (repo-relative path
+    substrings, same semantics as the built-in markers) — MERGED with `SIGNOFF_PATH_MARKERS`,
+    never replacing them, so the built-ins can never be configured away. A hit against a
+    configured marker names its source as `CONFIGURED_SIGNOFF_WHY` rather than the built-in's own
+    text, so the NOT-CLEARED detail line always says WHERE a marker came from. Pure: the caller
+    (bin/relay) loads and validates the config; this never reads a file."""
+    markers = list(SIGNOFF_PATH_MARKERS) + [(m, CONFIGURED_SIGNOFF_WHY) for m in configured_paths]
     hits = []
     for path in staged:
-        for marker, why in SIGNOFF_PATH_MARKERS:
+        for marker, why in markers:
             if marker in path:
                 hits.append((path, why))
                 break
@@ -838,13 +852,15 @@ def signoff_hits(staged, staged_diff=""):
     return hits
 
 
-def clearance(result, staged_diff="", in_plan=False, diff_reviewed=False):
+def clearance(result, staged_diff="", in_plan=False, diff_reviewed=False, signoff_paths=()):
     """Evaluate the five auto-commit conditions. Returns
     {cleared: bool, reason: str|None, conditions: [{n, name, ok, detail, checkable}]}.
 
     `reason` is the slug for the NOT-CLEARED-BECAUSE-<reason> line — the FIRST failed condition in
     numeric order, so the headline is stable and the lead is pointed at the earliest problem.
-    Pure: the caller supplies the attestations, this never infers them."""
+    `signoff_paths` is the caller's already-loaded-and-validated `signoff_paths` config list,
+    passed straight through to `signoff_hits` (see there). Pure: the caller supplies the
+    attestations (and the config), this never infers or reads either."""
     tldr = result["tldr"]
     conds = []
 
@@ -874,7 +890,7 @@ def clearance(result, staged_diff="", in_plan=False, diff_reviewed=False):
                   "detail": ("attested by the lead (--in-plan)" if in_plan else
                              "NOT attested — autonomy is within the plan, never expands it")})
 
-    hits = signoff_hits(result["staged"], staged_diff)
+    hits = signoff_hits(result["staged"], staged_diff, signoff_paths)
     conds.append({"n": 4, "name": "nothing sign-off-gated is touched", "checkable": True,
                   "ok": not hits, "slug": "signoff-gated-path-touched",
                   "detail": ("; ".join(f"{p} ({w})" for p, w in hits) if hits

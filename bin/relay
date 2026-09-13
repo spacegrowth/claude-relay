@@ -3112,6 +3112,11 @@ def cmd_doctor(args):
     cfg = lead_guard.load_config(STATE_ROOT)
     add("config loads", True, f"auto_close={cfg.get('auto_close')} escalation={cfg.get('executor_escalation')} "
         f"default_model={cfg.get('executor_default_model')} ceiling={cfg.get('executor_model_ceiling')}")
+    configured_signoff = _configured_signoff_paths()
+    add("sign-off gate (condition 4)", True,
+        f"built-in: {', '.join(m for m, _ in report_verify.SIGNOFF_PATH_MARKERS)}"
+        + (f" + configured: {', '.join(configured_signoff)}" if configured_signoff
+           else " + configured: (none — signoff_paths unset)"))
     # executor effort pinned: relay's own executor_default_effort policy must be a valid level, and
     # the human's OWN personal effortLevel (~/.claude/settings.json) is surfaced right alongside it
     # so a mismatch — the exact leak this check exists for (2026-09-05) — is visible at a glance
@@ -4225,6 +4230,19 @@ def _usage_limit_pattern():
         return _USAGE_LIMIT_RE
 
 
+def _configured_signoff_paths():
+    """The `signoff_paths` config list, validated: a value that isn't a list — the same "bad
+    config degrades to the default, never crashes" contract every other config key gets (see
+    `_usage_limit_pattern` above) — falls back to `[]` (built-ins only). Non-string entries inside
+    an otherwise-valid list are dropped rather than failing the whole list, so one bad entry can't
+    silently disable every other configured marker. `report_verify.signoff_hits`/`clearance` stay
+    pure: this is the one place that reads the config file for condition 4."""
+    raw = lead_guard.load_config(STATE_ROOT).get("signoff_paths", [])
+    if not isinstance(raw, list):
+        return []
+    return [p for p in raw if isinstance(p, str) and p]
+
+
 _LAST_ASSISTANT_TAIL_BYTES = 256 * 1024
 
 
@@ -5234,7 +5252,8 @@ def cmd_verify(args):
                                  capture_output=True, text=True).stdout
     clr = report_verify.clearance(result, staged_diff,
                                   in_plan=bool(getattr(args, "in_plan", False)),
-                                  diff_reviewed=bool(getattr(args, "diff_reviewed", False)))
+                                  diff_reviewed=bool(getattr(args, "diff_reviewed", False)),
+                                  signoff_paths=_configured_signoff_paths())
     for line, styles in report_verify.render_clearance(clr):
         print(c(line, *styles) if styles else line)
 

@@ -893,3 +893,44 @@ class TestSignoffGating:
     def test_signoff_hit_reports_a_reason_per_path(self):
         hits = rv.signoff_hits(["hooks/x.py"])
         assert len(hits) == 1 and "wake/gate" in hits[0][1]
+
+    # ── configurable additions (signoff_paths) ────────────────────────────────────────────────
+    def test_configured_path_stops_the_gate_with_its_own_source(self):
+        hits = rv.signoff_hits(["billing/invoice.py"], configured_paths=["billing/"])
+        assert hits == [("billing/invoice.py", rv.CONFIGURED_SIGNOFF_WHY)]
+        assert rv.CONFIGURED_SIGNOFF_WHY == "configured in signoff_paths"
+
+    def test_builtins_still_stop_it_with_configured_paths_present(self):
+        hits = rv.signoff_hits(["hooks/x.py"], configured_paths=["billing/"])
+        assert len(hits) == 1 and "wake/gate" in hits[0][1]  # the built-in's own text, unchanged
+
+    def test_builtins_still_stop_it_with_no_configured_paths(self):
+        hits = rv.signoff_hits(["hooks/x.py"], configured_paths=[])
+        assert len(hits) == 1 and "wake/gate" in hits[0][1]
+
+    def test_configured_paths_cannot_shadow_or_remove_a_builtin(self):
+        """Merged, never replacing: a configured entry that happens to collide with a built-in
+        marker still trips it, still under the built-in's own reason text."""
+        hits = rv.signoff_hits(["hooks/x.py"], configured_paths=["hooks/"])
+        assert len(hits) == 1 and "wake/gate" in hits[0][1]
+
+    def test_ordinary_paths_unaffected_by_configured_paths(self):
+        assert rv.signoff_hits(["src/app.py"], configured_paths=["billing/"]) == []
+
+    def test_clearance_accepts_and_uses_signoff_paths(self):
+        # Same reasoning as test_signoff_gated_paths_stop_clearance: both the TL;DR `Changed:`
+        # line and the body must name the staged path, or condition 1 (MISMATCH) trips first.
+        report = GOOD_REPORT.replace("Changed: one line appended to src/app.py",
+                                     "Changed: one line appended to billing/invoice.py") \
+                            .replace("- src/app.py:2 — appended the new line.",
+                                     "- billing/invoice.py:2 — appended the new line.")
+        clr = clr_for(report=report, staged=("billing/invoice.py",), signoff_paths=["billing/"])
+        assert clr["cleared"] is False
+        assert clr["reason"] == "signoff-gated-path-touched"
+        assert "billing/invoice.py" in cleared_lines(clr)
+        assert "configured in signoff_paths" in cleared_lines(clr)
+
+    def test_clearance_defaults_signoff_paths_to_empty(self):
+        """No `signoff_paths` argument at all ⇒ behaves exactly as before this config landed."""
+        clr = clr_for(staged=("src/app.py",))
+        assert clr["cleared"] is True
