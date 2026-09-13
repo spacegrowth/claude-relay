@@ -2630,7 +2630,7 @@ def _busy_elapsed(s):
 
 
 def _surfacing_caller(s):
-    """WHO is invoking a #17 stamping channel (`relay check`/`diff`/`close`) against session `s`?
+    """WHO is invoking a #17 stamping channel (`relay check`/`diff`/`close`/`verify`) against session `s`?
     Returns "lead" (the OWNING lead — the only invoker that proves the lead handled the report),
     "self" (the executor `s` itself), "other" (some other known relay session or lead), or
     "unknown" (no ambient session identity at all: a human at a plain terminal, a script, the test
@@ -2665,7 +2665,8 @@ def _mark_report_surfaced(s):
     """Stamp the owning lead's surfaced_reports.json for a session's current-packet report, if one
     exists — the fix for the asymmetric dedup (backlog §5b / task #17). Before this, ONLY the lead's
     own at-Stop wake path called lg.mark_surfaced; a report reviewed through any other channel
-    (`relay check`, `relay diff`, `relay close`) left the dedup unstamped, so the next at-Stop check
+    (`relay check`, `relay diff`, `relay close`, `relay retire`, and — row 80 — `relay verify`, the
+    review fork's first step) left the dedup unstamped, so the next at-Stop check
     still saw it as new and re-announced an already-handled report. These are all channels where the
     lead has DEMONSTRABLY handled the report (not merely been notified of it — see the explicit
     "do not mark on the mere nudge" warning in the backlog), so it's safe to stamp here. Best-effort;
@@ -5511,6 +5512,15 @@ def cmd_verify(args):
     append_ledger("report_verify", session_id=args.session_id, packet=n,
                   verdict=result["verdict"], rerun=bool(args.rerun),
                   mismatches=len([f for f in result["findings"] if f["level"] == "mismatch"]))
+
+    # Backlog row 80: running verify IS the lead picking this report up — the review fork
+    # (/relay:review) runs it on every shape (bare, --for-autocommit, --diff-reviewed, --findings) —
+    # so stamp the surfaced dedup exactly as check/diff/close do, or the at-Stop wake and the
+    # poller keep re-announcing a report already under review. Stamps the packet VERIFIED (`n`,
+    # which may be a --packet other than current_packet); the helper's invoker gate declines an
+    # executor's self-verify (ledgered) and keeps a foreign lead silent. The no-report early exit
+    # above never reaches here.
+    _mark_report_surfaced({**s, "current_packet": n})
 
     # skills/review/SKILL.md: `--diff-reviewed --findings <path>` records the ARTIFACT behind the
     # condition-5 attestation — the fork's own findings — rather than just a bare boolean. `--findings`

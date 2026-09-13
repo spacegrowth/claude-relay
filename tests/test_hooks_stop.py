@@ -432,6 +432,32 @@ class TestStopHookOwnershipScoping:
         assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == SILENT
 
     @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_report_the_lead_already_verified_does_not_wake_again(self, drv, tmp_path):
+        """Backlog row 80 (gate-200944-r2 packet 001): the same `reported` wake re-fired after the
+        lead's review fork had already run `relay verify` on the packet. Drives the real CLI as the
+        owning lead (CLAUDE_CODE_SESSION_ID=lead-1) against the same tmp HOME the hook reads: the
+        first Stop announces (pending), verify picks it up, the next Stop is silent."""
+        import subprocess
+        armed(tmp_path)
+        repo = H.git_repo(tmp_path / "wt")
+        H.git_commit(repo, "init", filename="src.py", body="one\n")
+        (repo / "src.py").write_text("changed\n")
+        subprocess.run(["git", "-C", str(repo), "add", "src.py"], check=True)
+        H.make_executor(tmp_path, status="reported", worktree=str(repo),
+                        report="Changed src.py; staged.\n\nStatus: clean\nRisk flags: none\n"
+                               "UNVERIFIED: none\nChanged: src.py\n")
+        assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == WAKE
+
+        bin_dir, log = H.stub_bin(tmp_path)
+        env = H._hook_env(tmp_path, log, bin_dir, extra={"CLAUDE_CODE_SESSION_ID": "lead-1"})
+        subprocess.run([sys.executable, str(H.REPO_ROOT / "bin" / "relay"), "verify", "exec-1"],
+                       env=env, capture_output=True, text=True, timeout=60)
+        root = H.state_root(tmp_path)
+        assert lg.load_surfaced(root, "lead-1") == {"exec-1:1"}
+        assert "exec-1:1" not in lg.load_pending(root, "lead-1")
+        assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == SILENT
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
     def test_a_new_packets_report_wakes_even_after_the_previous_one_was_seen(self, drv, tmp_path):
         """The key is `<sid>:<packet>`, so packet 2 is a fresh event for an executor whose packet 1
         was already surfaced."""

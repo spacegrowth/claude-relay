@@ -4078,6 +4078,76 @@ class TestSelfDiffMustNotStampSurfaced(_SurfacedStampSeam):
         assert self._new_keys(relay) == ["ex1:1"]
 
 
+class TestVerifyStampsSurfaced(_SurfacedStampSeam):
+    """Backlog row 80 — `relay verify` is a #17 stamping channel. The review fork runs it on every
+    reported packet, yet it only ledgered `report_reviewed` and never stamped, so the at-Stop wake
+    and the poller re-announced a report already under review (gate-200944-r2 packet 001: three
+    deliveries of the same `reported` wake). Same invoker gate as check/diff/close."""
+
+    def _mk_verifiable(self, relay, tmp_path, report=True):
+        self._mk(relay, tmp_path, reported=report)
+        s = relay.read_session("ex1")
+        s["worktree"] = str(TestVerify()._repo(tmp_path))
+        relay.write_session("ex1", s)
+        if report:
+            (relay.packets_dir("ex1") / "001-report.md").write_text(TestVerify.REPORT)
+
+    def _verify(self, relay, **flags):
+        args = SimpleNamespace(session_id="ex1", packet=None, rerun=False,
+                               for_autocommit=flags.get("for_autocommit", False),
+                               in_plan=flags.get("in_plan", False),
+                               diff_reviewed=flags.get("diff_reviewed", False),
+                               findings=flags.get("findings"))
+        with pytest.raises(SystemExit) as e:
+            relay.cmd_verify(args)
+        return e.value.code
+
+    def test_owning_lead_bare_verify_stamps_and_drops_the_pending_wake(self, relay, tmp_path):
+        self._mk_verifiable(relay, tmp_path)
+        relay.lead_guard.mark_pending(relay.STATE_ROOT, self.LEAD, ["ex1:1"])   # lead announced
+        with self._as(self.LEAD):
+            self._verify(relay)
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, self.LEAD) == {"ex1:1"}
+        assert "ex1:1" not in relay.lead_guard.load_pending(relay.STATE_ROOT, self.LEAD)
+        assert self._new_keys(relay) == []
+
+    def test_owning_lead_autocommit_review_with_findings_stamps(self, relay, tmp_path):
+        """The exact /relay:review invocation shape."""
+        self._mk_verifiable(relay, tmp_path)
+        findings = tmp_path / "findings.md"
+        findings.write_text("1. src.py:1 — note — fine.\n")
+        with self._as(self.LEAD):
+            self._verify(relay, for_autocommit=True, in_plan=True, diff_reviewed=True,
+                         findings=str(findings))
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, self.LEAD) == {"ex1:1"}
+        assert self._new_keys(relay) == []
+
+    def test_executor_self_verify_does_not_stamp_and_is_ledgered(self, relay, tmp_path):
+        self._mk_verifiable(relay, tmp_path)
+        with self._as(self.EXEC_UUID):
+            self._verify(relay)
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, self.LEAD) == set()
+        assert self._new_keys(relay) == ["ex1:1"]
+        events = [json.loads(l) for l in relay.LEDGER.read_text().splitlines() if l.strip()]
+        declined = [e for e in events if e.get("event") == "surfaced_stamp_declined"]
+        assert [(e["session_id"], e["packet"], e["caller"]) for e in declined] == [("ex1", 1, "self")]
+
+    def test_a_foreign_lead_verify_does_not_stamp(self, relay, tmp_path):
+        self._mk_verifiable(relay, tmp_path)
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-2", project="other")
+        with self._as("lead-2"):
+            self._verify(relay)
+        assert self._new_keys(relay) == ["ex1:1"]
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, "lead-2") == set()
+
+    def test_verify_with_no_report_stamps_nothing(self, relay, tmp_path):
+        self._mk_verifiable(relay, tmp_path, report=False)
+        with self._as(self.LEAD):
+            code = self._verify(relay)
+        assert "no report yet" in str(code)
+        assert relay.lead_guard.load_surfaced(relay.STATE_ROOT, self.LEAD) == set()
+
+
 class TestWakeSplitWorkedVsSwallowed(_SurfacedStampSeam):
     """§16/#27's REQUIRED puzzle piece: if the GATES self-diff always stamped, why did most wakes
     still fire? Because the stamp and the lead's announce are in a RACE for the same key, opened by

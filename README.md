@@ -456,6 +456,10 @@ nudge-lead`, internal plumbing). Once its report lands and it goes idle, it fire
 into the lead's tab if the lead hasn't already surfaced the report, or notifies you directly if the
 owning lead is gone (crashed/closed/pruned). A net under the lead's own poller, not a replacement.
 
+A report is announced once: when the owning lead picks it up — `relay check`, `relay diff`,
+`relay close`, or `relay verify` (so `/relay:review`'s fork, which runs verify first, counts) — it
+is stamped as surfaced and the wake will not re-announce it.
+
 Wakes are scoped to executors the lead owns — multiple leads on different projects don't cross-wake.
 Ownership changing hands carries the "already seen" stamps with it: `relay adopt` / `relay send` /
 `relay resume` (adopt-on-claim) and a handoff's re-parenting each copy that executor's surfaced and
