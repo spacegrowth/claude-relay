@@ -5377,6 +5377,123 @@ class TestExecutorCTXColumn:
         assert "-" in row.split()
         assert "⚠ heavy:" not in out
 
+    def test_approaching_heavy_footnote_between_warn_and_nudge_lines(self, relay, capsys, tmp_path, monkeypatch):
+        # Backlog row 57: past the 120k warn line but under the 150k rotate line gets the DIM
+        # sibling footnote, distinct from the (yellow) heavy: one, so the table agrees with the
+        # ctx-warn banner instead of staying silent until 150k.
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-approach", 125000)
+        self._exec(relay, "approach-1", "cs-approach", packet=4)
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        assert "⚠ heavy:" not in out
+        footnote = [l for l in out.splitlines() if "⚠ approaching heavy:" in l][0]
+        assert "approach-1" in footnote and "4 pkts" in footnote and "125k" in footnote
+
+
+class TestContextWarnBanner:
+    """Backlog row 57: the ONE early desktop banner an executor's live context earns crossing
+    `context_warn_tokens` (default 120k), well before the 150k `context_nudge_tokens` rotate line.
+    Rides `_check_one` (the one place list/check/board/the lead's Stop-hook poller all pass
+    through) and reuses the shared `lead_guard.notify_banner`/`claim_notification` machinery —
+    only those two calls are mocked here, same as every other notify-chain test in this file."""
+
+    def _armed_lead(self, relay, sid="lead-1", project="webapp", iterm_session="w1t1p0:X"):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, sid, project=project,
+                                       iterm_session=iterm_session)
+
+    def _exec(self, relay, sid, claude_session, owner_lead="lead-1", status="reported", packet=3):
+        relay.write_session(sid, {"session_id": sid, "current_packet": packet, "status": status,
+            "topic": "t", "worktree": "/w", "scope": "", "model": "sonnet",
+            "claude_session": claude_session, "busy_since": relay.now(), "updated": relay.now(),
+            "owner_lead": owner_lead, "owner_project": None})
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        (relay.packets_dir(sid) / f"{packet:03d}-report.md").write_text("done")
+
+    def test_owned_executor_past_warn_line_fires_once_and_stamps(self, relay, tmp_path, monkeypatch):
+        self._armed_lead(relay)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-a", 125000)
+        self._exec(relay, "exec-a", "cs-a")
+        with mock.patch.object(relay.lead_guard, "notify_banner") as nb:
+            relay._check_one("exec-a")
+        assert nb.call_count == 1
+        args, kwargs = nb.call_args
+        assert kwargs.get("lead_sid") == "lead-1"
+        assert kwargs.get("iterm_session") == "w1t1p0:X"
+        assert kwargs.get("group") == "ctx-warn"
+        assert "exec-a" in args[2]  # subtitle names the session
+        assert "125k" in args[3] and "120k" in args[3] and "150k" in args[3]  # message spells out both lines
+        assert "relay retire exec-a" in args[3]
+        # stamped: the claim key is keyed on the SID alone, no packet number
+        notified = json.loads((relay.STATE_ROOT / "lead" / "lead-1" / "notified.json").read_text())
+        assert "exec-a:ctx-warn" in notified
+
+    def test_second_check_does_not_refire(self, relay, tmp_path, monkeypatch):
+        self._armed_lead(relay)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-b", 130000)
+        self._exec(relay, "exec-b", "cs-b")
+        with mock.patch.object(relay.lead_guard, "notify_banner") as nb:
+            relay._check_one("exec-b")
+            relay._check_one("exec-b")
+        assert nb.call_count == 1
+
+    def test_below_warn_line_never_fires(self, relay, tmp_path, monkeypatch):
+        self._armed_lead(relay)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-c", 119000)
+        self._exec(relay, "exec-c", "cs-c")
+        with mock.patch.object(relay.lead_guard, "notify_banner") as nb:
+            relay._check_one("exec-c")
+        assert nb.call_count == 0
+
+    def test_unowned_executor_never_fires(self, relay, tmp_path, monkeypatch):
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-d", 130000)
+        self._exec(relay, "exec-d", "cs-d", owner_lead=None)
+        with mock.patch.object(relay.lead_guard, "notify_banner") as nb:
+            relay._check_one("exec-d")
+        assert nb.call_count == 0
+
+    def test_closed_executor_never_fires(self, relay, tmp_path, monkeypatch):
+        self._armed_lead(relay)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-e", 130000)
+        self._exec(relay, "exec-e", "cs-e", status="closed")
+        with mock.patch.object(relay.lead_guard, "notify_banner") as nb:
+            relay._check_one("exec-e")
+        assert nb.call_count == 0
+
+    def test_warn_threshold_at_or_above_nudge_never_fires(self, relay, tmp_path, monkeypatch):
+        # row 57: context_warn_tokens >= context_nudge_tokens is a no-op, never an error.
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        relay.lead_guard.config_path(relay.STATE_ROOT).write_text(
+            json.dumps({"context_warn_tokens": 200000, "context_nudge_tokens": 150000}))
+        self._armed_lead(relay)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-f", 199999)
+        self._exec(relay, "exec-f", "cs-f")
+        with mock.patch.object(relay.lead_guard, "notify_banner") as nb:
+            relay._check_one("exec-f")
+        assert nb.call_count == 0
+
+    def test_notify_on_wake_false_neither_fires_nor_burns_the_stamp(self, relay, tmp_path, monkeypatch):
+        # Packet 002: notify_on_wake must be checked BEFORE claim_notification — a silenced
+        # banner must never consume the once-only <sid>:ctx-warn stamp. Flip the config back to
+        # true and the very next check still fires exactly once (the claim was never burned).
+        self._armed_lead(relay)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-g", 125000)
+        self._exec(relay, "exec-g", "cs-g")
+        (relay.STATE_ROOT / "lead").mkdir(parents=True, exist_ok=True)
+        config_path = relay.lead_guard.config_path(relay.STATE_ROOT)
+        config_path.write_text(json.dumps({"notify_on_wake": False}))
+        with mock.patch.object(relay.lead_guard, "notify_banner") as nb:
+            relay._check_one("exec-g")
+        assert nb.call_count == 0
+        notified_path = relay.STATE_ROOT / "lead" / "lead-1" / "notified.json"
+        assert not notified_path.exists() or "exec-g:ctx-warn" not in json.loads(notified_path.read_text())
+
+        config_path.write_text(json.dumps({"notify_on_wake": True}))
+        with mock.patch.object(relay.lead_guard, "notify_banner") as nb:
+            relay._check_one("exec-g")
+        assert nb.call_count == 1
+        notified = json.loads(notified_path.read_text())
+        assert "exec-g:ctx-warn" in notified
+
 
 class TestSendHeavinessGate:
     """§6e e2 (retargeted, ctx-gate): `relay send` into a heavy session refuses unless

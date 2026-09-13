@@ -2751,6 +2751,15 @@ class TestIsHeavy:
         assert lg.heavy_reading_text(None, None) == "unknown"
 
 
+class TestContextWarnDefault:
+    """Backlog row 57: `context_warn_tokens` is the EARLIER executor heads-up line, below
+    `context_nudge_tokens`'s rotate line."""
+
+    def test_default_is_120000_below_the_nudge_line(self):
+        assert lg.LEAD_DEFAULTS["context_warn_tokens"] == 120000
+        assert lg.LEAD_DEFAULTS["context_warn_tokens"] < lg.LEAD_DEFAULTS["context_nudge_tokens"]
+
+
 class TestLeadNudgeSplit:
     """Task: split the heaviness threshold by role — leads nudge at `lead_nudge_tokens` (default
     300000) on a 1M window, executors keep `context_nudge_tokens` (default 150000) unchanged.

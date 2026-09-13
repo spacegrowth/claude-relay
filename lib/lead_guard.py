@@ -67,6 +67,10 @@ LEAD_DEFAULTS = {
                                  # LEAD's handoff nudge/statusline segment alongside tokens, and is
                                  # the EXECUTOR fallback reading when a transcript can't be parsed
                                  # for real usage at all.
+    "context_warn_tokens": 120000,  # backlog row 57: an EARLIER, one-shot desktop-banner heads-up
+                                 # for EXECUTORS, well below context_nudge_tokens' rotate line, so
+                                 # a rotate can be PLANNED rather than discovered in a `relay list`
+                                 # footnote. At/above `context_nudge_tokens` it simply never fires.
     "context_nudge_tokens": 150000,  # the COST/CONTEXT signal for EXECUTORS ONLY (bin/relay's
                                  # cmd_send gate, `relay list`/board's heavy footnote and CTX
                                  # columns, `relay send --rotate` advice): heavy when the LAST

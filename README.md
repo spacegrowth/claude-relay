@@ -485,6 +485,17 @@ write a handoff md, then `/relay:handoff <md>`. When a wake carries this nudge, 
 alongside whatever else woke it and lets the user decide whether to hand off — it never steps down
 or starts a fresh session unilaterally.
 
+Executors get their own, earlier heads-up (backlog row 57): the first time an armed lead's own
+executor crosses `context_warn_tokens` (default 120k, comfortably below `context_nudge_tokens`'s
+150k rotate line), relay fires ONE desktop banner through the same three-tier chain above —
+`relay · <project>` naming the session as heavy, both lines (warn/rotate), and a plan-a-rotate
+suggestion (`relay retire <sid>` + a fresh spawn). It rides `_check_one`, so `relay list`, `relay
+check`, the board, and the lead's own Stop-hook poller all surface it without any extra command.
+Exactly once per executor session — a rotated executor gets a fresh sid, so it can warn again on
+its own account — and `relay list`'s heavy footnote gains a dim `⚠ approaching heavy:` line for the
+same window, so the table never disagrees with the banner. Set `context_warn_tokens` at or above
+`context_nudge_tokens` to turn it off.
+
 ### Handing off a long-lived lead
 
 Heavy session (large transcript, or just wanting a fresh context)? Distill what matters to a
@@ -703,6 +714,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
 | `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) — the secondary "session age" (compaction-count) signal for **both** leads and executors: MB on disk never shrinks, so a big number alone means several compactions in even when live context currently looks fine. Fires the lead's handoff nudge/statusline segment alongside tokens, and is the executor fallback reading (`relay send`'s gate, `relay list`'s heavy footnote) only when a transcript can't be parsed for real usage at all |
+| `context_warn_tokens` | 120000 | Backlog row 57: an EARLIER, one-shot desktop banner for **executors**, well below `context_nudge_tokens`'s rotate line, so a rotate can be planned instead of discovered in a footnote. Fires once per executor session (via the same three-tier `notify_banner` chain and `claim_notification` stamp every other relay banner uses) the first time live context crosses this line, and adds the session to `relay list`'s dim `⚠ approaching heavy:` line. Set at/above `context_nudge_tokens` to disable it — that's a no-op, not an error |
 | `context_nudge_tokens` | 150000 | The cost/context signal for **executors**: heavy when the LAST request's live context (input + cache_read + cache_creation tokens — the real spend the next turn pays, not a transcript-size proxy) is at/above this many tokens. Drives `relay send`'s heaviness gate, `relay list`/board's heavy footnote/CTX columns, and `relay send --rotate` advice. A lead's own line is `lead_nudge_tokens` (below) — never this key |
 | `lead_nudge_tokens` | 300000 | A **lead's** own heaviness/handoff-nudge line, on a 1M window — a lead's handoff costs more than an executor's rotation (a fresh successor-seed vs. a plain respawn) and its context grows slowly once diffs are reviewed by a fork, so it earns a higher line than `context_nudge_tokens`. Drives the lead's own handoff nudge (Stop hook), `relay status --statusline`'s weight segment, `relay list`'s LEADS CTX/heavy footnote, and the board's lead chip. When the lead's real context window is known (`relay doctor`'s probe, or inferred from a `[1m]`-suffixed model) to be 200k rather than 1M, the EFFECTIVE line is capped to `context_nudge_tokens` instead — a 200k-window lead can never reach 300k live context, so it's still nudged, just on the executor's line |
 | `cache_ttl_minutes` | 60 | Claude Code's prompt-cache TTL — how long an executor's last request stays cached free. Drives the warm/cold readout in `relay list`'s TOKENS column, the board, and `relay send`'s advisory line — see [Cache state](#executor-context-window-200k-vs-1m) |

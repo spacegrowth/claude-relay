@@ -2791,6 +2791,13 @@ def _check_one(session_id):
         s["updated"] = now()
         write_session(session_id, s)
 
+    # Backlog row 57: the early context-warn banner rides this same per-session refresh so every
+    # surface (list/check/board/the lead's Stop-hook poller) gets it for free. Gated on the SAME
+    # freshly-computed status as the block above (skipped entirely, above, when it was already
+    # terminal) — never for a session that just went dead/closed/superseded this very poll.
+    if s.get("status") not in ("dead", "superseded", "closed", LAUNCH_FAILED):
+        _maybe_warn_ctx_heavy(s)
+
     return s
 
 
@@ -4641,6 +4648,15 @@ def _heaviness_threshold_tokens():
                  lead_guard.LEAD_DEFAULTS["context_nudge_tokens"]))
 
 
+def _ctx_warn_threshold_tokens():
+    """Backlog row 57's EARLIER executor heads-up threshold, in tokens (`context_warn_tokens`,
+    default 120000) — well below `_heaviness_threshold_tokens`'s 150k rotate line, so a rotate can
+    be planned rather than discovered in a footnote. See LEAD_DEFAULTS; _maybe_warn_ctx_heavy is
+    the only caller."""
+    return float(lead_guard.load_config(STATE_ROOT).get("context_warn_tokens",
+                 lead_guard.LEAD_DEFAULTS["context_warn_tokens"]))
+
+
 def _heaviness_threshold_mb():
     """The MB-fallback threshold (`handoff_nudge_mb`, default 5) — used ONLY when an executor's
     transcript can't be parsed for real usage (§6e e2's fallback, so an unreadable transcript never
@@ -4660,6 +4676,63 @@ def _heavy_reading_text(usage, mb):
     """The human-readable 'how heavy' reading behind both the heavy footnote (cmd_list) and the
     send-time gate message. Thin wrapper over lead_guard.heavy_reading_text — see _is_heavy."""
     return lead_guard.heavy_reading_text(usage, mb)
+
+
+def _maybe_warn_ctx_heavy(s):
+    """Backlog row 57: the ONE desktop banner an executor's live context earns the first time it
+    crosses `context_warn_tokens` (default 120k) — well before `_heaviness_threshold_tokens`'s 150k
+    rotate line already drives (`relay list`'s heavy footnote/chip, cmd_send's gate). The point is
+    to let the OWNING LEAD plan a rotate instead of discovering it in a footnote later.
+
+    Called from `_check_one` — the one place `list`/`check`/`board_data` and the lead's Stop-hook
+    poller (`cmd_auto_close_sweep`) all already pass through — so every surface gets this for free
+    without touching hooks/. Reuses the shared `lead_guard.notify_banner` three-tier chain and
+    `lead_guard.claim_notification` once-only stamp exactly like every other relay banner (no new
+    banner path, no new stamp file): the stamp key is `<sid>:ctx-warn`, deliberately WITHOUT a
+    packet number — a rotated executor gets a fresh sid, so it can warn again on its own account.
+
+    Silent (never fires) unless: the executor is owned by a currently-ARMED lead (an unowned or
+    orphaned executor has nobody to warn); `context_warn_tokens < context_nudge_tokens` (row 57's
+    "never fires" clause — a misconfigured warn line at/after the rotate line is simply inert, no
+    error); and the transcript actually parsed to a real `last_prompt` reading (an unreadable
+    transcript has no live number to warn on — the MB fallback stays a heaviness-only signal, never
+    a warn banner). Best-effort/never-raises: any failure here must not affect `_check_one`'s own
+    status bookkeeping."""
+    try:
+        owner = s.get("owner_lead")
+        if not owner or not lead_guard.is_lead(STATE_ROOT, owner):
+            return
+        warn_threshold = _ctx_warn_threshold_tokens()
+        nudge_threshold = _heaviness_threshold_tokens()
+        if warn_threshold >= nudge_threshold:
+            return  # row 57: warn at/after the rotate line is a no-op, not an error
+        usage = _usage_for_session(s)
+        if usage is None:
+            return  # transcript unparsable — no live reading to warn on
+        last_prompt = usage.get("last_prompt") or 0
+        if last_prompt < warn_threshold:
+            return
+        cfg = lead_guard.load_config(STATE_ROOT)
+        if not cfg.get("notify_on_wake", True):
+            return  # kill-switch checked BEFORE claiming — a silenced banner must never burn
+                     # the once-only stamp (packet 002): flip it back on later and the FIRST
+                     # real check still gets the one banner it's owed.
+        sid = s["session_id"]
+        key = f"{sid}:ctx-warn"
+        if not lead_guard.claim_notification(STATE_ROOT, owner, key):
+            return  # already warned once for this sid
+        marker = lead_guard.read_marker(STATE_ROOT, owner) or {}
+        project = marker.get("project") or owner[:8]
+        ctx_k = int(last_prompt // 1000)
+        warn_k = int(warn_threshold // 1000)
+        nudge_k = int(nudge_threshold // 1000)
+        lead_guard.notify_banner(
+            cfg, f"relay · {project}", f"{sid} is heavy",
+            f"{ctx_k}k ctx (warn line {warn_k}k, rotate line {nudge_k}k) — plan a rotate: "
+            f"relay retire {sid} + fresh spawn",
+            lead_sid=owner, iterm_session=marker.get("iterm_session"), group="ctx-warn")
+    except Exception:
+        pass
 
 
 def _lead_liveness_verdict(m):
@@ -5214,6 +5287,23 @@ def cmd_list(args):
         print(c(f"  ⚠ heavy: {parts} — no verdict on the work, just a heads up: `relay retire "
                 f"<sid>` and a fresh spawn keeps the next packet's context cheap; `relay send "
                 f"--heavy-override \"<reason>\"` keeps going in this one.", "yellow"))
+
+    # Backlog row 57: the DIMMER sibling of the heavy footnote above — sessions past
+    # `context_warn_tokens` (the same line that already fired their one desktop banner via
+    # `_maybe_warn_ctx_heavy`) but not yet `context_nudge_tokens`, so this table agrees with the
+    # banner instead of staying silent until the 150k line. Excludes anything already in `heavy`
+    # (that line owns them) — token-reading only, same as the banner (no MB-fallback approach-line;
+    # a fallback "approaching" reading off a proxy would be guessing at a number nobody set).
+    warn_threshold = _ctx_warn_threshold_tokens()
+    approaching = [s for s in rows if s not in heavy and usage_by_sid[s["session_id"]] is not None
+                   and (usage_by_sid[s["session_id"]].get("last_prompt") or 0) >= warn_threshold]
+    if approaching:
+        parts = ", ".join(f"{s['session_id']} ({s['current_packet']} pkts / "
+                          f"{_heavy_reading_text(usage_by_sid[s['session_id']], mb_by_sid[s['session_id']])})"
+                          for s in approaching)
+        print(c(f"  ⚠ approaching heavy: {parts} — past the {int(warn_threshold // 1000)}k warn "
+                f"line, not yet the {int(token_threshold // 1000)}k rotate line; a rotate is worth "
+                f"planning.", "dim"))
 
     # Row 70 item 2: one line per pinned executor, naming WHO pinned it (by project, the name a
     # human recognises) and HOW LONG AGO — the two facts that turn "there is a 📌 here" into a
