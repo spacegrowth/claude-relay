@@ -10,11 +10,13 @@ handoff nudge) and the healthy move is a fresh context, not more of this one.
 
 **First, write the handoff file** — a short packet-file-style summary under `~/.relay-tasks/`
 (gate-exempt), covering: what's in flight, what's reviewed/committed, open questions, next steps.
-Write it like a memo to your successor, not a transcript dump. Carry forward every `[discipline]`
-marker your own predecessor's doc had (relay warns if one goes missing — see the linter note
-below), and on every queue item name an EXECUTOR to do it (or write "delegate this") — never phrase
-box/deploy/ops work as this lead's own to pick up (§10's `[ops-not-lead-work]` incident: a dropped
-marker plus ops phrased as the lead's task is exactly how a successor drifted into implementation).
+Write it like a memo to your successor, not a transcript dump. Give it a real `# ` heading naming
+the work (`# Relay 0.5.0 release`, not `# Handoff`) — it's also where the successor's project name
+comes from by default (see the `--project` note below). Carry forward every `[discipline]` marker
+your own predecessor's doc had (relay warns if one goes missing — see the linter note below), and
+on every queue item name an EXECUTOR to do it (or write "delegate this") — never phrase box/deploy/
+ops work as this lead's own to pick up (§10's `[ops-not-lead-work]` incident: a dropped marker plus
+ops phrased as the lead's task is exactly how a successor drifted into implementation).
 
 **Then run:**
 
@@ -45,8 +47,11 @@ Code minted a different session id for the tab. It then asks the user whether to
 predecessor's now-unarmed tab, and on a yes runs `relay close-predecessor` (never unasked) — the
 predecessor's tab identity travels in the successor's marker for exactly this.
 
-Optional flags: `--project NAME` and `--model NAME` override the successor's project/model
-(default: inherited from this lead's own marker).
+Optional flags: `--project NAME` and `--model NAME` override the successor's project/model. Project
+defaults to the handoff note's own `# ` heading (slugified; a leading "Handoff"/"Handoff — " title
+word is stripped since that names the artifact, not the work) when it has one, else this lead's own
+project with any auto-suffix counter stripped (`webapp-2` → `webapp` — a handoff never carries a
+collision counter forward); model defaults to inherited from this lead's own marker.
 
 **Linter note.** `relay handoff` compares the doc THIS lead itself inherited against the doc it's
 handing off and warns if any `[discipline]` marker went missing (`dropped_discipline_markers`) —

@@ -360,10 +360,24 @@ class TestLeadStart:
         assert m["backend"] == relay.iterm.NAME
         assert "lead mode active for session 'lead-1'" in capsys.readouterr().out
 
-    def test_project_defaults_to_the_cwd_basename(self, relay, terms):
+    def test_project_defaults_to_the_cwd_basename(self, relay, terms, capsys):
+        """Row 92: the bare basename is only the last-resort fallback — `lead-start` says so, once,
+        in its own output (`lead name: <name> (from cwd)`)."""
         run_main(relay, "lead-start", "lead-1")
         m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
         assert m["project"] == os.path.basename(os.getcwd())
+        assert f"lead name: {os.path.basename(os.getcwd())} (from cwd)" in capsys.readouterr().out
+
+    def test_a_context_derived_project_is_slugified(self, relay, terms, capsys):
+        """Row 92: `/relay:mode` derives a natural-language name from context ("relay 0.5.0
+        release") and passes it as `--project` — stored (and titled) as one clean slug, not the raw
+        phrase, everywhere relay treats `project` as an identifier."""
+        run_main(relay, "lead-start", "lead-1", "--project", "relay 0.5.0 release")
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        expected = relay.slugify("relay 0.5.0 release")
+        assert m["project"] == expected
+        assert m["tab_label"] == f"[Lead] {expected}"
+        assert f"lead name: {expected} (from --project)" in capsys.readouterr().out
 
     def test_an_empty_session_id_is_refused(self, relay, terms):
         """"lead-start: session id is empty (is $CLAUDE_CODE_SESSION_ID set?)"."""
@@ -380,6 +394,32 @@ class TestLeadStart:
         m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
         assert m["started"] == "2020-01-01T00:00:00"
         assert m["predecessor"] == pred
+
+    def test_a_prearmed_successor_keeps_its_handoff_given_name(self, relay, terms, capsys):
+        """Row 92 follow-up fix: a marker with BOTH `predecessor` and `project` already set (the
+        shape `cmd_handoff` pre-arms) ignores `--project` on its aftercare `/relay:mode` re-arm —
+        otherwise the skill's new "derive a fresh context name" instruction would silently rename
+        the successor and drop its `·<id4>` disambiguation (row 75's bug shape)."""
+        pred = {"session_id": "old", "tab_label": "[ex-Lead] weekly-release", "iterm_session": "w0:OLD"}
+        arm_lead(relay, "lead-1", "weekly-release", predecessor=pred)
+        relay.lead_guard.update_marker(relay.STATE_ROOT, "lead-1",
+                                       tab_label="[Lead] weekly-release ·70e2")
+        run_main(relay, "lead-start", "lead-1", "--project", "other")
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert m["project"] == "weekly-release"
+        assert m["tab_label"] == "[Lead] weekly-release ·70e2"
+        err = capsys.readouterr().err
+        assert "pre-armed successor keeps its handoff-given name 'weekly-release'" in err
+        assert "--project 'other' ignored" in err
+
+    def test_a_non_prearmed_marker_still_renames_on_project(self, relay, terms):
+        """The matched negative: a marker with no `predecessor` at all (never went through a
+        handoff) is renamed by `--project` exactly as before Fix 1."""
+        arm_lead(relay, "lead-1", "webapp")
+        run_main(relay, "lead-start", "lead-1", "--project", "other")
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert m["project"] == "other"
+        assert m["tab_label"] == "[Lead] other"
 
     def test_arming_resets_the_autonomous_posture_from_config(self, relay, terms, capsys):
         """cmd_lead_start: "Autonomous posture … is stamped FRESH on every arm from config —
@@ -402,7 +442,10 @@ class TestLeadStart:
 
     def test_a_colliding_project_name_is_auto_suffixed_and_announced(self, relay, terms, capsys):
         """unique_lead_project: "Resolve `project` to a name no other LIVE lead currently holds,
-        auto-suffixing with the smallest free `-N`"."""
+        auto-suffixing with the smallest free `-N`". `other`'s tab is alive (the `terms` fixture's
+        default) — a truly live holder still creeps the suffix (row 92 only stopped a
+        ghost/paused/tombstoned one from doing so). `lead-start` itself never adds the separate
+        `·<id4>` tab-title disambiguator — that's `_distinct_lead_label`, used by handoff/resume."""
         arm_lead(relay, "other", "webapp")
         run_main(relay, "lead-start", "lead-1", "--project", "webapp")
         m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
@@ -410,10 +453,11 @@ class TestLeadStart:
         assert "armed as 'webapp-2' instead" in capsys.readouterr().err
 
     def test_a_ghost_lead_does_not_reserve_its_name(self, relay, terms):
-        """"an unparseable/missing stamp, or one older than the window, is treated as a ghost and
-        never reserves its name"."""
+        """Row 92: only `_lead_liveness(m) == "live"` reserves a name now — a marker whose tab
+        isn't actually alive never does, stale stamp or not."""
         arm_lead(relay, "ghost", "webapp")
         relay.lead_guard.update_marker(relay.STATE_ROOT, "ghost", last_active="2020-01-01T00:00:00")
+        terms.alive = False  # its tab is genuinely gone, not just idle
         run_main(relay, "lead-start", "lead-1", "--project", "webapp")
         assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")["project"] == "webapp"
 

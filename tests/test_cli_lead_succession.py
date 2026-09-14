@@ -513,6 +513,37 @@ class TestHandoff:
         assert m["project"] == "docs" and m["model"] == "sonnet"
         assert m["tab_label"] == "[Lead] docs"
 
+    def test_a_named_heading_names_the_successor(self, relay, terms, tmp_path, outgoing):
+        """Row 92: the handoff note's own `# ` heading, when it names the work, is the successor's
+        default project — not the caller's ("webapp") at all."""
+        doc = self._doc(tmp_path, "# Relay release 0.5.0\n\nIn flight: e1.\n")
+        run_main(relay, "handoff", doc)
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, self._successor(relay))
+        expected = relay.slugify("Relay release 0.5.0")
+        assert m["project"] == expected
+        assert m["tab_label"] == f"[Lead] {expected}"
+
+    def test_a_handoff_prefixed_heading_drops_the_prefix(self, relay, terms, tmp_path, outgoing):
+        """"Handoff — …"/"Handoff: …" names the ARTIFACT, not the work — stripped before
+        slugifying, so the successor isn't named "handoff-relay-release-0-5-0"."""
+        doc = self._doc(tmp_path, "# Handoff — Relay release 0.5.0\n\nIn flight: e1.\n")
+        run_main(relay, "handoff", doc)
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, self._successor(relay))
+        assert m["project"] == relay.slugify("Relay release 0.5.0")
+
+    def test_no_heading_falls_back_to_the_callers_project_counter_stripped(self, relay, terms,
+                                                                           tmp_path, monkeypatch):
+        """Row 92 field shape: "this lead is `claude-relay-2` only because the name creeped once
+        and every handoff since inherited the counter" — a handoff must never carry that counter
+        forward, whether or not the note names a heading of its own."""
+        arm_lead(relay, "lead-old", "claude-relay-2", model="opus", iterm_session="w0t0p0:OLD",
+                 backend="iterm", started="2020-01-01T00:00:00")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-old")
+        doc = self._doc(tmp_path, "what's in flight, what's done, next steps\n")  # no '# ' heading
+        run_main(relay, "handoff", doc)
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, self._successor(relay))
+        assert m["project"] == "claude-relay"
+
     def test_a_dropped_discipline_marker_is_warned_about(self, relay, terms, tmp_path, outgoing,
                                                          capsys):
         """d4: "`[discipline]` markers … that appear in the doc the outgoing lead itself inherited

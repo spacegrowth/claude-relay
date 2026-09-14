@@ -158,7 +158,10 @@ The flow, in five beats:
 1. **Design** — tell the session what to build, or point it at a brief.
 2. **`/relay:mode`** — arm it as the lead. (Order is flexible: arm first and then describe the
    work, or design first and arm after — both work. Armed with no task yet? Don't invent one —
-   say you're ready and wait to be told what to build, then propose the split as usual.)
+   say you're ready and wait to be told what to build, then propose the split as usual.) The lead
+   names itself from context — 2-4 words on what it's here to do, not the folder it's in — and
+   passes that as `--project`; only a genuinely fresh, brief-less session falls back to the cwd
+   basename, and says so.
 3. **Approve the split** — the lead proposes executors + packet files and **waits for your go**.
 4. **Spawn** — executors build in parallel, each in its own tab/pane, each on the model the lead
    picked for it (`--model`, per executor — see [Why](#why)); the lead wakes you as each one

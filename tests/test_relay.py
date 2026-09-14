@@ -6209,7 +6209,17 @@ class TestResolveSid:
 
 
 class TestUniqueLeadProject:
-    """unique_lead_project: auto-suffixing so no two LIVE leads share a project name at arm time."""
+    """unique_lead_project: auto-suffixing so no two live-or-unreachable leads share a project name
+    at arm time.
+
+    Row 92 (2026-09-14, "relay can figure it out with all the context") plus its same-day follow-up
+    fix: reservation runs through `_lead_liveness(m)` being `"live"` OR `"unreachable"` — never a
+    ghost (stale AND unreachable) or a tombstoned marker (see TestTombstoneNameReservation). The
+    follow-up widened the original "only 'live' reserves" rule because right after an iTerm restart
+    every genuinely-live lead reads as 'unreachable' until row 91's tty-refresh lands, and treating
+    that as free would let a restarted `lead-start` mint a duplicate name out from under a lead
+    that's actually still there. Every test below that means to simulate a specific state mocks
+    `relay.iterm.is_alive` explicitly rather than relying on stamp freshness alone."""
 
     NOW = time.mktime(time.strptime("2026-01-01T12:00:00", "%Y-%m-%dT%H:%M:%S"))
 
@@ -6223,24 +6233,30 @@ class TestUniqueLeadProject:
                 "last_active": self._stamp(offset_seconds) if last_active is ... else last_active}
 
     def test_fresh_name_returned_unchanged(self, relay):
+        # No marker even claims "claude-relay", so this never probes is_alive at all.
         leads = [self._lead("other-1", "some-other-project")]
         name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
         assert (name, clash) == ("claude-relay", None)
 
     def test_exact_collision_with_live_lead_suffixes_to_2(self, relay):
         leads = [self._lead("other-1", "claude-relay")]
-        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads,
+                                                     now_ts=self.NOW)
         assert name == "claude-relay-2"
         assert clash == "other-1"
 
     def test_dash_2_also_taken_advances_to_smallest_free(self, relay):
         leads = [self._lead("other-1", "claude-relay"), self._lead("other-2", "claude-relay-2")]
-        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads,
+                                                     now_ts=self.NOW)
         assert name == "claude-relay-3"
         assert clash == "other-1"
 
     def test_self_session_id_is_not_reserved(self, relay):
-        # idempotent re-arm: this session's own existing marker must not suffix itself.
+        # idempotent re-arm: this session's own existing marker must not suffix itself — excluded
+        # before any liveness probe, so no is_alive mock is needed here either.
         leads = [self._lead("self-1", "claude-relay")]
         name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
         assert (name, clash) == ("claude-relay", None)
@@ -6255,14 +6271,32 @@ class TestUniqueLeadProject:
     def test_stale_last_active_beyond_window_is_a_ghost(self, relay):
         leads = [self._lead("other-1", "claude-relay",
                              offset_seconds=relay.LEAD_LIVE_WINDOW_SECONDS + 1)]
-        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads,
+                                                     now_ts=self.NOW)
         assert (name, clash) == ("claude-relay", None)
 
     def test_unparseable_or_missing_last_active_is_a_ghost(self, relay):
         leads = [self._lead("other-1", "claude-relay", last_active=None),
                  self._lead("other-2", "claude-relay", last_active="not-a-timestamp")]
-        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads,
+                                                     now_ts=self.NOW)
         assert (name, clash) == ("claude-relay", None)
+
+    def test_an_unreachable_holder_still_reserves(self, relay):
+        """The follow-up fix's actual behaviour change: a fresh `last_active` whose tab probe
+        failed (`_lead_liveness` calls this 'unreachable', not 'live' or 'ghost') still reserves —
+        exactly the post-iTerm-restart shape the fix exists for, where every genuinely-live lead
+        reads this way until row 91's tty-refresh lands. (An earlier revision of this test asserted
+        the opposite, pinning the original row-92 "only 'live' reserves" rule the follow-up
+        widened.)"""
+        leads = [self._lead("other-1", "claude-relay", offset_seconds=60)]  # fresh stamp
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):  # tab probe failed
+            name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads,
+                                                     now_ts=self.NOW)
+        assert name == "claude-relay-2"
+        assert clash == "other-1"
 
 
 class TestLaunchBackgroundLabelAssert:
@@ -6548,13 +6582,12 @@ class TestCmdEnsureLabel:
 
 
 class TestTombstoneNameReservation:
-    """A PAUSED (tombstoned) lead keeps holding its project name; a plain stale GHOST does not.
-
-    These two cases look identical by `last_active` alone — both are old — so they are tested as a
-    matched pair. The difference is intent: a tombstone announced it is coming back (resume revives
-    it under its own name), a ghost never did. Without the tombstone half, quitting and resuming
-    could hand your name to another lead and bring you back as `<project>-2`
-    (docs/lead-arming-durability.md §9.2)."""
+    """Row 92 (2026-09-14 decision, "relay can figure it out with all the context"): a PAUSED
+    (tombstoned) lead no longer reserves its project name — this REVERSES the prior contract
+    (docs/lead-arming-durability.md §9.2 predates the decision, where a tombstone held its name
+    indefinitely so a resume wouldn't come back suffixed). `unique_lead_project` now skips a
+    tombstoned marker unconditionally, same as a plain ghost; only `_distinct_lead_label`'s
+    `·<id4>` tab suffix still disambiguates two truly-live tabs sharing a title."""
 
     NOW = TestUniqueLeadProject.NOW
     STALE = 999999  # far beyond LEAD_LIVE_WINDOW_SECONDS
@@ -6566,16 +6599,21 @@ class TestTombstoneNameReservation:
             m["ended"] = True
         return m
 
-    def test_tombstoned_lead_reserves_its_name_even_when_stale(self, relay):
-        leads = [self._lead("paused-1", "claude-relay", self.STALE, ended=True)]
-        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
-        assert name == "claude-relay-2"
-        assert clash == "paused-1"
+    def test_a_tombstoned_lead_no_longer_reserves_its_name(self, relay):
+        """The direct reversal: even with a FRESH stamp and is_alive mocked True (the most
+        favorable case for reservation), a tombstoned marker must still not hold the name —
+        `is_tombstoned` is an unconditional skip in `unique_lead_project` now, not a reservation."""
+        leads = [self._lead("paused-1", "claude-relay", offset_seconds=60, ended=True)]
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads,
+                                                     now_ts=self.NOW)
+        assert (name, clash) == ("claude-relay", None)
 
     def test_plain_stale_ghost_still_releases_its_name(self, relay):
-        """The matched negative: same staleness, no tombstone → name reclaimed, no suffix creep."""
         leads = [self._lead("ghost-1", "claude-relay", self.STALE, ended=False)]
-        name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads, now_ts=self.NOW)
+        with mock.patch.object(relay.iterm, "is_alive", return_value=False):
+            name, clash = relay.unique_lead_project("claude-relay", "self-1", [], leads,
+                                                     now_ts=self.NOW)
         assert (name, clash) == ("claude-relay", None)
 
     def test_resuming_lead_gets_its_own_name_back(self, relay):

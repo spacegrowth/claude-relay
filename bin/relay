@@ -4683,9 +4683,11 @@ def _lead_term_cell(m):
 
 
 def _lead_stamp_fresh(m, now_ts=None):
-    """Whether marker `m`'s last_active is parseable and within LEAD_LIVE_WINDOW_SECONDS — the
-    same "fresh" test unique_lead_project uses to decide whether a name is still reserved (§3).
-    An unparseable/missing stamp degrades to False (not fresh), mirroring that convention."""
+    """Whether marker `m`'s last_active is parseable and within LEAD_LIVE_WINDOW_SECONDS — used by
+    `_lead_liveness` to tell an 'unreachable' lead (tab down, stamp still fresh) from a 'ghost'
+    (stamp stale too). `unique_lead_project` no longer consults this directly (row 92): only the
+    'live' verdict reserves a name now, so a merely-fresh-but-not-alive lead doesn't. An
+    unparseable/missing stamp degrades to False (not fresh), mirroring that convention."""
     now_ts = time.time() if now_ts is None else now_ts
     try:
         last_active = time.mktime(time.strptime(m.get("last_active") or "", "%Y-%m-%dT%H:%M:%S"))
@@ -6336,62 +6338,63 @@ def cmd_prune(args):
         print(f"nothing to prune (terminal sessions newer than {args.days}d: {kept})")
 
 
-# How long a lead's last_active stamp counts as "plausibly still live" for the purpose of reserving
-# its project name (see unique_lead_project). Too short and two genuinely-live-but-idle leads could
-# momentarily collide on a name; too long and a crashed lead's name stays reserved (and a stale
-# ghost sitting in the same folder makes every re-arm creep the suffix) long after it's gone. 15
-# minutes comfortably outlasts normal idle gaps between turns while still reclaiming crashed names
-# well within a session.
+# How long a lead's last_active stamp counts as "plausibly still live" — feeds `_lead_liveness`'s
+# 'unreachable' (tab down, stamp fresh) vs 'ghost' (stamp stale) split, which in turn is what
+# `unique_lead_project` consults. Too short and two genuinely-live-but-idle leads could momentarily
+# read as unreachable; too long and a crashed-but-recently-active lead's tab-down state takes a
+# while to age into 'ghost'. Doesn't gate reservation directly any more (row 92) — only 'live'
+# (tab actually alive) does that — so this mostly affects `relay list`'s WAKE/LIVE styling now.
 LEAD_LIVE_WINDOW_SECONDS = 900
 
 
 def unique_lead_project(project, self_sid, exclude_sids, leads, now_ts=None):
-    """Resolve `project` to a name no other LIVE lead currently holds, auto-suffixing with the
-    smallest free `-N` (N >= 2) on collision. `leads` is the list of marker dicts (as returned by
-    `lead_guard.list_leads`); a marker reserves its name only if its session_id is neither
-    `self_sid` (idempotent re-arm must keep the same name) nor in `exclude_sids` (a handoff
+    """Resolve `project` to a name no other LIVE-OR-UNREACHABLE lead currently holds, auto-suffixing
+    with the smallest free `-N` (N >= 2) on collision. `leads` is the list of marker dicts (as
+    returned by `lead_guard.list_leads`); a marker reserves its name only if its session_id is
+    neither `self_sid` (idempotent re-arm must keep the same name) nor in `exclude_sids` (a handoff
     successor passes its predecessor's id here, since succession intentionally inherits the name),
-    AND its `last_active` parses and is within LEAD_LIVE_WINDOW_SECONDS of `now_ts` — an
-    unparseable/missing stamp, or one older than the window, is treated as a ghost and never
-    reserves its name, mirroring the existing "unparseable → ancient" convention used elsewhere in
-    this file for lead pruning.
+    it is NOT tombstoned, AND `_lead_liveness(m, now_ts)` is `"live"` OR `"unreachable"` (2026-09-14
+    decision, backlog row 92, refined by the follow-up fix: "unreachable" — a fresh stamp whose tab
+    probe simply failed, e.g. every lead reads that way right after an iTerm restart until row 91's
+    tty-refresh lands — must still reserve, or a post-restart `lead-start` mints a DUPLICATE live
+    name out from under a lead that's actually still there. Only `"ghost"` (stale AND unreachable)
+    and a tombstoned/paused marker release their name immediately; "relay can figure it out with
+    all the context" still holds for those.
+    `_distinct_lead_label` still adds a `·<id4>` tab-title suffix separately when two truly live
+    leads share a name — unaffected by this.
 
-    Returns `(resolved_project, clashing_sid)` — `clashing_sid` is the session_id of the live lead
-    that holds the *exact* `project` name (for the caller's NOTE), or None when `project` was
-    already free (the common case, including reclaiming a name whose only holder is a ghost).
+    Returns `(resolved_project, clashing_sid)` — `clashing_sid` is the session_id of the
+    live-or-unreachable lead that holds the *exact* `project` name (for the caller's NOTE), or None
+    when `project` was already free (the common case, including reclaiming a name whose only holder
+    is a ghost or tombstoned).
 
     Pure and fail-open by design: any exception degrades to returning `project` unchanged — a bug
     in this uniqueness check must never prevent a lead from arming."""
     try:
         now_ts = time.time() if now_ts is None else now_ts
         exclude = set(exclude_sids or ()) | {self_sid}
-        reserved = {}  # project name -> session_id of the first (oldest) live lead holding it
-        for m in leads:
-            sid = m.get("session_id")
-            name = m.get("project")
-            if not sid or not name or sid in exclude:
-                continue
-            if lead_guard.is_tombstoned(m):
-                # A tombstoned lead is PAUSED, not dead — it will be revived under its own name on
-                # resume, so it keeps holding that name (docs/lead-arming-durability.md §9.2).
-                # Without this, quitting and resuming could hand your name to someone else and bring
-                # you back as "<project>-2". Deliberately different from the ghost rule below: a
-                # ghost never announced an intent to return, a tombstone did.
-                reserved.setdefault(name, sid)
-                continue
-            try:
-                last_active = time.mktime(time.strptime(m.get("last_active") or "", "%Y-%m-%dT%H:%M:%S"))
-            except Exception:
-                continue  # unparseable/missing last_active → ghost, doesn't reserve
-            if now_ts - last_active > LEAD_LIVE_WINDOW_SECONDS:
-                continue  # stale → ghost, doesn't reserve
-            reserved.setdefault(name, sid)
-        if project not in reserved:
+
+        def reserving_holder(name):
+            """The session_id of the first lead marker genuinely reserving `name` right now, or
+            None. Only probes markers whose project actually matches `name`, so a name nobody
+            else claims never triggers a liveness probe at all."""
+            for m in leads:
+                sid = m.get("session_id")
+                if not sid or m.get("project") != name or sid in exclude:
+                    continue
+                if lead_guard.is_tombstoned(m):
+                    continue  # paused, not dead — but no longer reserves either (row 92)
+                if _lead_liveness(m, now_ts) in ("live", "unreachable"):
+                    return sid
+            return None
+
+        holder = reserving_holder(project)
+        if holder is None:
             return project, None
         n = 2
-        while f"{project}-{n}" in reserved:
+        while reserving_holder(f"{project}-{n}") is not None:
             n += 1
-        return f"{project}-{n}", reserved[project]
+        return f"{project}-{n}", holder
     except Exception:
         return project, None
 
@@ -6410,10 +6413,19 @@ def cmd_lead_start(args):
             and not (iterm.NAME == "iterm" and os.environ.get("TERM_SESSION_ID")):
         print("NOTE: desktop banners in Terminal.app use macOS's built-in notification and are not "
               "clickable.", file=sys.stderr)
-    # The project name identifies this lead's work in `relay list` and restore; defaults to the
-    # working-directory basename when not named explicitly. cwd is where a restored lead reopens.
+    # The project name identifies this lead's work in `relay list` and restore. Row 92: the lead is
+    # expected to derive this from context (the brief, a handoff note, cwd + branch) and pass it as
+    # `--project` — the bare cwd basename is only the last-resort fallback for a session with
+    # genuinely nothing to go on yet. cwd is where a restored lead reopens.
     cwd = os.getcwd()
-    project = getattr(args, "project", None) or os.path.basename(cwd)
+    given_project = getattr(args, "project", None)
+    # A context-derived name is natural-language ("relay 0.5.0 release") — slugified so it's one
+    # clean token everywhere relay treats `project` as an identifier (tab titles, `relay focus
+    # <project>`, `owner_project` matching). The cwd fallback is left as-is: a directory basename is
+    # already close enough to a slug, and forcing it through slugify would rewrite underscores/dots
+    # a human didn't ask to have touched.
+    project = slugify(given_project) if given_project else os.path.basename(cwd)
+    name_origin = "--project" if given_project else "cwd"
     # Re-arm (e.g. the successor's post-handoff /relay:mode verify) must not clobber handoff/history
     # state that only the FIRST arm ever sets: `predecessor` (cmd_handoff pre-arms it before this
     # ever runs) and `started` (should reflect when the lead actually began, not each re-verify).
@@ -6421,22 +6433,38 @@ def cmd_lead_start(args):
     # name-uniqueness exclusion: a handoff successor inherits its predecessor's name on purpose.
     existing = lead_guard.read_marker(STATE_ROOT, args.session_id)
     pred_sid = (existing.get("predecessor") or {}).get("session_id")
-    resolved_project, clash_sid = unique_lead_project(
-        project, args.session_id, [pred_sid] if pred_sid else [], lead_guard.list_leads(STATE_ROOT))
-    if resolved_project != project:
-        print(f"NOTE: '{project}' is taken by a live lead ({(clash_sid or '?')[:8]}) — armed as "
-              f"'{resolved_project}' instead.", file=sys.stderr)
-    project = resolved_project
+    # Row 92 follow-up fix: a marker `cmd_handoff` pre-armed has BOTH a `predecessor` and a
+    # `project` written before this ever runs. The skill now has every arm derive a FRESH
+    # context name — including the successor's own aftercare `/relay:mode` verify — so without
+    # this override that verify would silently rename the successor away from its handoff-given
+    # name and drop its `·<id4>` disambiguation (row 75's bug shape, reopened by row 92).
+    prearmed_name = bool(existing.get("predecessor")) and bool(existing.get("project"))
+    if prearmed_name:
+        if given_project:
+            print(f"NOTE: pre-armed successor keeps its handoff-given name "
+                  f"'{existing['project']}' — --project '{given_project}' ignored", file=sys.stderr)
+        project = existing["project"]
+        name_origin = "handoff"
+    else:
+        resolved_project, clash_sid = unique_lead_project(
+            project, args.session_id, [pred_sid] if pred_sid else [], lead_guard.list_leads(STATE_ROOT))
+        if resolved_project != project:
+            print(f"NOTE: '{project}' is taken by a live lead ({(clash_sid or '?')[:8]}) — armed as "
+                  f"'{resolved_project}' instead.", file=sys.stderr)
+        project = resolved_project
     iterm_session = os.environ.get("TERM_SESSION_ID")  # the lead's own iTerm session ("w#t#p#:UUID")
     # Give the lead tab a stable, relay-controlled title (like executors get) so `relay focus <lead>`
     # and notification click-through can land on it. Rename via /rename into the lead's OWN session,
     # matched by its iTerm id. Best-effort — if it doesn't take, focus just won't find the lead tab.
-    tab_label = f"[Lead] {slugify(project)}"
-    # Row 75: a handoff successor whose title was disambiguated (`[Lead] X ·70e2`, see
-    # _distinct_lead_label) keeps it through its aftercare /relay:mode re-arm — renaming it back to
-    # the bare title here would recreate the very collision the handoff avoided.
-    if existing.get("tab_label") == f"{tab_label}{_successor_label_suffix(args.session_id)}":
-        tab_label = existing["tab_label"]
+    if prearmed_name:
+        tab_label = existing["tab_label"]  # keep the handoff's exact title, `·<id4>` suffix and all
+    else:
+        tab_label = f"[Lead] {slugify(project)}"
+        # Row 75: a handoff successor whose title was disambiguated (`[Lead] X ·70e2`, see
+        # _distinct_lead_label) keeps it through its aftercare /relay:mode re-arm — renaming it back
+        # to the bare title here would recreate the very collision the handoff avoided.
+        if existing.get("tab_label") == f"{tab_label}{_successor_label_suffix(args.session_id)}":
+            tab_label = existing["tab_label"]
     if not getattr(args, "no_rename", False):
         iterm.rename_by_id(iterm_session, tab_label)
     # Stable per-lead tab color; this lead's executors inherit it at spawn so its tabs group
@@ -6476,6 +6504,9 @@ def cmd_lead_start(args):
     append_ledger("lead_started", session_id=args.session_id, model=args.model, autonomous=auto_on)
     print(f"lead mode active for session '{args.session_id}'"
           + (f" (model {args.model})" if args.model else ""))
+    # Row 92: name the origin every time, so a lead riding the cwd-basename fallback is visible at
+    # a glance in the very output that arms it, not just inferable from the name itself.
+    print(f"lead name: {project} (from {name_origin})")
     # A lead that armed straight into auto must SAY so — an unannounced inverted posture is exactly
     # the silent-autonomy failure §6f warns against. (Manual is the default and needs no announcement.)
     if auto_on:
@@ -6507,6 +6538,37 @@ def _distinct_lead_label(base, successor_sid, caller_marker):
     return f"{base}{_successor_label_suffix(successor_sid)}" if taken else base
 
 
+def _strip_trailing_counter(name):
+    """Strip a trailing `unique_lead_project` auto-suffix counter (`webapp-2` → `webapp`), so a
+    handoff successor never carries forward a collision that had nothing to do with its own work
+    (row 92 field shape: "this lead is `claude-relay-2` only because the name creeped once and
+    every handoff since inherited the counter"). The successor gets its own fresh uniqueness check
+    (via its own eventual /relay:mode re-arm) rather than starting one generation further suffixed."""
+    return re.sub(r"-\d+$", "", name) if name else name
+
+
+def _successor_name_from_handoff(handoff_body, caller_project):
+    """Row 92: the successor's default project name. Prefers the handoff note's OWN `# ` heading —
+    the author already named the work in flight when writing it — over anything ambient. A leading
+    "Handoff" title word ("Handoff — Relay release 0.5.0", "Handoff: …") names the ARTIFACT, not
+    the work, so it's stripped before slugifying; the heading is capped to its first 6 words so a
+    verbose title doesn't turn into a slug of the whole sentence. Falls back to the caller's own
+    project (its auto-suffix counter stripped — see `_strip_trailing_counter`) when the note has no
+    heading, or the heading is nothing but "Handoff" itself. `cmd_handoff`'s `--project` flag
+    overrides this outright; only reached when it wasn't passed."""
+    heading = None
+    for line in (handoff_body or "").splitlines():
+        m = re.match(r"^#\s+(.+?)\s*$", line)
+        if m:
+            heading = m.group(1).strip()
+            break
+    if heading:
+        heading = re.sub(r"(?i)^handoff\b\s*[-–—:]*\s*", "", heading).strip()
+        if heading:
+            return slugify(" ".join(heading.split()[:6]))
+    return _strip_trailing_counter(caller_project or "")
+
+
 def cmd_handoff(args):
     """One-command lead succession: spawn a successor lead tab PRE-ARMED (its marker written for a
     pinned session id before its first turn — same trick `cmd_spawn` already uses to pin an
@@ -6533,7 +6595,12 @@ def cmd_handoff(args):
                  f"steps) first, then hand off.")
 
     caller_marker = lead_guard.read_marker(STATE_ROOT, caller)
-    project = args.project or caller_marker.get("project") or os.path.basename(os.getcwd())
+    # Read the note now (rather than at the d4-linter spot below where it used to be read) — row 92
+    # needs its body to derive the successor's default name before anything downstream (tab_label,
+    # the pre-arm write) is computed from `project`.
+    new_body = handoff_path.read_text()
+    project = args.project or _successor_name_from_handoff(new_body, caller_marker.get("project")) \
+        or os.path.basename(os.getcwd())
     cwd = caller_marker.get("cwd") or os.getcwd()
     model = args.model or caller_marker.get("model")
     successor_sid = str(uuid.uuid4())  # pinned — this IS the successor's session id
@@ -6597,7 +6664,7 @@ def cmd_handoff(args):
     # doc in the lineage; warn on any `[discipline]` marker it carried that the doc being handed
     # onward has dropped (same warning-stamp style as cmd_list's stale-hooks check, §10). A first-ever
     # lead (no inherited copy) has nothing to compare against — dropped_discipline_markers no-ops.
-    new_body = handoff_path.read_text()
+    # (`new_body` was already read above, before the row-92 name derivation.)
     inherited_copy_path = lead_guard.lead_dir(STATE_ROOT, caller) / "handoff.md"
     inherited_body = inherited_copy_path.read_text() if inherited_copy_path.is_file() else ""
     dropped = dropped_discipline_markers(inherited_body, new_body)
@@ -7681,7 +7748,8 @@ def main():
     lst = sub.add_parser("lead-start")
     lst.add_argument("session_id")
     lst.add_argument("--model")
-    lst.add_argument("--project", help="name this lead's project (defaults to the cwd basename)")
+    lst.add_argument("--project", help="name this lead's project — 2-4 words derived from context; "
+                                       "falls back to the cwd basename when nothing better is known")
     lst.add_argument("--no-rename", action="store_true", help="don't rename the lead's iTerm tab")
     lst.set_defaults(func=cmd_lead_start)
 
@@ -7820,7 +7888,9 @@ def main():
 
     hf = sub.add_parser("handoff")
     hf.add_argument("handoff_md", help="path to the handoff summary file")
-    hf.add_argument("--project", help="successor's project name (default: caller lead's project, else cwd basename)")
+    hf.add_argument("--project", help="successor's project name (default: the handoff note's own "
+                                      "'# ' heading, else the caller's project with any "
+                                      "auto-suffix counter stripped, else cwd basename)")
     hf.add_argument("--model", help="successor's model (default: caller lead's marker model)")
     hf.set_defaults(func=cmd_handoff)
 

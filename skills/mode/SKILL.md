@@ -28,17 +28,23 @@ class never outranks a stronger class), and say the matching line, filling in yo
   Please run `/model opus` (or similar) first."**, then **STOP** until the user switches. (Every
   other case: continue.)
 
-**Then arm the routing gate:**
+**Name this lead from context, then arm the routing gate.** Derive 2-4 words for what this lead is
+here to DO (`relay 0.5.0 release`, `vigie seen-model`) from the user's brief, a handoff note, or
+cwd + branch — never fall back to a bare directory name when anything better is known. Pass it as
+`--project "<name>"`. A pre-armed handoff successor keeps the name its handoff gave it; `--project`
+is ignored there.
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/relay lead-start "$CLAUDE_CODE_SESSION_ID" --project "<project>"
+${CLAUDE_PLUGIN_ROOT}/bin/relay lead-start "$CLAUDE_CODE_SESSION_ID" --project "<name>"
 ```
 
 Use `${CLAUDE_PLUGIN_ROOT}` (not bare `relay` — often missing from the Bash tool's PATH); let bash
 expand `$CLAUDE_CODE_SESSION_ID` (not `${CLAUDE_SESSION_ID}`, a different, unguaranteed var). Omit
-`--project` to default to the cwd basename. Banners come from iTerm (clickable) or macOS's built-in
-notification (not clickable, e.g. under Terminal.app) — arms either way, no install to check.
-`/relay:stop` steps back down.
+`--project` only when genuinely nothing is known yet (a fresh session, no brief) — it then falls
+back to the cwd basename, and `lead-start`'s own `lead name: <name> (from cwd)` line says so; call
+that out alongside your model-check line rather than letting it pass silently. Banners come from
+iTerm (clickable) or macOS's built-in notification (not clickable, e.g. under Terminal.app) — arms
+either way, no install to check. `/relay:stop` steps back down.
 
 **The routing gate** blocks a large inline `Edit`/`Write`/`MultiEdit` (over a line threshold, or a
 new file) — delegate, or `/relay:route retain "<reason>"` for genuinely lead-appropriate work (a
