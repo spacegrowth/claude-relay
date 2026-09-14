@@ -5389,6 +5389,18 @@ class TestExecutorCTXColumn:
         footnote = [l for l in out.splitlines() if "⚠ approaching heavy:" in l][0]
         assert "approach-1" in footnote and "4 pkts" in footnote and "125k" in footnote
 
+    def test_approaching_heavy_footnote_is_yellow_not_dim(self, relay, capsys, tmp_path, monkeypatch):
+        """Backlog row 87: the footnote is one of the few places colour actually renders (the wake
+        line itself can only ever carry the fixed 🟠 emoji) — `yellow`, no longer `dim`."""
+        monkeypatch.setattr(relay, "_color_on", lambda: True)
+        _write_usage_transcript(tmp_path, monkeypatch, "cs-approach2", 125000)
+        self._exec(relay, "approach-2", "cs-approach2", packet=4)
+        relay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        footnote = [l for l in out.splitlines() if "approaching heavy:" in l][0]
+        assert "\033[33m" in footnote     # yellow
+        assert "\033[2m" not in footnote  # no longer dim
+
 
 class TestContextWarnBanner:
     """Backlog row 57: the ONE early desktop banner an executor's live context earns crossing

@@ -179,6 +179,46 @@ class TestLeadHeavyOnBoard:
         assert data["leads"][0]["heavy_reading"] == "310k live, line 300k on a ? window"
 
 
+class TestExecutorApproachingOnBoard:
+    """Backlog row 87: `board_data`'s `approaching`/`approaching_reading` fields — the board's own
+    amber sibling of `relay list`'s yellow footnote, computed alongside the existing executor
+    `heavy` field (past `context_warn_tokens`, below `context_nudge_tokens`; never set once
+    `heavy` already is)."""
+
+    def test_approaching_at_125k(self, relay, tmp_path, monkeypatch):
+        _write_lead(relay, tmp_path)
+        _write_exec(relay, tmp_path, sid="e1")
+        monkeypatch.setattr(relay, "_usage_for_session", lambda r: {"last_prompt": 125000})
+        data = relay.board_data()
+        ex = data["executors"][0]
+        assert ex["approaching"] is True
+        assert ex["heavy"] is False
+        assert "125k" in ex["approaching_reading"]
+        html = board_render.render(data)
+        assert "approaching heavy" in html and "125k" in html
+        assert 'class="chip approach"' in html
+
+    def test_not_approaching_below_the_warn_line(self, relay, tmp_path, monkeypatch):
+        _write_lead(relay, tmp_path)
+        _write_exec(relay, tmp_path, sid="e1")
+        monkeypatch.setattr(relay, "_usage_for_session", lambda r: {"last_prompt": 119000})
+        data = relay.board_data()
+        assert data["executors"][0]["approaching"] is False
+        assert 'class="chip approach"' not in board_render.render(data)
+
+    def test_past_the_rotate_line_is_heavy_not_approaching(self, relay, tmp_path, monkeypatch):
+        _write_lead(relay, tmp_path)
+        _write_exec(relay, tmp_path, sid="e1")
+        monkeypatch.setattr(relay, "_usage_for_session", lambda r: {"last_prompt": 155000})
+        data = relay.board_data()
+        ex = data["executors"][0]
+        assert ex["heavy"] is True
+        assert ex["approaching"] is False
+        html = board_render.render(data)
+        assert 'class="chip flag">heavy</span>' in html
+        assert 'class="chip approach"' not in html
+
+
 class TestLiveBoard:
     """`relay board --live` (and the `board_live` config default): board.html gains a meta-refresh
     + "updated" badge and a sibling board.json is written, then every state-changing command keeps

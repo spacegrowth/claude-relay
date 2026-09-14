@@ -253,6 +253,27 @@ def make_executor(home, sid="exec-1", packet=1, owner_lead="lead-1", report="don
     return d
 
 
+def executor_transcript(home, claude_session, last_prompt_tokens, project_slug="proj"):
+    """A fake executor transcript JSONL at `<home>/.claude/projects/<slug>/<claude_session>.jsonl`,
+    one assistant message whose `usage.input_tokens` alone sums to `last_prompt_tokens` — enough
+    for `lead_guard.transcript_usage`'s `last_prompt` reading (row 87's `_ctx_warn_lines`, and row
+    57's `_maybe_warn_ctx_heavy`, both read ONLY that field for the warn/rotate comparison). Callers
+    pass this transcript's path as an executor's `claude_session` (via `make_executor`) so the
+    hook's own `_executor_transcript_path` — which scans every dir under `.claude/projects` the
+    same way bin/relay's `_find_transcript_path` does — can find it without any other wiring."""
+    d = Path(home) / ".claude" / "projects" / project_slug
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{claude_session}.jsonl"
+    p.write_text(json.dumps({
+        "type": "assistant", "timestamp": "2026-09-13T10:00:00Z",
+        "message": {"id": "msg_1", "model": "claude-sonnet-5",
+                    "usage": {"input_tokens": int(last_prompt_tokens),
+                              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+                              "output_tokens": 10}},
+    }) + "\n")
+    return p
+
+
 def ledger(home):
     """Every record in the shared `~/.relay-tasks/sessions.jsonl`, in order."""
     p = state_root(home) / "sessions.jsonl"

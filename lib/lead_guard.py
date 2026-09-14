@@ -228,6 +228,15 @@ LEAD_DEFAULTS = {
                                   # board_render.render): a page not rewritten within 3 refresh
                                   # cycles is presumed abandoned (lead stopped nudging state) and its
                                   # "updated HH:MM:SS" header turns red.
+    "ctx_warn_wake": True,        # backlog row 87: whether an owned executor past `context_warn_tokens`
+                                  # (but not yet `context_nudge_tokens`) also earns a 🟠 line on the
+                                  # LEAD's own Stop-hook wake (hooks/stop_lead_watch.py), once per
+                                  # executor sid, alongside row 57's desktop banner (which this does
+                                  # NOT silence — a separate kill-switch on purpose: `notify_on_wake`
+                                  # governs desktop banners generally, this governs only whether the
+                                  # heads-up also rides the lead's own conversation). False = the
+                                  # executor is still warned by the banner/footnote/board chip, just
+                                  # never inside the wake text itself.
 }
 
 # Distinguishable, colorblind-tolerant tab colors — brightened so they remain visible when dimmed

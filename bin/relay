@@ -3687,6 +3687,7 @@ def board_data(include_all=True, lead_sid=None, sweep=True):
         rows = [r for r in rows if r.get("owner_lead") in (None, lead_sid)]
     token_threshold = _heaviness_threshold_tokens()
     mb_threshold = _heaviness_threshold_mb()
+    warn_threshold = _ctx_warn_threshold_tokens()  # row 87: the board's amber "approaching" chip
     ttl_minutes = cfg.get("cache_ttl_minutes", lead_guard.LEAD_DEFAULTS["cache_ttl_minutes"])
     lead_ids = {m.get("session_id") for m in leads}
     unannounced = set()
@@ -3722,11 +3723,21 @@ def board_data(include_all=True, lead_sid=None, sweep=True):
         cache = lead_guard.cache_state(usage, time.time(), ttl_minutes)
         hit_rate = usage.get("cache_hit_rate") if usage else None
         ctx_cell, ctx_bad = lead_guard.ctx_window_cell(usage, r.get("context"), r.get("model"), tier_windows)
+        heavy_val = _is_heavy(usage, mb, token_threshold, mb_threshold)
+        # Row 87: the amber "approaching heavy" chip — same window `relay list`'s dim/yellow
+        # footnote uses (past `context_warn_tokens`, not yet `context_nudge_tokens`), token-reading
+        # only like the banner/footnote (no MB-fallback approach reading — a fallback "approaching"
+        # off a proxy would be guessing at a number nobody set). Never true when already `heavy_val`
+        # (that chip owns it instead).
+        approaching = (not heavy_val and usage is not None
+                       and (usage.get("last_prompt") or 0) >= warn_threshold)
         execs.append({**r, "rendered_status": rendered, "launch": lead_guard.launch_cell(r),
                       "tokens": lead_guard.usage_cell(usage, cache), "usage": usage, "mb": _mb_cell_text(mb),
                       "ctx_cell": ctx_cell, "ctx_contradiction": ctx_bad,
                       "hit_rate": round(hit_rate * 100) if hit_rate is not None else None,
-                      "heavy": _is_heavy(usage, mb, token_threshold, mb_threshold), "queued": len(read_queue(sid)),
+                      "heavy": heavy_val, "queued": len(read_queue(sid)),
+                      "approaching": approaching,
+                      "approaching_reading": _heavy_reading_text(usage, mb) if approaching else None,
                       "pkt": str(cur).zfill(3) if cur is not None else "-", "packets": packets,
                       "unannounced": sid in unannounced,
                       "orphan": bool(r.get("owner_lead")) and r.get("owner_lead") not in lead_ids
@@ -5531,12 +5542,15 @@ def cmd_list(args):
                 f"<sid>` and a fresh spawn keeps the next packet's context cheap; `relay send "
                 f"--heavy-override \"<reason>\"` keeps going in this one.", "yellow"))
 
-    # Backlog row 57: the DIMMER sibling of the heavy footnote above — sessions past
+    # Backlog row 57: the sibling of the heavy footnote above — sessions past
     # `context_warn_tokens` (the same line that already fired their one desktop banner via
-    # `_maybe_warn_ctx_heavy`) but not yet `context_nudge_tokens`, so this table agrees with the
-    # banner instead of staying silent until the 150k line. Excludes anything already in `heavy`
-    # (that line owns them) — token-reading only, same as the banner (no MB-fallback approach-line;
-    # a fallback "approaching" reading off a proxy would be guessing at a number nobody set).
+    # `_maybe_warn_ctx_heavy`, and row 87's 🟠 line on the owning lead's own Stop-hook wake) but not
+    # yet `context_nudge_tokens`, so this table agrees with the banner instead of staying silent
+    # until the 150k line. Excludes anything already in `heavy` (that line owns them) — token-reading
+    # only, same as the banner (no MB-fallback approach-line; a fallback "approaching" reading off a
+    # proxy would be guessing at a number nobody set). Row 87: printed in `yellow` (not `dim`) — the
+    # one place besides the board chip colour actually renders, since the wake line itself can only
+    # ever carry a fixed 🟠 emoji marker (ANSI doesn't survive the injected-text path).
     warn_threshold = _ctx_warn_threshold_tokens()
     approaching = [s for s in rows if s not in heavy and usage_by_sid[s["session_id"]] is not None
                    and (usage_by_sid[s["session_id"]].get("last_prompt") or 0) >= warn_threshold]
@@ -5546,7 +5560,7 @@ def cmd_list(args):
                           for s in approaching)
         print(c(f"  ⚠ approaching heavy: {parts} — past the {int(warn_threshold // 1000)}k warn "
                 f"line, not yet the {int(token_threshold // 1000)}k rotate line; a rotate is worth "
-                f"planning.", "dim"))
+                f"planning.", "yellow"))
 
     # Row 70 item 2: one line per pinned executor, naming WHO pinned it (by project, the name a
     # human recognises) and HOW LONG AGO — the two facts that turn "there is a 📌 here" into a

@@ -42,16 +42,22 @@ _STATUS = {
 }
 
 _CSS = """
+/* Row 87: --amber/--amber-bg is the "approaching heavy" chip's own pair, distinct from the
+   already-taken --warn/--warn-bg (the existing "heavy"/"busy" amber) — same ink/bg naming
+   convention as --ok/--ok-bg and --bad/--bad-bg elsewhere in this block, one shade lighter so
+   "approaching" reads as the earlier, milder heads-up next to the existing "heavy" chip. */
 :root{
  --bg:#faf9f7;--rail:#f4f2ee;--panel:#ffffff;--ink:#1c1b22;--muted:#6c6a76;--faint:#a5a2ad;
  --line:#ece9e4;--line2:#f2f0eb;--accent:#2f56e6;--accent-ink:#2447c4;--tint:#eef1fe;
  --ok:#1f8f52;--ok-bg:#e9f5ee;--warn:#b06a00;--warn-bg:#fbf0dd;--bad:#c73a3a;--bad-bg:#fbe8e6;
+ --amber:#8a6d00;--amber-bg:#fbf3d9;
  --dim:#a5a2ad;--dim-bg:#f0eeea;--chip:#f3f1ec;--chip-ink:#4a4854;
  --sh:0 1px 2px rgba(28,27,34,.05),0 3px 10px rgba(28,27,34,.04);--sh2:0 6px 22px rgba(28,27,34,.08);--r:12px}
 :root[data-theme=dark]{
  --bg:#131217;--rail:#0f0e13;--panel:#1a191f;--ink:#eceaf1;--muted:#9a97a4;--faint:#66636f;
  --line:#272530;--line2:#201f28;--accent:#7c93ff;--accent-ink:#a9baff;--tint:#1b2340;
  --ok:#5cd08a;--ok-bg:#12291c;--warn:#e9a94a;--warn-bg:#2c2109;--bad:#f0736b;--bad-bg:#2d1513;
+ --amber:#d9c15a;--amber-bg:#2e2808;
  --dim:#66636f;--dim-bg:#1c1b23;--chip:#22212a;--chip-ink:#b4b1bd;
  --sh:none;--sh2:0 8px 26px rgba(0,0,0,.5);--r:12px}
 *{box-sizing:border-box}
@@ -138,6 +144,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 .chip{background:var(--chip);color:var(--chip-ink);border-radius:9px;padding:5px 11px;font-size:12px}
 .chip b{color:var(--ink);font-weight:650;margin-left:4px}
 .chip.flag{background:var(--warn-bg);color:var(--warn)} .chip.pin{background:var(--tint);color:var(--accent-ink)} .chip.bad{background:var(--bad-bg);color:var(--bad)}
+.chip.approach{background:var(--amber-bg);color:var(--amber)}
 .wt{color:var(--faint);font-size:12px;margin:10px 0 0}
 /* packet dot strip */
 .dots{display:flex;gap:7px;flex-wrap:wrap;margin:22px 0 4px}
@@ -317,6 +324,18 @@ def _chips(ex):
         out.append(f'<span class="chip">size<b>{_e(ex["mb"])} MB</b></span>')
     if ex.get("heavy"):
         out.append('<span class="chip flag">heavy</span>')
+    if ex.get("approaching"):
+        # Row 87: past `context_warn_tokens`, not yet the rotate line — `board_data` never sets
+        # this alongside "heavy" (that chip owns the executor once it's actually past the rotate
+        # line), so the two chips never appear together.
+        usage = ex.get("usage") or {}
+        try:
+            ctx_k = f'{int((usage.get("last_prompt") or 0) // 1000)}k'
+        except Exception:
+            ctx_k = None
+        label = f"approaching heavy · {ctx_k}" if ctx_k else "approaching heavy"
+        out.append(f'<span class="chip approach" title="{_e(ex.get("approaching_reading") or "")}">'
+                    f'{_e(label)}</span>')
     if ex.get("keep"):
         out.append('<span class="chip pin">\U0001F4CC pinned</span>')
     if ex.get("queued"):

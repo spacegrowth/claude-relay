@@ -533,9 +533,23 @@ executor crosses `context_warn_tokens` (default 120k, comfortably below `context
 suggestion (`relay retire <sid>` + a fresh spawn). It rides `_check_one`, so `relay list`, `relay
 check`, the board, and the lead's own Stop-hook poller all surface it without any extra command.
 Exactly once per executor session — a rotated executor gets a fresh sid, so it can warn again on
-its own account — and `relay list`'s heavy footnote gains a dim `⚠ approaching heavy:` line for the
-same window, so the table never disagrees with the banner. Set `context_warn_tokens` at or above
+its own account — and `relay list`'s heavy footnote gains a yellow `⚠ approaching heavy:` line for
+the same window, so the table never disagrees with the banner. Set `context_warn_tokens` at or above
 `context_nudge_tokens` to turn it off.
+
+That heads-up also rides the **lead's own Stop-hook wake** (backlog row 87), not just the desktop
+banner and the footnote you'd otherwise have to go looking for: the first time an owned executor
+crosses `context_warn_tokens` (and hasn't yet reached `context_nudge_tokens`), one 🟠 line —
+`🟠 <sid> is approaching heavy (…) — plan a rotate: relay retire <sid> + a fresh spawn for its next
+packet` — is appended to whatever the wake already announces (a report, a commit, nothing at all),
+and the model is told to surface it verbatim before continuing. Once per executor sid, on its own
+key (independent of the banner's own once-only stamp, so a lead that misses one still gets the
+other) — a wake made up of nothing but 🟠 lines skips the desktop banner tier entirely, since that
+executor's banner already fired separately. Turn it off with `ctx_warn_wake: false` (the banner and
+footnote are unaffected — this only governs whether the heads-up also lands in the lead's own
+conversation). Colour survives only as far as text injected into a transcript can carry it: the 🟠
+emoji **is** the colour here — real colour renders where it can, in the `relay list` footnote
+(yellow) and as an amber `approaching heavy · <ctx>k` chip on the board.
 
 ### Handing off a long-lived lead
 
@@ -780,7 +794,8 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
 | `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) — the secondary "session age" (compaction-count) signal for **both** leads and executors: MB on disk never shrinks, so a big number alone means several compactions in even when live context currently looks fine. Fires the lead's handoff nudge/statusline segment alongside tokens, and is the executor fallback reading (`relay send`'s gate, `relay list`'s heavy footnote) only when a transcript can't be parsed for real usage at all |
-| `context_warn_tokens` | 120000 | Backlog row 57: an EARLIER, one-shot desktop banner for **executors**, well below `context_nudge_tokens`'s rotate line, so a rotate can be planned instead of discovered in a footnote. Fires once per executor session (via the same three-tier `notify_banner` chain and `claim_notification` stamp every other relay banner uses) the first time live context crosses this line, and adds the session to `relay list`'s dim `⚠ approaching heavy:` line. Set at/above `context_nudge_tokens` to disable it — that's a no-op, not an error |
+| `context_warn_tokens` | 120000 | Backlog row 57: an EARLIER, one-shot desktop banner for **executors**, well below `context_nudge_tokens`'s rotate line, so a rotate can be planned instead of discovered in a footnote. Fires once per executor session (via the same three-tier `notify_banner` chain and `claim_notification` stamp every other relay banner uses) the first time live context crosses this line, and adds the session to `relay list`'s yellow `⚠ approaching heavy:` line and an amber `approaching heavy · <ctx>k` chip on the board. Set at/above `context_nudge_tokens` to disable it — that's a no-op, not an error |
+| `ctx_warn_wake` | true | Backlog row 87: whether the `context_warn_tokens` heads-up above also earns a 🟠 line on the owning **lead's own** Stop-hook wake (once per executor sid, ridden alongside whatever else the wake announces) — see [Auto-wake and notifications](#auto-wake-and-notifications). A separate switch from `notify_on_wake`: false here only silences the wake line, never the desktop banner/footnote/board chip |
 | `context_nudge_tokens` | 150000 | The cost/context signal for **executors**: heavy when the LAST request's live context (input + cache_read + cache_creation tokens — the real spend the next turn pays, not a transcript-size proxy) is at/above this many tokens. Drives `relay send`'s heaviness gate, `relay list`/board's heavy footnote/CTX columns, and `relay send --rotate` advice. A lead's own line is `lead_nudge_tokens` (below) — never this key |
 | `lead_nudge_tokens` | 300000 | A **lead's** own heaviness/handoff-nudge line, on a 1M window — a lead's handoff costs more than an executor's rotation (a fresh successor-seed vs. a plain respawn) and its context grows slowly once diffs are reviewed by a fork, so it earns a higher line than `context_nudge_tokens`. Drives the lead's own handoff nudge (Stop hook), `relay status --statusline`'s weight segment, `relay list`'s LEADS CTX/heavy footnote, and the board's lead chip. When the lead's real context window is known (`relay doctor`'s probe, or inferred from a `[1m]`-suffixed model) to be 200k rather than 1M, the EFFECTIVE line is capped to `context_nudge_tokens` instead — a 200k-window lead can never reach 300k live context, so it's still nudged, just on the executor's line |
 | `cache_ttl_minutes` | 60 | Claude Code's prompt-cache TTL — how long an executor's last request stays cached free. Drives the warm/cold readout in `relay list`'s TOKENS column, the board, and `relay send`'s advisory line — see [Cache state](#executor-context-window-200k-vs-1m) |

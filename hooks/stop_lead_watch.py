@@ -28,6 +28,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "scripts"))
@@ -38,6 +39,10 @@ RELAY_BIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin
 # reading .claude-plugin/plugin.json / hooks/hooks.json from here (not wherever the lead armed
 # under) is what keeps touch_lead's version re-stamp always current.
 PLUGIN_ROOT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
+
+# Backlog row 87: the fixed marker for the "approaching heavy" wake line — ANSI can't survive the
+# injected-text path (see the module docstring's sibling in bin/relay), so this emoji IS the colour.
+CTX_WARN_MARKER = "\U0001f7e0"  # 🟠
 
 
 def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_session=None,
@@ -66,6 +71,13 @@ def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_sess
 
 def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg, kind="sync",
                        transcript_path=None):
+    # Row 87: `notify_msg=None` means "skip the banner tier for this wake entirely" — used for a
+    # wake whose `lines` are ALL 🟠 ctx-warn lines (row 57's `_maybe_warn_ctx_heavy` already fired
+    # that executor's ONE desktop banner from `_check_one`, under its own `<sid>:ctx-warn` key; a
+    # second banner here for the same sid would just be noise). A wake that mixes a 🟠 line with a
+    # report/commit still gets its normal banner (see main()'s notify_msg selection) — only the
+    # all-🟠 case is silent here. The exit-2/stdout announce below is UNCHANGED either way; only the
+    # desktop banner is conditional on this.
     # #22 (§13): record the announce as PENDING, never as surfaced. Firing is not delivering — this
     # exit-2 only wakes the lead if the harness is still listening to THIS hook process, and a
     # stale poller announcing while the lead is mid-turn is exactly the case that got dropped and
@@ -86,7 +98,7 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg, kind="syn
     # batch (so each report is independently deduped even when several land in one announce); skip
     # the banner only when EVERY key here was already claimed by someone else.
     claims = [lg.claim_notification(STATE_ROOT, sid, key) for key in surfaced_keys]
-    if not surfaced_keys or any(claims):
+    if notify_msg is not None and (not surfaced_keys or any(claims)):
         _notify(cfg, notify_msg, project=project, executor=executor, lead_sid=sid,
                 iterm_session=marker.get("iterm_session"))
     # Emoji-forward banner: the model echoes this into its announcement, so 🚦 is a visible,
@@ -121,13 +133,16 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg, kind="syn
             "omit --findings only if you read the diff inline) and pass the attestation flags only if "
             "they are TRUE — it prints CLEARED or NOT-CLEARED-BECAUSE-<reason>. On NOT-CLEARED, "
             "stop and ask, naming the condition. The verifier gates the AUTOMATION; it never "
-            "replaces reviewing the diff, and COUNTS-MATCH never means the report is true.\n")
+            "replaces reviewing the diff, and COUNTS-MATCH never means the report is true.\n\n"
+            "If any line above starts with 🟠, surface that line verbatim to the user in your reply, "
+            "then continue.\n")
     else:
         instruction = (
             "\n\nOpen your reply with the marker '🚦 [relay] — review needed:', surface these to the "
             "user, and WAIT for their direction. Do NOT auto-review, auto-commit, or otherwise act "
             "on them yourself until the user asks. If a report needs reviewing, tell the user it's "
-            "ready and ask whether to review it.\n")
+            "ready and ask whether to review it. If any line above starts with 🟠, surface that line "
+            "verbatim to the user in your reply, then continue.\n")
     # #23: relay's OWN receipt-in-waiting for THIS announce (nonce + transcript offset). The next
     # stop_hook_active run promotes pending only if this claim is outstanding and its wake text
     # actually landed — never on the global flag alone, which any other blocking Stop hook sets.
@@ -192,6 +207,92 @@ def _report_lines(lg, sid):
                      else f"{head} — report at {path}")
         keys.append(key)
     return lines, keys
+
+
+def _executor_transcript_path(claude_session):
+    """Best-effort location of an EXECUTOR's own transcript JSONL, by `claude_session` id — mirrors
+    bin/relay's `_transcript_project_dirs`/`_find_transcript_path` (duplicated here, deliberately:
+    this hook must never shell out to bin/relay, which also has no `.py` extension and so isn't a
+    normal import target for a hook script). None on any error/missing/not-found, same contract."""
+    if not claude_session:
+        return None
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")) / "projects"
+    try:
+        for d in root.iterdir():
+            if not d.is_dir():
+                continue
+            p = d / f"{claude_session}.jsonl"
+            if p.exists():
+                return p
+    except OSError:
+        return None
+    return None
+
+
+def _ctx_warn_lines(lg, cfg, sid):
+    """Backlog row 87: one 🟠 wake line per executor OWNED by this lead that has crossed
+    `context_warn_tokens` (the same line whose desktop banner `_maybe_warn_ctx_heavy` already fired,
+    in bin/relay, from `_check_one`) but not yet `context_nudge_tokens` (the rotate line — past that,
+    the existing heavy footnote/banner already own it). Claims a SEPARATE once-only key
+    (`<exec_sid>:ctx-warn-wake`) from the banner's own `<exec_sid>:ctx-warn`, so the banner and this
+    wake line each fire exactly once, independently — a lead that missed the desktop banner (asleep,
+    notifications off) still gets told here, and vice versa.
+
+    Kill-switch: `ctx_warn_wake` (default True) — checked BEFORE claiming anything, same reasoning
+    as the banner's own `notify_on_wake` check (`_maybe_warn_ctx_heavy`'s comment): a silenced line
+    must never burn the once-only stamp, so flipping it back on later still gets the FIRST real
+    check its line.
+
+    Best-effort/fail-open throughout, like every other block in this hook: a corrupt session.json,
+    an unlocatable transcript, or any other single-executor failure is skipped rather than raised,
+    and never affects any other executor's line."""
+    if not cfg.get("ctx_warn_wake", True):
+        return []
+    warn_threshold = float(cfg.get("context_warn_tokens", lg.LEAD_DEFAULTS["context_warn_tokens"]))
+    nudge_threshold = float(cfg.get("context_nudge_tokens", lg.LEAD_DEFAULTS["context_nudge_tokens"]))
+    if warn_threshold >= nudge_threshold:
+        return []  # row 57's own "never fires" clause — a misconfigured line is inert, not an error
+    lines = []
+    try:
+        root = Path(STATE_ROOT)
+        if not root.exists():
+            return []
+        for d in sorted(root.iterdir()):
+            exec_sid = d.name
+            sj = d / "session.json"
+            if not sj.exists():
+                continue
+            try:
+                s = json.loads(sj.read_text())
+            except Exception:
+                continue
+            if s.get("owner_lead") != sid:
+                continue  # not owned by THIS lead (another lead's, or unowned) — not ours to warn on
+            if s.get("status") not in ("busy", "idle", "stalled", "reported"):
+                continue
+            try:
+                path = _executor_transcript_path(s.get("claude_session"))
+                usage = lg.transcript_usage(str(path)) if path else None
+            except Exception:
+                usage = None
+            if usage is None:
+                continue  # no live reading to warn on — same rule as the banner
+            last_prompt = usage.get("last_prompt") or 0
+            if last_prompt < warn_threshold or last_prompt >= nudge_threshold:
+                continue
+            key = f"{exec_sid}:ctx-warn-wake"
+            if not lg.claim_notification(STATE_ROOT, sid, key):
+                continue  # already warned once for this sid
+            ctx_k = int(last_prompt // 1000)
+            warn_k = int(warn_threshold // 1000)
+            nudge_k = int(nudge_threshold // 1000)
+            lines.append(
+                f"  {CTX_WARN_MARKER} {exec_sid} is approaching heavy ({ctx_k}k ctx, warn line "
+                f"{warn_k}k, rotate line {nudge_k}k) — plan a rotate: relay retire {exec_sid} + a "
+                f"fresh spawn for its next packet")
+    except Exception:
+        pass
+    return lines
 
 
 def _notify_summary(lines):
@@ -305,6 +406,14 @@ def main():
             rlines, rkeys = _report_lines(lg, sid)
             lines += rlines
             surfaced_keys += rkeys
+        # Backlog row 87: the "approaching heavy" 🟠 line(s) — after the report lines, before the
+        # handoff nudge below (see _ctx_warn_lines' own docstring for the once-per-executor/kill-
+        # switch rules). Never added to surfaced_keys: like the handoff nudge line, this isn't a
+        # report, so nothing here participates in the report-delivery dedupe machinery above.
+        try:
+            lines += _ctx_warn_lines(lg, cfg, sid)
+        except Exception:
+            pass  # fail-open — a heads-up line is best-effort, never worth breaking the hook over
         # Handoff nudge — token-first, MB as the secondary "session age" signal: live context
         # (transcript_usage's last_prompt) is the primary trip, exactly like the executor heaviness
         # gate (lead_guard.is_heavy); a heavy transcript-MB-on-disk (never shrinks — compaction
@@ -342,7 +451,14 @@ def main():
         except Exception:
             pass  # fail-open — the nudge is best-effort, never worth breaking the hook over
         if lines:
-            _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, _notify_summary(lines),
+            # Row 87: a wake whose lines are ALL 🟠 ctx-warn lines has nothing new to bannerize — the
+            # desktop banner for each of those sids already fired (from bin/relay's own
+            # `_maybe_warn_ctx_heavy`, under its own `<sid>:ctx-warn` key) — so pass notify_msg=None
+            # to skip that tier here rather than duplicate it. Any OTHER mix (a report, a commit, the
+            # handoff nudge) still gets its normal summary/banner.
+            all_ctx_warn = all(ln.lstrip().startswith(CTX_WARN_MARKER) for ln in lines)
+            notify_msg = None if all_ctx_warn else _notify_summary(lines)
+            _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg,
                                kind="sync", transcript_path=transcript_path)  # exits 2
 
         # Nothing instant. If an executor is still busy, become a BACKGROUND poller that waits for

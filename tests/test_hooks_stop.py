@@ -775,6 +775,95 @@ class TestStopHookHandoffNudge:
 
 
 # =================================================================================================
+# Backlog row 87 — the 🟠 "approaching heavy" line on the lead's own wake
+# =================================================================================================
+
+class TestStopHookCtxWarnWake:
+    """stop_lead_watch.py's `_ctx_warn_lines` — the sibling of row 57's desktop banner
+    (bin/relay's `_maybe_warn_ctx_heavy`) that rides the LEAD's own Stop-hook wake instead of only
+    a footnote/banner the lead has to go looking for. One 🟠 line per OWNED executor past
+    `context_warn_tokens` but below `context_nudge_tokens`, once per executor sid."""
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_an_owned_executor_past_the_warn_line_gets_the_line(self, drv, tmp_path):
+        armed(tmp_path, context_warn_tokens=120000, context_nudge_tokens=150000)
+        H.make_executor(tmp_path, status="busy", report=None, claude_session="exec-1-cs")
+        H.executor_transcript(tmp_path, "exec-1-cs", 125_000)
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert run.returncode == WAKE
+        assert "\U0001f7e0 exec-1 is approaching heavy" in run.stderr
+        assert "125k ctx" in run.stderr
+        assert "warn line 120k" in run.stderr
+        assert "rotate line 150k" in run.stderr
+        assert "relay retire exec-1" in run.stderr
+        assert "surface that line verbatim" in run.stderr
+        # The wake's own once-only key is claimed — a second attempt at the SAME key must fail.
+        assert lg.claim_notification(H.state_root(tmp_path), "lead-1", "exec-1:ctx-warn-wake") is False
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_second_stop_does_not_repeat_it(self, drv, tmp_path):
+        armed(tmp_path, context_warn_tokens=120000, context_nudge_tokens=150000)
+        H.make_executor(tmp_path, status="busy", report=None, claude_session="exec-1-cs")
+        H.executor_transcript(tmp_path, "exec-1-cs", 125_000)
+        first = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert first.returncode == WAKE
+        second = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert "\U0001f7e0" not in second.stderr
+
+    @pytest.mark.parametrize("tokens", [119_000, 155_000], ids=["below-warn", "past-rotate"])
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_outside_the_warn_band_produces_no_line(self, drv, tokens, tmp_path):
+        armed(tmp_path, context_warn_tokens=120000, context_nudge_tokens=150000)
+        H.make_executor(tmp_path, status="busy", report=None, claude_session="exec-1-cs")
+        H.executor_transcript(tmp_path, "exec-1-cs", tokens)
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert "\U0001f7e0" not in run.stderr
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_an_unowned_executor_never_gets_the_line(self, drv, tmp_path):
+        armed(tmp_path, context_warn_tokens=120000, context_nudge_tokens=150000)
+        H.make_executor(tmp_path, status="busy", report=None, owner_lead="lead-2",
+                         claude_session="exec-1-cs")
+        H.executor_transcript(tmp_path, "exec-1-cs", 125_000)
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert "\U0001f7e0" not in run.stderr
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_ctx_warn_wake_kill_switch(self, drv, tmp_path):
+        """LEAD_DEFAULTS `ctx_warn_wake` — a separate switch from `notify_on_wake` (README/row 87):
+        false here silences only the wake line, not the banner/footnote/board chip."""
+        armed(tmp_path, context_warn_tokens=120000, context_nudge_tokens=150000,
+              ctx_warn_wake=False)
+        H.make_executor(tmp_path, status="busy", report=None, claude_session="exec-1-cs")
+        H.executor_transcript(tmp_path, "exec-1-cs", 125_000)
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert "\U0001f7e0" not in run.stderr
+        assert run.returncode == SILENT
+
+    def test_a_wake_of_only_ctx_warn_lines_skips_the_banner_tier(self, tmp_path):
+        """Item 2: row 57's `_maybe_warn_ctx_heavy` already fired this sid's ONE desktop banner
+        (from `_check_one`, under its own `<sid>:ctx-warn` key) — a wake whose `lines` are ALL 🟠
+        must not fire a second banner for it here."""
+        armed(tmp_path, context_warn_tokens=120000, context_nudge_tokens=150000)
+        H.make_executor(tmp_path, status="busy", report=None, claude_session="exec-1-cs")
+        H.executor_transcript(tmp_path, "exec-1-cs", 125_000)
+        run = H.run_hook(STOP, stop_payload(tmp_path), tmp_path, no_notify=False)
+        assert run.returncode == WAKE
+        assert "\U0001f7e0 exec-1 is approaching heavy" in run.stderr
+        assert H.stub_calls(tmp_path / "stub-calls.log") == []
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_the_line_rides_an_existing_report_wake(self, drv, tmp_path):
+        armed(tmp_path, context_warn_tokens=120000, context_nudge_tokens=150000)
+        H.make_executor(tmp_path, status="reported", claude_session="exec-1-cs")
+        H.executor_transcript(tmp_path, "exec-1-cs", 125_000)
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert run.returncode == WAKE
+        assert "executor 'exec-1' reported" in run.stderr
+        assert "\U0001f7e0 exec-1 is approaching heavy" in run.stderr
+
+
+# =================================================================================================
 # The announce instruction — posture-aware (SKILL.md §6f / task #16)
 # =================================================================================================
 

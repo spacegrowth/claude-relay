@@ -2760,6 +2760,15 @@ class TestContextWarnDefault:
         assert lg.LEAD_DEFAULTS["context_warn_tokens"] < lg.LEAD_DEFAULTS["context_nudge_tokens"]
 
 
+class TestCtxWarnWakeDefault:
+    """Backlog row 87: `ctx_warn_wake` is the kill-switch for the 🟠 wake line hooks/stop_lead_
+    watch.py appends alongside row 57's banner — additive, defaults on, and independent of
+    `notify_on_wake` (which governs desktop banners generally, not this)."""
+
+    def test_default_is_true(self):
+        assert lg.LEAD_DEFAULTS["ctx_warn_wake"] is True
+
+
 class TestLeadNudgeSplit:
     """Task: split the heaviness threshold by role — leads nudge at `lead_nudge_tokens` (default
     300000) on a 1M window, executors keep `context_nudge_tokens` (default 150000) unchanged.
