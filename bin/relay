@@ -1322,7 +1322,7 @@ def cmd_spawn(args):
             mcp_flags=mcp_flags,
             agent_flags=agent_flags,
             effort=effort,
-            lead_handle=owner_marker.get("iterm_session"),
+            lead_handle=_live_lead_handle(owner_lead, owner_marker),
             layout=layout,
         )
         pid = read_pid(session_id)
@@ -1613,6 +1613,22 @@ def _inherited_pins(old_owner):
 TIDY_TERMINAL_STATUSES = ("closed", "superseded", "dead")
 
 
+def _live_lead_handle(lead_sid, marker):
+    """The lead's CURRENT iTerm handle for placing a new tab next to it. When the caller IS that
+    lead (`relay spawn` typed in the lead's own session) its `$ITERM_SESSION_ID`/`$TERM_SESSION_ID`
+    is the live tab, while the marker's `iterm_session` is whatever was captured at arm time — and
+    goes stale when iTerm restarts and restores the tab under a new UUID (backlog row 89), which
+    sent `try_create_adjacent_tab` and the AppleScript fallback looking for a tab that no longer
+    exists. Any other caller gets the marker's handle, as before."""
+    recorded = (marker or {}).get("iterm_session")
+    if lead_sid and os.environ.get("CLAUDE_CODE_SESSION_ID") == lead_sid \
+            and not os.environ.get("RELAY_HEADLESS"):
+        env = os.environ.get("ITERM_SESSION_ID") or os.environ.get("TERM_SESSION_ID")
+        if env and re.match(r"^w\d+t\d+p\d+:[0-9A-Fa-f-]{36}$", env):
+            return env
+    return recorded
+
+
 def _lead_order_key(marker):
     """Where a lead's group sits in the tab bar: its LINEAGE start, not its own `started`. A handoff
     successor is a brand-new marker with a brand-new `started`, so ordering on `started` alone would
@@ -1714,6 +1730,82 @@ def tidy_order(groups):
     return order
 
 
+def tidy_follows(groups):
+    """{executor handle: its lead's handle} for every grouped executor — handed to
+    `iterm.reorder_tabs` so an executor is only ever moved when its lead's tab was found in the
+    SAME window (backlog row 89: a lead whose handle resolved to nothing used to leave its
+    executors to be hoisted, alone, to the front of the window)."""
+    return {e["handle"]: g["handle"] for g in groups for e in g["executors"]}
+
+
+# Where Claude Code records each running interactive session: `<pid>.json` carrying `sessionId`.
+# Backlog row 89 reads it to find the claude process behind a lead (a lead marker's own `pid` file
+# goes stale on `claude --resume` just like its `iterm_session` does).
+CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+
+
+def _ttys_of_pids(pids):
+    """{pid: 'ttys002'} for the live pids among `pids`, via ONE `ps` call; {} on any failure."""
+    pids = sorted({int(p) for p in pids if p})
+    if not pids:
+        return {}
+    try:
+        r = subprocess.run(["ps", "-o", "pid=,tty=", "-p", ",".join(map(str, pids))],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        return {}
+    out = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1] not in ("??", "-"):
+            out[int(parts[0])] = parts[1]
+    return out
+
+
+def _tidy_tty_hints(groups):
+    """{handle: tty} — the tty of the claude process behind every lead and executor in `groups`.
+
+    BACKLOG ROW 89, the root cause: iTerm was restarted (2026-09-13 17:20, window arrangement
+    restored, every `claude --resume`d back into its tab) and EVERY restored tab got a NEW session
+    UUID, while each lead marker kept the pre-restart `iterm_session`. tidy's order then matched
+    none of the seven leads and only the one executor spawned after the restart (its handle was
+    captured live) — and `reorder_tabs` hoisted that lone matched tab to the FRONT of the window,
+    reporting `reordered 1 window(s); 8 session id(s) had no tab`, every run. A handle is a
+    snapshot; the claude process's tty is not: `reorder_tabs` re-points a handle no live tab holds
+    at the tab on this tty, inside its one API connection (a second connection from one process
+    fails, row 73). Leads are found through Claude Code's own `~/.claude/sessions/<pid>.json`
+    (its `sessionId`); executors through the same file keyed by their `claude_session`, falling
+    back to the pid relay recorded at launch. Best-effort: {} when
+    nothing resolves, and a miss just leaves that handle as it was."""
+    lead_pids = {}
+    try:
+        for f in CLAUDE_SESSIONS_DIR.glob("*.json"):
+            try:
+                rec = json.loads(f.read_text())
+            except Exception:
+                continue
+            if isinstance(rec, dict) and rec.get("sessionId") and str(rec.get("pid", "")).isdigit():
+                lead_pids.setdefault(rec["sessionId"], []).append(int(rec["pid"]))
+    except Exception:
+        pass
+    wanted = {}   # handle -> [candidate pids]
+    for g in groups:
+        wanted[g["handle"]] = lead_pids.get(g["lead"], [])
+        for e in g["executors"]:
+            s = read_session(e["sid"]) or {}
+            # Its Claude Code conversation id first (survives a `claude --resume` into a restored
+            # tab, which is exactly when the recorded pid has also gone stale), then that pid.
+            wanted[e["handle"]] = lead_pids.get(s.get("claude_session"), []) \
+                or [p for p in (s.get("pid"),) if p]
+    ttys = _ttys_of_pids(p for ps in wanted.values() for p in ps)
+    hints = {}
+    for handle, pids in wanted.items():
+        found = {ttys[p] for p in pids if p in ttys}
+        if len(found) == 1:           # two live claudes for one sid on different ttys: don't guess
+            hints[handle] = found.pop()
+    return hints
+
+
 def _paint_group(g, cfg=None):
     """Re-apply one lead's color to its own tab and to every executor tab in its group, so a group
     that drifted apart (an adopted executor, a lead armed before it had a color) converges again.
@@ -1745,7 +1837,10 @@ _TIDY_RETRYABLE_EXC_RE = re.compile(r"connection|timeout|websocket|brokenpipe|os
 
 # The two figures try_reorder_tabs reports in its success reason, read back for the ledger so a
 # `tidy` event carries them as fields instead of only inside prose.
-_TIDY_WINDOWS_RE = re.compile(r"reordered (\d+) window")
+# Row 89 changed the success reason to `moved N tab(s) in M window(s)` (N = tabs whose position
+# actually changed); the old `reordered M window(s)` shape is still accepted for older ledgers.
+_TIDY_WINDOWS_RE = re.compile(r"(?:reordered|tab\(s\) in) (\d+) window")
+_TIDY_MOVED_RE = re.compile(r"(?:moved|would move) (\d+) tab\(s\)")
 _TIDY_MISSING_RE = re.compile(r"(\d+) session id\(s\) had no tab")
 
 # ── backlog row 73: the automatic tidy always failed with tidy_skipped attempts=2 ──────────────
@@ -1789,6 +1884,8 @@ def _ledger_tidy(ok, reason, attempts):
     if ok:
         w = _TIDY_WINDOWS_RE.search(reason or "")
         m = _TIDY_MISSING_RE.search(reason or "")
+        n = _TIDY_MOVED_RE.search(reason or "")
+        fields["moved"] = int(n.group(1)) if n else 0
         fields["windows"] = int(w.group(1)) if w else 0
         fields["missing"] = int(m.group(1)) if m else 0
     try:
@@ -1814,11 +1911,12 @@ def _tidy_now(cfg=None):
     if not order:
         return False, "no lead tabs to order", groups   # nothing was attempted → nothing to ledger
     attempts = 1
-    ok, reason = iterm_backend.reorder_tabs(order)
+    kw = {"tty_hints": _tidy_tty_hints(groups), "follows": tidy_follows(groups)}
+    ok, reason = iterm_backend.reorder_tabs(order, **kw)
     if not ok and _tidy_retryable(reason):
         time.sleep(TIDY_RETRY_DELAY)
         attempts = 2
-        ok, reason = iterm_backend.reorder_tabs(order)
+        ok, reason = iterm_backend.reorder_tabs(order, **kw)
     _ledger_tidy(ok, reason, attempts)
     return ok, reason, groups
 
@@ -1897,8 +1995,18 @@ def cmd_tidy(args):
                 print(c(f"  · {sid} — another window, left where it is", "dim"))
     if args.dry_run:
         if not args.quiet:
-            print(c(f"dry run — {len(tidy_order(groups))} tab(s) would be reordered; nothing "
-                    f"moved.", "dim"))
+            # Row 89: the count is the plan DIFFED against the live tab bar (iterm_pyapi computes
+            # it with `dry_run=True`, moving nothing) — not `len(tidy_order(groups))`, which named
+            # every managed tab and so could never say whether anything would move.
+            ok, reason = iterm_backend.reorder_tabs(tidy_order(groups), dry_run=True,
+                                                     tty_hints=_tidy_tty_hints(groups),
+                                                     follows=tidy_follows(groups))
+            n = _TIDY_MOVED_RE.search(reason or "") if ok else None
+            if n:
+                print(c(f"dry run — {n.group(1)} tab(s) would be reordered ({reason}); nothing "
+                        f"moved.", "dim"))
+            else:
+                print(c(f"dry run — live tab order unreadable ({reason}); nothing moved.", "dim"))
         return
     ok, reason, _ = _tidy_now()
     if args.quiet:

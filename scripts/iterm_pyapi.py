@@ -83,7 +83,7 @@ def try_create_adjacent_tab(lead_handle, timeout=DEFAULT_TIMEOUT):
         return None
 
 
-def _window_tab_order(tabs_session_ids, desired):
+def _window_tab_order(tabs_session_ids, desired, follows=None):
     """Pure, no-iterm2-needed: ONE window's new tab order. `tabs_session_ids` is that window's tabs,
     each a list of that tab's session ids (the same shape `_index_of_lead_tab` takes); `desired` is
     the wanted order of session ids, which may name tabs in other windows or none at all.
@@ -93,9 +93,19 @@ def _window_tab_order(tabs_session_ids, desired):
     existing relative order; `matched` is the desired ids this window actually holds, in that same
     order. A desired id this window doesn't hold is simply skipped — it belongs to another window
     (or to no tab at all), and `try_reorder_tabs` reports the ones no window claimed. A tab holding
-    two desired ids (a split pane) is placed once, at its FIRST mention."""
+    two desired ids (a split pane) is placed once, at its FIRST mention.
+
+    `follows` (backlog row 89) maps an id to the id it must sit AFTER — an executor to its lead. An
+    id whose anchor this window did not match (the lead's tab is in another window, or its recorded
+    handle resolves to no tab at all) is NOT moved: it stays among the untouched tabs. Without this,
+    a group whose lead could not be found lost its head and its executors alone were hoisted to the
+    FRONT of the window — exactly the "spawned executor lands first" incident."""
+    follows = follows or {}
     front, matched = [], []
     for uuid in desired:
+        anchor = follows.get(uuid)
+        if anchor is not None and anchor not in matched:
+            continue
         i = _index_of_lead_tab(tabs_session_ids, uuid)
         if i is None or i in front:
             continue
@@ -105,52 +115,116 @@ def _window_tab_order(tabs_session_ids, desired):
     return front + rest, matched
 
 
-async def _reorder_tabs(desired, timeout):
+def _moved_count(order):
+    """Pure: how many tabs a window order actually changes the position of — the number `relay
+    tidy` reports, 0 for a window that is already in the wanted order."""
+    return sum(1 for pos, i in enumerate(order) if pos != i)
+
+
+def _norm_tty(tty):
+    """'/dev/ttys002' and 'ttys002' are the same device; compare on the bare name."""
+    tty = str(tty or "").strip()
+    return tty[len("/dev/"):] if tty.startswith("/dev/") else tty
+
+
+async def _reorder_tabs(desired, timeout, tty_hints=None, follows=None, dry_run=False):
     import iterm2  # lazy: only ever imported here, inside the try/except caller below
 
     connection = await iterm2.Connection.async_create()
     app = await iterm2.async_get_app(connection)
-    matched, moved = [], 0
-    for window in app.windows:
-        tabs = list(window.tabs)
-        shape = [[s.session_id for s in t.sessions] for t in tabs]
-        order, here = _window_tab_order(shape, desired)
+    windows = list(app.windows)
+    tabs_by_window = [list(w.tabs) for w in windows]
+    shapes = [[[s.session_id for s in t.sessions] for t in tabs] for tabs in tabs_by_window]
+    live = {sid for shape in shapes for tab in shape for sid in tab}
+
+    # Backlog row 89: a recorded handle goes STALE when iTerm restarts (every restored tab gets a
+    # new session UUID) while the claude inside keeps running. The caller hands a tty per id (the
+    # tty of the claude process behind that lead/executor); an id no live tab holds is re-pointed
+    # at the live session on that tty. Asked only when some id is actually unresolved.
+    tty_hints = {k: _norm_tty(v) for k, v in (tty_hints or {}).items() if v}
+    alias = {}
+    unresolved = [u for u in desired if u not in live and tty_hints.get(u)]
+    if unresolved:
+        by_tty = {}
+        for tabs in tabs_by_window:
+            for t in tabs:
+                for s in t.sessions:
+                    tty = _norm_tty(await s.async_get_variable("tty"))
+                    if tty:
+                        by_tty.setdefault(tty, s.session_id)
+        used = set(desired) & live
+        for u in unresolved:
+            cand = by_tty.get(tty_hints[u])
+            if cand and cand not in used:
+                alias[u] = cand
+                used.add(cand)
+    ids = [alias.get(u, u) for u in desired]
+    anchors = {alias.get(k, k): alias.get(v, v) for k, v in (follows or {}).items()}
+
+    matched, left, tabs_moved, windows_moved = [], 0, 0, 0
+    for window, tabs, shape in zip(windows, tabs_by_window, shapes):
+        order, here = _window_tab_order(shape, ids, anchors)
         matched.extend(here)
-        if not here or order == list(range(len(tabs))):
+        held = {sid for tab in shape for sid in tab}
+        left += sum(1 for u in ids if u in held and u not in here and u in anchors)
+        n = _moved_count(order)
+        if not here or n == 0:
             continue  # nothing of ours in this window, or it is already in the wanted order
+        tabs_moved += n
+        windows_moved += 1
+        if dry_run:
+            continue
         # ONLY ever this window's own tabs. async_set_tabs documents that "the provided tabs may
         # belong to any window. They will be moved if needed" — handing it a tab from elsewhere
         # would YANK that tab into this window, which is not what tidying a tab bar means.
         await window.async_set_tabs([tabs[i] for i in order])
-        moved += 1
-    return matched, moved
+    missing = sum(1 for u in ids if u not in live)
+    return {"matched": matched, "tabs": tabs_moved, "windows": windows_moved, "missing": missing,
+            "left": left, "resolved": len(alias)}
 
 
-def try_reorder_tabs(desired, timeout=REORDER_TIMEOUT):
+def try_reorder_tabs(desired, timeout=REORDER_TIMEOUT, tty_hints=None, follows=None,
+                     dry_run=False):
     """Best-effort: move the tabs holding `desired`'s iTerm session ids to the FRONT of their OWN
     window, in that order, leaving every other tab in that window after them in its existing order
     (exactly what `iterm2.Window.async_set_tabs` does with a partial list). Ids may be given in
-    either form — a `w#t#p#:UUID` handle or a bare UUID.
+    either form — a `w#t#p#:UUID` handle or a bare UUID (the same goes for `tty_hints`/`follows`
+    keys and values).
+
+    `tty_hints` {id: tty} re-points an id no live tab holds at the tab on that tty (a handle made
+    stale by an iTerm restart); `follows` {id: anchor id} leaves an id where it is when its anchor
+    was not found in the same window (see `_window_tab_order`); `dry_run` computes everything and
+    moves nothing.
 
     Returns `(ok, reason)` and NEVER raises. False + the reason when the `iterm2` package is
     missing, the Python API is disabled in iTerm's settings, the connection times out, or NO tab
-    anywhere holds any of the given ids. True when at least one window was inspected and claimed an
-    id — `reason` then says how many windows were actually moved (a window already in the wanted
-    order is left untouched) and how many ids no window claimed. Bounded to `timeout` seconds
-    total, so a caller can never hang on this being unreachable.
+    anywhere holds any of the given ids. True when at least one window claimed an id — `reason` is
+    then `moved N tab(s) in M window(s)` (`would move …` on a dry run), N being the tabs whose
+    POSITION actually changes (0 when already tidy), followed by how many ids no window claimed.
+    Bounded to `timeout` seconds total, so a caller can never hang on this being unreachable.
 
     Deliberately NOT `iterm2.run_until_complete`: that helper calls `sys.exit(1)` when the
     connection is refused, which would abort the whole relay command over a cosmetic tab move.
     Same bounded `asyncio.run(...)` shape `try_create_adjacent_tab` uses."""
-    ids = [str(x).split(":")[-1] for x in (desired or []) if x]
+    def bare(x):
+        return str(x).split(":")[-1]
+    ids = [bare(x) for x in (desired or []) if x]
     if not ids:
         return False, "nothing to order"
+    hints = {bare(k): v for k, v in (tty_hints or {}).items() if k}
+    anchors = {bare(k): bare(v) for k, v in (follows or {}).items() if k and v}
     try:
-        matched, moved = asyncio.run(asyncio.wait_for(_reorder_tabs(ids, timeout), timeout=timeout))
+        r = asyncio.run(asyncio.wait_for(
+            _reorder_tabs(ids, timeout, hints, anchors, dry_run), timeout=timeout))
     except Exception as e:
         return False, f"iterm2 python api unavailable ({type(e).__name__}: {e})"
-    if not matched:
+    if not r["matched"]:
         return False, "no iTerm tab found for any of the ordered session ids"
-    missing = len(ids) - len(matched)
-    return True, ((f"reordered {moved} window(s)" if moved else "already in order")
-                  + (f"; {missing} session id(s) had no tab" if missing else ""))
+    reason = f"{'would move' if dry_run else 'moved'} {r['tabs']} tab(s) in {r['windows']} window(s)"
+    if r["missing"]:
+        reason += f"; {r['missing']} session id(s) had no tab"
+    if r["left"]:
+        reason += f"; {r['left']} executor tab(s) left in place (lead tab not in their window)"
+    if r["resolved"]:
+        reason += f"; {r['resolved']} stale handle(s) resolved by tty"
+    return True, reason

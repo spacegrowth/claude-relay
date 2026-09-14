@@ -177,7 +177,7 @@ def tab_color_printf(rgb):
     return tab_color_escape(rgb).replace("\033", "\\033").replace("\a", "\\a")
 
 
-def reorder_tabs(window_ordering, timeout=None):
+def reorder_tabs(window_ordering, timeout=None, tty_hints=None, follows=None, dry_run=False):
     """Move the tabs holding `window_ordering`'s iTerm session ids to the FRONT of their OWN window,
     in that order, leaving every other tab in that window after them in its existing order — how
     `relay tidy` puts the tab bar back into [Lead] [Exec 1] [Exec 2] … [Lead 2] [Exec 2.1] … order.
@@ -193,12 +193,17 @@ def reorder_tabs(window_ordering, timeout=None):
     RELAY_NO_TIDY is an absolute kill-switch, checked FIRST: this is the only code path that can
     reorder a human's real tabs, so it must be switchable off from the environment. The test suite
     sets it for every test (tests/conftest.py) — a test asserting on tidy stubs this function
-    instead of unsetting it."""
+    instead of unsetting it.
+
+    `tty_hints`, `follows` and `dry_run` pass straight through (backlog row 89 — see
+    `iterm_pyapi.try_reorder_tabs`): stale-handle resolution by tty, executors never hoisted
+    without their lead, and a count-only dry run."""
     if os.environ.get("RELAY_NO_TIDY"):
         return False, "disabled by RELAY_NO_TIDY"
+    kw = {"tty_hints": tty_hints, "follows": follows, "dry_run": dry_run}
     if timeout is None:
-        return iterm_pyapi.try_reorder_tabs(window_ordering)
-    return iterm_pyapi.try_reorder_tabs(window_ordering, timeout)
+        return iterm_pyapi.try_reorder_tabs(window_ordering, **kw)
+    return iterm_pyapi.try_reorder_tabs(window_ordering, timeout, **kw)
 
 
 def notify_via_tty(tty_path, title, body):

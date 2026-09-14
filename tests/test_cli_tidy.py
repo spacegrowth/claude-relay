@@ -115,7 +115,13 @@ class FakeTerm:
         self.titles = {}
         self.ttys = {}             # handle -> a real path relay's tab painter may write to
         self.reorders = []         # every reorder_tabs call, as the handle list it was given
-        self.reorder_result = (True, "reordered 1 window(s)")
+        self.dry_runs = []         # row 89: every dry_run=True call — never a move, kept apart
+        self.reorder_kw = []       # row 89: the tty_hints/follows each call carried
+        self.reorder_result = (True, "moved 3 tab(s) in 1 window(s)")
+        # Row 89: when set, a LIVE tab bar — windows, each a list of tabs, each a list of bare
+        # session ids — that reorder_tabs diffs the plan against (and, unless dry_run, rearranges)
+        # with iterm_pyapi's own pure helpers, so a moved-count is computed rather than scripted.
+        self.live = None
         # Row 69: an optional QUEUE of results, one popped per call, for the retry tests — a
         # single `reorder_result` cannot express "fails, then succeeds". Empty/None falls back to
         # `reorder_result`, so every existing test is unaffected.
@@ -190,11 +196,41 @@ class FakeTerm:
     def live_session_names(self):
         return set(self.titles.values())
 
-    def reorder_tabs(self, window_ordering, timeout=None):
+    def reorder_tabs(self, window_ordering, timeout=None, tty_hints=None, follows=None,
+                     dry_run=False):
+        self.reorder_kw.append({"tty_hints": tty_hints, "follows": follows})
+        if self.live is not None:
+            return self._live_reorder(window_ordering, follows, dry_run)
+        if dry_run:
+            self.dry_runs.append(list(window_ordering))
+            return (True, "would move 0 tab(s) in 0 window(s)")
         self.reorders.append(list(window_ordering))
         if self.reorder_results:
             return self.reorder_results.pop(0)
         return self.reorder_result
+
+
+def _fake_live_reorder(self, window_ordering, follows, dry_run):
+    pyapi = sys.modules["iterm_pyapi"]
+    (self.dry_runs if dry_run else self.reorders).append(list(window_ordering))
+    ids = [str(x).split(":")[-1] for x in window_ordering]
+    anchors = {str(k).split(":")[-1]: str(v).split(":")[-1] for k, v in (follows or {}).items()}
+    tabs = windows = 0
+    matched = []
+    for wi, window in enumerate(self.live):
+        order, here = pyapi._window_tab_order([[t] for t in window], ids, anchors)
+        matched += here
+        n = pyapi._moved_count(order)
+        if here and n:
+            tabs, windows = tabs + n, windows + 1
+            if not dry_run:
+                self.live[wi] = [window[i] for i in order]
+    if not matched:
+        return (False, "no iTerm tab found for any of the ordered session ids")
+    return (True, f"{'would move' if dry_run else 'moved'} {tabs} tab(s) in {windows} window(s)")
+
+
+FakeTerm._live_reorder = _fake_live_reorder
 
 
 @pytest.fixture
@@ -482,13 +518,14 @@ class TestTidyCommand:
         assert out.index("[Exec] a-one") < out.index("[Lead] beta") < out.index("[Exec] b-one")
         assert "nothing moved" in out
         assert terms.reorders == []
+        assert len(terms.dry_runs) == 1   # it READ the live order (dry_run=True) and moved nothing
 
     def test_it_applies_the_order_through_the_backend(self, relay, terms, capsys):
         two_leads(relay)
         run_main(relay, "tidy")
         assert terms.reorders == [["w0t0p0:A", "w0t3p0:A1", "w0t4p0:A2",
                                    "w0t9p0:B", "w0t7p0:B1", "w0t8p0:B2"]]
-        assert "reordered 1 window(s)" in capsys.readouterr().out
+        assert "moved 3 tab(s) in 1 window(s)" in capsys.readouterr().out
 
     def test_an_unavailable_api_is_reported_not_raised(self, relay, terms, capsys):
         two_leads(relay)
@@ -1051,3 +1088,157 @@ class TestTidyOnFixtureDoesNotHijackOtherSubprocessCalls:
                                        capture_output=True, text=True)
         assert result.returncode == 0                              # real exit 0, not the fake's exit 2
         assert result.stdout.strip() == "not-a-tidy-call-7f2c"     # only the real /bin/echo emits this
+
+
+# ── backlog row 89: the real moved-count, stale handles, orphaned executors ─────────────────────
+
+class TestTidyMovedCount:
+    """Row 89: a spawned executor landed FIRST in its window and stayed there through every tidy,
+    while `--dry-run` printed `len(tidy_order(groups))` — every managed tab — as its count. The
+    count is now the plan diffed against the LIVE tab bar."""
+
+    def test_dry_run_prints_the_real_count_and_moves_nothing(self, relay, terms, capsys):
+        two_leads(relay)
+        terms.live = [["B1", "A", "X", "A1", "A2", "B", "B2"]]
+        run_main(relay, "tidy", "--dry-run")
+        out = capsys.readouterr().out
+        assert "dry run — 7 tab(s) would be reordered" in out
+        assert terms.live == [["B1", "A", "X", "A1", "A2", "B", "B2"]]   # untouched
+        assert terms.reorders == []
+
+    def test_dry_run_on_a_tidy_tab_bar_says_zero(self, relay, terms, capsys):
+        two_leads(relay)
+        terms.live = [["A", "A1", "A2", "B", "B1", "B2", "X"]]
+        run_main(relay, "tidy", "--dry-run")
+        assert "dry run — 0 tab(s) would be reordered" in capsys.readouterr().out
+
+    def test_tidy_is_idempotent(self, relay, terms, capsys, monkeypatch):
+        monkeypatch.delenv("RELAY_NO_TIDY", raising=False)   # ledger is silent under the switch;
+        two_leads(relay)                                       # reorder_tabs itself is stubbed
+        terms.live = [["X", "B2", "A1", "B", "A", "A2", "B1"]]
+        run_main(relay, "tidy")
+        assert terms.live == [["A", "A1", "A2", "B", "B1", "B2", "X"]]
+        assert "tidy: moved 6 tab(s) in 1 window(s)" in capsys.readouterr().out
+        run_main(relay, "tidy")
+        assert "tidy: moved 0 tab(s) in 0 window(s)" in capsys.readouterr().out
+        assert terms.live == [["A", "A1", "A2", "B", "B1", "B2", "X"]]
+        ev = ledger_events(relay, "tidy")
+        assert [e["moved"] for e in ev] == [6, 0]   # B already sat at index 3
+        assert ev[0]["windows"] == 1 and ev[1]["windows"] == 0
+        run_main(relay, "tidy", "--dry-run")
+        assert "dry run — 0 tab(s) would be reordered" in capsys.readouterr().out
+
+    def test_the_ledger_reason_carries_the_moved_count(self, relay, terms, monkeypatch):
+        monkeypatch.delenv("RELAY_NO_TIDY", raising=False)
+        two_leads(relay)
+        terms.reorder_result = (True, "moved 4 tab(s) in 2 window(s); 1 session id(s) had no tab")
+        run_main(relay, "tidy")
+        ev = ledger_events(relay, "tidy")[-1]
+        assert ev["reason"].startswith("moved 4 tab(s) in 2 window(s)")
+        assert (ev["moved"], ev["windows"], ev["missing"]) == (4, 2, 1)
+
+    def test_an_old_shape_reason_still_parses(self, relay, terms, monkeypatch):
+        monkeypatch.delenv("RELAY_NO_TIDY", raising=False)
+        two_leads(relay)
+        terms.reorder_result = (True, "reordered 2 window(s); 3 session id(s) had no tab")
+        run_main(relay, "tidy")
+        ev = ledger_events(relay, "tidy")[-1]
+        assert (ev["moved"], ev["windows"], ev["missing"]) == (0, 2, 3)
+
+    def test_executors_are_anchored_to_their_lead(self, relay, terms):
+        two_leads(relay)
+        run_main(relay, "tidy")
+        assert terms.reorder_kw[-1]["follows"] == {
+            "w0t3p0:A1": "w0t0p0:A", "w0t4p0:A2": "w0t0p0:A",
+            "w0t7p0:B1": "w0t9p0:B", "w0t8p0:B2": "w0t9p0:B"}
+
+    def test_the_incident_an_executor_whose_lead_tab_is_gone_is_not_hoisted_first(
+            self, relay, terms):
+        """The 2026-09-13 shape: the lead's recorded handle names no live tab, the executor's does.
+        Pre-fix the lone matched executor was moved to index 0."""
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w0t0p0:STALE", color=[200, 140, 135],
+                 started="2020-01-01T00:00:00")
+        make_exec(relay, "e1", "lead-a", "w0t3p0:E1", spawned="2020-01-02T00:00:00")
+        terms.live = [["OTHER-LEAD", "LIVE-A", "E1"]]
+        run_main(relay, "tidy")
+        assert terms.live == [["OTHER-LEAD", "LIVE-A", "E1"]]
+
+
+class TestTidyTtyHints:
+    """Row 89 root cause: an iTerm restart re-mints every tab's session UUID; the claude process
+    (and its tty) survives. Hints map each handle to that tty."""
+
+    def _sessions_dir(self, relay, tmp_path, monkeypatch, recs):
+        d = tmp_path / "claude-sessions"
+        d.mkdir()
+        for pid, sid in recs:
+            (d / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": sid}))
+        monkeypatch.setattr(relay, "CLAUDE_SESSIONS_DIR", d)
+
+    def test_leads_via_claude_sessions_and_executors_via_claude_session_or_pid(
+            self, relay, terms, tmp_path, monkeypatch):
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w0t0p0:A", started="2020-01-01T00:00:00")
+        make_exec(relay, "e1", "lead-a", "w0t1p0:E1", spawned="2020-01-02T00:00:00", pid=303)
+        make_exec(relay, "e2", "lead-a", "w0t2p0:E2", spawned="2020-01-03T00:00:00", pid=999)
+        self._sessions_dir(relay, tmp_path, monkeypatch, [(101, "lead-a"), (202, "cs-e2")])
+        monkeypatch.setattr(relay, "_ttys_of_pids",
+                            lambda pids: {101: "ttys001", 202: "ttys002", 303: "ttys003"})
+        hints = relay._tidy_tty_hints(relay.tidy_groups())
+        assert hints == {"w0t0p0:A": "ttys001", "w0t1p0:E1": "ttys003", "w0t2p0:E2": "ttys002"}
+
+    def test_an_ambiguous_or_dead_process_gives_no_hint(self, relay, terms, tmp_path, monkeypatch):
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w0t0p0:A", started="2020-01-01T00:00:00")
+        arm_lead(relay, "lead-b", "beta", iterm_session="w0t1p0:B", started="2020-01-02T00:00:00")
+        self._sessions_dir(relay, tmp_path, monkeypatch, [(1, "lead-a"), (2, "lead-a"), (3, "lead-b")])
+        monkeypatch.setattr(relay, "_ttys_of_pids", lambda pids: {1: "ttys001", 2: "ttys009"})
+        assert relay._tidy_tty_hints(relay.tidy_groups()) == {}
+
+    def test_tidy_hands_the_hints_to_the_backend(self, relay, terms, tmp_path, monkeypatch):
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w0t0p0:A", started="2020-01-01T00:00:00")
+        self._sessions_dir(relay, tmp_path, monkeypatch, [(101, "lead-a")])
+        monkeypatch.setattr(relay, "_ttys_of_pids", lambda pids: {101: "ttys001"})
+        run_main(relay, "tidy")
+        run_main(relay, "tidy", "--dry-run")
+        assert [kw["tty_hints"] for kw in terms.reorder_kw] == [{"w0t0p0:A": "ttys001"}] * 2
+
+    def test_ps_output_is_parsed(self, relay, monkeypatch):
+        out = " 101 ttys001\n 202 ??\n"
+        monkeypatch.setattr(relay.subprocess, "run",
+                            lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=out))
+        assert relay._ttys_of_pids([101, 202]) == {101: "ttys001"}
+        assert relay._ttys_of_pids([]) == {}
+
+
+class TestSpawnLeadHandle:
+    """Row 89: the tab is created next to the lead's LIVE tab — the caller's own
+    $ITERM_SESSION_ID when the caller is that lead — not the marker's possibly-stale handle."""
+
+    def _spawn(self, relay, tmp_path, monkeypatch):
+        run_main(relay, "spawn", str(tmp_path), "topic", write_packet(tmp_path), "--name", "e1")
+
+    def test_the_calling_leads_own_session_id_wins(self, relay, terms, tmp_path, monkeypatch):
+        arm_lead(relay, "lead-a", "alpha", iterm_session="w1t7p0:" + "0" * 36,
+                 started="2020-01-01T00:00:00")
+        live = "w1t1p0:3D646899-FF6B-4C79-B062-1138A605D519"
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-a")
+        monkeypatch.setenv("ITERM_SESSION_ID", live)
+        monkeypatch.delenv("RELAY_HEADLESS", raising=False)
+        self._spawn(relay, tmp_path, monkeypatch)
+        assert terms.spawns[-1]["lead_handle"] == live
+
+    def test_another_caller_gets_the_marker_handle(self, relay, terms, tmp_path, monkeypatch):
+        recorded = "w1t7p0:" + "0" * 36
+        m = arm_lead(relay, "lead-a", "alpha", iterm_session=recorded)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "someone-else")
+        monkeypatch.setenv("ITERM_SESSION_ID", "w1t1p0:3D646899-FF6B-4C79-B062-1138A605D519")
+        assert relay._live_lead_handle("lead-a", m) == recorded
+
+    def test_a_headless_or_malformed_env_is_ignored(self, relay, monkeypatch):
+        recorded = "w1t7p0:" + "0" * 36
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-a")
+        monkeypatch.setenv("ITERM_SESSION_ID", "garbage")
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+        assert relay._live_lead_handle("lead-a", {"iterm_session": recorded}) == recorded
+        monkeypatch.setenv("ITERM_SESSION_ID", "w1t1p0:3D646899-FF6B-4C79-B062-1138A605D519")
+        monkeypatch.setenv("RELAY_HEADLESS", "1")
+        assert relay._live_lead_handle("lead-a", {"iterm_session": recorded}) == recorded

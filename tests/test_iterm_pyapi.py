@@ -253,7 +253,7 @@ class TestTryReorderTabs:
         window = _window(["LEAD"], ["EXEC"], ["X"])
         _fake_app(monkeypatch, [window])
         ok, reason = pyapi.try_reorder_tabs(["LEAD", "EXEC"])
-        assert ok is True and reason == "already in order"
+        assert ok is True and reason == "moved 0 tab(s) in 0 window(s)"   # row 89: a real count
         assert window.set_calls == []
 
     def test_ids_with_no_tab_are_reported_but_do_not_fail_the_tidy(self, monkeypatch):
@@ -263,3 +263,77 @@ class TestTryReorderTabs:
         assert ok is True
         assert "1 session id(s) had no tab" in reason
         assert window.set_calls == [[["LEAD"], ["X"]]]
+
+
+# ── backlog row 89 ──────────────────────────────────────────────────────────────────────────────
+
+def _tty_window(*tabs):
+    """Like `_window`, but each tab is (session_id, tty) and sessions answer
+    `async_get_variable("tty")` the way the real iterm2 Session does."""
+    window = _window(*[[sid] for sid, _ in tabs])
+    for t, (_, tty) in zip(window.tabs, tabs):
+        async def get_var(name, _tty=tty):
+            return _tty if name == "tty" else None
+        t.sessions[0].async_get_variable = get_var
+    return window
+
+
+class TestRow89Placement:
+    def test_moved_count_is_positions_changed(self):
+        assert pyapi._moved_count([0, 1, 2]) == 0
+        assert pyapi._moved_count([2, 0, 1]) == 3
+        assert pyapi._moved_count([1, 0, 2]) == 2
+
+    def test_an_executor_whose_lead_is_not_in_the_window_is_not_hoisted(self):
+        """The incident: the lead's id matched nothing, the lone executor went to index 0."""
+        tabs = [["L1"], ["L2"], ["EXEC"]]
+        order, matched = pyapi._window_tab_order(tabs, ["STALE-LEAD", "EXEC"],
+                                                 {"EXEC": "STALE-LEAD"})
+        assert order == [0, 1, 2] and matched == []
+        # …and pre-fix (no anchors) exactly that hoist:
+        assert pyapi._window_tab_order(tabs, ["STALE-LEAD", "EXEC"])[0] == [2, 0, 1]
+
+    def test_an_anchored_executor_follows_its_found_lead(self):
+        tabs = [["EXEC"], ["X"], ["LEAD"]]
+        order, matched = pyapi._window_tab_order(tabs, ["LEAD", "EXEC"], {"EXEC": "LEAD"})
+        assert order == [2, 0, 1] and matched == ["LEAD", "EXEC"]
+
+    def test_reason_counts_moved_tabs_and_windows(self, monkeypatch):
+        w = _window(["EXEC"], ["X"], ["LEAD"])
+        _fake_app(monkeypatch, [w])
+        ok, reason = pyapi.try_reorder_tabs(["LEAD", "EXEC"], follows={"EXEC": "LEAD"})
+        assert ok and reason == "moved 3 tab(s) in 1 window(s)"
+        assert w.set_calls == [[["LEAD"], ["EXEC"], ["X"]]]
+
+    def test_dry_run_counts_and_moves_nothing(self, monkeypatch):
+        w = _window(["EXEC"], ["X"], ["LEAD"])
+        _fake_app(monkeypatch, [w])
+        ok, reason = pyapi.try_reorder_tabs(["LEAD", "EXEC"], dry_run=True)
+        assert ok and reason == "would move 3 tab(s) in 1 window(s)"
+        assert w.set_calls == []
+
+    def test_a_stale_handle_is_resolved_by_tty(self, monkeypatch):
+        """iTerm restarted: the lead's recorded UUID is gone, its claude still runs on ttys002."""
+        w = _tty_window(("EXEC", "/dev/ttys000"), ("OTHER", "/dev/ttys001"),
+                        ("LIVE-LEAD", "/dev/ttys002"))
+        _fake_app(monkeypatch, [w])
+        ok, reason = pyapi.try_reorder_tabs(
+            ["w1t7p0:STALE-LEAD", "w1t2p0:EXEC"], tty_hints={"w1t7p0:STALE-LEAD": "ttys002"},
+            follows={"w1t2p0:EXEC": "w1t7p0:STALE-LEAD"})
+        assert ok and reason == "moved 3 tab(s) in 1 window(s); 1 stale handle(s) resolved by tty"
+        assert w.set_calls == [[["LIVE-LEAD"], ["EXEC"], ["OTHER"]]]
+
+    def test_a_tty_already_claimed_by_a_live_id_is_not_reused(self, monkeypatch):
+        w = _tty_window(("LEAD", "/dev/ttys002"), ("EXEC", "/dev/ttys003"))
+        _fake_app(monkeypatch, [w])
+        ok, reason = pyapi.try_reorder_tabs(["LEAD", "GHOST", "EXEC"],
+                                            tty_hints={"GHOST": "/dev/ttys002"})
+        assert ok and "1 session id(s) had no tab" in reason and "resolved" not in reason
+
+    def test_unanchored_executors_are_reported_as_left_in_place(self, monkeypatch):
+        w = _window(["X"], ["EXEC"])
+        _fake_app(monkeypatch, [w])
+        ok, reason = pyapi.try_reorder_tabs(["X", "GONE", "EXEC"], follows={"EXEC": "GONE"})
+        assert ok and w.set_calls == []
+        assert reason == ("moved 0 tab(s) in 0 window(s); 1 session id(s) had no tab; "
+                          "1 executor tab(s) left in place (lead tab not in their window)")
