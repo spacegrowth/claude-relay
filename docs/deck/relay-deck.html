@@ -266,9 +266,10 @@ bin/relay
     <div><p class="light">Everything else.</p><p class="muted step"><strong>Sonnet.</strong> Bounded features, bugs with a repro, refactors inside one module. Most packets land here.</p></div>
   </div>
   <hr class="rule">
-  <p class="step"><strong>Picked too weak?</strong> Third packet into the same session, relay puts a banner on your screen. Say "upgrade" and it moves one tier up. <strong>Too strong?</strong> The lead's terminal says "haiku can do this" at spawn.</p>
+  <p class="step"><strong>Who decides?</strong> <code>/relay:tier</code> — <code>auto</code> (the lead picks per packet, default) · <code>manual</code> (you pick at every spawn — relay puts the three options in front of you, recommended first) · <code>lead</code> (executors mirror the lead's own model).</p>
+  <p class="step"><strong>Picked too weak?</strong> Say "upgrade" — one tier up, seeded successor. <strong>Too strong?</strong> The lead says so at spawn.</p>
   <p class="foot">Pass the tier name (<code>haiku</code> / <code>sonnet</code> / <code>opus</code>); relay resolves it through this machine's CLI. Effort: leave it alone. Relay pins executors to <code>high</code>, the CLI default, whatever your own <code>/effort</code> is set to. A longer-thinking Sonnet is still a Sonnet — the tier is the lever, not the dial.</p>
-  <aside class="notes">Check the cheap case first, then the expensive one; Sonnet is what is left. The "two rounds" rule is the only feedback most people will actually use.</aside>
+  <aside class="notes">Check the cheap case first, then the expensive one; Sonnet is what is left. The "two rounds" rule is the only feedback most people will actually use. New since the last pass: /relay:tier decides WHO picks, separate from the rubric that decides WHAT to pick — manual is the one posture autonomous mode never relaxes, so a manual-tier lead still stops to ask even with /relay:auto on.</aside>
 </section>
 <section class="slide">
   <p class="eyebrow">caching, in simple terms</p>
@@ -322,26 +323,25 @@ without a cache        ≈ 5.2M</pre>
   <h1>Keep using a session while it's cheap. Replace it when it isn't.</h1>
   <div class="cols cols-2">
     <div>
-      <p><strong>Executors.</strong> The next packet goes into the one you already have. It's warm and it knows the code. A fresh one is the exception, not the default.</p>
-      <p class="step">Its context grows with every turn. Past 150k the lead stops sending into it: it retires the session and starts a successor that reads a seed of what the old one did. You lose the conversation, you keep the knowledge.</p>
+      <p><strong>Executors.</strong> The next packet goes into the one you already have — reuse by default, a fresh spawn only when there's a reason.</p>
+      <p class="step">Two lines, not one: past 120k, a single 🟠 line rides the lead's wake plus a desktop banner (once per executor) — plan a rotate. Past 150k the lead stops sending in: retire + a seeded successor. You lose the conversation, keep the knowledge.</p>
       <div class="step" style="margin-top:2.4vh">
-        <p class="small muted" style="margin-bottom:.6vh">executor live context, against the 150k line</p>
-        <div class="gauge"><i style="width:88%"></i><s style="left:50%"></s></div>
-        <p class="small tabular">264k: rotate</p>
+        <p class="small muted" style="margin-bottom:.6vh">executor live context — warn at 120k, rotate at 150k</p>
+        <div class="gauge"><i style="width:48%"></i><s style="left:40%"></s><s style="left:50%"></s></div>
+        <p class="small tabular">145k: past warn — plan a rotate</p>
       </div>
     </div>
     <div>
-      <p><strong>The lead.</strong> It grows too, more slowly, because it reads reports and diffs instead of code — a lead's line is 300k on a 1M window (150k when its window is 200k), because an executor is a stateless worker (the packet and the seed carry everything, so replacing it is cheap) while a lead is the stateful judge (its context IS the project's decisions), so it earns twice the room before a handoff pays off; and it grows slowly once diffs are reviewed by a fork (slide 7). Past it relay nudges once: hand off. The lead writes a note of where things stand, and a fresh lead picks up from the note. Every executor keeps running.</p>
-      <p class="step">Transcript size is the second signal: 5 MB on disk means several compactions, so the plan in its head is a summary of summaries.</p>
+      <p><strong>The lead.</strong> It grows too, but slower — reports and reviewed diffs, not code. One line: 300k on a 1M window (150k on 200k). Past it, relay nudges once: hand off with a note, and a fresh lead picks up. Every executor keeps running.</p>
       <div class="step" style="margin-top:2.4vh">
-        <p class="small muted" style="margin-bottom:.6vh">the lead that wrote this deck: live context against the 300k line (1M window)</p>
+        <p class="small muted" style="margin-bottom:.6vh">the lead that wrote this deck: live context against the 300k line</p>
         <div class="gauge"><i style="width:80%"></i><s style="left:75%"></s></div>
-        <p class="small tabular">321k: hand off &nbsp;·&nbsp; its transcript said 4.5 MB, "getting close"</p>
+        <p class="small tabular">321k: hand off</p>
       </div>
     </div>
   </div>
-  <p class="foot">The first session the 150k gate ever caught was the executor that built it. Why reuse is cheap and size is a tax: caching, a few slides on.</p>
-  <aside class="notes">Same idea at two speeds, and two prices. Executors are stateless workers: the packet and the seed carry everything, so rotating one is cheap and the line sits at 150k. A lead is the stateful judge: its context is the project's decisions, and a handoff means a note, a new tab and re-adoption, so it earns 300k before the memory tax outweighs that. Not higher, because past a few hundred thousand tokens every turn is slower and attention drops, exactly where review and routing calls live. Executors churn in an afternoon; a lead lasts days. Rotate = retire plus a seeded successor, one step, the lead does it. Handoff = a note plus a fresh lead, and it's the one thing agent teams can't do at all. The 321k / 4.5 MB pair is real: the lead building this deck. MB said "getting close"; tokens said "twice past the line". That's why the nudge went token-first in 0.3.49. Why 300k and not 800k: per-turn memory cost is ~10% of live context at the cached rate, and a cold cache rewrites the whole prefix, so past ~300k the memory bill exceeds a ~15k handoff.</aside>
+  <p class="foot">Two lines for an executor, plan then act; one for the lead, hand off with a note — nothing rotates or hands off silently.</p>
+  <aside class="notes">Executors are stateless workers: the packet and the seed carry everything, so rotating one is cheap, and it gets two lines instead of one — 120k plans it (a 🟠 line the lead surfaces verbatim, once per executor sid, plus a desktop banner and a yellow footnote/amber board chip — same underlying signal, three places it shows up), 150k does it (retire + seeded successor). A lead is the stateful judge: its context is the project's decisions, and a handoff means a note plus a fresh lead, so it earns one higher line — 300k on a 1M window, capped to 150k when the window is really 200k. Not higher, because past a few hundred thousand tokens every turn is slower and attention drops, exactly where review and routing calls live. It also grows slower once diffs are reviewed by a fork (slide 7) instead of read inline. Transcript size on disk is the secondary signal for BOTH roles (handoff_nudge_mb, default 5MB): it never shrinks, so a big number alone means several compactions in even when live context looks fine right now. The lead building this deck sat at 321k live context and 4.5MB on disk — tokens crossed the line before MB looked urgent, which is why the nudge went token-first. Rotate = retire plus a seeded successor, one step, the lead does it. Handoff = a note plus a fresh lead, the one thing agent teams can't do at all.</aside>
 </section>
 <section class="slide">
   <p class="eyebrow">lifecycle</p>
@@ -397,7 +397,10 @@ without a cache        ≈ 5.2M</pre>
     <div><h3>lead</h3>
       <p><code>mode</code> become the lead: model check, edit gate, wake</p>
       <p><code>auto</code> proceed-by-default inside an approved plan</p>
+      <p><code>tier</code> who picks an executor's model: auto / manual / lead</p>
+      <p><code>plan</code> this lead's ordered packet queue · <code>next</code> prints the spawn command, never sends</p>
       <p><code>handoff</code> hand this lead to a fresh one, with a note</p>
+      <p><code>close-predecessor</code> successor-only: close the outgoing lead's tab</p>
       <p><code>route</code> the edit gate's escape hatch, reason ledgered</p>
       <p><code>stop</code> step down</p>
     </div>
@@ -421,7 +424,7 @@ without a cache        ≈ 5.2M</pre>
     <div><h3>lifecycle</h3>
       <p><code>close</code> park it now · <code>retire</code> park + successor seed · <code>keep</code> pin</p>
       <p><code>resume</code> bring back a closed or crashed one, context intact · <code>restart</code> re-run the packet fresh</p>
-      <p><code>adopt</code> claim an orphan · <code>prune</code> clear old state</p>
+      <p><code>adopt</code> claim an orphan · <code>prune</code> clear old state, stale paused leads too (<code>[lead, paused]</code>)</p>
       <p><code>tidy</code> re-group tabs [Lead] [Exec…] [Lead 2] [Exec…] in each lead's colour, automatic after spawn/rotate/handoff/resume/restart</p>
     </div>
     <div><h3>learn</h3>
@@ -430,11 +433,14 @@ without a cache        ≈ 5.2M</pre>
 haiku   1        -       100%     353k
 opus    11       -       36%      8.3M
 sonnet  259      0.5     20%      10.1M</pre>
+    </div>
+    <div><h3>setup</h3>
       <p><code>doctor</code> proves the installed CLI still behaves as relay assumes. Run it after every Claude Code update.</p>
+      <p><code>install-cli</code> writes a bare <code>relay</code> wrapper on $PATH that survives <code>/plugin update</code></p>
     </div>
   </div>
   <p class="foot">Now the live run: arm, spawn a Haiku packet, watch the wake, verify, review, commit.</p>
-  <aside class="notes">Don't read this out. Point at the six groups, then at stats: that's the one that turns "did I pick the right model" from a feeling into a number. Then straight into the demo.</aside>
+  <aside class="notes">Don't read this out. Point at the seven groups, then at stats: that's the one that turns "did I pick the right model" from a feeling into a number. New since the model-tier slide: tier and plan under lead, close-predecessor for handoff cleanup, and a new setup group pairing doctor with install-cli (the $PATH wrapper that survives a marketplace /plugin update, since the cache path is versioned with no stable symlink). Then straight into the demo.</aside>
 </section>
 </div>
 

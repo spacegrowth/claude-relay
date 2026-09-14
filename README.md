@@ -208,6 +208,7 @@ relay keep <session_id> [--off]            pin/unpin an executor against auto-cl
 /relay:restart <session_id> [--mcp SPEC]   re-run a dead session's packet fresh (loses context)
 /relay:route retain "<reason>"             open a grace window when the gate blocks lead work
 /relay:auto on|off|status                  autonomous posture: proceed by default on routine, in-plan steps (per-session; committing still stops)
+/relay:tier auto|manual|lead|status        who picks an executor's model when spawn doesn't say one (see Model tier below)
 /relay:diff <session_id>                   render staged changes to an HTML review page and open it
 /relay:verify <session_id> [--rerun]       machine-check a report against its staged reality: MALFORMED / MISMATCH / INCONCLUSIVE / COUNTS-MATCH (never "PASS" — see below for why)
 relay verify <sid> --for-autocommit [--in-plan] [--diff-reviewed]   the auto-commit gate: CLEARED / NOT-CLEARED-BECAUSE-… (flags are the lead's own attestations)
@@ -456,16 +457,30 @@ The posture lives in that lead's own marker, so it's per-session and **resets on
 scoped it to. Set `autonomous_mode: true` if you always work this way; the command still overrides it
 either direction.
 
-A separate posture, `/relay:tier`, governs a different question — not *whether* the lead proceeds,
-but *who picks an executor's model* when
-`/relay:spawn` (or `relay send --rotate`/`--upgrade`) doesn't say. `auto` (default) leaves that
-decision to the lead's own rubric, same as today; `manual` moves it to the human at every one of
-those calls — **the one posture that ADDS a stop, and it is never relaxed by autonomous mode**, so
-turning autonomous mode on does not let a manual-tier lead skip asking about a model; `lead` makes
-executors mirror the lead's own model class instead. Layering: config `executor_default_model` /
-`executor_model_ceiling` (machine default, and the ceiling on everything below it) < `relay tier`
-(this lead session, resets to `auto` on every fresh arm exactly like the autonomous posture) <
-`--model` on one spawn (always wins).
+### Model tier: who picks the executor's model
+
+A separate posture, `/relay:tier`, governs a different question from `/relay:auto` above — not
+*whether* the lead proceeds, but *who picks an executor's model* when `/relay:spawn` (or `relay
+send --rotate`/`--upgrade`) doesn't say one:
+
+```
+/relay:tier auto      # the lead's own rubric decides, per packet — same as today (default)
+/relay:tier manual    # the human decides at EVERY spawn/rotate/upgrade
+/relay:tier lead      # executors mirror the lead's own model class
+/relay:tier status    # current posture + where it came from
+```
+
+- **`auto`** (default) — the lead's own rubric decides per packet, exactly like today.
+- **`manual`** — the human decides at *every* spawn/rotate/upgrade: instead of picking silently,
+  the lead runs `relay tier ask --packet <p> --json` and puts the tier options in front of you.
+  **This is the one posture that ADDS a stop, and autonomous mode never relaxes it** — turning
+  `/relay:auto on` does not let a manual-tier lead skip asking about a model.
+- **`lead`** — executors mirror the lead's own model class instead of the rubric.
+
+Like the autonomous posture, this one lives in the lead's own marker and **resets to `auto` on
+every fresh arm** (`/relay:mode`) — it can't silently outlive the session you set it in. Layering:
+config `executor_default_model` / `executor_model_ceiling` (machine default, and the ceiling on
+everything below it) < `relay tier` (this lead session) < `--model` on one spawn (always wins).
 
 ## Auto-wake and notifications
 
@@ -605,6 +620,11 @@ time, never stored (except a hand-set `done`):
 - **reported** — that executor's report for the bound packet exists and it has not landed.
 - **done** — the bound packet has a `landed` ledger event, or `relay plan done N` was run by hand.
 
+Known caveat: `done` derives from the `landed` ledger event, which only the auto-close sweep
+writes. A packet the lead instead commits by cherry-pick (a different branch/worktree than the
+executor's own) and then closes with `relay close` skips that sweep entirely, so the item sits at
+`reported` forever — run `relay plan done N` by hand in that case.
+
 v0 **never sends**: `relay plan next` prints the exact `relay spawn …` / `relay send …` command for
 the first queued item (exit 1 when nothing is queued) — running it stays the lead's call.
 
@@ -639,8 +659,11 @@ says how many).
 
 `/relay:board` (`relay board --open`) renders a self-contained HTML snapshot of everything relay
 knows: a summary strip, warning banners (orphaned executors, reports not yet proven delivered to
-their lead, heavy sessions, stale wake hooks), then one card per lead with its executors — status,
-model + `LAUNCH`, `TOKENS` (with cache warm/cold and a hit-rate chip)/MB, packet count — each row expanding to the executor's packet timeline
+their lead, heavy sessions, stale wake hooks, a present-but-unreadable executor `session.json`
+rendered as a red `broken` row — same treatment `relay list` gives it), then one card per lead with
+its executors — status, model + `LAUNCH`, `TOKENS` (with cache warm/cold and a hit-rate chip)/MB,
+packet count (an executor between the 120k warn line and the 150k rotate line shows an amber
+`approaching heavy · <ctx>k` chip) — each row expanding to the executor's packet timeline
 (gist, the report's outcome sentence and TL;DR, links to the packet / report / diff page) and
 copyable `relay …` commands. Filter box, "show closed", light theme by default with a remembered
 ☀️/🌙 switch. It is built from exactly the functions `relay list` uses (and runs the same liveness
@@ -736,6 +759,11 @@ Closing is parking, not loss: the report is on disk, staged work stays in the wo
 - **Unique lead names**: if a lead's project name collides with another *live* lead's, relay
   auto-suffixes it (`claude-relay` → `claude-relay-2`) and prints a note; a crashed/stale lead never
   holds onto its name, so re-arming in the same folder reclaims the base name.
+- **Resuming a crashed lead keeps its disambiguated title too**: `/relay:resume <sid>` (it routes to
+  the lead-resume path automatically when the id belongs to a crashed lead — marker present, no
+  `session.json`) reopens the conversation under the title its marker actually recorded, which may
+  already carry a collision suffix (`[Lead] X ·<id4>`) from a prior handoff — never a freshly
+  recomputed bare `[Lead] X` that would re-collide with a still-open sibling tab.
 - **Per-lead tab colors** (iTerm only): each lead gets a stable color from a 6-color palette, and
   every executor it spawns inherits it — so with multiple leads running, one glance groups each
   lead with its workers. The color follows a lead's *identity*, not its session: a handoff

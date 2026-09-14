@@ -26,7 +26,7 @@ next slide; `←` back; `Home` / `End`; `n` toggles speaker notes; `?` shows thi
 
 Before the talk: a repo with a green test suite, `terminal-notifier` installed, iTerm open.
 
-1. `/relay:mode` — read the model check out loud.
+1. `/relay:mode` — read the model check out loud. (Optional: `/relay:tier status` — auto, by default.)
 2. Show the packet (already written, 8 lines):
    ```
    Add a one-line docstring to every public function in src/util.py that lacks one.
