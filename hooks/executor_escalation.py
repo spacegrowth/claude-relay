@@ -221,7 +221,7 @@ def main():
         # the two producers gets here first for this "<executor>:<packet>" key fires the banner, the
         # other stays quiet. When THIS is the one that fires, `_notify_human` reads the lead's own
         # marker for its iterm_session, so it uses the SAME iTerm-OSC tier a wake would rather than
-        # landing on terminal-notifier for lack of one.
+        # landing on osascript's degraded banner for lack of one.
         if lg.claim_notification(STATE_ROOT, owner_lead, f"{sid}:{n}"):
             _notify_human(lg, cfg, sid, n, owner_lead, "review it")
         # A successful `nudge-lead` proves the TEXT was typed, not that the lead consumed it (a busy

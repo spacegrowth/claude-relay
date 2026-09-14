@@ -79,7 +79,7 @@ def _pristine_backends():
 
 @pytest.fixture(autouse=True)
 def _no_desktop_notifications():
-    """desktop_nudge() shells out to terminal-notifier/osascript. RELAY_NO_NOTIFY is its own
+    """desktop_nudge() shells out to osascript. RELAY_NO_NOTIFY is its own
     documented kill-switch — set it so no test can put a banner on the human's screen. Env is
     handled by hand rather than via `monkeypatch`, so that requesting `monkeypatch` here does not
     force it to be the FIRST fixture set up (and so the LAST torn down) in every test — which is

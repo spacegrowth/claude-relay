@@ -39,8 +39,8 @@ HARD_CLEAR_SOURCES = {"clear"}
 
 
 def _notify_rearm(lg, sid, marker):
-    """Desktop banner on re-arm — reuses stop_lead_watch's existing three-tier `_notify` (iTerm
-    OSC 777 → terminal-notifier → osascript) rather than inventing a second notification path.
+    """Desktop banner on re-arm — reuses stop_lead_watch's existing two-tier `_notify` (iTerm
+    OSC 777 → osascript) rather than inventing a second notification path.
 
     This is the ONLY channel that reaches the human here: a SessionStart hook's stdout goes to the
     model as session context, and its stderr goes nowhere at all. Honours the same `notify_on_wake`

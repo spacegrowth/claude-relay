@@ -519,8 +519,8 @@ class TestEscalationSendPath:
 
 
 class TestDuplicateBannerDedup:
-    """8b (lead-found): a user saw BOTH an iTerm banner and a terminal-notifier banner for the
-    SAME executor report. Two producers can decide to notify for the same report — the lead's own
+    """8b (lead-found): a user saw BOTH an iTerm banner and an osascript banner for the SAME
+    executor report. Two producers can decide to notify for the same report — the lead's own
     Stop-hook wake (hooks/stop_lead_watch.py) and this hook's own escalation push — because this
     wake's own pending→surfaced promotion (proven-delivery only) lags behind the banner it just
     fired, so an escalation push racing in that exact window still sees "not yet surfaced" and
@@ -533,8 +533,8 @@ class TestDuplicateBannerDedup:
     def _escalate(self, tmp_path, monkeypatch):
         """Runs executor_escalation.py's main() in-process: `relay whoami --json` reaches the real
         CLI against this tmp HOME (same identity contract TestEscalationSendPath exercises);
-        `nudge-lead` and any terminal-notifier/osascript call are intercepted and recorded instead
-        of reaching a real tab or a real desktop banner. Returns the list of intercepted calls."""
+        `nudge-lead` and any osascript call are intercepted and recorded instead of reaching a real
+        tab or a real desktop banner. Returns the list of intercepted calls."""
         mod = load_escalation_module()
         root = H.state_root(tmp_path)
         real_run = mod.subprocess.run
@@ -543,13 +543,12 @@ class TestDuplicateBannerDedup:
         monkeypatch.setattr("sys.argv", [ESCALATE, "exec-1"])
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
-        monkeypatch.setattr(lg, "find_terminal_notifier", lambda: "/x/terminal-notifier")
 
         def fake_run(cmd, **kw):
             if len(cmd) > 1 and cmd[1] == "nudge-lead":
                 calls.append(list(cmd))
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
-            if cmd and (str(cmd[0]).endswith("terminal-notifier") or cmd[0] == "osascript"):
+            if cmd and cmd[0] == "osascript":
                 calls.append(list(cmd))
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             return real_run(cmd, **kw)
@@ -563,14 +562,13 @@ class TestDuplicateBannerDedup:
     def _notifier_calls(self, calls):
         """Matches EITHER shape this test collects: raw stub-log lines (strings, from the real
         wake subprocess's stub PATH) or intercepted argv lists (from the in-process escalation
-        run) — either way, a call whose command names terminal-notifier or osascript."""
+        run) — either way, a call whose command names osascript."""
         out = []
         for c in calls:
             if not c:
                 continue
             first = c[0] if isinstance(c, (list, tuple)) else c
-            if "terminal-notifier" in str(first) or str(first).strip() == "osascript" \
-                    or (isinstance(c, str) and "osascript" in c):
+            if str(first).strip() == "osascript" or (isinstance(c, str) and "osascript" in c):
                 out.append(c)
         return out
 

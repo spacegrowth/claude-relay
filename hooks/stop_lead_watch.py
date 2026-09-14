@@ -49,10 +49,10 @@ def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_sess
             subtitle=None):
     """Desktop notification for a lead wake — resolves the title (project name) and default
     subtitle (which executor reported) from THIS call site's own vocabulary, then hands off to
-    `lead_guard.notify_banner` for the actual three-tier chain (iTerm OSC → terminal-notifier →
-    osascript — see that function's docstring). Lead-found gap (fixed): that chain used to be
-    copy-pasted here AND skipped entirely by bin/relay's own `desktop_nudge`, which went straight
-    to terminal-notifier; both now call the ONE shared implementation.
+    `lead_guard.notify_banner` for the actual two-tier chain (iTerm OSC → osascript — see that
+    function's docstring). Lead-found gap (fixed): that chain used to be copy-pasted here AND
+    skipped entirely by bin/relay's own `desktop_nudge`, which went straight to osascript; both now
+    call the ONE shared implementation.
 
     Title names the project, subtitle/body names the executor. Configurable via notify_on_wake
     (checked HERE, before resolving title/subtitle at all — notify_banner itself only checks the

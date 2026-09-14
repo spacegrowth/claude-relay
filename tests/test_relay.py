@@ -2512,6 +2512,7 @@ class TestSend:
 
     def test_round_nudge_also_posts_a_desktop_banner(self, relay, tmp_path, capsys, monkeypatch):
         # The ℹ line lives in collapsed tool output; the banner is what the human actually sees.
+        # No iterm_session on this lead's marker → tier 1 doesn't apply, osascript (tier 2) fires.
         self._mk(relay, status="reported", pid=os.getpid(), claude_session="cs-x", report=True)
         s = relay.read_session("e1"); s["model"] = "sonnet"; s["owner_lead"] = "lead-1"
         relay.write_session("e1", s)
@@ -2523,15 +2524,12 @@ class TestSend:
         calls = []
         with mock.patch.object(relay.iterm, "send", return_value=True), \
              mock.patch.object(relay.iterm, "is_alive", return_value=True), \
-             mock.patch.object(relay.lead_guard, "find_terminal_notifier", return_value="/fake/tn"), \
              mock.patch.object(relay.subprocess, "run", side_effect=lambda a, **k: calls.append(a)):
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
-        banners = [a for a in calls if a and a[0] == "/fake/tn"]
+        banners = [a for a in calls if a and a[0] == "osascript"]
         assert banners, "no desktop banner posted for the round-3 nudge"
-        a = banners[-1]
-        assert "this is packet 3 into a sonnet session" in a[a.index("-message") + 1]
-        assert a[a.index("-group") + 1] == "relay-nudge-lead-1"
-        assert "focus lead-1" in a[a.index("-execute") + 1]
+        script = banners[-1][2]
+        assert "this is packet 3 into a sonnet session" in script
 
     def test_round_nudge_banner_respects_no_notify(self, relay, tmp_path, monkeypatch):
         self._mk(relay, status="reported", pid=os.getpid(), claude_session="cs-x", report=True)
@@ -2544,10 +2542,9 @@ class TestSend:
         calls = []
         with mock.patch.object(relay.iterm, "send", return_value=True), \
              mock.patch.object(relay.iterm, "is_alive", return_value=True), \
-             mock.patch.object(relay.lead_guard, "find_terminal_notifier", return_value="/fake/tn"), \
              mock.patch.object(relay.subprocess, "run", side_effect=lambda a, **k: calls.append(a)):
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
-        assert not [a for a in calls if a and a[0] == "/fake/tn"]
+        assert not [a for a in calls if a and a[0] == "osascript"]
 
     def test_send_records_landed_for_current_packet_before_next_packet_sent(self, relay, tmp_path):
         # Ledger event ORDER matters here: packet 001's `landed` must be appended before packet
@@ -7876,9 +7873,9 @@ class TestHeadlessProbeEnv:
 
 class TestDesktopNudgeUsesTheSharedNotifyChain:
     """Lead-found gap (fixed): `desktop_nudge` (the round-3-packet nudge) used to skip straight to
-    terminal-notifier, disagreeing with the Stop hook's documented three-tier chain (README "Auto-
-    wake and notifications"). Both now call `lead_guard.notify_banner` — one test per transport,
-    only the actual OS-facing calls (subprocess.run, iterm.notify_via_tty) mocked, so this proves
+    osascript, disagreeing with the Stop hook's documented two-tier chain (README "Auto-wake and
+    notifications"). Both now call `lead_guard.notify_banner` — one test per transport, only the
+    actual OS-facing calls (subprocess.run, iterm.notify_via_tty) mocked, so this proves
     `desktop_nudge` really drives the shared chain rather than just calling SOMETHING."""
 
     def _armed(self, relay, iterm_session=None):
@@ -7899,26 +7896,12 @@ class TestDesktopNudgeUsesTheSharedNotifyChain:
         assert len(tty_calls) == 1
         assert tty_calls[0][0] == "/dev/ttys004"
         assert "model check" in tty_calls[0][1]
-        assert sub_calls == []   # terminal-notifier/osascript never reached — tier 1 won
+        assert sub_calls == []   # osascript never reached — tier 1 won
 
-    def test_terminal_notifier_tier_used_when_no_tty_resolves(self, relay, monkeypatch):
+    def test_osascript_tier_used_when_no_tty_resolves(self, relay, monkeypatch):
         self._armed(relay, iterm_session=None)
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
         sub_calls = []
-        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier",
-                            lambda: "/x/terminal-notifier")
-        monkeypatch.setattr(relay.lead_guard.subprocess, "run",
-                            lambda cmd, **k: sub_calls.append(cmd))
-        relay.desktop_nudge("packet 3 on sonnet", lead_sid="lead-1")
-        assert sub_calls and sub_calls[0][0] == "/x/terminal-notifier"
-        assert "-group" in sub_calls[0] and "relay-nudge-lead-1" in sub_calls[0]
-        assert "-execute" in sub_calls[0]   # click → `relay focus lead-1` wired
-
-    def test_osascript_tier_used_when_terminal_notifier_is_missing(self, relay, monkeypatch):
-        self._armed(relay, iterm_session=None)
-        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
-        sub_calls = []
-        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: None)
         monkeypatch.setattr(relay.lead_guard.subprocess, "run",
                             lambda cmd, **k: sub_calls.append(cmd))
         relay.desktop_nudge("packet 3 on sonnet", lead_sid="lead-1")

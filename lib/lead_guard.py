@@ -39,10 +39,11 @@ LEAD_DEFAULTS = {
     "poll_interval": 5,          # how often that watcher re-checks for a report
     "notify_on_wake": True,      # pop a macOS notification when the lead is woken to review
     "notify_via": "auto",        # notification transport. "auto" = iTerm OSC-to-tty first (native
-                                 # click→the posting session), then terminal-notifier, then osascript.
-                                 # iTerm forces a "Session …"-prefixed banner title on that OSC tier
-                                 # (no escape parameter overrides it); "terminal-notifier" SKIPS the
-                                 # OSC tier for a clean title/subtitle (falls back to osascript).
+                                 # click→the posting session), falling back to osascript's built-in
+                                 # banner. iTerm forces a "Session …"-prefixed banner title on that
+                                 # OSC tier (no escape parameter overrides it); "osascript" SKIPS the
+                                 # OSC tier for a clean title/subtitle. A legacy "terminal-notifier"
+                                 # value (pre-drop) is treated as "osascript" — no error, no retitle.
     "executor_skip_permissions": False,  # spawn executors with --dangerously-skip-permissions
     "terminal_app": "auto",      # "iterm" | "terminal" | "auto" ($TERM_PROGRAM decides; iTerm default)
     "tab_colors": True,          # iTerm only: color each lead's tab + its executors' tabs alike
@@ -315,38 +316,24 @@ def now():
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def find_terminal_notifier():
-    """Absolute path to terminal-notifier, or None — PATH-robust. `shutil.which` alone gives FALSE
-    negatives in Stop-hook / launchd shells whose PATH lacks Homebrew's bin dir, so also probe the
-    standard brew locations. Callers must invoke it by THIS absolute path so it runs regardless of
-    the caller's PATH."""
-    p = shutil.which("terminal-notifier")
-    if p:
-        return p
-    for cand in ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"):
-        if os.access(cand, os.X_OK):
-            return cand
-    return None
-
-
 def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=None, group=None):
-    """The three-tier desktop notification chain EVERY relay banner should use — extracted from
+    """The two-tier desktop notification chain EVERY relay banner should use — extracted from
     hooks/stop_lead_watch.py's original `_notify` (lead-found gap: bin/relay's own `desktop_nudge`,
-    the round-3-packet nudge, skipped straight to terminal-notifier, disagreeing with the
-    documented chain — README "Auto-wake and notifications" — for no reason beyond having been
-    written separately). Both now call this ONE function, so a lead's tab-native OSC banner (zero
-    deps, native click-to-focus) fires for every relay notification, not only Stop-hook wakes.
+    the round-3-packet nudge, skipped straight to osascript, disagreeing with the documented chain
+    — README "Auto-wake and notifications" — for no reason beyond having been written separately).
+    Both now call this ONE function, so a lead's tab-native OSC banner (zero deps, native
+    click-to-focus) fires for every relay notification, not only Stop-hook wakes.
 
     1. iTerm native (OSC 777, written straight to the lead's own tty) — zero external deps, and
        clicking it focuses the POSTING session natively. Used whenever `iterm_session` is given AND
        `iterm.tty_by_id` can still resolve it to a live tty; returns regardless of whether the write
        itself succeeds (best-effort/never-raises — the point of a tier system, not a retry).
-    2. terminal-notifier — `-group` coalesces repeated pings of the SAME kind (replace rather than
-       stack); `-execute` runs `relay focus <lead>` so it works even if the lead's tty is gone.
-       `group` defaults to `relay-<lead_sid>`; a caller notifying for a DIFFERENT reason than "an
-       executor reported" (e.g. the round-3 nudge) passes its own group so the two banner kinds
-       don't replace each other in Notification Center.
-    3. osascript's built-in `display notification` — same info, NOT clickable, no coalescing.
+    2. osascript's built-in `display notification` — same info, NOT clickable, no coalescing.
+       Always available on macOS, so this is the unconditional fallback (no PATH probe needed).
+
+    `lead_sid` and `group` stay in the signature for callers that still pass them, but neither is
+    used by the osascript tier: it has no click-action and no grouping/coalescing concept (unlike
+    the retired terminal-notifier tier's `-execute`/`-group`).
 
     Honours `notify_on_wake` (the CALLER checks this — both call sites do, before building
     title/subtitle/message at all) is NOT re-checked here; RELAY_NO_NOTIFY IS checked here
@@ -354,8 +341,11 @@ def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=No
     raises."""
     if os.environ.get("RELAY_NO_NOTIFY"):
         return  # kill-switch: the test suite sets this so a hook/CLI run never fires a REAL
-                #             desktop banner (neither notifier path has a dry-run). Also usable in CI.
-    if iterm_session and (cfg or {}).get("notify_via", "auto") != "terminal-notifier":
+                #             desktop banner (osascript has no dry-run). Also usable in CI.
+    notify_via = (cfg or {}).get("notify_via", "auto")
+    if notify_via == "terminal-notifier":  # legacy config value (pre-drop) — treat as osascript
+        notify_via = "osascript"
+    if iterm_session and notify_via != "osascript":
         try:
             import iterm
             tty = iterm.tty_by_id(iterm_session)
@@ -364,23 +354,14 @@ def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=No
                 return
         except Exception:
             pass  # fall through to tier 2 — tty_by_id shells out to osascript, which can misbehave
-    tn = find_terminal_notifier()  # PATH-robust — a bare `which` fails in a hook's minimal PATH
     try:
-        if tn:
-            args = [tn, "-title", title, "-subtitle", subtitle, "-message", message[:200], "-sound", "Glass"]
-            if lead_sid:
-                relay_bin = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "relay")
-                args += ["-group", group or f"relay-{lead_sid}",
-                         "-execute", f"'{relay_bin}' focus {lead_sid}"]  # click → jump to the lead tab
-            subprocess.run(args, capture_output=True, timeout=5)
-        else:
-            # FALLBACK: no terminal-notifier → macOS's built-in banner via osascript. Same
-            # information but degraded: NOT clickable and no per-lead coalescing.
-            def q(s):
-                return (s or "").replace("\\", "\\\\").replace('"', '\\"')
-            script = (f'display notification "{q(subtitle + " — " + message[:180])}" '
-                      f'with title "{q(title)}" sound name "Glass"')
-            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+        # Tier 2 / only tier without iTerm: macOS's built-in banner via osascript. Same information
+        # but degraded: NOT clickable and no per-lead coalescing.
+        def q(s):
+            return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+        script = (f'display notification "{q(subtitle + " — " + message[:180])}" '
+                  f'with title "{q(title)}" sound name "Glass"')
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
     except Exception:
         pass
 
@@ -1424,7 +1405,7 @@ def mark_surfaced(state_root, lead_sid, keys):
 
 
 # ---- 8b: ONE desktop banner per (executor, packet) (lead-found duplicate-banner incident) -------
-# THE INCIDENT: a user saw BOTH an iTerm banner and a terminal-notifier banner for the SAME
+# THE INCIDENT: a user saw BOTH an iTerm banner and an osascript banner for the SAME
 # executor report. Two producers can legitimately fire for the same report: the lead's own
 # Stop-hook wake (stop_lead_watch.py's _notify, via _announce_and_wake) and the executor's own
 # escalation push (executor_escalation.py, which also now attempts a banner alongside its

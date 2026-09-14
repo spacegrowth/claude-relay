@@ -10,9 +10,9 @@ Oracle, in the shared bug-hunt priority order:
      exit 0 (fail open, never brick normal usage)".
   4. lib/lead_guard.py's #22/#23 blocks (L813-1011), which document the two-phase surfaced stamp.
 
-Every run here sets `RELAY_NO_NOTIFY=1` and puts stub `terminal-notifier`/`osascript` FIRST on
-PATH, so no test can post a real desktop banner; the one test that deliberately drops the
-kill-switch asserts against those stubs.
+Every run here sets `RELAY_NO_NOTIFY=1` and puts a stub `osascript` FIRST on PATH, so no test can
+post a real desktop banner; the one test that deliberately drops the kill-switch asserts against
+that stub.
 
 Run: pytest tests/test_hooks_stop.py -q
 """
@@ -943,23 +943,19 @@ class TestStopHookNotification:
 
     def test_a_wake_does_post_a_banner_when_nothing_suppresses_it(self, tmp_path):
         """The positive control that makes the two tests above meaningful: with neither switch
-        set, tier 2 (`terminal-notifier`) fires, titled by project and clickable back to the lead
-        (README:435-441)."""
+        set and no live iTerm tty to resolve, tier 2 (`osascript`) fires, titled by project
+        (README:435-441). Not clickable, no coalescing — the only tier a Terminal.app lead has."""
         armed(tmp_path)
         H.make_executor(tmp_path, status="reported")
         run = H.run_hook(STOP, stop_payload(tmp_path), tmp_path, no_notify=False)
         assert run.returncode == WAKE
         calls = " ".join(H.stub_calls(tmp_path / "stub-calls.log"))
-        assert "terminal-notifier" in calls
+        assert "osascript" in calls
         assert "relay · proj" in calls                  # title names the project
-        assert "-group relay-lead-1" in calls           # coalesces per lead
-        assert "focus lead-1" in calls                  # click jumps to the lead's tab
-        assert "osascript" not in calls                 # tier 3 is a FALLBACK, not an extra banner
 
     def test_notification_never_touches_the_real_desktop_tools(self, tmp_path):
-        """The stub dir is first on PATH and lead_guard.find_terminal_notifier probes PATH first
-        (L209-220), so even the "no kill-switch" path is contained. This test pins that: the
-        binary actually invoked is the stub inside tmp_path."""
+        """The stub dir is first on PATH, so even the "no kill-switch" path is contained. This
+        test pins that: the binary actually invoked is the stub inside tmp_path."""
         armed(tmp_path)
         H.make_executor(tmp_path, status="reported")
         H.run_hook(STOP, stop_payload(tmp_path), tmp_path, no_notify=False)

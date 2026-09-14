@@ -93,7 +93,7 @@ def _pristine_backends():
 
 @pytest.fixture(autouse=True)
 def _no_desktop_notifications():
-    """desktop_nudge() shells out to terminal-notifier/osascript — RELAY_NO_NOTIFY is its
+    """desktop_nudge() shells out to osascript — RELAY_NO_NOTIFY is its
     documented kill-switch."""
     saved = os.environ.get("RELAY_NO_NOTIFY")
     os.environ["RELAY_NO_NOTIFY"] = "1"

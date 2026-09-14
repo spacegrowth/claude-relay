@@ -4,8 +4,8 @@ report poller, and the per-turn heartbeat.
 
 Split out of tests/test_hooks_stop.py purely for size; the oracle, the drivers and the fixtures are
 that file's. Read its module docstring first — in particular the note that every run here sets
-`RELAY_NO_NOTIFY=1` and shadows `terminal-notifier`/`osascript` with stubs on PATH, so no test can
-post a real desktop banner or touch a real iTerm session.
+`RELAY_NO_NOTIFY=1` and shadows `osascript` with a stub on PATH, so no test can post a real
+desktop banner or touch a real iTerm session.
 
 Run: pytest tests/test_hooks_stop_poller.py -q
 """
@@ -35,10 +35,9 @@ armed = H.armed_lead_with_config
 def load_stop_module():
     """hooks/stop_lead_watch.py as an importable module, for the two notification tiers that
     cannot be reached from stdin without touching the real machine: tier 1 writes an OSC escape to
-    a live iTerm tty, and tier 3 only runs when terminal-notifier is genuinely absent (it is
-    installed on this machine, so PATH alone cannot suppress it). Both are documented, user-facing
-    behaviour (README:435-445), so they are worth pinning — the alternative is leaving the whole
-    fallback chain untested."""
+    a live iTerm tty, tier 2 shells out to osascript. Both are documented, user-facing behaviour
+    (README:435-445), so they are worth pinning — the alternative is leaving the whole fallback
+    chain untested."""
     import importlib.util
     path = str(H.HOOKS_DIR / STOP)
     spec = importlib.util.spec_from_file_location("stop_watch_notify_tiers", path)
@@ -48,7 +47,7 @@ def load_stop_module():
 
 
 class TestStopHookNotificationTiers:
-    """README:435-445 / _notify:44-58 — "three tiers, first one that applies wins"."""
+    """README:435-445 / _notify:44-58 — "two tiers, first one that applies wins"."""
 
     def test_tier_one_writes_the_osc_notification_to_the_leads_own_tty(self, monkeypatch):
         """"iTerm native (OSC 777, written straight to the lead's own tty) ... clicking it focuses
@@ -65,9 +64,9 @@ class TestStopHookNotificationTiers:
                     executor="exec-1", lead_sid="lead-1", iterm_session="w0t1p0:UUID")
         assert sent and sent[0][0] == "/dev/ttys999"
         assert sent[0][1] == "relay · proj"
-        assert ran == [], "tier 1 winning must not also fire terminal-notifier/osascript"
+        assert ran == [], "tier 1 winning must not also fire osascript"
 
-    def test_tier_one_is_skipped_when_notify_via_is_terminal_notifier(self, monkeypatch):
+    def test_tier_one_is_skipped_when_notify_via_is_osascript(self, monkeypatch):
         """_notify:70-74 — "a lead who wants a clean banner title opts out of this tier". iTerm
         forces its own "Session …" prefix on the OSC tier, which no escape can override."""
         mod = load_stop_module()
@@ -77,10 +76,25 @@ class TestStopHookNotificationTiers:
         monkeypatch.setattr(mod.subprocess, "run",
                             lambda *a, **k: ran.append(a[0]) or SimpleNamespace(returncode=0))
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
-        mod._notify({"notify_on_wake": True, "notify_via": "terminal-notifier"}, "msg",
+        mod._notify({"notify_on_wake": True, "notify_via": "osascript"}, "msg",
                     project="proj", lead_sid="lead-1", iterm_session="w0t1p0:UUID")
         assert sent == [], "tty_by_id must not even be consulted when the tier is opted out of"
-        assert ran and "terminal-notifier" in ran[0][0]
+        assert ran and ran[0][0] == "osascript"
+
+    def test_tier_one_is_skipped_for_legacy_terminal_notifier_config_value(self, monkeypatch):
+        """A pre-drop config still holding notify_via='terminal-notifier' must keep opting out of
+        tier 1 exactly like 'osascript' does — no error, no silent revert to the OSC tier."""
+        mod = load_stop_module()
+        import iterm
+        sent, ran = [], []
+        monkeypatch.setattr(iterm, "tty_by_id", lambda sid: sent.append(sid) or "/dev/ttys999")
+        monkeypatch.setattr(mod.subprocess, "run",
+                            lambda *a, **k: ran.append(a[0]) or SimpleNamespace(returncode=0))
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        mod._notify({"notify_on_wake": True, "notify_via": "terminal-notifier"}, "msg",
+                    project="proj", lead_sid="lead-1", iterm_session="w0t1p0:UUID")
+        assert sent == []
+        assert ran and ran[0][0] == "osascript"
 
     def test_tier_one_falling_over_drops_through_to_tier_two(self, monkeypatch):
         """"fall through to tier 2 — tty_by_id shells out to osascript, WHICH CAN MISBEHAVE"
@@ -98,7 +112,7 @@ class TestStopHookNotificationTiers:
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
         mod._notify({"notify_on_wake": True}, "msg", project="proj", lead_sid="lead-1",
                     iterm_session="w0t1p0:UUID")
-        assert ran and "terminal-notifier" in ran[0][0]
+        assert ran and ran[0][0] == "osascript"
 
     def test_tier_one_with_no_resolvable_tty_drops_through(self, monkeypatch):
         """A lead whose iTerm session is gone (window closed, iTerm restarted) — tty_by_id returns
@@ -112,16 +126,13 @@ class TestStopHookNotificationTiers:
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
         mod._notify({"notify_on_wake": True}, "msg", project="proj", lead_sid="lead-1",
                     iterm_session="w0t1p0:UUID")
-        assert ran and "terminal-notifier" in ran[0][0]
+        assert ran and ran[0][0] == "osascript"
 
-    def test_tier_three_osascript_fallback_when_terminal_notifier_is_absent(self, monkeypatch):
-        """README:445 — "osascript fallback (neither of the above): macOS's built-in `display
-        notification`, same info, NOT clickable". terminal-notifier IS installed on this machine
-        and find_terminal_notifier probes absolute Homebrew paths too (lead_guard:209-220), so its
-        absence has to be simulated rather than arranged with PATH."""
+    def test_tier_two_osascript_fallback_when_no_iterm_session(self, monkeypatch):
+        """README:445 — "osascript fallback (tier 1 didn't apply): macOS's built-in `display
+        notification`, same info, NOT clickable"."""
         mod = load_stop_module()
         ran = []
-        monkeypatch.setattr(lg, "find_terminal_notifier", lambda: None)
         monkeypatch.setattr(mod.subprocess, "run",
                             lambda *a, **k: ran.append(a[0]) or SimpleNamespace(returncode=0))
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
@@ -137,7 +148,6 @@ class TestStopHookNotificationTiers:
         malformed AppleScript, i.e. a silently lost notification."""
         mod = load_stop_module()
         ran = []
-        monkeypatch.setattr(lg, "find_terminal_notifier", lambda: None)
         monkeypatch.setattr(mod.subprocess, "run",
                             lambda *a, **k: ran.append(a[0]) or SimpleNamespace(returncode=0))
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
@@ -163,23 +173,21 @@ class TestStopHookNotificationTiers:
         running still says WHOSE executor finished."""
         mod = load_stop_module()
         ran = []
-        monkeypatch.setattr(lg, "find_terminal_notifier", lambda: "/stub/terminal-notifier")
         monkeypatch.setattr(mod.subprocess, "run",
                             lambda *a, **k: ran.append(a[0]) or SimpleNamespace(returncode=0))
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
         mod._notify({"notify_on_wake": True}, "msg", project="proj", executor="exec-7",
                     lead_sid="lead-1")
-        assert "exec-7 reported" in ran[0]
+        assert "exec-7 reported" in ran[0][2]
 
     def test_a_notification_with_no_project_still_says_what_it_is(self, monkeypatch):
         mod = load_stop_module()
         ran = []
-        monkeypatch.setattr(lg, "find_terminal_notifier", lambda: "/stub/terminal-notifier")
         monkeypatch.setattr(mod.subprocess, "run",
                             lambda *a, **k: ran.append(a[0]) or SimpleNamespace(returncode=0))
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
         mod._notify({"notify_on_wake": True}, "msg")
-        assert "relay — review needed" in ran[0]
+        assert "relay — review needed" in ran[0][2]
 
     def test_notify_summary_falls_back_when_every_line_is_empty(self):
         """_notify_summary:201-207 — the banner must never be blank."""

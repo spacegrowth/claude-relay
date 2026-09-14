@@ -10,8 +10,8 @@ Two drivers, on purpose:
   `run_hook`        — a REAL subprocess, exactly as Claude Code launches a hook: the script path,
                       the JSON payload on stdin, a tmp `HOME` so `os.path.expanduser("~")` resolves
                       to an isolated `~/.relay-tasks`, `RELAY_NO_NOTIFY=1`, and a stub bin dir
-                      FIRST on PATH shadowing `terminal-notifier`/`osascript`/`open` so a
-                      notification can never reach the real desktop. This is the fixture the
+                      FIRST on PATH shadowing `osascript`/`open` so a notification can never reach
+                      the real desktop. This is the fixture the
                       contract actually describes ("read the hook payload from stdin ... exit 0"),
                       and it is what the fail-open cases must be proven through — only a real
                       process can show that an unparseable payload exits 0 rather than tracebacks.
@@ -91,15 +91,14 @@ exit 0
 def stub_bin(tmp_path):
     """A bin dir that shadows every external notifier this suite could otherwise fire for real.
 
-    `lead_guard.find_terminal_notifier` probes PATH first, so a stub named `terminal-notifier`
-    here wins over a real Homebrew install; `osascript` and `open` are shadowed the same way. Each
+    `osascript` and `open` are shadowed on PATH so neither can reach the real desktop. Each
     invocation appends its argv to `$RELAY_TEST_STUB_LOG`, so a test can assert a notification was
     or was not attempted instead of just hoping. Returns (bin_dir, log_path)."""
     tmp_path = Path(tmp_path)
     d = tmp_path / "stubbin"
     d.mkdir(exist_ok=True)
     log = tmp_path / "stub-calls.log"
-    for name in ("terminal-notifier", "osascript", "open", "tmux"):
+    for name in ("osascript", "open", "tmux"):
         p = d / name
         p.write_text(_STUB)
         p.chmod(0o755)

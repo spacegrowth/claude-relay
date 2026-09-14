@@ -420,19 +420,6 @@ class TestMarkerState:
         lg.update_marker(sr, "lead-a", color=[7, 7, 7])          # a stale, off-palette colour
         assert lg.pick_lead_color(sr, "lead-a") in [list(c) for c in lg.TAB_PALETTE]
 
-    def test_find_terminal_notifier_probes_brew_paths_when_path_lookup_fails(self, monkeypatch):
-        """find_terminal_notifier: '`shutil.which` alone gives FALSE negatives in Stop-hook /
-        launchd shells whose PATH lacks Homebrew's bin dir, so also probe the standard brew
-        locations' — and None when it is genuinely absent."""
-        monkeypatch.setattr(lg.shutil, "which", lambda _n: None)
-        monkeypatch.setattr(lg.os, "access", lambda p, m: False)
-        assert lg.find_terminal_notifier() is None
-        monkeypatch.setattr(lg.os, "access",
-                            lambda p, m: p == "/opt/homebrew/bin/terminal-notifier")
-        assert lg.find_terminal_notifier() == "/opt/homebrew/bin/terminal-notifier"
-        monkeypatch.setattr(lg.shutil, "which", lambda _n: "/usr/bin/terminal-notifier")
-        assert lg.find_terminal_notifier() == "/usr/bin/terminal-notifier"
-
 
 # ── the ledger + report surfacing ──────────────────────────────────────────────────────────────
 class TestLedgerAndReports:

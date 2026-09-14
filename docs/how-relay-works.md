@@ -223,7 +223,7 @@ prior Stop, it exits silently. Otherwise its decision tree (`escalation_decision
   two layers *working*, not a dead hook — the packet's ledger entry exists precisely so the two cases
   don't look identical from the outside.
 - **unowned** / **owner-missing** — no `owner_lead` recorded, or its marker is gone (crashed, closed,
-  pruned) — notify the human directly (the one fallback; same three-tier banner as layer 1).
+  pruned) — notify the human directly (the one fallback; same two-tier banner as layer 1).
 - **send** — the owning lead is reachable and hasn't surfaced this yet: call `relay nudge-lead`
   (`cmd_nudge_lead`, `bin/relay`), which types into the lead's tab the same way `relay send` does —
   **unconditionally**, whether the lead is busy or idle. A spike (§9.5b of the design doc) proved
@@ -323,7 +323,7 @@ fail-toward-adoptable default.
 | stale-hooks footnote (`relay list`) | red `⚠ stale hooks: <project>, ...` | a lead active within the last 6h whose stamped `VER` parses LOWER than the installed plugin version — current hooks re-stamp on every turn, so a recent-but-stale stamp proves `/reload-plugins` did not re-point that session's hooks (`_version_tuple`, `bin/relay`) | restart that session — a manual `/relay:mode` re-stamp only hides the warning (it also blinds this same check) |
 | `relay status` lead view | `🚦 busy: tk-parser,tk-render · ✅ tk-auth · 4.2MB` | busy-executor NAMES (not a bare count — live-usage feedback: "1 busy" doesn't say who), reported-executor names (report-file existence, read-only), optional `WAKE stuck`/`WAKE stale` segment, transcript-weight segment (`--statusline` only) | see the matching WAKE row above; `4.2MB → /relay:handoff` once past threshold |
 | `relay status` executor view | `🚦 pkt 003 busy · for webapp` | this executor's current packet + state, and its owning lead's project name | check the lead's tab for overall progress |
-| desktop notification | iTerm OSC banner (native click→session) → terminal-notifier (`-execute relay focus`, coalesces per lead) → osascript (`display notification`, not clickable) | three tiers, first one that applies wins — see the README's [Auto-wake and notifications](../README.md#auto-wake-and-notifications) for the full breakdown | `notify_via: "terminal-notifier"` in config skips tier 1 for a clean, relay-set title/subtitle |
+| desktop notification | iTerm OSC banner (native click→session) → osascript (`display notification`, not clickable) | two tiers, first one that applies wins — see the README's [Auto-wake and notifications](../README.md#auto-wake-and-notifications) for the full breakdown | `notify_via: "osascript"` in config skips tier 1 for a clean, relay-set title/subtitle |
 
 `has_inflight_executors` counts a `stalled` executor as in-flight, not just `busy` — a long-but-alive
 executor is exactly the kind most likely to report while the lead idles, so excluding it would be

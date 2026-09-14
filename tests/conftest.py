@@ -1,8 +1,8 @@
 """Session-wide test safety net.
 
 RELAY_NO_NOTIFY=1 is set for EVERY test by default so no test run ever pops a REAL desktop banner
-(terminal-notifier — confirmed installed on dev machines, or the osascript fallback) as a side
-effect of exercising code that calls `lead_guard.notify_banner`. Needed as of the packet-002 fix
+(iTerm's OSC tier, or the osascript fallback) as a side effect of exercising code that calls
+`lead_guard.notify_banner`. Needed as of the packet-002 fix
 that made `tombstone_lead`/`migrate_lead` call `notify_banner` unconditionally on every successful
 call (lead-found notify gap: a hijack or silent tombstone used to happen with nothing on screen) —
 dozens of pre-existing tests across this suite exercise those two functions directly with zero

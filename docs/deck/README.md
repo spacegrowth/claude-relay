@@ -24,7 +24,7 @@ next slide; `←` back; `Home` / `End`; `n` toggles speaker notes; `?` shows thi
 
 ## Demo script (10 min)
 
-Before the talk: a repo with a green test suite, `terminal-notifier` installed, iTerm open.
+Before the talk: a repo with a green test suite, iTerm open.
 
 1. `/relay:mode` — read the model check out loud. (Optional: `/relay:tier status` — auto, by default.)
 2. Show the packet (already written, 8 lines):

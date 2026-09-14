@@ -36,9 +36,9 @@ ${CLAUDE_PLUGIN_ROOT}/bin/relay lead-start "$CLAUDE_CODE_SESSION_ID" --project "
 
 Use `${CLAUDE_PLUGIN_ROOT}` (not bare `relay` — often missing from the Bash tool's PATH); let bash
 expand `$CLAUDE_CODE_SESSION_ID` (not `${CLAUDE_SESSION_ID}`, a different, unguaranteed var). Omit
-`--project` to default to the cwd basename. No `terminal-notifier` → arms anyway with a WARNING
-(banners still work, not clickable/coalesced) — surface the fix (`brew install terminal-notifier`)
-and continue. `/relay:stop` steps back down.
+`--project` to default to the cwd basename. Banners come from iTerm (clickable) or macOS's built-in
+notification (not clickable, e.g. under Terminal.app) — arms either way, no install to check.
+`/relay:stop` steps back down.
 
 **The routing gate** blocks a large inline `Edit`/`Write`/`MultiEdit` (over a line threshold, or a
 new file) — delegate, or `/relay:route retain "<reason>"` for genuinely lead-appropriate work (a

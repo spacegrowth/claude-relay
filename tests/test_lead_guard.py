@@ -376,24 +376,6 @@ class TestLedger:
         assert "ts" in rec
 
 
-class TestFindTerminalNotifier:
-    """PATH-robust detection: `shutil.which` first, then standard brew locations — the fix for
-    hook/launchd shells whose PATH lacks /opt/homebrew/bin (a bare which there false-negatives)."""
-    def test_uses_which_when_on_path(self, monkeypatch):
-        monkeypatch.setattr(lg.shutil, "which", lambda n: "/somewhere/terminal-notifier")
-        assert lg.find_terminal_notifier() == "/somewhere/terminal-notifier"
-
-    def test_falls_back_to_brew_path_when_path_misses(self, monkeypatch):
-        monkeypatch.setattr(lg.shutil, "which", lambda n: None)   # PATH miss (the hook case)
-        monkeypatch.setattr(lg.os, "access", lambda p, m: p == "/opt/homebrew/bin/terminal-notifier")
-        assert lg.find_terminal_notifier() == "/opt/homebrew/bin/terminal-notifier"
-
-    def test_none_when_truly_absent(self, monkeypatch):
-        monkeypatch.setattr(lg.shutil, "which", lambda n: None)
-        monkeypatch.setattr(lg.os, "access", lambda p, m: False)
-        assert lg.find_terminal_notifier() is None
-
-
 class TestIsGateExempt:
     """Packet files are the lead's OWN deliverable — the gate must never block writing them
     (before this, block_on_new_file gated every new packet the lead wrote)."""
@@ -1010,9 +992,7 @@ class TestExecutorEscalationHookQueueDelivery:
 
 class TestRelayLeadCommands:
     @pytest.fixture(autouse=True)
-    def _has_terminal_notifier(self, relay, monkeypatch):
-        # lead-start now HARD-requires terminal-notifier; pretend it's installed for these tests.
-        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: "/x/terminal-notifier")
+    def _stub_real_terminal(self, relay, monkeypatch):
         # NEVER /rename the REAL terminal these tests run in: cmd_lead_start reads TERM_SESSION_ID
         # and types an osascript /rename into the matching live iTerm session — which, unmocked, is
         # the developer's own tab running pytest (observed live: the suite renamed the user's tab
@@ -1040,24 +1020,24 @@ class TestRelayLeadCommands:
         relay.cmd_lead_start(SimpleNamespace(session_id="sess-1", model=None, project="webapp"))
         assert lg.read_marker(root, "sess-1")["project"] == "webapp"
 
-    def test_lead_start_warns_but_arms_without_terminal_notifier(self, relay, root, monkeypatch, capsys):
-        # Missing notifier is no longer a hard failure: banners degrade to the osascript fallback,
-        # so arming must proceed — with a visible warning naming the degradation and the fix.
-        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: None)  # absent
+    def test_lead_start_notes_unclickable_banners_for_terminal_app_and_arms(self, relay, root, capsys):
+        # No TERM_SESSION_ID (the fixture already drops it) reads as a Terminal.app lead: banners
+        # degrade to the unclickable osascript fallback — a neutral NOTE, no install suggestion,
+        # and arming must proceed regardless.
         relay.cmd_lead_start(SimpleNamespace(session_id="sess-1", model=None, project=None))
         assert lg.is_lead(root, "sess-1") is True    # DID arm
         err = capsys.readouterr().err
-        assert "terminal-notifier" in err and "brew install" in err
+        assert "NOTE" in err and "not clickable" in err
+        assert "brew install" not in err
 
-    def test_lead_start_no_warning_when_notifications_disabled(self, relay, root, monkeypatch, capsys):
-        # notify_on_wake: false is an explicit opt-out of banners → no notifier, no warning.
-        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: None)  # absent
+    def test_lead_start_no_note_when_notifications_disabled(self, relay, root, capsys):
+        # notify_on_wake: false is an explicit opt-out of banners → no note about them either.
         cfgp = lg.config_path(root)
         cfgp.parent.mkdir(parents=True, exist_ok=True)
         cfgp.write_text(json.dumps({"notify_on_wake": False}))
         relay.cmd_lead_start(SimpleNamespace(session_id="sess-1", model=None, project=None))
         assert lg.is_lead(root, "sess-1") is True
-        assert "terminal-notifier" not in capsys.readouterr().err
+        assert "NOTE" not in capsys.readouterr().err
 
     def test_lead_start_marker_records_color_and_label(self, relay, root):
         relay.cmd_lead_start(SimpleNamespace(session_id="sess-1", model=None, project="webapp"))
@@ -1122,7 +1102,6 @@ class TestAutonomousPosture:
     @pytest.fixture(autouse=True)
     def _armable(self, relay, monkeypatch):
         # Same isolation the sibling lead-command tests use: never touch the real terminal.
-        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: "/x/terminal-notifier")
         monkeypatch.delenv("TERM_SESSION_ID", raising=False)
         monkeypatch.setattr(relay.iterm, "rename_by_id", lambda *a, **k: True)
 
@@ -1442,7 +1421,6 @@ class TestTierPosture:
 
     @pytest.fixture(autouse=True)
     def _armable(self, relay, monkeypatch):
-        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: "/x/terminal-notifier")
         monkeypatch.delenv("TERM_SESSION_ID", raising=False)
         monkeypatch.setattr(relay.iterm, "rename_by_id", lambda *a, **k: True)
 
@@ -1647,7 +1625,6 @@ class TestTierAsk:
         monkeypatch.setattr(relay.shutil, "which", lambda name: "/usr/local/bin/claude")
         # Same isolation TestTierPosture/TestAutonomousPosture use, needed only by the one test
         # below that arms a lead to give it a recorded model.
-        monkeypatch.setattr(relay.lead_guard, "find_terminal_notifier", lambda: "/x/terminal-notifier")
         monkeypatch.delenv("TERM_SESSION_ID", raising=False)
         monkeypatch.setattr(relay.iterm, "rename_by_id", lambda *a, **k: True)
 
@@ -2471,8 +2448,8 @@ class TestDiffSizeText:
 
 
 class TestNotifyFallback:
-    """_notify uses terminal-notifier when present, else falls back to macOS's built-in
-    `display notification` via osascript (same info; not clickable, no coalescing).
+    """_notify uses the iTerm OSC/tty tier when a live tty resolves, else falls back to macOS's
+    built-in `display notification` via osascript (same info; not clickable, no coalescing).
     subprocess.run is mocked — no real banners fire."""
     def _load_hook(self):
         import importlib.machinery
@@ -2484,12 +2461,11 @@ class TestNotifyFallback:
         loader.exec_module(mod)
         return mod
 
-    def _notify(self, monkeypatch, notifier_path, iterm_session=None, tty=None, cfg=None):
+    def _notify(self, monkeypatch, iterm_session=None, tty=None, cfg=None):
         mod = self._load_hook()
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)  # the suite sets it; this test mocks instead
         calls = []
         monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: calls.append(list(a[0])))
-        monkeypatch.setattr(lg, "find_terminal_notifier", lambda: notifier_path)
         monkeypatch.setattr(iterm, "tty_by_id", lambda sid: tty)
         tty_calls = []
         monkeypatch.setattr(iterm, "notify_via_tty",
@@ -2498,20 +2474,13 @@ class TestNotifyFallback:
                     project="webapp", executor="exec-1", lead_sid="lead-1", iterm_session=iterm_session)
         return calls, tty_calls
 
-    def test_terminal_notifier_used_when_present(self, monkeypatch):
-        calls, tty_calls = self._notify(monkeypatch, "/x/terminal-notifier")
-        assert calls and calls[0][0] == "/x/terminal-notifier"
-        assert "-execute" in calls[0]                      # click→focus wired
-        assert "-group" in calls[0]                        # per-lead coalescing
-        assert tty_calls == []                              # no iterm_session → tty tier never engaged
-
-    def test_osascript_fallback_when_missing(self, monkeypatch):
-        calls, tty_calls = self._notify(monkeypatch, None)
+    def test_osascript_used_when_no_tty(self, monkeypatch):
+        calls, tty_calls = self._notify(monkeypatch)
         assert calls and calls[0][0] == "osascript"
         joined = " ".join(calls[0])
         assert "display notification" in joined
         assert "webapp" in joined                          # still names the project
-        assert tty_calls == []
+        assert tty_calls == []                              # no iterm_session → tty tier never engaged
 
     def test_notify_on_wake_false_sends_nothing(self, monkeypatch):
         mod = self._load_hook()
@@ -2522,10 +2491,9 @@ class TestNotifyFallback:
         assert calls == []
 
     def test_tty_tier_used_when_marker_has_tty(self, monkeypatch):
-        """Marker has iterm_session AND tty_by_id resolves → notify_via_tty is used and NEITHER
-        terminal-notifier nor osascript (subprocess.run) is ever called."""
-        calls, tty_calls = self._notify(monkeypatch, "/x/terminal-notifier",
-                                         iterm_session="w1t1p0:some-uuid", tty="/dev/ttys004")
+        """Marker has iterm_session AND tty_by_id resolves → notify_via_tty is used and osascript
+        (subprocess.run) is never called."""
+        calls, tty_calls = self._notify(monkeypatch, iterm_session="w1t1p0:some-uuid", tty="/dev/ttys004")
         assert calls == []                                  # subprocess.run never invoked
         assert len(tty_calls) == 1
         path, title, body = tty_calls[0]
@@ -2535,34 +2503,40 @@ class TestNotifyFallback:
 
     def test_tty_tier_skipped_when_tty_unresolved(self, monkeypatch):
         """iterm_session present but tty_by_id can't resolve it (session closed/stale) → falls
-        through to terminal-notifier, tier 2."""
-        calls, tty_calls = self._notify(monkeypatch, "/x/terminal-notifier",
-                                         iterm_session="w1t1p0:some-uuid", tty=None)
+        through to tier 2, osascript."""
+        calls, tty_calls = self._notify(monkeypatch, iterm_session="w1t1p0:some-uuid", tty=None)
         assert tty_calls == []
-        assert calls and calls[0][0] == "/x/terminal-notifier"
+        assert calls and calls[0][0] == "osascript"
 
     def test_tty_tier_skipped_without_iterm_session(self, monkeypatch):
         """No iterm_session on the marker at all → tty tier never even attempted."""
-        calls, tty_calls = self._notify(monkeypatch, "/x/terminal-notifier", iterm_session=None)
+        calls, tty_calls = self._notify(monkeypatch, iterm_session=None)
         assert tty_calls == []
-        assert calls and calls[0][0] == "/x/terminal-notifier"
+        assert calls and calls[0][0] == "osascript"
 
-    def test_notify_via_terminal_notifier_skips_tty_tier(self, monkeypatch):
-        """notify_via='terminal-notifier' bypasses the iTerm OSC/tty tier even when a live tty
-        resolves (opting out of iTerm's forced 'Session …' banner title) → terminal-notifier used."""
+    def test_notify_via_osascript_skips_tty_tier(self, monkeypatch):
+        """notify_via='osascript' bypasses the iTerm OSC/tty tier even when a live tty resolves
+        (opting out of iTerm's forced 'Session …' banner title) → osascript used directly."""
         calls, tty_calls = self._notify(
-            monkeypatch, "/x/terminal-notifier",
-            iterm_session="w1t1p0:some-uuid", tty="/dev/ttys004",
-            cfg={"notify_on_wake": True, "notify_via": "terminal-notifier"})
+            monkeypatch, iterm_session="w1t1p0:some-uuid", tty="/dev/ttys004",
+            cfg={"notify_on_wake": True, "notify_via": "osascript"})
         assert tty_calls == []                              # OSC/tty tier skipped despite a live tty
-        assert calls and calls[0][0] == "/x/terminal-notifier"
+        assert calls and calls[0][0] == "osascript"
+
+    def test_notify_via_legacy_terminal_notifier_value_treated_as_osascript(self, monkeypatch):
+        """A pre-drop config still holding notify_via='terminal-notifier' must keep working — no
+        error, same behavior as 'osascript' (skip the tty tier)."""
+        calls, tty_calls = self._notify(
+            monkeypatch, iterm_session="w1t1p0:some-uuid", tty="/dev/ttys004",
+            cfg={"notify_on_wake": True, "notify_via": "terminal-notifier"})
+        assert tty_calls == []
+        assert calls and calls[0][0] == "osascript"
 
     def test_notify_via_auto_still_uses_tty_tier(self, monkeypatch):
         """The default notify_via='auto' preserves tier-1 behavior: a resolvable tty → OSC/tty used,
-        subprocess notifiers never reached. Guards the new config from regressing the default path."""
+        osascript never reached. Guards the config from regressing the default path."""
         calls, tty_calls = self._notify(
-            monkeypatch, "/x/terminal-notifier",
-            iterm_session="w1t1p0:some-uuid", tty="/dev/ttys004",
+            monkeypatch, iterm_session="w1t1p0:some-uuid", tty="/dev/ttys004",
             cfg={"notify_on_wake": True, "notify_via": "auto"})
         assert calls == []
         assert len(tty_calls) == 1

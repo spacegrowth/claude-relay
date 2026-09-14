@@ -41,8 +41,7 @@ wakes you when an executor finishes.
 - **Claude Code** — the only hard dependency.
 - **Notifications** —
   - **iTerm2** (default): built-in, clickable, nothing to install.
-  - **Terminal.app**: install `terminal-notifier` (brew) for clickable banners; without it you
-    still get macOS's plain notification — it shows the info, but clicking does nothing.
+  - **Terminal.app**: macOS's built-in notification — it shows the info, but clicking does nothing.
 - **Optional**: `pip3 install iterm2` + enable iTerm's Python API (Settings → General → Magic) —
   new executor tabs then open right next to the lead's tab instead of at the end of the tab bar.
 
@@ -53,7 +52,7 @@ wakes you when an executor finishes.
 | Executors open as | tabs next to the lead (or split panes) | new windows |
 | Follow-up `send` | typed into the running session | reopens via `--resume` in a fresh window |
 | Per-lead tab colors | yes | — |
-| Clickable notifications | yes, nothing to install | only with terminal-notifier |
+| Clickable notifications | yes, nothing to install | no |
 | `relay focus` | jumps to tab/pane, leads too | brings the window forward |
 | `relay close` | closes the tab | window may linger (Cmd-W it) |
 | Lead push-wake (`nudge-lead`) | yes | no — Terminal.app can't inject text into a running process; a Terminal-hosted lead degrades to its own at-Stop check + desktop notification |
@@ -488,24 +487,22 @@ While the lead sits idle, a Stop hook watches in the background. When an executo
 the lead **wakes**, announces what's ready, and **waits for your direction** — it never auto-reviews
 or auto-commits (unless you've turned on [autonomous mode](#autonomous-mode), where committing still
 needs all five auto-commit conditions above). You also get a macOS notification naming the project
-and executor. Three tiers, first one that applies wins:
+and executor. Two tiers, first one that applies wins:
 
 1. **iTerm native** (no external tool needed): writes straight to the lead's own tty via iTerm's OSC
    777 escape. Clicking it **focuses the lead's session natively** (confirmed live). No coalescing —
    repeated wakes stack as separate banners.
-2. **terminal-notifier** (if installed and tier 1 didn't apply — e.g. Terminal.app, or the lead's
-   iTerm session couldn't be resolved): clicking runs `relay focus <lead>`; repeated wakes
-   **coalesce** per lead via `-group`.
-3. **osascript fallback** (neither of the above): macOS's `display notification`, same info,
-   **not clickable**.
+2. **osascript fallback** (tier 1 didn't apply — e.g. Terminal.app, or the lead's iTerm session
+   couldn't be resolved): macOS's `display notification`, same info, **not clickable**, no
+   coalescing.
 
 One-time gotcha for tier 1: macOS must allow iTerm to post notifications — **System Settings →
 Notifications → iTerm → Allow Notifications** (iTerm's own in-app setting is not enough).
 
 Tier 1's banners carry a **"Session …" title that iTerm forces** — no escape parameter overrides it.
-Set `"notify_via": "terminal-notifier"` in the config for a clean, relay-set title/subtitle instead
-(skips the OSC tier, falling back to osascript if terminal-notifier isn't installed; you lose native
-click-to-the-posting-session, but terminal-notifier's click still runs `relay focus <lead>`).
+Set `"notify_via": "osascript"` in the config for a clean, relay-set title/subtitle instead (skips
+the OSC tier; you lose native click-to-the-posting-session, since osascript's banner isn't
+clickable at all).
 
 **A second layer underneath.** Every spawned executor also carries a one-shot Stop-hook push (`relay
 nudge-lead`, internal plumbing). Once its report lands and it goes idle, it fires once: it types
@@ -543,7 +540,7 @@ or starts a fresh session unilaterally.
 
 Executors get their own, earlier heads-up (backlog row 57): the first time an armed lead's own
 executor crosses `context_warn_tokens` (default 120k, comfortably below `context_nudge_tokens`'s
-150k rotate line), relay fires ONE desktop banner through the same three-tier chain above —
+150k rotate line), relay fires ONE desktop banner through the same two-tier chain above —
 `relay · <project>` naming the session as heavy, both lines (warn/rotate), and a plan-a-rotate
 suggestion (`relay retire <sid>` + a fresh spawn). It rides `_check_one`, so `relay list`, `relay
 check`, the board, and the lead's own Stop-hook poller all surface it without any extra command.
@@ -811,7 +808,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `poll_seconds` | 1800 | How long idle lead's report-watcher waits before timing out |
 | `poll_interval` | 5 | Interval (seconds) for report-watcher to re-check for new executor reports |
 | `notify_on_wake` | true | Send macOS notification when lead wakes to review |
-| `notify_via` | "auto" | "auto" \| "terminal-notifier". "auto" uses iTerm's OSC banner first (native click→session, but iTerm forces a "Session …" title you can't override); "terminal-notifier" skips that tier for a clean title/subtitle (falls back to osascript) |
+| `notify_via` | "auto" | "auto" \| "osascript". "auto" uses iTerm's OSC banner first (native click→session, but iTerm forces a "Session …" title you can't override); "osascript" skips that tier for a clean title/subtitle (a legacy "terminal-notifier" value is read the same way) |
 | `executor_skip_permissions` | false | Spawn executors with `--dangerously-skip-permissions` (false = prompt before edits/commands; true = hands-off but requires careful review before landing) |
 | `executor_default_model` | "sonnet" | Model an executor launches with when `--model` is omitted — relay's own policy, never the CLI's personal `/model` default. An alias (`sonnet`/`opus`/`haiku`/`fable`, optionally `[1m]`) is **resolved through this machine's Claude Code at spawn** and the executor is launched with the concrete id (`claude-sonnet-5[1m]`), so the same alias can't mean different models on different machines and `[1m]` always rides a full id; cached per CLI version in `~/.relay-tasks/models.json`, shown in `relay doctor`. A full id is passed through untouched; an unrecognised model is refused before any tab opens |
 | `executor_model_ceiling` | "opus" | Spawn refuses a requested executor model above this tier unless `--model-override "<reason>"` is passed (recorded in the ledger) |
@@ -822,7 +819,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
 | `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) — the secondary "session age" (compaction-count) signal for **both** leads and executors: MB on disk never shrinks, so a big number alone means several compactions in even when live context currently looks fine. Fires the lead's handoff nudge/statusline segment alongside tokens, and is the executor fallback reading (`relay send`'s gate, `relay list`'s heavy footnote) only when a transcript can't be parsed for real usage at all |
-| `context_warn_tokens` | 120000 | Backlog row 57: an EARLIER, one-shot desktop banner for **executors**, well below `context_nudge_tokens`'s rotate line, so a rotate can be planned instead of discovered in a footnote. Fires once per executor session (via the same three-tier `notify_banner` chain and `claim_notification` stamp every other relay banner uses) the first time live context crosses this line, and adds the session to `relay list`'s yellow `⚠ approaching heavy:` line and an amber `approaching heavy · <ctx>k` chip on the board. Set at/above `context_nudge_tokens` to disable it — that's a no-op, not an error |
+| `context_warn_tokens` | 120000 | Backlog row 57: an EARLIER, one-shot desktop banner for **executors**, well below `context_nudge_tokens`'s rotate line, so a rotate can be planned instead of discovered in a footnote. Fires once per executor session (via the same two-tier `notify_banner` chain and `claim_notification` stamp every other relay banner uses) the first time live context crosses this line, and adds the session to `relay list`'s yellow `⚠ approaching heavy:` line and an amber `approaching heavy · <ctx>k` chip on the board. Set at/above `context_nudge_tokens` to disable it — that's a no-op, not an error |
 | `ctx_warn_wake` | true | Backlog row 87: whether the `context_warn_tokens` heads-up above also earns a 🟠 line on the owning **lead's own** Stop-hook wake (once per executor sid, ridden alongside whatever else the wake announces) — see [Auto-wake and notifications](#auto-wake-and-notifications). A separate switch from `notify_on_wake`: false here only silences the wake line, never the desktop banner/footnote/board chip |
 | `context_nudge_tokens` | 150000 | The cost/context signal for **executors**: heavy when the LAST request's live context (input + cache_read + cache_creation tokens — the real spend the next turn pays, not a transcript-size proxy) is at/above this many tokens. Drives `relay send`'s heaviness gate, `relay list`/board's heavy footnote/CTX columns, and `relay send --rotate` advice. A lead's own line is `lead_nudge_tokens` (below) — never this key |
 | `lead_nudge_tokens` | 300000 | A **lead's** own heaviness/handoff-nudge line, on a 1M window — a lead's handoff costs more than an executor's rotation (a fresh successor-seed vs. a plain respawn) and its context grows slowly once diffs are reviewed by a fork, so it earns a higher line than `context_nudge_tokens`. Drives the lead's own handoff nudge (Stop hook), `relay status --statusline`'s weight segment, `relay list`'s LEADS CTX/heavy footnote, and the board's lead chip. When the lead's real context window is known (`relay doctor`'s probe, or inferred from a `[1m]`-suffixed model) to be 200k rather than 1M, the EFFECTIVE line is capped to `context_nudge_tokens` instead — a 200k-window lead can never reach 300k live context, so it's still nudged, just on the executor's line |

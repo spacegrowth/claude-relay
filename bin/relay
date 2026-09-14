@@ -683,9 +683,9 @@ def desktop_nudge(message, lead_sid=None, subtitle="model check"):
     The ℹ lines print inside the lead's Bash tool output, which Claude Code collapses — the human
     never sees them unless the lead relays them. This puts the same sentence on screen. Same
     kill-switches as the wake banner (notify_on_wake config, RELAY_NO_NOTIFY env), and — lead-found
-    gap (fixed) — the SAME three-tier chain the Stop hook's wake banner uses (iTerm OSC →
-    terminal-notifier → osascript, `lead_guard.notify_banner`): this used to skip straight to
-    terminal-notifier, so a lead's tab-native OSC banner never fired for a nudge, only for a wake.
+    gap (fixed) — the SAME two-tier chain the Stop hook's wake banner uses (iTerm OSC → osascript,
+    `lead_guard.notify_banner`): this used to skip straight to osascript, so a lead's tab-native OSC
+    banner never fired for a nudge, only for a wake.
     A distinct `relay-nudge-<sid>` group keeps a nudge from replacing/being replaced by a wake
     banner for the same lead in Notification Center. Best-effort, never raises."""
     try:
@@ -5035,7 +5035,7 @@ def _maybe_warn_ctx_heavy(s):
 
     Called from `_check_one` — the one place `list`/`check`/`board_data` and the lead's Stop-hook
     poller (`cmd_auto_close_sweep`) all already pass through — so every surface gets this for free
-    without touching hooks/. Reuses the shared `lead_guard.notify_banner` three-tier chain and
+    without touching hooks/. Reuses the shared `lead_guard.notify_banner` two-tier chain and
     `lead_guard.claim_notification` once-only stamp exactly like every other relay banner (no new
     banner path, no new stamp file): the stamp key is `<sid>:ctx-warn`, deliberately WITHOUT a
     packet number — a rotated executor gets a fresh sid, so it can warn again on its own account.
@@ -6402,23 +6402,14 @@ def cmd_lead_start(args):
     Idempotent: re-running /relay:mode just refreshes the marker."""
     if not args.session_id:
         sys.exit("lead-start: session id is empty (is $CLAUDE_CODE_SESSION_ID set?)")
-    # terminal-notifier gives the GOOD banners (named source, click→focus, per-lead coalescing).
-    # Without it, iTerm leads still get click-to-focus for free (the Stop hook's tier-1 path writes
-    # the notification straight to this session's own tty via OSC 777 — see _notify in
-    # hooks/stop_lead_watch.py) — just no coalescing (repeated wakes stack instead of replacing).
-    # Terminal.app leads have no such fallback: without terminal-notifier they get the fully
-    # degraded osascript banner (not clickable at all). PATH-robust check (find_terminal_notifier
-    # probes brew dirs too) so we don't falsely warn.
+    # iTerm leads get click-to-focus for free (the Stop hook's tier-1 path writes the notification
+    # straight to this session's own tty via OSC 777 — see _notify in hooks/stop_lead_watch.py).
+    # Terminal.app leads have no such tier: their banners fall back to osascript's built-in
+    # notification, which is not clickable.
     if lead_guard.load_config(STATE_ROOT).get("notify_on_wake", True) \
-            and not lead_guard.find_terminal_notifier():
-        if iterm.NAME == "iterm" and os.environ.get("TERM_SESSION_ID"):
-            print("NOTE: terminal-notifier not found — desktop banners use iTerm's native "
-                  "click-to-focus\ninstead (no per-lead coalescing: repeated wakes stack rather "
-                  "than replace). For that too:\n  brew install terminal-notifier", file=sys.stderr)
-        else:
-            print("WARNING: terminal-notifier not found — desktop banners fall back to macOS's built-in\n"
-                  "notifications (not clickable, no per-lead coalescing). For click-to-focus banners:\n"
-                  "  brew install terminal-notifier", file=sys.stderr)
+            and not (iterm.NAME == "iterm" and os.environ.get("TERM_SESSION_ID")):
+        print("NOTE: desktop banners in Terminal.app use macOS's built-in notification and are not "
+              "clickable.", file=sys.stderr)
     # The project name identifies this lead's work in `relay list` and restore; defaults to the
     # working-directory basename when not named explicitly. cwd is where a restored lead reopens.
     cwd = os.getcwd()

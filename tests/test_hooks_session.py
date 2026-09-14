@@ -480,14 +480,14 @@ class TestSessionStartRearmNotification:
         lg.tombstone_lead(root, "lead-1")
         H.run_hook(START, {"session_id": "lead-1", "source": "resume"}, tmp_path, no_notify=False)
         calls = " ".join(H.stub_calls(tmp_path / "stub-calls.log"))
-        assert "terminal-notifier" in calls
-        assert "-subtitle lead re-armed on resume" in calls
+        assert "osascript" in calls
+        assert "lead re-armed on resume" in calls
         assert "review needed" not in calls
         assert "relay · proj" in calls
 
     def test_a_failed_notification_never_affects_arming(self, tmp_path):
         """"Best-effort; a notification failure must never affect arming" (L103-104). With NO
-        terminal-notifier and NO osascript on PATH at all, the re-arm must still happen."""
+        osascript on PATH at all, the re-arm must still happen."""
         root = H.arm_lead(tmp_path, project="proj")
         H.write_config(tmp_path)
         lg.tombstone_lead(root, "lead-1")
