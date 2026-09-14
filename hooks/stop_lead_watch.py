@@ -46,7 +46,7 @@ CTX_WARN_MARKER = "\U0001f7e0"  # 🟠
 
 
 def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_session=None,
-            subtitle=None):
+            subtitle=None, tty=None):
     """Desktop notification for a lead wake — resolves the title (project name) and default
     subtitle (which executor reported) from THIS call site's own vocabulary, then hands off to
     `lead_guard.notify_banner` for the actual two-tier chain (iTerm OSC → osascript — see that
@@ -57,7 +57,9 @@ def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_sess
     Title names the project, subtitle/body names the executor. Configurable via notify_on_wake
     (checked HERE, before resolving title/subtitle at all — notify_banner itself only checks the
     RELAY_NO_NOTIFY kill-switch, since not every caller ties itself to notify_on_wake the same
-    way)."""
+    way). `tty` (row 91 — the caller's own marker read, passed straight through) lets tier 1 skip
+    the live AppleScript lookup entirely; `state_root` is always STATE_ROOT here so a tier-2
+    fall-through gets ledgered like every other relay banner."""
     if not cfg.get("notify_on_wake", True):
         return
     import lead_guard as lg
@@ -66,7 +68,8 @@ def _notify(cfg, message, project=None, executor=None, lead_sid=None, iterm_sess
     # without it the default below would mislabel every notification as "review needed".
     if subtitle is None:
         subtitle = f"{executor} reported" if executor else "review needed"
-    lg.notify_banner(cfg, title, subtitle, message, lead_sid=lead_sid, iterm_session=iterm_session)
+    lg.notify_banner(cfg, title, subtitle, message, lead_sid=lead_sid, iterm_session=iterm_session,
+                     tty=tty, state_root=STATE_ROOT)
 
 
 def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg, kind="sync",
@@ -100,7 +103,7 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg, kind="syn
     claims = [lg.claim_notification(STATE_ROOT, sid, key) for key in surfaced_keys]
     if notify_msg is not None and (not surfaced_keys or any(claims)):
         _notify(cfg, notify_msg, project=project, executor=executor, lead_sid=sid,
-                iterm_session=marker.get("iterm_session"))
+                iterm_session=marker.get("iterm_session"), tty=marker.get("tty"))
     # Emoji-forward banner: the model echoes this into its announcement, so 🚦 is a visible,
     # consistent "you have a relay update" marker in the lead's on-screen text.
     #

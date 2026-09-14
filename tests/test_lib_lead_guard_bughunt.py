@@ -181,6 +181,15 @@ class TestBashTaxonomy:
 
 # ── marker read/write, tombstones, grace ──────────────────────────────────────────────────────
 class TestMarkerState:
+    @pytest.fixture(autouse=True)
+    def _no_ambient_iterm_env(self, monkeypatch):
+        # revive_lead's row-89/91 tty/iterm_session refresh reads the LIVE $ITERM_SESSION_ID/
+        # $TERM_SESSION_ID directly (hooks/sessionstart_lead_rearm.py never passes it through — see
+        # revive_lead's own docstring) — strip both so a suite run from inside a real iTerm tab
+        # can never leak its actual tab id into a "revive restores losslessly" assertion below.
+        monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+
     def test_a_truncated_marker_reads_as_empty(self, sr):
         """read_marker returns {} on any error. write_marker is a plain write_text (no
         tmp+rename), so a crash or a full disk mid-write leaves exactly this shape."""

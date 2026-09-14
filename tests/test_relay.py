@@ -8140,6 +8140,55 @@ class TestDoctorSignoffGate:
         assert "billing/" in row["detail"] and "lib/pricing.py" in row["detail"]
 
 
+class TestDoctorBannerFallback:
+    """Row 91: `relay doctor` reports how many `banner_fallback` ledger events the CURRENT armed
+    lead has racked up in the last 24h — purely informational (never FAILs)."""
+
+    def _checks(self, relay, capsys):
+        with mock.patch.object(relay, "_probe_claude"):
+            relay.cmd_doctor(SimpleNamespace(offline=True, quick=False, model=None, json=True))
+        return json.loads(capsys.readouterr().out)
+
+    def _row(self, relay, capsys):
+        return [c for c in self._checks(relay, capsys) if c["check"] == "banner fallbacks (24h)"][0]
+
+    def test_no_armed_lead_skips_with_a_reason(self, relay, capsys, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        row = self._row(relay, capsys)
+        assert row["status"] == "SKIP"
+        assert "no armed lead" in row["detail"]
+
+    def test_zero_events_skips_with_none(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-1")
+        row = self._row(relay, capsys)
+        assert row["status"] == "SKIP"
+        assert row["detail"] == "none"
+
+    def test_counts_only_this_leads_recent_events(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-1")
+        relay.lead_guard.append_ledger(relay.STATE_ROOT, "banner_fallback", session_id="lead-1",
+                                       reason="no-tty")
+        relay.lead_guard.append_ledger(relay.STATE_ROOT, "banner_fallback", session_id="lead-1",
+                                       reason="tty-lookup-failed")
+        relay.lead_guard.append_ledger(relay.STATE_ROOT, "banner_fallback", session_id="other-lead",
+                                       reason="no-tty")  # a DIFFERENT lead — must not count here
+        row = self._row(relay, capsys)
+        assert row["status"] == "SKIP"
+        assert row["detail"].startswith("2 —")
+        assert "no-tty×1" in row["detail"] and "tty-lookup-failed×1" in row["detail"]
+
+    def test_stale_events_outside_24h_are_excluded(self, relay, capsys, monkeypatch):
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-1", project="webapp")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-1")
+        with (relay.STATE_ROOT / "sessions.jsonl").open("a") as f:
+            f.write(json.dumps({"ts": "2020-01-01T00:00:00", "event": "banner_fallback",
+                                "session_id": "lead-1", "reason": "no-tty"}) + "\n")
+        row = self._row(relay, capsys)
+        assert row["detail"] == "none"
+
+
 class TestDoctorExecutorEffortPinned:
     """`relay doctor`'s plumbing check: executor_default_effort is a valid level, and the human's
     OWN ~/.claude/settings.json effortLevel is named right alongside it — the leak this check

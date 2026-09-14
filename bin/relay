@@ -697,7 +697,8 @@ def desktop_nudge(message, lead_sid=None, subtitle="model check"):
         title = "relay · model check"
         marker = lead_guard.read_marker(STATE_ROOT, lead_sid) if lead_sid else {}
         lead_guard.notify_banner(cfg, title, subtitle, message, lead_sid=lead_sid,
-                                 iterm_session=marker.get("iterm_session"),
+                                 iterm_session=marker.get("iterm_session"), tty=marker.get("tty"),
+                                 state_root=STATE_ROOT,
                                  group=f"relay-nudge-{lead_sid}" if lead_sid else None)
     except Exception:
         pass
@@ -3575,6 +3576,28 @@ def cmd_doctor(args):
     mc = lead_guard.load_model_cache(STATE_ROOT / "models.json").get(_cli_version()) or {}
     add("model alias cache (this CLI version)", True,
         ", ".join(f"{k}→{v}" for k, v in sorted(mc.items())) or "(empty — filled on first spawn per alias)")
+    # Row 91: how often tier 1 (the clickable iTerm banner) fell through to tier 2 (the un-clickable
+    # macOS one) for THIS lead in the last 24h — purely informational (never FAILs; a fallback is a
+    # degraded banner, not a broken one), so the rate that used to be invisible under load is now
+    # one line away. No current lead (doctor run outside an armed session, or from a plain
+    # terminal) reads as an explicit SKIP rather than silently omitting the row.
+    caller_lead = _armed_lead_caller()
+    if not caller_lead:
+        add("banner fallbacks (24h)", False, "no armed lead for this session", skip=True)
+    else:
+        cutoff = time.time() - 86400
+        fallbacks = [e for e in _ledger_by_session().get(caller_lead, [])
+                    if e.get("event") == "banner_fallback" and (_ts_epoch(e.get("ts")) or 0) >= cutoff]
+        if fallbacks:
+            reasons = {}
+            for e in fallbacks:
+                r = e.get("reason") or "?"
+                reasons[r] = reasons.get(r, 0) + 1
+            add("banner fallbacks (24h)", False,
+                f"{len(fallbacks)} — " + ", ".join(f"{r}×{n}" for r, n in sorted(reasons.items())),
+                skip=True)
+        else:
+            add("banner fallbacks (24h)", False, "none", skip=True)
 
     # ---- live probes ----
     if args.offline:
@@ -5081,7 +5104,8 @@ def _maybe_warn_ctx_heavy(s):
             cfg, f"relay · {project}", f"{sid} is heavy",
             f"{ctx_k}k ctx (warn line {warn_k}k, rotate line {nudge_k}k) — plan a rotate: "
             f"relay retire {sid} + fresh spawn",
-            lead_sid=owner, iterm_session=marker.get("iterm_session"), group="ctx-warn")
+            lead_sid=owner, iterm_session=marker.get("iterm_session"), tty=marker.get("tty"),
+            state_root=STATE_ROOT, group="ctx-warn")
     except Exception:
         pass
 
@@ -6474,9 +6498,15 @@ def cmd_lead_start(args):
     color = lead_guard.pick_lead_color(STATE_ROOT, args.session_id) if cfg.get("tab_colors", True) else None
     if not getattr(args, "no_rename", False):
         _paint_tab(iterm, iterm_session, color)  # cosmetic — never blocks arming on a paint failure
+    # Row 91: capture the lead's own tty ONCE here, off notify_banner's load path — arming isn't a
+    # busy moment, so the AppleScript session→tty lookup can be trusted here in a way it can't be
+    # on every single banner later. Best-effort (None for a Terminal.app lead, or if neither the
+    # lookup nor this process's own controlling tty resolves) — notify_banner falls back to its
+    # pre-row-91 live lookup whenever the marker has no tty, so this never makes things worse.
+    tty = lead_guard._capture_tty(iterm_session)
     lead_guard.write_marker(STATE_ROOT, args.session_id, model=args.model,
                             iterm_session=iterm_session, project=project, cwd=cwd,
-                            tab_label=tab_label, color=color,
+                            tab_label=tab_label, color=color, tty=tty,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
                             predecessor=existing.get("predecessor"), started=existing.get("started"),
                             # Preserved like started/predecessor, and for the same reason: a re-arm

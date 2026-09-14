@@ -2542,6 +2542,104 @@ class TestNotifyFallback:
         assert len(tty_calls) == 1
 
 
+class TestNotifyBannerTtyCache:
+    """Row 91: `notify_banner`'s tier 1 uses a caller-given `tty` (the marker's cached one) directly,
+    only falling back to a live `iterm.tty_by_id` lookup when none was given, and ledgers exactly one
+    `banner_fallback` event — with the right `reason` — on every fall-through tier 1 was actually
+    expected to cover. `RELAY_NO_NOTIFY` is deleted per-test (autouse in conftest.py otherwise) and
+    every OS-facing call (`iterm.tty_by_id`, `iterm.notify_via_tty`, `subprocess.run`) is mocked, so
+    nothing here ever touches a real tty, AppleScript, or the real notifier."""
+
+    def _mocks(self, monkeypatch, tty_by_id=None, notify_via_tty=True):
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        tty_by_id_calls = []
+        write_calls = []
+        osascript_calls = []
+
+        def fake_tty_by_id(sid):
+            tty_by_id_calls.append(sid)
+            if isinstance(tty_by_id, Exception):
+                raise tty_by_id
+            return tty_by_id
+
+        def fake_notify_via_tty(path, title, body):
+            write_calls.append((path, title, body))
+            return notify_via_tty
+
+        monkeypatch.setattr(iterm, "tty_by_id", fake_tty_by_id)
+        monkeypatch.setattr(iterm, "notify_via_tty", fake_notify_via_tty)
+        monkeypatch.setattr(lg.subprocess, "run",
+                            lambda *a, **k: osascript_calls.append(list(a[0])))
+        return tty_by_id_calls, write_calls, osascript_calls
+
+    def _fallbacks(self, root):
+        if not (root / "sessions.jsonl").exists():
+            return []
+        events = [json.loads(l) for l in (root / "sessions.jsonl").read_text().splitlines()]
+        return [e for e in events if e["event"] == "banner_fallback"]
+
+    def test_given_tty_used_without_calling_tty_by_id(self, root, monkeypatch):
+        tty_by_id_calls, write_calls, osascript_calls = self._mocks(monkeypatch)
+        lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", iterm_session="w1t1p0:X",
+                         tty="/dev/ttys009", state_root=root)
+        assert tty_by_id_calls == []                       # tier 1 never even asked
+        assert write_calls == [("/dev/ttys009", "t", "s — m")]
+        assert osascript_calls == []
+        assert self._fallbacks(root) == []
+
+    def test_falls_back_to_tty_by_id_when_no_tty_given(self, root, monkeypatch):
+        tty_by_id_calls, write_calls, osascript_calls = self._mocks(monkeypatch, tty_by_id="/dev/ttys004")
+        lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", iterm_session="w1t1p0:X",
+                         state_root=root)
+        assert tty_by_id_calls == ["w1t1p0:X"]
+        assert write_calls == [("/dev/ttys004", "t", "s — m")]
+        assert osascript_calls == []
+        assert self._fallbacks(root) == []
+
+    def test_tty_by_id_raise_falls_through_and_ledgers_tty_lookup_failed(self, root, monkeypatch):
+        self._mocks(monkeypatch, tty_by_id=RuntimeError("AppleScript busy"))
+        lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", iterm_session="w1t1p0:X",
+                         state_root=root)
+        fallbacks = self._fallbacks(root)
+        assert len(fallbacks) == 1
+        assert fallbacks[0]["session_id"] == "lead-1"
+        assert fallbacks[0]["reason"] == "tty-lookup-failed"
+
+    def test_tty_by_id_resolving_to_none_ledgers_no_tty(self, root, monkeypatch):
+        self._mocks(monkeypatch, tty_by_id=None)
+        lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", iterm_session="w1t1p0:X",
+                         state_root=root)
+        fallbacks = self._fallbacks(root)
+        assert len(fallbacks) == 1 and fallbacks[0]["reason"] == "no-tty"
+
+    def test_write_failure_ledgers_write_failed(self, root, monkeypatch):
+        self._mocks(monkeypatch, notify_via_tty=False)
+        lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", tty="/dev/ttys009", state_root=root)
+        fallbacks = self._fallbacks(root)
+        assert len(fallbacks) == 1 and fallbacks[0]["reason"] == "write-failed"
+
+    def test_successful_tty_write_never_reaches_tier2_and_ledgers_nothing(self, root, monkeypatch):
+        tty_by_id_calls, write_calls, osascript_calls = self._mocks(monkeypatch)
+        lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", tty="/dev/ttys009", state_root=root)
+        assert osascript_calls == []
+        assert self._fallbacks(root) == []
+
+    def test_no_tty_and_no_iterm_session_skips_tier1_with_no_ledger(self, root, monkeypatch):
+        """Neither a cached tty nor an iterm_session at all (Terminal.app lead) — tier 1 was never on
+        the table, so this is osascript directly, not a 'fallback'."""
+        tty_by_id_calls, write_calls, osascript_calls = self._mocks(monkeypatch)
+        lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", state_root=root)
+        assert tty_by_id_calls == [] and write_calls == []
+        assert len(osascript_calls) == 1
+        assert self._fallbacks(root) == []
+
+    def test_no_state_root_skips_ledgering_but_still_falls_through(self, root, monkeypatch):
+        tty_by_id_calls, write_calls, osascript_calls = self._mocks(monkeypatch, tty_by_id=None)
+        lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", iterm_session="w1t1p0:X")
+        assert len(osascript_calls) == 1                    # still falls through correctly...
+        assert not (root / "sessions.jsonl").exists()        # ...just nothing to ledger to
+
+
 class TestNotifyViaTty:
     """scripts/iterm.py: notify_via_tty — escape-safe OSC 777 write, best-effort/never-raises."""
     def test_writes_osc_777_to_tty_path(self, tmp_path):
@@ -3207,6 +3305,15 @@ class TestTombstone:
     """Arming that survives exit→resume (docs/lead-arming-durability.md). A resumable exit
     TOMBSTONES the marker (identity retained, arming dropped); a resume revives it losslessly."""
 
+    @pytest.fixture(autouse=True)
+    def _no_ambient_iterm_env(self, monkeypatch):
+        # revive_lead's row-89/91 tty/iterm_session refresh reads the LIVE $ITERM_SESSION_ID/
+        # $TERM_SESSION_ID directly (hooks/sessionstart_lead_rearm.py never passes it through — see
+        # revive_lead's own docstring) — strip both so a suite run from inside a real iTerm tab
+        # can never leak its actual tab id into a "revive restores losslessly" assertion below.
+        monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+        monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+
     def _armed(self, root, sid="lead-1"):
         lg.write_marker(root, sid, model="opus", iterm_session="w1t2p0:ABC", project="proj",
                         cwd="/tmp/x", tab_label="[Lead] proj", color=[1, 2, 3],
@@ -3306,6 +3413,54 @@ class TestTombstone:
         assert lg.revive_lead(root, "lead-2") is False  # armed, not tombstoned → no double-arm
         assert lg.is_lead(root, "lead-2") is True
 
+    LIVE_UUID = "w9t9p0:11111111-2222-3333-4444-555555555555"
+
+    def test_revive_refreshes_iterm_session_and_tty_when_live_value_differs(self, root, monkeypatch):
+        """Row 89/91: an iTerm restart gives a resumed tab a NEW session UUID while the tombstoned
+        marker keeps the old one — revive_lead must pick that up from the live env (this process's
+        own — the SessionStart hook that calls it never passes anything through) and re-capture tty
+        in the SAME write, not leave tidy/tier-1 pointed at a tab that's gone."""
+        lg.write_marker(root, "lead-1", project="proj", iterm_session="w1t2p0:11111111-1111-1111-"
+                        "1111-111111111111", cwd="/tmp/x")
+        lg.tombstone_lead(root, "lead-1", reason="exit")
+        monkeypatch.setenv("TERM_SESSION_ID", self.LIVE_UUID)
+        tty_calls = []
+        monkeypatch.setattr(lg, "_tty_by_id",
+                            lambda sid: tty_calls.append(sid) or "/dev/ttys777")
+        assert lg.revive_lead(root, "lead-1") is True
+        after = lg.read_marker(root, "lead-1")
+        assert after["iterm_session"] == self.LIVE_UUID
+        assert after["tty"] == "/dev/ttys777"
+        assert tty_calls == [self.LIVE_UUID]
+
+    def test_revive_leaves_iterm_session_and_tty_untouched_when_live_value_matches(self, root, monkeypatch):
+        """The common case — an ordinary resume, no iTerm restart in between: no needless
+        AppleScript call, and whatever tty was already recorded survives untouched."""
+        lg.write_marker(root, "lead-1", project="proj", iterm_session=self.LIVE_UUID,
+                        cwd="/tmp/x", tty="/dev/ttys111")
+        lg.tombstone_lead(root, "lead-1", reason="exit")
+        monkeypatch.setenv("TERM_SESSION_ID", self.LIVE_UUID)
+        tty_calls = []
+        monkeypatch.setattr(lg, "_tty_by_id", lambda sid: tty_calls.append(sid) or "/dev/ttysXXX")
+        assert lg.revive_lead(root, "lead-1") is True
+        after = lg.read_marker(root, "lead-1")
+        assert after["iterm_session"] == self.LIVE_UUID
+        assert after["tty"] == "/dev/ttys111"           # untouched, not re-captured
+        assert tty_calls == []                           # no AppleScript call at all
+
+    def test_revive_ignores_a_live_value_that_does_not_look_like_a_real_iterm_handle(self, root, monkeypatch):
+        """A live env var that isn't shaped like a real iTerm session id (LIVE_ITERM_SESSION_RE —
+        the same check bin/relay's `_live_lead_handle` trusts) must never overwrite a recorded
+        `iterm_session` — e.g. a stray/malformed value, or a Terminal.app session."""
+        lg.write_marker(root, "lead-1", project="proj", iterm_session="w1t2p0:11111111-1111-1111-"
+                        "1111-111111111111", cwd="/tmp/x")
+        lg.tombstone_lead(root, "lead-1", reason="exit")
+        monkeypatch.setenv("TERM_SESSION_ID", "not-a-real-handle")
+        assert lg.revive_lead(root, "lead-1") is True
+        after = lg.read_marker(root, "lead-1")
+        assert after["iterm_session"] == "w1t2p0:11111111-1111-1111-1111-111111111111"
+        assert after.get("tty") is None
+
 
 class TestSessionEndReasonSplit:
     """hooks/sessionend_lead_cleanup.py: clear/logout destroy the conversation (hard clear);
@@ -3350,13 +3505,20 @@ class TestSessionStartRearmHook:
 
     def _run(self, home, payload):
         import subprocess
+        env = {**os.environ, "HOME": str(home), "RELAY_NO_NOTIFY": "1"}
+        # revive_lead's row-89/91 refresh reads the LIVE $ITERM_SESSION_ID/$TERM_SESSION_ID directly
+        # (hooks/sessionstart_lead_rearm.py never passes it through — see revive_lead's own
+        # docstring) — strip both so a suite run from inside a real iTerm tab (this dev loop's own)
+        # can never leak its actual tab id in and trigger a REAL AppleScript tty lookup here.
+        env.pop("ITERM_SESSION_ID", None)
+        env.pop("TERM_SESSION_ID", None)
         p = subprocess.run(
             ["python3", str(REPO_ROOT / "hooks" / "sessionstart_lead_rearm.py")],
             input=json.dumps(payload), capture_output=True, text=True,
             # RELAY_NO_NOTIFY: re-arm now fires a real desktop banner. Without this the suite
             # would spam actual notifications on every run (same kill-switch every other relay
             # notification honours).
-            env={**os.environ, "HOME": str(home), "RELAY_NO_NOTIFY": "1"})
+            env=env)
         return p.returncode, p.stdout, p.stderr
 
     def test_resume_revives_tombstoned_lead(self, tmp_path):
@@ -3426,6 +3588,10 @@ class TestSessionStartRearmMigration:
     def _run(self, home, payload, term_session_id, extra_env=None):
         import subprocess
         env = {**os.environ, "HOME": str(home), "RELAY_NO_NOTIFY": "1"}
+        # revive_lead's row-89/91 refresh prefers $ITERM_SESSION_ID over $TERM_SESSION_ID (matching
+        # bin/relay's _live_lead_handle) — strip the former unconditionally so an ambient dev-tab
+        # value can never outrank the `term_session_id` this helper is explicitly asked to set.
+        env.pop("ITERM_SESSION_ID", None)
         if term_session_id is None:
             env.pop("TERM_SESSION_ID", None)
         else:
@@ -3635,6 +3801,43 @@ class TestStopHookMigration:
         assert lg.read_marker(root, "new-sid") == {}
         assert lg.is_lead(root, "old-sid") is True   # untouched — never even looked at
         assert not (root / "sessions.jsonl").exists()
+
+
+class TestCaptureTty:
+    """lead_guard._capture_tty — the row-91 arm-time tty capture: prefer the AppleScript
+    session→tty lookup (_tty_by_id), fall back to this process's own controlling tty
+    (os.ttyname(0)) when that fails or there's no iterm_session at all, None when neither
+    resolves. Never raises."""
+
+    def test_prefers_tty_by_id_when_it_resolves(self, monkeypatch):
+        monkeypatch.setattr(lg, "_tty_by_id", lambda sid: "/dev/ttys004")
+        monkeypatch.setattr(os, "ttyname", lambda fd: (_ for _ in ()).throw(
+            AssertionError("os.ttyname should not be called when _tty_by_id resolves")))
+        assert lg._capture_tty("w1t1p0:X") == "/dev/ttys004"
+
+    def test_falls_back_to_os_ttyname_when_tty_by_id_returns_none(self, monkeypatch):
+        monkeypatch.setattr(lg, "_tty_by_id", lambda sid: None)
+        monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/ttys777")
+        assert lg._capture_tty("w1t1p0:X") == "/dev/ttys777"
+
+    def test_falls_back_to_os_ttyname_when_tty_by_id_raises(self, monkeypatch):
+        def boom(sid):
+            raise RuntimeError("AppleScript busy")
+        monkeypatch.setattr(lg, "_tty_by_id", boom)
+        monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/ttys777")
+        assert lg._capture_tty("w1t1p0:X") == "/dev/ttys777"
+
+    def test_no_iterm_session_skips_straight_to_os_ttyname(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(lg, "_tty_by_id", lambda sid: calls.append(sid))
+        monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/ttys777")
+        assert lg._capture_tty(None) == "/dev/ttys777"
+        assert calls == []
+
+    def test_none_when_neither_resolves(self, monkeypatch):
+        monkeypatch.setattr(lg, "_tty_by_id", lambda sid: None)
+        monkeypatch.setattr(os, "ttyname", lambda fd: (_ for _ in ()).throw(OSError("not a tty")))
+        assert lg._capture_tty("w1t1p0:X") is None
 
 
 class TestFindLeadByTab:

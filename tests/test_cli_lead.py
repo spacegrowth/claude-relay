@@ -471,6 +471,29 @@ class TestLeadStart:
         run_main(relay, "lead-start", "lead-1", "--project", "webapp")
         assert {"handle": "w9t9p9:LEAD", "name": "[Lead] webapp"} in terms.renames
 
+    def test_lead_start_captures_and_records_tty(self, relay, terms, monkeypatch):
+        """Row 91: lead-start captures the lead's own tty ONCE at arm time (from its own iTerm
+        handle) and stores it on the marker, so notify_banner's tier 1 never needs a live
+        AppleScript lookup for an ordinary banner. `_capture_tty`'s own AppleScript/os.ttyname
+        fallback chain is covered directly in tests/test_lead_guard.py::TestCaptureTty — this only
+        proves cmd_lead_start actually calls it (with the live handle) and records the result."""
+        monkeypatch.setenv("TERM_SESSION_ID", "w9t9p9:LEAD")
+        calls = []
+        monkeypatch.setattr(relay.lead_guard, "_capture_tty",
+                            lambda iterm_session: calls.append(iterm_session) or "/dev/ttys042")
+        run_main(relay, "lead-start", "lead-1", "--project", "webapp")
+        assert calls == ["w9t9p9:LEAD"]
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert m["tty"] == "/dev/ttys042"
+
+    def test_lead_start_tty_is_none_when_capture_fails(self, relay, terms, monkeypatch):
+        """A Terminal.app lead, or one where neither the AppleScript lookup nor this process's own
+        controlling tty resolved — `tty` is a normal, fully-supported None, not an error."""
+        monkeypatch.setattr(relay.lead_guard, "_capture_tty", lambda iterm_session: None)
+        run_main(relay, "lead-start", "lead-1", "--project", "webapp")
+        m = relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")
+        assert m.get("tty") is None
+
     def test_lead_start_is_never_name_resolved(self, relay, terms):
         """main()'s RESOLVE_FIELDS comment: "`lead-start`'s session_id CREATES the lead namespace
         (always the raw $CLAUDE_CODE_SESSION_ID, nothing to resolve against yet)"."""

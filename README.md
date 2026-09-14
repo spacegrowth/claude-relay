@@ -507,6 +507,13 @@ Set `"notify_via": "osascript"` in the config for a clean, relay-set title/subti
 the OSC tier; you lose native click-to-the-posting-session, since osascript's banner isn't
 clickable at all).
 
+Backlog row 91: tier 1 used to resolve the lead's tty via a live AppleScript lookup on **every**
+banner, which could misbehave (and silently fall through to tier 2) while iTerm was busy — a tidy
+or a spawn in flight. The tty is now captured **once**, at arm/re-arm time, and cached on the lead's
+marker, so an ordinary banner no longer needs AppleScript at all; every fall-through to tier 2 that
+tier 1 was actually expected to cover appends a `banner_fallback` ledger event, and `relay doctor`
+reports how many the current lead has racked up in the last 24 hours.
+
 **A second layer underneath.** Every spawned executor also carries a one-shot Stop-hook push (`relay
 nudge-lead`, internal plumbing). Once its report lands and it goes idle, it fires once: it types
 into the lead's tab if the lead hasn't already surfaced the report, or notifies you directly if the
@@ -783,7 +790,10 @@ Closing is parking, not loss: the report is on disk, staged work stays in the wo
   (a "no tab holds these ids" answer is not — it would just be re-asked). Every tidy that reaches
   iTerm ledgers its outcome — `tidy` (windows reordered, ids unclaimed) or `tidy_skipped` (reason,
   attempts) — and `relay list` names a lead whose last tidy was skipped, since the dim line itself
-  scrolls away.
+  scrolls away. An iTerm restart gives every restored tab a new session UUID (its saved id goes
+  stale), so tidy re-resolves a stale id by the tab's own tty instead of losing track of it, and
+  `--dry-run`/the `tidy` ledger line report the tabs that would actually move, not just every id it
+  looked at (row 89).
 - **Pane layout** (iTerm only): set `"executor_layout": "pane"` (or pass `--pane` at spawn) to open
   executors as split panes inside the lead's own tab instead of separate tabs; `--tab` forces a
   tab for one spawn regardless of config. Falls back to a tab if the lead's iTerm session can't be

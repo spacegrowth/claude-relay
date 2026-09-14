@@ -316,7 +316,8 @@ def now():
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=None, group=None):
+def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=None, group=None,
+                  tty=None, state_root=None):
     """The two-tier desktop notification chain EVERY relay banner should use — extracted from
     hooks/stop_lead_watch.py's original `_notify` (lead-found gap: bin/relay's own `desktop_nudge`,
     the round-3-packet nudge, skipped straight to osascript, disagreeing with the documented chain
@@ -325,11 +326,26 @@ def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=No
     click-to-focus) fires for every relay notification, not only Stop-hook wakes.
 
     1. iTerm native (OSC 777, written straight to the lead's own tty) — zero external deps, and
-       clicking it focuses the POSTING session natively. Used whenever `iterm_session` is given AND
-       `iterm.tty_by_id` can still resolve it to a live tty; returns regardless of whether the write
-       itself succeeds (best-effort/never-raises — the point of a tier system, not a retry).
+       clicking it focuses the POSTING session natively. `tty` (from the caller's marker — the tty
+       recorded ONCE at arm/re-arm time, backlog row 91) is used directly when given, so a normal
+       banner never needs a live AppleScript call at all; only when `tty` is absent does this fall
+       back to resolving `iterm_session` via `iterm.tty_by_id` (the pre-row-91 behaviour, and still
+       what a caller with no marker handy — or an old marker armed before this field existed — gets).
+       Returns regardless of whether the write itself succeeds (best-effort/never-raises — the point
+       of a tier system, not a retry) — UNLESS the tty never resolved / the lookup raised / the write
+       itself failed, in which case this falls through to tier 2 (see `banner_fallback` below).
     2. osascript's built-in `display notification` — same info, NOT clickable, no coalescing.
        Always available on macOS, so this is the unconditional fallback (no PATH probe needed).
+
+    Every fall-through to tier 2 that happened because tier 1 was EXPECTED to work (a `tty` or
+    `iterm_session` was actually given) appends one `banner_fallback` ledger event — `state_root`,
+    `reason` one of "no-tty" (neither a given tty nor a resolvable one), "tty-lookup-failed"
+    (`iterm.tty_by_id` raised) or "write-failed" (a tty resolved but `notify_via_tty` returned
+    False) — so the rate `relay doctor` reports is real, not a guess. `state_root` is optional and
+    additive: a caller that doesn't pass it (or passes no `lead_sid`) just loses that visibility,
+    never breaks — ledgering is best-effort like everything else here. No ledger event when neither
+    `tty` nor `iterm_session` was given at all (a Terminal.app lead, or a caller with no marker) —
+    tier 1 was never on the table, so that isn't a "fallback".
 
     `lead_sid` and `group` stay in the signature for callers that still pass them, but neither is
     used by the osascript tier: it has no click-action and no grouping/coalescing concept (unlike
@@ -345,15 +361,29 @@ def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=No
     notify_via = (cfg or {}).get("notify_via", "auto")
     if notify_via == "terminal-notifier":  # legacy config value (pre-drop) — treat as osascript
         notify_via = "osascript"
-    if iterm_session and notify_via != "osascript":
-        try:
-            import iterm
-            tty = iterm.tty_by_id(iterm_session)
-            if tty:
-                iterm.notify_via_tty(tty, title, subtitle + " — " + message[:180])
-                return
-        except Exception:
-            pass  # fall through to tier 2 — tty_by_id shells out to osascript, which can misbehave
+    if (tty or iterm_session) and notify_via != "osascript":
+        resolved_tty = tty
+        reason = None
+        if not resolved_tty:
+            try:
+                import iterm
+                resolved_tty = iterm.tty_by_id(iterm_session)
+            except Exception:
+                reason = "tty-lookup-failed"
+        if reason is None:
+            if not resolved_tty:
+                reason = "no-tty"
+            else:
+                try:
+                    import iterm
+                    posted = iterm.notify_via_tty(resolved_tty, title, subtitle + " — " + message[:180])
+                except Exception:
+                    posted = False
+                if posted:
+                    return
+                reason = "write-failed"
+        if state_root is not None:
+            append_ledger(state_root, "banner_fallback", session_id=lead_sid, reason=reason)
     try:
         # Tier 2 / only tier without iTerm: macOS's built-in banner via osascript. Same information
         # but degraded: NOT clickable and no per-lead coalescing.
@@ -616,7 +646,7 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
                  tab_label=None, color=None, plugin_version=None, stop_hook_timeout=None,
                  predecessor=None, started=None, backend=None, autonomous=False,
                  autonomous_source="config", lineage_started=None, tier="auto",
-                 tier_source="config"):
+                 tier_source="config", tty=None):
     d = lead_dir(state_root, session_id)
     d.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(marker_path(state_root, session_id), {
@@ -637,6 +667,12 @@ def write_marker(state_root, session_id, model=None, iterm_session=None, project
         "lineage_started": lineage_started,
         "model": model,
         "iterm_session": iterm_session,  # $TERM_SESSION_ID — recorded tab metadata (debugging)
+        # The lead's own tty, captured ONCE at arm/re-arm time (backlog row 91) — see
+        # `_capture_tty`. `notify_banner` tier 1 uses this directly, only falling back to a live
+        # `iterm.tty_by_id` lookup (the sole pre-row-91 path, and what a marker armed before this
+        # field existed still gets) when it's absent. Additive/best-effort: None is a normal,
+        # fully-supported value, not an error.
+        "tty": tty,
         "backend": backend,          # which terminal app hosts this lead's OWN tab ("iterm" |
                                       # "terminal"), same field name/values as an executor's
                                       # session.json — term_backend() reads either. Re-stamped on
@@ -951,7 +987,9 @@ def _notify_marker_change(state_root, marker, verb, reason):
         title = "relay: lead %s %s" % (project, verb)
         subtitle = reason or verb
         message = "%s — run /relay:mode to re-arm" % (reason or verb)
-        notify_banner(cfg, title, subtitle, message, iterm_session=iterm_session)
+        notify_banner(cfg, title, subtitle, message, lead_sid=(marker or {}).get("session_id"),
+                     iterm_session=iterm_session, tty=(marker or {}).get("tty"),
+                     state_root=state_root)
     except Exception:
         pass
 
@@ -1002,7 +1040,19 @@ def revive_lead(state_root, session_id):
     """Re-arm a tombstoned lead (SessionStart source="resume"): drop the tombstone flags and refresh
     last_active. Everything else — project name included — is restored untouched, so a resumed lead
     is indistinguishable from one that never exited. Returns True ONLY if a tombstone was actually
-    revived, so a plain fresh start stays a silent no-op. Never raises."""
+    revived, so a plain fresh start stays a silent no-op. Never raises.
+
+    Row 89/91 follow-up: an iTerm restart gives every restored tab a NEW session UUID while a
+    tombstoned marker keeps the old one, so `_lead_alive`/`relay focus`/tidy/tier-1 banners all
+    quietly miss the (still very much alive) resumed lead. This process inherits the SAME
+    environment the SessionStart hook that called us was invoked with, so when the live
+    `$ITERM_SESSION_ID`/`$TERM_SESSION_ID` looks like a real iTerm handle (`LIVE_ITERM_SESSION_RE`
+    — the exact shape check bin/relay's `_live_lead_handle` trusts) AND differs from what's
+    recorded, this refreshes `iterm_session` and re-captures `tty` (`_capture_tty`) in the SAME
+    write. Left untouched when it matches (the common case — no needless AppleScript call on every
+    ordinary resume) or when the live value isn't a real iTerm handle at all (Terminal.app, or a
+    revive that isn't happening from inside the lead's own tab). Additive to the caller's contract:
+    still no ledger event for the refresh itself, exactly as before."""
     try:
         m = read_marker(state_root, session_id)
         if not m or not is_tombstoned(m):
@@ -1011,6 +1061,10 @@ def revive_lead(state_root, session_id):
         m.pop("ended_at", None)
         m.pop("ended_reason", None)
         m["last_active"] = now()
+        live = os.environ.get("ITERM_SESSION_ID") or os.environ.get("TERM_SESSION_ID")
+        if live and LIVE_ITERM_SESSION_RE.match(live) and live != m.get("iterm_session"):
+            m["iterm_session"] = live
+            m["tty"] = _capture_tty(live)
         marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
         return True
     except Exception:
@@ -1042,6 +1096,35 @@ def _tty_by_id(iterm_session_id):
         return _iterm.tty_by_id(iterm_session_id)
     except Exception:
         return None
+
+
+# Same shape check bin/relay's `_live_lead_handle` uses to trust a live $ITERM_SESSION_ID/
+# $TERM_SESSION_ID value (row 89) — reused here so a re-arm's "does the live tab differ from what's
+# recorded" comparison and that function's own live-tab check can never quietly drift apart.
+LIVE_ITERM_SESSION_RE = re.compile(r"^w\d+t\d+p\d+:[0-9A-Fa-f-]{36}$")
+
+
+def _capture_tty(iterm_session):
+    """The lead's own tty, captured ONCE at arm/re-arm time — off the load path `notify_banner`'s
+    tier 1 otherwise has to hit on every single banner (backlog row 91: an AppleScript lookup that
+    misbehaves while iTerm is busy tidying/spawning silently degraded a clickable iTerm banner to
+    an un-clickable macOS one). Prefers the AppleScript session→tty lookup (`_tty_by_id`) — arming
+    is not a busy moment, so it's trusted here — and falls back to this process's own controlling
+    tty (`os.ttyname(0)`) when that fails or there's no `iterm_session` at all. Returns None when
+    neither resolves (e.g. called from inside a hook subprocess, whose stdin is a JSON payload
+    pipe, not a terminal — the caller keeps whatever `tty` it already had). Never raises."""
+    tty = None
+    if iterm_session:
+        try:
+            tty = _tty_by_id(iterm_session)
+        except Exception:
+            tty = None
+    if not tty:
+        try:
+            tty = os.ttyname(0)
+        except Exception:
+            tty = None
+    return tty
 
 
 def _own_ancestor_pids():

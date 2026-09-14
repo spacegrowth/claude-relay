@@ -56,8 +56,12 @@ class TestStopHookNotificationTiers:
         import iterm
         sent, ran = [], []
         monkeypatch.setattr(iterm, "tty_by_id", lambda sid: "/dev/ttys999")
+        # Row 91: notify_banner now checks notify_via_tty's OWN return value (True/False — it never
+        # raises, so that's the only signal a real write failure has) to decide whether to fall
+        # through to tier 2, so the stub must return True on success exactly like the real function
+        # does — otherwise a "winning" write reads as a failed one and osascript fires too.
         monkeypatch.setattr(iterm, "notify_via_tty",
-                            lambda tty, title, body: sent.append((tty, title, body)))
+                            lambda tty, title, body: sent.append((tty, title, body)) or True)
         monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: ran.append(a))
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
         mod._notify({"notify_on_wake": True}, "exec-1 reported", project="proj",
