@@ -1889,32 +1889,128 @@ def git_dirty_paths(worktree):
         return None
 
 
-def report_landed(state_root, exec_sid, report_path):
-    """Row 70 item 4, belt-and-braces half: has this executor's report ALREADY landed — is every
-    path it claims under "What changed" clean in its worktree? Exactly the test auto-close's
-    `landed` reason applies, asked here so the Stop-hook wake can skip a report the previous owner
-    already reviewed and committed instead of re-announcing it as "review needed" (the incident in
-    `relay-issues/03-surfaced-not-carried-on-adopt.md`, which cost the successor a turn per stale
-    report and invited a re-review of committed work).
+def git_repo_files(worktree):
+    """Every path git tracks in `worktree` (`git ls-files`), as a set — the universe a report's
+    claimed path can resolve into. None on any git failure (callers must read that as UNKNOWN)."""
+    if not worktree:
+        return None
+    try:
+        r = subprocess.run(["git", "-C", str(worktree), "ls-files"], capture_output=True,
+                           text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        return {ln.strip() for ln in r.stdout.splitlines() if ln.strip()}
+    except Exception:
+        return None
 
-    Conservative by construction — False for everything it cannot PROVE: no recorded worktree, git
-    unreadable, or a report that claims no paths at all (an ops report claims none, and "no claims"
-    is not evidence of landing). A wake wrongly skipped is a silent report, which is worse than a
-    wake wrongly fired, so every uncertainty resolves towards waking."""
+
+def git_head_epoch(worktree):
+    """HEAD's commit time as a unix epoch, or None (no repo, no commits, git failure)."""
+    if not worktree:
+        return None
+    try:
+        r = subprocess.run(["git", "-C", str(worktree), "log", "-1", "--format=%ct"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        return int(r.stdout.strip())
+    except Exception:
+        return None
+
+
+def resolve_landed_claims(claimed, repo_files):
+    """Map each claimed path to the ONE tracked file it names — itself when tracked, else the
+    unique tracked path it is a `/`-suffix of (a report written relative to a package directory
+    says `foo.py` for `pkg/foo.py`; backlog row 93). Returns the list of resolved worktree-relative
+    paths, or None the moment ANY claim fails to resolve (no match, or an ambiguous suffix):
+    a claim that names nothing real cannot be proven clean, and "no overlap with the dirty set"
+    must never be mistaken for "committed" again."""
+    known = set(repo_files or ())
+    out = []
+    for p in claimed:
+        p = (p or "").strip()
+        if not p:
+            return None
+        if p in known:
+            out.append(p)
+            continue
+        matches = [k for k in known if k.endswith("/" + p)]
+        if len(matches) != 1:
+            return None
+        out.append(matches[0])
+    return out
+
+
+def landed_event_exists(state_root, exec_sid, packet):
+    """Whether the ledger holds a `landed` event for (exec_sid, packet) — the auto-close sweep's
+    own proof that the work reached a commit. False on any read failure."""
+    try:
+        path = Path(state_root) / "sessions.jsonl"
+        if not path.exists():
+            return False
+        with open(path) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if (e.get("event") == "landed" and e.get("session_id") == exec_sid
+                        and e.get("packet") == packet):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def claims_landed(state_root, exec_sid, report_path):
+    """Tri-state: has this executor's report PROVABLY landed (row 93)?
+
+      True   — at least one claimed path resolved to a tracked file, every resolved path is clean
+               in the worktree, and HEAD is at least as new as the report file.
+      False  — a resolved path is still dirty (the work is sitting in the worktree).
+      None   — cannot prove: no worktree, git unreadable, report missing/empty, no claims, a claim
+               that resolves to nothing or ambiguously, or HEAD older than the report.
+
+    The field failure this replaces: `report_landed` intersected the report's claimed paths (often
+    written relative to a subdirectory) with the worktree-root-relative dirty set; no overlap read
+    as "all clean" = landed, the wake was skipped and the surfaced stamp burned before the lead
+    ever saw the report, and auto-close parked the executor before review. Every uncertainty here
+    resolves to None, and None must be treated as "wake, keep open" by every caller."""
     try:
         import report_verify
+        rp = Path(report_path)
+        if not rp.is_file():
+            return None
+        text = rp.read_text()
+        if not text.strip():
+            return None
         worktree = read_session_json(state_root, exec_sid).get("worktree")
         if not worktree:
-            return False
-        claimed, _scoped = report_verify.claimed_paths(Path(report_path).read_text())
+            return None
+        claimed, _scoped = report_verify.claimed_paths(text)
         if not claimed:
-            return False
+            return None
+        repo_files = git_repo_files(worktree)
+        if repo_files is None:
+            return None
+        resolved = resolve_landed_claims(claimed, repo_files)
+        if not resolved:
+            return None
         dirty = git_dirty_paths(worktree)
         if dirty is None:
-            return False
-        return not (set(claimed) & dirty)
+            return None
+        head_ts = git_head_epoch(worktree)
+        if head_ts is None or head_ts < int(rp.stat().st_mtime):
+            return None  # nothing has been committed since the report was written
+        return not (set(resolved) & set(dirty))
     except Exception:
-        return False
+        return None
+
+
+def report_landed(state_root, exec_sid, report_path):
+    """Compatibility wrapper: `claims_landed(...) is True`. Callers that can act on the tri-state
+    (the Stop-hook wake, auto-close) should call `claims_landed` directly."""
+    return claims_landed(state_root, exec_sid, report_path) is True
 
 
 def diff_size_text(worktree):
@@ -2442,7 +2538,10 @@ def queue_stuck_on_heaviness(last_error):
     return bool(last_error) and QUEUE_HEAVY_REFUSAL in str(last_error)
 
 
-def auto_close_decision(s, *, report_age, surfaced, queued, claimed, dirty, heavy,
+_LANDED_UNSET = object()  # row 93: 'caller gave no tri-state' vs an explicit None (unprovable)
+
+
+def auto_close_decision(s, *, report_age, surfaced, queued, claimed, dirty, heavy, landed=_LANDED_UNSET,
                         idle_minutes, grace=AUTO_CLOSE_LANDED_GRACE_SECONDS,
                         queue_stuck_heavy=False, no_change=False):
     """PURE: should session record `s` be parked, and why? Returns (action, reason) with action
@@ -2465,7 +2564,13 @@ def auto_close_decision(s, *, report_age, surfaced, queued, claimed, dirty, heav
     if queued and not queue_stuck_heavy:
         return None
     reason = None
-    if claimed and report_age >= grace and not (set(claimed) & set(dirty or ())):
+    # Row 93: when the caller supplies `claims_landed`'s tri-state, ONLY True means landed —
+    # None (unprovable) falls through to the idle timer exactly like an unreadable git.
+    if landed is not _LANDED_UNSET:
+        landed_now = landed is True
+    else:
+        landed_now = bool(claimed) and not (set(claimed) & set(dirty or ()))
+    if landed_now and report_age >= grace:
         reason = "landed"
     # Row 70 item 3: an ops report claims no paths, so the rule above can never fire for it and the
     # session used to sit out the whole idle timer having finished. It lands the moment BOTH halves

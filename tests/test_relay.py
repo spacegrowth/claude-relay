@@ -221,17 +221,43 @@ class TestCheckTransitions:
         import subprocess as sp
         wt = tmp_path / "wt"; wt.mkdir()
         sp.run(["git", "-C", str(wt), "init", "-q"], check=True)
+        # Row 93: "landed" is proven, so the claimed file must be one git TRACKS and is clean.
+        (wt / "src").mkdir(); (wt / "src" / "a.py").write_text("committed\n")
+        sp.run(["git", "-C", str(wt), "add", "-A"], check=True)
         sp.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
-                "--allow-empty", "-m", "init"], check=True)
+                "-m", "init"], check=True)
         self._make_session(relay, "s1c", pid=os.getpid())
         s = relay.read_session("s1c"); s["worktree"] = str(wt); relay.write_session("s1c", s)
-        (relay.packets_dir("s1c") / "001-report.md").write_text("## What changed\n- `src/a.py`\n")
+        rp = relay.packets_dir("s1c") / "001-report.md"
+        rp.write_text("## What changed\n- `src/a.py`\n")
+        past = int(rp.stat().st_mtime) - 60
+        os.utime(rp, (past, past))   # the report predates HEAD, as a real landing does
         with mock.patch.object(relay.iterm, "is_alive", return_value=True):
             result = relay._check_one("s1c")
         assert result["status"] == "reported"
         events = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
         assert any(e.get("event") == "landed" and e.get("session_id") == "s1c" and e.get("packet") == 1
                    for e in events)
+
+    def test_reported_with_an_unresolvable_claim_never_records_landed(self, relay, tmp_path):
+        """Row 93: the old code intersected claims with the dirty set, so a claim naming a file git
+        never tracked read as 'clean' and ledgered `landed` — parking the executor before review."""
+        import subprocess as sp
+        wt = tmp_path / "wt"; wt.mkdir()
+        sp.run(["git", "-C", str(wt), "init", "-q"], check=True)
+        # Row 93: "landed" needs the claimed file to be one git TRACKS — commit src/a.py clean.
+        (wt / "src").mkdir(exist_ok=True); (wt / "src" / "a.py").write_text("committed\n")
+        sp.run(["git", "-C", str(wt), "add", "-A"], check=True)
+        sp.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "-m", "init"], check=True)
+        self._make_session(relay, "s1d", pid=os.getpid())
+        s = relay.read_session("s1d"); s["worktree"] = str(wt); relay.write_session("s1d", s)
+        (relay.packets_dir("s1d") / "001-report.md").write_text("## What changed\n- `src/ghost.py`\n")
+        with mock.patch.object(relay.iterm, "is_alive", return_value=True):
+            result = relay._check_one("s1d")
+        assert result["status"] == "reported"
+        events = [json.loads(l) for l in relay.LEDGER.read_text().splitlines()]
+        assert not any(e.get("event") == "landed" and e.get("session_id") == "s1d" for e in events)
 
     def test_title_miss_with_live_pid_is_not_dead(self, relay):
         # REGRESSION: a tab-title match miss must NOT override a live process. Claude Code mutates
@@ -2553,11 +2579,17 @@ class TestSend:
         import subprocess as sp
         wt = tmp_path / "wt"; wt.mkdir()
         sp.run(["git", "-C", str(wt), "init", "-q"], check=True)
+        # Row 93: "landed" needs the claimed file to be one git TRACKS — commit src/a.py clean.
+        (wt / "src").mkdir(exist_ok=True); (wt / "src" / "a.py").write_text("committed\n")
+        sp.run(["git", "-C", str(wt), "add", "-A"], check=True)
         sp.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
-                "--allow-empty", "-m", "init"], check=True)
+                "-m", "init"], check=True)
         self._mk(relay, status="reported", pid=os.getpid(), claude_session="cs-x", report=True)
         s = relay.read_session("e1"); s["worktree"] = str(wt); relay.write_session("e1", s)
-        (relay.packets_dir("e1") / "001-report.md").write_text("## What changed\n- `src/a.py`\n")
+        rp = relay.packets_dir("e1") / "001-report.md"
+        rp.write_text("## What changed\n- `src/a.py`\n")
+        past = int(rp.stat().st_mtime) - 60
+        os.utime(rp, (past, past))   # row 93: a landed report predates HEAD
         with mock.patch.object(relay.iterm, "send", return_value=True), \
              mock.patch.object(relay.iterm, "is_alive", return_value=True):
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
@@ -6936,8 +6968,11 @@ class TestAutoCloseSweep:
         wt = tmp_path / "wt"; wt.mkdir()
         import subprocess as sp
         sp.run(["git", "-C", str(wt), "init", "-q"], check=True)
+        # Row 93: "landed" needs the claimed file to be one git TRACKS — commit src/a.py clean.
+        (wt / "src").mkdir(exist_ok=True); (wt / "src" / "a.py").write_text("committed\n")
+        sp.run(["git", "-C", str(wt), "add", "-A"], check=True)
         sp.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
-                "--allow-empty", "-m", "init"], check=True)
+                "-m", "init"], check=True)
         return wt
 
     def _exec(self, relay, wt, sid="e1", age=600, surfaced=True, claimed=("src/a.py",), keep=False,
@@ -6988,7 +7023,7 @@ class TestAutoCloseSweep:
 
     def test_staged_work_still_present_is_not_landed(self, relay, tmp_path):
         wt = self._repo(tmp_path)
-        (wt / "src").mkdir(); (wt / "src" / "a.py").write_text("x")   # untracked claimed file = still here
+        (wt / "src" / "a.py").write_text("x")   # modified claimed file = work still here
         self._exec(relay, wt)
         assert self._sweep(relay) == [] and relay.read_session("e1")["status"] == "reported"
 
@@ -7079,8 +7114,11 @@ class TestRecordLandedIfClean:
         import subprocess as sp
         wt = tmp_path / "wt"; wt.mkdir()
         sp.run(["git", "-C", str(wt), "init", "-q"], check=True)
+        # Row 93: "landed" needs the claimed file to be one git TRACKS — commit src/a.py clean.
+        (wt / "src").mkdir(exist_ok=True); (wt / "src" / "a.py").write_text("committed\n")
+        sp.run(["git", "-C", str(wt), "add", "-A"], check=True)
         sp.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
-                "--allow-empty", "-m", "init"], check=True)
+                "-m", "init"], check=True)
         return wt
 
     def _mk(self, relay, wt, sid="e1", report_body="## What changed\n- `src/a.py`\n"):
@@ -7088,7 +7126,10 @@ class TestRecordLandedIfClean:
         relay.write_session(sid, {"session_id": sid, "worktree": str(wt), "topic": "t", "scope": "t",
             "tab_label": f"[Exec] {sid}", "status": "reported", "current_packet": 1,
             "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
-        (relay.packets_dir(sid) / "001-report.md").write_text(report_body)
+        rp = relay.packets_dir(sid) / "001-report.md"
+        rp.write_text(report_body)
+        past = int(rp.stat().st_mtime) - 60
+        os.utime(rp, (past, past))   # row 93: a landed report predates HEAD
         return relay.read_session(sid)
 
     def _landed_events(self, relay):
@@ -7108,7 +7149,7 @@ class TestRecordLandedIfClean:
 
     def test_not_recorded_when_claimed_path_is_dirty(self, relay, tmp_path):
         wt = self._repo(tmp_path)
-        (wt / "src").mkdir(); (wt / "src" / "a.py").write_text("x")  # untracked = still dirty
+        (wt / "src" / "a.py").write_text("x")  # modified = still dirty
         s = self._mk(relay, wt)
         relay.record_landed_if_clean("e1", s, 1, "test")
         assert self._landed_events(relay) == []

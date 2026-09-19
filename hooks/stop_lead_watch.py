@@ -188,16 +188,19 @@ def _report_lines(lg, sid):
     False for anything it cannot prove, so an uncertain report still wakes."""
     lines, keys = [], []
     for key, exsid, packet, path in lg.new_reports_for(STATE_ROOT, sid):
-        if lg.report_landed(STATE_ROOT, exsid, path):
-            # Lead review of packet 001: skipping is not enough. `new_reports_for` returns this
-            # report again on EVERY Stop hook (a git status each time) and `relay list` keeps
-            # naming it under "NOT yet proven delivered" forever, because nothing ever stamps it.
-            # Landing IS the terminal outcome for a report — the lead reviewed and committed it —
-            # so stamp it surfaced here, once, exactly as the #17 delivery-proven channels do.
+        landed = lg.claims_landed(STATE_ROOT, exsid, path)
+        if landed is True:
+            # Row 93: skipping is only safe when relay can PROVE the landing. Stamp the one-shot
+            # surfaced mark ONLY when the auto-close sweep's own `landed` ledger event exists for
+            # this packet; otherwise ledger the skip without stamping so the next Stop re-evaluates
+            # (an early or mistaken skip must never silence a report forever again).
             try:
-                lg.mark_surfaced(STATE_ROOT, sid, [key])
+                proven = lg.landed_event_exists(STATE_ROOT, exsid, packet)
+                if proven:
+                    lg.mark_surfaced(STATE_ROOT, sid, [key])
                 lg.append_ledger(STATE_ROOT, "wake_skipped_landed", session_id=sid,
-                                 executor=exsid, packet=packet, key=key, reason="landed")
+                                 executor=exsid, packet=packet, key=key, reason="landed",
+                                 stamped=bool(proven))
             except Exception:
                 pass
             continue

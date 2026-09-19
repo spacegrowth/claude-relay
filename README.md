@@ -715,6 +715,8 @@ sessions included, that's where the history is. `--lead <sid>` scopes to that le
 
 ### Auto-close: finished executors park themselves
 
+"Landed" is proven, never inferred (row 93): at least one path the report claims under "What changed" must resolve to a file git tracks (a subdirectory-relative claim resolves by unique suffix), every resolved path must be clean, and HEAD must be at least as new as the report. Anything relay cannot prove keeps the executor open and still wakes the lead; the Stop hook's landed-skip stamps a report surfaced only once the sweep has ledgered `landed` for that packet.
+
 Executors used to sit idle for hours after reporting because nobody said `relay close` — tabs piling
 up, `relay list` full of noise. Now relay parks them on two deterministic signals, no model call:
 

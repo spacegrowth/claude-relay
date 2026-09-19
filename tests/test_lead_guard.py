@@ -4796,3 +4796,42 @@ class TestClosedExecutorsNeverNag:
             self._exec(root, sid, st)
         got = {sid for _, sid, _, _ in lg.new_reports_for(root, "lead-1")}
         assert got == {"e-dead", "e-rep"}
+
+
+class TestResolveLandedClaims:
+    """Row 93: a claim resolves to itself when tracked, to the unique tracked path it is a
+    `/`-suffix of, and to None (whole result) when anything is unresolvable or ambiguous."""
+    FILES = {"a.py", "pkg/b.py", "pkg/sub/c.py", "other/c.py"}
+
+    def test_tracked_claim_resolves_to_itself(self):
+        assert lg.resolve_landed_claims(["a.py"], self.FILES) == ["a.py"]
+
+    def test_subdirectory_relative_claim_resolves_by_unique_suffix(self):
+        assert lg.resolve_landed_claims(["b.py", "sub/c.py"], self.FILES) == ["pkg/b.py", "pkg/sub/c.py"]
+
+    def test_ambiguous_suffix_is_unprovable(self):
+        assert lg.resolve_landed_claims(["c.py"], self.FILES) is None
+
+    def test_a_claim_naming_nothing_tracked_is_unprovable(self):
+        assert lg.resolve_landed_claims(["a.py", "ghost.py"], self.FILES) is None
+
+    def test_no_repo_files_is_unprovable(self):
+        assert lg.resolve_landed_claims(["a.py"], None) is None
+
+
+class TestAutoCloseDecisionLandedTriState:
+    """Row 93: `landed=` (claims_landed's tri-state) overrides the claimed/dirty intersection —
+    only True lands; None falls through to the idle timer like an unreadable git."""
+    def _d(self, landed, report_age=200):
+        return lg.auto_close_decision({"status": "reported", "keep": False}, report_age=report_age,
+                                      surfaced=True, queued=False, claimed=["a.py"], dirty=[],
+                                      heavy=False, landed=landed, idle_minutes=0)
+
+    def test_true_lands(self):
+        assert self._d(True) == ("close", "landed")
+
+    def test_none_does_not_land_even_when_claims_look_clean(self):
+        assert self._d(None) != ("close", "landed")
+
+    def test_false_does_not_land(self):
+        assert self._d(False) != ("close", "landed")

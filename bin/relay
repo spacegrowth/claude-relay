@@ -3012,12 +3012,8 @@ def record_landed_if_clean(sid, s, packet_n, trigger):
         report = packets_dir(sid) / f"{packet_n:03d}-report.md"
         if not report.exists():
             return
-        claimed, _scoped = report_verify.claimed_paths(report.read_text())
-        if not claimed:
-            return  # investigation packets that claim no paths can never land
-        dirty = _git_dirty_paths(s.get("worktree") or "")
-        if dirty is None or (set(claimed) & set(dirty)):
-            return  # unreadable worktree state, or a claimed path is still dirty
+        if lead_guard.claims_landed(STATE_ROOT, sid, str(report)) is not True:
+            return  # row 93: unprovable (None) or still dirty (False) — never record a landing
         events = _ledger_by_session().get(sid, [])
         if any(e.get("event") == "landed" and e.get("packet") == packet_n for e in events):
             return  # already recorded
@@ -3089,9 +3085,10 @@ def auto_close_sweep(trigger, sids=None, lead_sid=None):
                     claimed = []  # git unreadable → the landed path is unavailable, timer only
                 heavy = _is_heavy(_usage_for_session(s), _transcript_mb_for(s.get("claude_session")),
                                   token_threshold, mb_threshold)
+                landed = lead_guard.claims_landed(STATE_ROOT, sid, str(report))
                 decision = lead_guard.auto_close_decision(
                     s, report_age=report_age, surfaced=surfaced, queued=queued, claimed=claimed,
-                    dirty=dirty, heavy=heavy, idle_minutes=idle_minutes,
+                    dirty=dirty, heavy=heavy, landed=landed, idle_minutes=idle_minutes,
                     queue_stuck_heavy=queue_stuck_heavy, no_change=no_change)
                 if not decision:
                     continue

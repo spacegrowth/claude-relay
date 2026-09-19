@@ -327,10 +327,66 @@ class TestStopHookSkipsLandedReports:
         armed(tmp_path)
         repo = self._repo(tmp_path)
         H.make_executor(tmp_path, report=self.REPORT, worktree=str(repo), status="reported")
+        # Row 93: the stamp needs the auto-close sweep's own `landed` event as proof.
+        lg.append_ledger(H.state_root(tmp_path), "landed", session_id="exec-1", packet=1)
         assert lg.new_reports_for(H.state_root(tmp_path), "lead-1")   # it is pending before
         assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == SILENT
         assert lg.new_reports_for(H.state_root(tmp_path), "lead-1") == []
         assert lg.load_surfaced(H.state_root(tmp_path), "lead-1") == {"exec-1:1"}
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_landed_skip_without_a_landed_event_is_not_stamped(self, drv, tmp_path):
+        """Row 93: a skip relay cannot back with a `landed` ledger event must not burn the one-shot
+        surfaced stamp — the field incident stamped reports 17 minutes before they existed. The
+        skip is ledgered with `stamped: false` and the report stays pending for the next Stop."""
+        armed(tmp_path)
+        repo = self._repo(tmp_path)
+        H.make_executor(tmp_path, report=self.REPORT, worktree=str(repo), status="reported")
+        assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == SILENT
+        assert lg.load_surfaced(H.state_root(tmp_path), "lead-1") == set()
+        assert lg.new_reports_for(H.state_root(tmp_path), "lead-1")   # still pending
+        recs = [json.loads(l) for l in (H.state_root(tmp_path) / "sessions.jsonl").read_text().splitlines()]
+        skips = [r for r in recs if r.get("event") == "wake_skipped_landed"]
+        assert skips and skips[-1].get("stamped") is False
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_claim_that_resolves_to_no_tracked_file_still_wakes(self, drv, tmp_path):
+        """Row 93's root cause: a claimed path with no overlap in the dirty set used to read as
+        'all clean'. A claim naming nothing git tracks is unprovable, so the lead is woken."""
+        armed(tmp_path)
+        repo = self._repo(tmp_path)
+        report = self.REPORT.replace("`a.py:1`", "`pkg/never/existed.py`")
+        H.make_executor(tmp_path, report=report, worktree=str(repo), status="reported")
+        assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == WAKE
+        assert "wake_skipped_landed" not in H.ledger_events(tmp_path)
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_subdirectory_relative_claim_resolves_by_unique_suffix(self, drv, tmp_path):
+        """A report written relative to a package dir says `b.py` for `pkg/b.py`; it resolves to
+        the one tracked file with that suffix and is judged on THAT path's state."""
+        armed(tmp_path)
+        repo = self._repo(tmp_path)
+        (repo / "pkg").mkdir(); (repo / "pkg" / "b.py").write_text("x\n")
+        self._git(repo, "add", "-A"); self._git(repo, "commit", "-m", "pkg")
+        report = self.REPORT.replace("`a.py:1`", "`b.py`")
+        H.make_executor(tmp_path, report=report, worktree=str(repo), status="reported")
+        assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == SILENT   # clean → landed
+        (repo / "pkg" / "b.py").write_text("in flight\n")
+        H.make_executor(tmp_path, sid="exec-2", report=report, worktree=str(repo), status="reported")
+        assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == WAKE     # dirty → wakes
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_report_newer_than_head_is_not_landed(self, drv, tmp_path):
+        """Nothing can have committed a report's work before the report existed: HEAD older than
+        the report file is unprovable, so the lead is woken."""
+        armed(tmp_path)
+        repo = self._repo(tmp_path)
+        H.make_executor(tmp_path, report=self.REPORT, worktree=str(repo), status="reported")
+        rp = H.state_root(tmp_path) / "exec-1" / "packets" / "001-report.md"
+        future = int(rp.stat().st_mtime) + 600
+        os.utime(rp, (future, future))
+        assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == WAKE
+        assert "wake_skipped_landed" not in H.ledger_events(tmp_path)
 
     @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
     def test_the_landed_skip_is_ledgered_once_not_on_every_stop(self, drv, tmp_path):
@@ -339,6 +395,7 @@ class TestStopHookSkipsLandedReports:
         armed(tmp_path)
         repo = self._repo(tmp_path)
         H.make_executor(tmp_path, report=self.REPORT, worktree=str(repo), status="reported")
+        lg.append_ledger(H.state_root(tmp_path), "landed", session_id="exec-1", packet=1)
         drv(STOP, stop_payload(tmp_path), tmp_path)
         drv(STOP, stop_payload(tmp_path), tmp_path)
         assert H.ledger_events(tmp_path).count("wake_skipped_landed") == 1
