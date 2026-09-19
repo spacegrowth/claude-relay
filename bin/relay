@@ -6501,7 +6501,11 @@ def cmd_lead_start(args):
     # lookup nor this process's own controlling tty resolves) — notify_banner falls back to its
     # pre-row-91 live lookup whenever the marker has no tty, so this never makes things worse.
     tty = lead_guard._capture_tty(iterm_session)
-    lead_guard.write_marker(STATE_ROOT, args.session_id, model=args.model,
+    # Record the model this lead actually runs on (row 94): --model when given, else the marker's
+    # existing value (a pre-armed successor's handoff-given model), else the CLI's own stamp on the
+    # transcript's last assistant turn — so `relay list` shows it and a handoff can inherit it.
+    lead_model = args.model or existing.get("model") or _lead_live_model(args.session_id)
+    lead_guard.write_marker(STATE_ROOT, args.session_id, model=lead_model,
                             iterm_session=iterm_session, project=project, cwd=cwd,
                             tab_label=tab_label, color=color, tty=tty,
                             plugin_version=plugin_version(), stop_hook_timeout=stop_hook_timeout(),
@@ -6528,7 +6532,7 @@ def cmd_lead_start(args):
     # only reports commits made AFTER lead mode began — not the repo's entire prior history.
     lead_guard.write_head(STATE_ROOT, args.session_id, lead_guard.git_head(os.getcwd()))
     auto_on = bool(cfg.get("autonomous_mode", False))
-    append_ledger("lead_started", session_id=args.session_id, model=args.model, autonomous=auto_on)
+    append_ledger("lead_started", session_id=args.session_id, model=lead_model, autonomous=auto_on)
     print(f"lead mode active for session '{args.session_id}'"
           + (f" (model {args.model})" if args.model else ""))
     # Row 92: name the origin every time, so a lead riding the cwd-basename fallback is visible at
@@ -6629,7 +6633,23 @@ def cmd_handoff(args):
     project = args.project or _successor_name_from_handoff(new_body, caller_marker.get("project")) \
         or os.path.basename(os.getcwd())
     cwd = caller_marker.get("cwd") or os.getcwd()
-    model = args.model or caller_marker.get("model")
+    # The successor must run on the SAME model as the outgoing lead. The marker's `model` is only
+    # set when lead-start was given --model (rarely), so fall back to the caller's LIVE model — the
+    # CLI's own stamp on its last assistant turn — before letting the CLI default win. Field
+    # incident (2026-09-18): every handoff successor came up on the default model.
+    model = args.model
+    model_source = "--model"
+    if not model:
+        model = caller_marker.get("model")
+        model_source = "caller marker"
+    if not model:
+        model = _lead_live_model(caller)
+        model_source = "caller's live transcript"
+    if model:
+        print(f"successor model: {model} (from {model_source})")
+    else:
+        print("WARNING: could not determine the outgoing lead's model — the successor will start "
+              "on the CLI default; pass --model to pin it", file=sys.stderr)
     successor_sid = str(uuid.uuid4())  # pinned — this IS the successor's session id
     # Row 75: never open the successor under a title a LIVE lead already wears. At this moment the
     # caller is still armed and still titled `[Lead] <project>` — the `[ex-Lead]` retitle below

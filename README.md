@@ -575,6 +575,8 @@ emoji **is** the colour here — real colour renders where it can, in the `relay
 
 ### Handing off a long-lived lead
 
+The successor runs on the same model as the outgoing lead: `--model` if given, else the model recorded in the caller's marker, else the caller's live model read from its own transcript (row 94). `relay handoff` prints which one it used and warns if none resolved.
+
 Heavy session (large transcript, or just wanting a fresh context)? Distill what matters to a
 handoff md — what's in flight, what's reviewed/committed, open questions, next steps — then run
 `/relay:handoff <handoff.md>`. A handoff file should fit one screen — it's a distillation for the

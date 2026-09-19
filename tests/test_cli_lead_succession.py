@@ -1263,3 +1263,31 @@ class TestWhoami:
         arm_lead(relay, "11111111-2222-3333-4444-555555555555", "webapp")
         run_main(relay, "whoami", "webapp", "--json")
         assert json.loads(capsys.readouterr().out)["role"] == "lead"
+
+
+class TestHandoffInheritsTheCallersModel:
+    """Row 94: a handoff successor must run on the SAME model as the outgoing lead. The marker's
+    `model` is only set when lead-start was given --model, so handoff falls back to the caller's
+    LIVE model (the CLI's stamp on its last assistant turn) before the CLI default can win."""
+
+    def _doc(self, tmp_path):
+        p = tmp_path / "handoff.md"; p.write_text("# Handoff\n\nnext steps\n"); return str(p)
+
+    def _run(self, relay, terms, tmp_path, monkeypatch, marker_model, live_model, *extra):
+        from unittest import mock
+        arm_lead(relay, "lead-old", "webapp", model=marker_model, iterm_session="w0t0p0:OLD",
+                 backend="iterm", started="2020-01-01T00:00:00")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-old")
+        with mock.patch.object(relay, "_lead_live_model", return_value=live_model):
+            run_main(relay, "handoff", self._doc(tmp_path), *extra)
+        return terms.spawns[0].get("model")
+
+    def test_marker_model_wins_over_live(self, relay, terms, tmp_path, monkeypatch):
+        assert self._run(relay, terms, tmp_path, monkeypatch, "opus", "claude-sonnet-5") == "opus"
+
+    def test_live_model_used_when_marker_has_none(self, relay, terms, tmp_path, monkeypatch):
+        assert self._run(relay, terms, tmp_path, monkeypatch, None, "claude-fable-5-1") == "claude-fable-5-1"
+
+    def test_explicit_flag_wins_over_both(self, relay, terms, tmp_path, monkeypatch):
+        assert self._run(relay, terms, tmp_path, monkeypatch, "opus", "claude-fable-5-1",
+                         "--model", "sonnet") == "sonnet"
