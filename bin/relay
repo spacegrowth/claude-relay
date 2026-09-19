@@ -5945,6 +5945,39 @@ def _diff_stat(worktree):
     return stat
 
 
+def _park_after_review(sid, packet_n):
+    """Row 95: once a packet's report has been REVIEWED (`report_reviewed` just ledgered), the
+    executor has nothing left to do — park it now, not hours later when the human says commit.
+    Its staged work stays in the worktree (the lead commits from the branch), and a fix-list
+    `relay send` resumes the closed session with full context, so nothing is lost by closing
+    early; what is gained is a tab that stops drawing 120k banners while it idles. Same
+    `auto_closed` shape and ledger event as the sweep, reason `reviewed`. Skipped when the session
+    is pinned (`keep`), already terminal, has a queued packet waiting, or is not on this packet.
+    Best-effort: a parking failure must never fail the verify that triggered it."""
+    try:
+        s = read_session(sid)
+        if not s or s.get("keep") or s.get("status") in ("closed", "superseded", "dead"):
+            return
+        if int(s.get("current_packet") or 0) != int(packet_n):
+            return
+        if read_queue(sid):
+            return
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_close(SimpleNamespace(session_id=sid, supersede=None, self_session=None,
+                                      keep_tab=False))
+        s2 = read_session(sid) or s
+        s2["auto_closed"] = "reviewed"
+        s2["updated"] = now()
+        write_session(sid, s2)
+        append_ledger("auto_closed", session_id=sid, action="close", reason="reviewed",
+                      trigger="verify")
+        print(c(f"  🛏 parked '{sid}' (reviewed) — its staged work stays in the worktree; "
+                f"`relay send {sid} <packet>` resumes it with full context", "dim"))
+    except Exception as e:
+        append_ledger("auto_close_error", session_id=sid, error=str(e)[:200], trigger="verify")
+
+
 def cmd_verify(args):
     """`relay verify <sid> [--packet N] [--rerun] [--for-autocommit]` — check an executor's report
     against the staged reality in its worktree, and stamp MALFORMED / MISMATCH / INCONCLUSIVE /
@@ -6037,6 +6070,7 @@ def cmd_verify(args):
                           path=str(review_path), findings=findings_count)
         else:
             append_ledger("report_reviewed", session_id=args.session_id, packet=n, mode="inline")
+        _park_after_review(args.session_id, n)
 
     if not getattr(args, "for_autocommit", False):
         sys.exit(report_verify.EXIT_CODES[result["verdict"]])

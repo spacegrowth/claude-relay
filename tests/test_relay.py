@@ -3793,6 +3793,46 @@ class TestVerifyFindings:
         assert rec["mode"] == "fork" and rec["findings"] == 3
         assert rec["path"] == str(relay.packets_dir("e1") / "001-review.md")
 
+    def _close_mocks(self, relay):
+        from unittest import mock
+        return (mock.patch.object(relay, "_kill_and_wait"),
+                mock.patch.object(relay.iterm, "close", return_value=True),
+                mock.patch.object(relay.iterm, "is_alive", return_value=False))
+
+    def test_review_parks_the_executor_with_reason_reviewed(self, relay, tmp_path):
+        """Row 95: a reviewed packet has nothing left to do — verify parks it right away."""
+        self._setup(relay, tmp_path)
+        f = tmp_path / "findings.md"; f.write_text("Findings:\n1. a — note — fine\n")
+        a, b, c_ = self._close_mocks(relay)
+        with a, b, c_:
+            self._run(relay, "e1", diff_reviewed=True, findings=str(f))
+        s = relay.read_session("e1")
+        assert s["status"] == "closed" and s["auto_closed"] == "reviewed"
+        ev = self._events(relay, "auto_closed")
+        assert ev and ev[-1]["reason"] == "reviewed" and ev[-1]["trigger"] == "verify"
+
+    def test_review_never_parks_a_pinned_or_queued_executor(self, relay, tmp_path):
+        self._setup(relay, tmp_path)
+        f = tmp_path / "findings.md"; f.write_text("Findings:\n1. a — note — fine\n")
+        s = relay.read_session("e1"); s["keep"] = True; relay.write_session("e1", s)
+        a, b, c_ = self._close_mocks(relay)
+        with a, b, c_:
+            self._run(relay, "e1", diff_reviewed=True, findings=str(f))
+        assert relay.read_session("e1")["status"] != "closed"
+        s = relay.read_session("e1"); s["keep"] = False; relay.write_session("e1", s)
+        relay.write_queue("e1", [{"id": 1, "source": "x", "body_path": "y"}])
+        with a, b, c_:
+            self._run(relay, "e1", diff_reviewed=True, findings=str(f))
+        assert relay.read_session("e1")["status"] != "closed"
+
+    def test_a_bare_verify_does_not_park(self, relay, tmp_path):
+        """Only a REVIEW (diff_reviewed) parks; a plain verify is just a machine check."""
+        self._setup(relay, tmp_path)
+        a, b, c_ = self._close_mocks(relay)
+        with a, b, c_:
+            self._run(relay, "e1")
+        assert relay.read_session("e1")["status"] != "closed"
+
     def test_diff_reviewed_without_findings_ledgers_inline(self, relay, tmp_path):
         self._setup(relay, tmp_path)
         self._run(relay, "e1", diff_reviewed=True)

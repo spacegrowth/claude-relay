@@ -717,6 +717,8 @@ sessions included, that's where the history is. `--lead <sid>` scopes to that le
 
 ### Auto-close: finished executors park themselves
 
+A REVIEWED packet parks its executor immediately (row 95): `relay verify <sid> --diff-reviewed [--findings <path>]` — what `/relay:review` runs — closes the session with `auto_closed: reviewed` the moment the review is ledgered, unless it is pinned with `relay keep`, has a queued packet, or has moved on to a later packet. The staged work stays in its worktree for the lead to commit, and a fix-list `relay send` reopens the same conversation.
+
 "Landed" is proven, never inferred (row 93): at least one path the report claims under "What changed" must resolve to a file git tracks (a subdirectory-relative claim resolves by unique suffix), every resolved path must be clean, and HEAD must be at least as new as the report. Anything relay cannot prove keeps the executor open and still wakes the lead; the Stop hook's landed-skip stamps a report surfaced only once the sweep has ledgered `landed` for that packet.
 
 Executors used to sit idle for hours after reporting because nobody said `relay close` — tabs piling
