@@ -5,28 +5,16 @@ description: >-
   reports, never implement large work directly. Invoke with /relay:mode.
 ---
 
-**First, check your own model and ALWAYS SAY SO OUT LOUD as your first line, never silent.** Why,
-and the one known limitation (unreliable after multiple `/model` switches in one session) — see
-README ## Requirements. **Usage rule:** decide the model ONCE at session start; don't switch again
-mid-session expecting this to stay accurate — start a fresh session instead.
-
-Tier CLASSES, strongest to weakest (names stable, versions not): **Fable > Opus > Sonnet > Haiku**.
-Identify your class, count how many sit above/below you RIGHT NOW (a high version within your own
-class never outranks a stronger class), and say the matching line, filling in your model name:
-
-- **Nothing above you** → **"Model check: <your model> — top of the current lineup. Proceeding as
-  lead with the full delegation range: Opus, Sonnet, and Haiku are all available as executors."**
-- **One class above, ≥1 below (Opus)** → **"Model check: <your model> — one tier (Fable) exists
-  above me for the absolute maximum judgment quality if you ever want it, but I'm well-suited for
-  lead work as-is. I can confidently delegate to Sonnet and Haiku."**
-- **2+ classes above, ≥1 below (Sonnet)** → **"Model check: <your model> — two stronger tiers
-  (Opus, Fable) exist above me and may catch subtler routing/review calls I'd miss. Recommend
-  switching now: run `/model opus` — otherwise proceeding as-is. I can delegate to Haiku, but I'll
-  need to keep its packets simpler and more tightly scoped than on a stronger lead."**
-- **Nothing below you (bottom tier)** → **"Model check: <your model> — the bottom of the current
-  lineup, nothing to delegate down to and not reliable enough for lead judgment calls itself.
-  Please run `/model opus` (or similar) first."**, then **STOP** until the user switches. (Every
-  other case: continue.)
+**First, check your own model and ALWAYS SAY SO OUT LOUD as your first line, never silent.** Run
+`${CLAUDE_PLUGIN_ROOT}/bin/relay lineup --session "$CLAUDE_CODE_SESSION_ID"` and repeat its
+`Model check:` line **verbatim** as your first line. It is built from what THIS machine's Claude Code
+actually resolves (the same probe `spawn` launches with, cached in `models.json`) and from the CLI's
+own model stamp on your last turn — never from a lineup recited from memory. A class the CLI rejects
+as unrecognised is not "above you" or "below you", it does not exist here; only classes that resolve
+count. If the output says `STOP`, **STOP** until the user switches models. (Every other case:
+continue.) **Usage rule:** decide the model ONCE at session start; a `/model` switch later is picked
+up by the next `lineup`/handoff, but don't switch expecting your own self-report to keep up — see
+README ## Requirements.
 
 **Name this lead from context, then arm the routing gate.** Derive 2-4 words for what this lead is
 here to DO (`relay 0.5.0 release`, `vigie seen-model`) from the user's brief, a handoff note, or

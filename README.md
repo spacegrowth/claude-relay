@@ -60,12 +60,14 @@ wakes you when an executor finishes.
 **Why the lead's own model matters**: this role's value is judgment calls (what to delegate, when
 to reuse a session, whether a report is truly mergeable) — that needs a strong reasoning model, and
 no skill can switch it programmatically, so `/relay:mode` has the session say its own tier out loud
-rather than trust it silently. Known limitation, confirmed empirically: the self-check becomes
-unreliable after multiple `/model` switches within one continuing session (self-knowledge of "which
-model am I" doesn't reliably refresh on every switch), and there's no known way to verify the
-running model programmatically. Decide the model once at session start — the session's launch
-model, or a single `/model` switch made before invoking `/relay:mode` — and don't switch again
-expecting the check to stay accurate; start a fresh session instead if you need a different one.
+rather than trust it silently. The line it says comes from `relay lineup`: the running model is
+read from the CLI's own stamp on the session's last turn (not the model's self-report, which goes
+stale after repeated `/model` switches), and the classes "above" and "below" it are the ones this
+machine's Claude Code actually resolves — probed with the same launch line `spawn` uses and cached
+per CLI version in `~/.relay-tasks/models.json` — never a fixed Fable/Opus/Sonnet/Haiku list. A
+handoff successor is launched on that same live model. Decide the model once at session start; a
+later `/model` switch is honoured by the next `lineup`/handoff, but not by the model's own memory of
+what it is.
 
 Fully local, no telemetry — see [PRIVACY.md](PRIVACY.md).
 

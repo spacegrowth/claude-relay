@@ -21,6 +21,7 @@ Commands:
   relay close --self <session_id>            # step down from lead mode
   relay stop <session_id>                    # step down from lead mode (alias for close --self)
   relay lead-start <session_id> [--model N]   # mark this session a lead (from /relay:mode)
+  relay lineup [--session S] [--json]         # model classes this machine's CLI offers + this lead's place
   relay adopt <session_id> [--force]          # re-point an executor's auto-wake ownership to this lead
   relay route retain "<reason>" --session <session_id>   # open the retain grace window
   relay handoff <handoff.md> [--project NAME] [--model NAME]  # succeed this lead with a pre-armed fresh one
@@ -2275,7 +2276,20 @@ def _rotate_and_send(args, s, mb=None, upgrade=False):
             idx = lead_guard.TIER_ORDER.index(from_tier)
             if idx + 1 >= len(lead_guard.TIER_ORDER):
                 sys.exit(f"--upgrade: '{sid}' already runs {from_tier}, the top tier — nothing above it")
-            model = lead_guard.TIER_ORDER[idx + 1]
+            # Row 96: "one tier up" means the next class THIS machine's Claude Code recognises, not
+            # the next word in TIER_ORDER — a class the CLI rejects as unrecognised is skipped (a
+            # probe that merely fails for other reasons stays fail-open, exactly like spawn).
+            model, skipped = None, []
+            for alias in lead_guard.TIER_ORDER[idx + 1:]:
+                if _class_availability(alias)["state"] == "unavailable":
+                    skipped.append(alias)
+                    continue
+                model = alias
+                break
+            if model is None:
+                sys.exit(f"--upgrade: '{sid}' runs {from_tier} and nothing above it is available on this "
+                         f"machine (not recognised by this Claude Code: {', '.join(skipped)}) — run "
+                         f"`relay lineup` to see the lineup")
     elif not explicit_model:
         # plain --rotate default: `relay tier`'s "lead" posture substitutes this owner's own model
         # class for the ordinary "same territory" default (config executor_default_model / the
@@ -3287,6 +3301,99 @@ def _tier_manual_block(owner_lead, tier, packet_path, ceiling):
     if not available:
         return TIER_ZERO_AVAILABLE_MSG
     return TIER_MANUAL_ASK_MSG.format(sid=owner_lead, packet=packet_path)
+
+
+def _class_availability(alias):
+    """{"class", "state", "id"|"why"} for one TIER_ORDER class on THIS machine, through the same
+    resolver spawn launches with (cached per CLI version in models.json, one probe otherwise).
+    state: "available" (the CLI resolved it to a concrete id), "unavailable" (the CLI rejected the
+    alias as unrecognised — it does not exist for this account/version), or "unknown" (the probe
+    failed for some other reason: timeout, no network, tests). Row 96: what a lead may say about
+    the models above/below it comes from HERE, never from a lineup recited from memory."""
+    try:
+        resolved, src = resolve_model_for_launch(alias)
+    except ValueError as e:
+        return {"class": alias, "state": "unavailable", "why": str(e)}
+    if src.startswith("unresolved"):
+        return {"class": alias, "state": "unknown", "why": src[len("unresolved:"):].strip()}
+    return {"class": alias, "state": "available", "id": resolved}
+
+
+def lineup_data(sid, ceiling):
+    """The `relay lineup` payload: this lead's own model (live transcript stamp, else marker), its
+    class, every TIER_ORDER class with its availability on this machine, the classes above/below the
+    lead that are actually available, the executor range (available AND within
+    `executor_model_ceiling`), and the one `Model check:` line /relay:mode has the lead say out loud
+    — built from what resolves HERE, so a machine without Fable never hears "one tier exists above
+    me", and a machine with only Sonnet never hears "Opus, Sonnet and Haiku are all available"."""
+    marker = lead_guard.read_marker(STATE_ROOT, sid) if sid else {}
+    live = _lead_live_model(sid) if sid else None
+    own = live or marker.get("model")
+    own_source = "live transcript" if live else ("marker" if own else None)
+    own_class = lead_guard.model_tier(own)
+    classes = [_class_availability(a) for a in lead_guard.TIER_ORDER]
+    available = [c["class"] for c in classes if c["state"] == "available"]
+    order = lead_guard.TIER_ORDER
+    above = [a for a in available if own_class and order.index(a) > order.index(own_class)]
+    below = [a for a in available if own_class and order.index(a) < order.index(own_class)]
+    executors = [a for a in available if not lead_guard.model_exceeds_ceiling(a, ceiling)]
+    strongest = available[-1] if available else None
+    label = own or "unknown model"
+    if own_class is None:
+        line = (f"Model check: {label} — can't place this model in the lineup (unknown class). "
+                f"Executors available here: {', '.join(executors) or 'none'}.")
+        stop = False
+    elif not available:
+        line = (f"Model check: {label} — no executor model resolves on this machine yet (run `relay "
+                f"doctor`). Proceeding as lead; spawns will fail until one does.")
+        stop = False
+    elif not below:
+        line = (f"Model check: {label} — the weakest class available on this machine; nothing to "
+                f"delegate down to, and not reliable enough for lead judgment calls itself. Please run "
+                f"`/model {strongest}` first.")
+        stop = True
+    elif not above:
+        line = (f"Model check: {label} — the strongest class available on this machine. Proceeding as "
+                f"lead; executors available here: {', '.join(executors)}.")
+        stop = False
+    elif len(above) == 1:
+        line = (f"Model check: {label} — one stronger class ({above[0]}) is available here for maximum "
+                f"judgment if you want it, but I'm well-suited for lead work as-is. Executors available "
+                f"here: {', '.join(executors)}.")
+        stop = False
+    else:
+        line = (f"Model check: {label} — {len(above)} stronger classes ({', '.join(above)}) are "
+                f"available here and may catch routing/review calls I'd miss. Recommend `/model "
+                f"{strongest}` now; otherwise proceeding as-is. Executors available here: "
+                f"{', '.join(executors)}.")
+        stop = False
+    return {"session": sid, "model": own, "model_source": own_source, "class": own_class,
+            "classes": classes, "available": available, "above": above, "below": below,
+            "executor_ceiling": ceiling, "executors": executors, "model_check": line, "stop": stop}
+
+
+def cmd_lineup(args):
+    """`relay lineup [--session SID] [--json]` — what this machine's Claude Code actually offers,
+    and where this lead sits in it. Invoked by /relay:mode for the spoken model check (row 96)."""
+    cfg = lead_guard.load_config(STATE_ROOT)
+    data = lineup_data(args.session or None, cfg.get("executor_model_ceiling", "opus"))
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    print(data["model_check"])
+    if data["stop"]:
+        print("STOP: wait for the user to switch models before continuing as lead.")
+    src = f" (from {data['model_source']})" if data["model_source"] else ""
+    print(f"  this session: {data['model'] or '-'}{src}, class {data['class'] or '?'}")
+    for c in data["classes"]:
+        if c["state"] == "available":
+            cap = "" if c["class"] in data["executors"] else f"  [above executor ceiling {data['executor_ceiling']}]"
+            print(f"  {c['class']:<7} available → {c['id']}{cap}")
+        elif c["state"] == "unavailable":
+            print(f"  {c['class']:<7} NOT available — not recognised by this Claude Code")
+        else:
+            print(f"  {c['class']:<7} unknown — probe failed: {c['why']}")
+    print(f"  source: this machine's Claude Code ({_cli_version()}), cached in {STATE_ROOT / 'models.json'}")
 
 
 def _lead_live_model(sid):
@@ -6535,10 +6642,11 @@ def cmd_lead_start(args):
     # lookup nor this process's own controlling tty resolves) — notify_banner falls back to its
     # pre-row-91 live lookup whenever the marker has no tty, so this never makes things worse.
     tty = lead_guard._capture_tty(iterm_session)
-    # Record the model this lead actually runs on (row 94): --model when given, else the marker's
-    # existing value (a pre-armed successor's handoff-given model), else the CLI's own stamp on the
-    # transcript's last assistant turn — so `relay list` shows it and a handoff can inherit it.
-    lead_model = args.model or existing.get("model") or _lead_live_model(args.session_id)
+    # Record the model this lead actually runs on (row 94/96): --model when given, else the CLI's
+    # own stamp on the transcript's last assistant turn (LIVE — a `/model` switch before re-arming
+    # must win), else the marker's existing value (a pre-armed successor's handoff-given model, for
+    # a transcript that has no turn yet) — so `relay list` shows it and a handoff can inherit it.
+    lead_model = args.model or _lead_live_model(args.session_id) or existing.get("model")
     lead_guard.write_marker(STATE_ROOT, args.session_id, model=lead_model,
                             iterm_session=iterm_session, project=project, cwd=cwd,
                             tab_label=tab_label, color=color, tty=tty,
@@ -6667,18 +6775,19 @@ def cmd_handoff(args):
     project = args.project or _successor_name_from_handoff(new_body, caller_marker.get("project")) \
         or os.path.basename(os.getcwd())
     cwd = caller_marker.get("cwd") or os.getcwd()
-    # The successor must run on the SAME model as the outgoing lead. The marker's `model` is only
-    # set when lead-start was given --model (rarely), so fall back to the caller's LIVE model — the
-    # CLI's own stamp on its last assistant turn — before letting the CLI default win. Field
-    # incident (2026-09-18): every handoff successor came up on the default model.
+    # The successor must run on the SAME model as the outgoing lead — the one it runs on NOW, not
+    # the one it was armed on. So: --model, else the caller's LIVE model (the CLI's own stamp on its
+    # last assistant turn, which follows a mid-session `/model` switch), else the marker's arm-time
+    # value, and only then the CLI default. Field incidents: 2026-09-18 every successor came up on
+    # the default model (marker empty, no live fallback — row 94); row 96 put live ahead of marker.
     model = args.model
     model_source = "--model"
     if not model:
-        model = caller_marker.get("model")
-        model_source = "caller marker"
-    if not model:
         model = _lead_live_model(caller)
         model_source = "caller's live transcript"
+    if not model:
+        model = caller_marker.get("model")
+        model_source = "caller marker"
     if model:
         print(f"successor model: {model} (from {model_source})")
     else:
@@ -7852,6 +7961,13 @@ def main():
     at.add_argument("--session", required=True)
     at.set_defaults(func=cmd_auto)
 
+    lu = sub.add_parser("lineup", help="which model classes THIS machine's Claude Code actually offers, "
+                                       "and where this lead sits — the spoken model check comes from here")
+    lu.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+                    help="the lead to place in the lineup (default $CLAUDE_CODE_SESSION_ID)")
+    lu.add_argument("--json", action="store_true")
+    lu.set_defaults(func=cmd_lineup)
+
     tp = sub.add_parser("tier", help="model-tier posture for this lead: who decides which model an "
                         "executor runs on — auto (rubric decides per packet, default), manual (the "
                         "human decides every spawn/rotate/upgrade), lead (executors mirror this "
@@ -7972,7 +8088,8 @@ def main():
     hf.add_argument("--project", help="successor's project name (default: the handoff note's own "
                                       "'# ' heading, else the caller's project with any "
                                       "auto-suffix counter stripped, else cwd basename)")
-    hf.add_argument("--model", help="successor's model (default: caller lead's marker model)")
+    hf.add_argument("--model", help="successor's model (default: the caller lead's LIVE model — the "
+                                    "CLI's stamp on its last turn — else its marker model)")
     hf.set_defaults(func=cmd_handoff)
 
     td = sub.add_parser("tidy", help="re-order every lead's tabs into [Lead] [Exec 1] [Exec 2] … "

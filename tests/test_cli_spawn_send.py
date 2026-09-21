@@ -1001,6 +1001,32 @@ class TestSendHeavinessAndUpgrade:
             run_main(relay, "send", "e1", write_packet(tmp_path), "--upgrade")
         assert "already runs fable, the top tier" in str(e.value)
 
+    def test_upgrade_skips_a_class_this_claude_code_does_not_recognise(self, relay, terms, tmp_path, capsys):
+        """Row 96: "one tier up" is the next class THIS machine resolves. With opus rejected as
+        unrecognised, sonnet upgrades straight to fable; with fable also rejected, it refuses."""
+        def resolve(alias):
+            if alias == "opus":
+                raise ValueError("model 'opus' is not recognised by this Claude Code (test)")
+            return alias, "unresolved: disabled in tests"   # fail-open, like spawn
+        relay.resolve_model_for_launch = resolve
+        cfg_write(relay, executor_model_ceiling="fable")
+        make_session(relay, "e1", status="reported", model="claude-sonnet-5")
+        run_main(relay, "send", "e1", write_packet(tmp_path), "--upgrade")
+        assert relay.lead_guard.model_tier(relay.read_session("e1-r2")["model"]) == "fable"
+        assert "upgrading 'e1' sonnet → fable" in capsys.readouterr().out
+
+    def test_upgrade_refuses_when_nothing_above_is_available_here(self, relay, terms, tmp_path):
+        def resolve(alias):
+            if alias in ("opus", "fable"):
+                raise ValueError(f"model '{alias}' is not recognised by this Claude Code (test)")
+            return alias, "cache"
+        relay.resolve_model_for_launch = resolve
+        make_session(relay, "e1", status="reported", model="claude-sonnet-5")
+        with pytest.raises(SystemExit) as e:
+            run_main(relay, "send", "e1", write_packet(tmp_path), "--upgrade")
+        assert "nothing above it is available on this machine" in str(e.value)
+        assert "opus, fable" in str(e.value)
+
     def test_rotate_carries_worktree_topic_mcp_effort_and_keep(self, relay, terms, tmp_path):
         """send SKILL.md `--rotate`: "spawns `<sid>-r2` over the same worktree/topic/model/MCP set
         on the 1M window, and delivers this packet to it as packet 001"."""

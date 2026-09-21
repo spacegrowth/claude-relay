@@ -1266,9 +1266,9 @@ class TestWhoami:
 
 
 class TestHandoffInheritsTheCallersModel:
-    """Row 94: a handoff successor must run on the SAME model as the outgoing lead. The marker's
-    `model` is only set when lead-start was given --model, so handoff falls back to the caller's
-    LIVE model (the CLI's stamp on its last assistant turn) before the CLI default can win."""
+    """Row 94/96: a handoff successor must run on the SAME model the outgoing lead runs on NOW —
+    the CLI's stamp on its last assistant turn (live) — falling back to the marker's arm-time model
+    only when the transcript has no turn, and to the CLI default only after both."""
 
     def _doc(self, tmp_path):
         p = tmp_path / "handoff.md"; p.write_text("# Handoff\n\nnext steps\n"); return str(p)
@@ -1282,8 +1282,13 @@ class TestHandoffInheritsTheCallersModel:
             run_main(relay, "handoff", self._doc(tmp_path), *extra)
         return terms.spawns[0].get("model")
 
-    def test_marker_model_wins_over_live(self, relay, terms, tmp_path, monkeypatch):
-        assert self._run(relay, terms, tmp_path, monkeypatch, "opus", "claude-sonnet-5") == "opus"
+    def test_live_model_wins_over_marker(self, relay, terms, tmp_path, monkeypatch):
+        """Row 96: a lead armed on opus that switched with `/model sonnet` hands off a SONNET lead,
+        not the arm-time opus its marker still says."""
+        assert self._run(relay, terms, tmp_path, monkeypatch, "opus", "claude-sonnet-5") == "claude-sonnet-5"
+
+    def test_marker_model_used_when_no_live_turn(self, relay, terms, tmp_path, monkeypatch):
+        assert self._run(relay, terms, tmp_path, monkeypatch, "opus", None) == "opus"
 
     def test_live_model_used_when_marker_has_none(self, relay, terms, tmp_path, monkeypatch):
         assert self._run(relay, terms, tmp_path, monkeypatch, None, "claude-fable-5-1") == "claude-fable-5-1"
@@ -1291,3 +1296,87 @@ class TestHandoffInheritsTheCallersModel:
     def test_explicit_flag_wins_over_both(self, relay, terms, tmp_path, monkeypatch):
         assert self._run(relay, terms, tmp_path, monkeypatch, "opus", "claude-fable-5-1",
                          "--model", "sonnet") == "sonnet"
+
+
+class TestLineupReadsThisMachineNotAStaticList:
+    """Row 96: `relay lineup` builds the spoken model check from what THIS machine's Claude Code
+    resolves (the spawn resolver) and from the lead's live model — never from TIER_ORDER recited as
+    fact. A class the CLI rejects as unrecognised is absent from above/below/executors."""
+
+    def _resolver(self, table):
+        def resolve(alias):
+            v = table.get(alias)
+            if v is None:
+                raise ValueError(f"model '{alias}' is not recognised by this Claude Code (test)")
+            if v == "?":
+                return alias, "unresolved: probe timed out"
+            return v, "cache"
+        return resolve
+
+    def _lineup(self, relay, monkeypatch, capsys, table, live, marker_model=None, *extra):
+        arm_lead(relay, "lead-1", "webapp", model=marker_model)
+        monkeypatch.setattr(relay, "resolve_model_for_launch", self._resolver(table))
+        with mock.patch.object(relay, "_lead_live_model", return_value=live):
+            run_main(relay, "lineup", "--session", "lead-1", "--json", *extra)
+        return json.loads(capsys.readouterr().out)
+
+    FULL = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-5", "opus": "claude-opus-5", "fable": "claude-fable-5-1"}
+
+    def test_no_fable_here_means_opus_is_the_top(self, relay, monkeypatch, capsys):
+        table = dict(self.FULL); del table["fable"]
+        d = self._lineup(relay, monkeypatch, capsys, table, "claude-opus-5")
+        assert d["class"] == "opus" and d["above"] == [] and d["below"] == ["haiku", "sonnet"]
+        assert "strongest class available on this machine" in d["model_check"]
+        assert "fable" not in d["model_check"].lower() and d["stop"] is False
+        assert [c["state"] for c in d["classes"]] == ["available", "available", "available", "unavailable"]
+
+    def test_fable_here_means_opus_has_one_above(self, relay, monkeypatch, capsys):
+        d = self._lineup(relay, monkeypatch, capsys, self.FULL, "claude-opus-5")
+        assert d["above"] == ["fable"] and "one stronger class (fable)" in d["model_check"]
+
+    def test_executor_range_is_what_resolves_within_the_ceiling(self, relay, monkeypatch, capsys):
+        table = {"sonnet": "claude-sonnet-5", "opus": "claude-opus-5", "fable": "claude-fable-5-1"}  # no haiku
+        d = self._lineup(relay, monkeypatch, capsys, table, "claude-fable-5-1")
+        assert d["executors"] == ["sonnet", "opus"]  # ceiling default opus, haiku absent here
+        assert "executors available here: sonnet, opus." in d["model_check"]
+
+    def test_bottom_of_what_is_available_stops(self, relay, monkeypatch, capsys):
+        table = {"sonnet": "claude-sonnet-5", "opus": "claude-opus-5"}
+        d = self._lineup(relay, monkeypatch, capsys, table, "claude-sonnet-5")
+        assert d["below"] == [] and d["stop"] is True and "/model opus" in d["model_check"]
+
+    def test_two_above_recommends_the_strongest_available(self, relay, monkeypatch, capsys):
+        d = self._lineup(relay, monkeypatch, capsys, self.FULL, "claude-sonnet-5")
+        assert d["above"] == ["opus", "fable"] and "/model fable" in d["model_check"] and d["stop"] is False
+
+    def test_live_model_beats_marker_and_unknown_probe_is_not_available(self, relay, monkeypatch, capsys):
+        table = dict(self.FULL); table["fable"] = "?"
+        d = self._lineup(relay, monkeypatch, capsys, table, "claude-opus-5", "claude-sonnet-5")
+        assert d["model"] == "claude-opus-5" and d["model_source"] == "live transcript"
+        assert d["above"] == [] and d["classes"][3]["state"] == "unknown"
+
+    def test_text_output_leads_with_the_model_check_line(self, relay, monkeypatch, capsys):
+        arm_lead(relay, "lead-1", "webapp")
+        monkeypatch.setattr(relay, "resolve_model_for_launch", self._resolver(self.FULL))
+        with mock.patch.object(relay, "_lead_live_model", return_value="claude-fable-5-1"):
+            run_main(relay, "lineup", "--session", "lead-1")
+        out = capsys.readouterr().out.splitlines()
+        assert out[0].startswith("Model check: claude-fable-5-1 — the strongest class available")
+        assert any(l.strip().startswith("fable") and "available → claude-fable-5-1" in l for l in out)
+
+
+class TestLeadStartRecordsTheLiveModelFirst:
+    """Row 96: a re-arm after `/model` must record the model the lead runs on NOW, not the marker's
+    arm-time value (which lead-start used to prefer)."""
+
+    def test_live_beats_existing_marker(self, relay, terms, monkeypatch):
+        arm_lead(relay, "lead-1", "webapp", model="opus")
+        with mock.patch.object(relay, "_lead_live_model", return_value="claude-sonnet-5"):
+            run_main(relay, "lead-start", "lead-1", "--no-rename")
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")["model"] == "claude-sonnet-5"
+
+    def test_marker_kept_when_no_live_turn_yet(self, relay, terms, monkeypatch):
+        arm_lead(relay, "lead-1", "webapp", model="claude-fable-5-1")
+        with mock.patch.object(relay, "_lead_live_model", return_value=None):
+            run_main(relay, "lead-start", "lead-1", "--no-rename")
+        assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")["model"] == "claude-fable-5-1"
