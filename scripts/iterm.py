@@ -232,6 +232,52 @@ def notify_via_tty(tty_path, title, body):
         return False
 
 
+# ── typing into a RUNNING Claude Code session ────────────────────────────────────────────────────
+# `write text "…"` delivers text + newline in ONE burst, which Claude Code reads as a paste: the
+# newline lands as a literal line break and the message sits unsubmitted in the input box (observed
+# live, 2026-07 on send; 2026-09-19 on the /rename typed at spawn/handoff and on wake nudges). So
+# every line typed into a running session is TWO writes: the text with `newline NO`, a beat, then a
+# bare `write text ""` that reads as a distinct Enter. The beat scales with the text — the terminal
+# is still absorbing a long paste when a fixed 0.3s Enter arrives, and a busy target (a lead
+# mid-turn, a loaded machine) stretches that window further — so it is never below ENTER_GAP_MIN.
+ENTER_GAP_MIN = 0.6
+ENTER_GAP_MAX = 2.0
+ENTER_GAP_PER_100_CHARS = 0.05
+
+
+def enter_gap(text):
+    """Seconds to wait between typing `text` and pressing Enter (see the block comment above)."""
+    return round(min(ENTER_GAP_MAX, ENTER_GAP_MIN + ENTER_GAP_PER_100_CHARS * len(text or "") / 100), 2)
+
+
+def typed_line_action(text):
+    """AppleScript fragment (inside a `tell s` match) that types `text` into a running session and
+    submits it as a distinct Enter — the ONLY way relay writes a line to a live Claude Code."""
+    return (f'          tell s to write text "{osa(text)}" newline NO\n'
+            f"          delay {enter_gap(text)}\n"
+            '          tell s to write text ""\n')
+
+
+def press_enter(label, handle=None, pid=None):
+    """One bare Enter into the live session matched by `handle` (iTerm session id), else by `label`
+    — the retry when a typed line is confirmed NOT to have submitted (relay-side transcript check).
+    Harmless on an empty prompt. Returns True if a session matched."""
+    action = '          tell s to write text ""\n'
+    if handle:
+        uuid = handle.split(":")[-1]
+        r = run_osascript(_for_session_by_id(uuid, action + "          return true\n") + "return false",
+                          timeout=5)
+        if r.returncode == 0 and r.stdout.strip().lower() == "true":
+            return True
+    script = ("set matched to false\n"
+              f'tell application "{ITERM_APP_NAME}"\n'
+              f"{_match_session_block(label, action)}"
+              "end tell\n"
+              "return matched")
+    r = run_osascript(script, timeout=5)
+    return r.returncode == 0 and r.stdout.strip().lower() == "true"
+
+
 def _for_session_by_id(uuid, action):
     """AppleScript fragment: walk windows → tabs → sessions and, on the session whose iTerm id
     equals `uuid`, run `action` (which must `return`). Shared by rename_by_id and tty_by_id."""
@@ -619,7 +665,6 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     # must not get any: a quote in the typed line is exactly the wedge risk the file protocol removes.
     boot_path = write_bootstrap_file(pidfile, cmd)
     payload_expr = f'"sh {osa(boot_path)} " & sid'
-    rename_e = osa("/rename " + label)
     # Only worth attempting adjacency for a separate TAB — a "pane" layout is inherently adjacent
     # (it's split off the lead's own session), no placement problem to solve.
     pyapi_session_id = (
@@ -669,7 +714,11 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
         "    repeat with t in tabs of w\n"
         "      repeat with s in sessions of t\n"
         "        if (id of s) is sid then\n"
-        f'          tell s to write text "{rename_e}"\n'
+        # Two writes (typed_line_action): a one-burst `/rename …` reads as a PASTE in a claude that
+        # is already up and sits unsubmitted in its input box — the "rename stuck in the input
+        # area" seen on handoffs (2026-09-19). In a shell that hasn't exec'd claude yet, the bare
+        # second write is just an empty Enter.
+        f"{typed_line_action('/rename ' + label)}"
         "        end if\n"
         "      end repeat\n"
         "    end repeat\n"
@@ -694,7 +743,7 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
         '  return "OK" & linefeed & sid & linefeed & frontTitle\n'
         "end tell"
     )
-    r = run_osascript(script, timeout=rename_delay + 5)
+    r = run_osascript(script, timeout=rename_delay + enter_gap('/rename ' + label) + 5)
     return _read_spawn_outcome(r)
 
 
@@ -730,20 +779,17 @@ def send(label, prompt, handle=None, pid=None):
     legacy/unowned session with no captured handle). pid: shared backend signature, unused here.
     Returns True if a match was found (by either path).
 
-    The text and the Enter are sent as TWO separate writes: `write text` delivers text+newline in
-    one burst, which Claude Code treats as a PASTE — the newline lands as a literal line break and
-    the message sits unsubmitted in the input box (observed live: the executor silently waited for
-    a human Enter). Writing the text with `newline NO`, then a bare newline after a beat, reads as
-    a distinct Enter keypress and actually submits."""
-    cmd_e = osa(prompt)  # raw text typed into the session, not a shell command
-    action = (f'          tell s to write text "{cmd_e}" newline NO\n'
-              "          delay 0.3\n"
-              '          tell s to write text ""\n')
+    Typed through typed_line_action (text, length-scaled beat, separate Enter) — see its block
+    comment for why one burst would sit unsubmitted. Matching a tab proves the text was TYPED, not
+    that it submitted; bin/relay's `_send_confirmed` watches the target's transcript for the
+    submit and presses Enter once more (press_enter) if it never lands."""
+    action = typed_line_action(prompt)  # raw text typed into the session, not a shell command
+    timeout = enter_gap(prompt) + 5
     if handle:
         uuid = handle.split(":")[-1]
         id_action = action + "          return true\n"
         script = _for_session_by_id(uuid, id_action) + "return false"
-        r = run_osascript(script, timeout=5)
+        r = run_osascript(script, timeout=timeout)
         if r.returncode == 0 and r.stdout.strip().lower() == "true":
             return True
     script = (
@@ -753,7 +799,7 @@ def send(label, prompt, handle=None, pid=None):
         "end tell\n"
         "return matched"
     )
-    r = run_osascript(script, timeout=5)
+    r = run_osascript(script, timeout=timeout)
     return r.returncode == 0 and r.stdout.strip().lower() == "true"
 
 
@@ -766,10 +812,10 @@ def rename_by_id(iterm_id, new_name):
     if not iterm_id:
         return False
     uuid = iterm_id.split(":")[-1]  # "w1t8p0:UUID" -> "UUID" (iTerm's session id)
-    cmd_e = osa("/rename " + new_name)
-    action = f'          tell s to write text "{cmd_e}"\n          return true\n'
+    text = "/rename " + new_name
+    action = typed_line_action(text) + "          return true\n"  # two writes, never one burst
     script = _for_session_by_id(uuid, action) + "return false"
-    r = run_osascript(script, timeout=5)
+    r = run_osascript(script, timeout=enter_gap(text) + 5)
     return r.returncode == 0 and r.stdout.strip().lower() == "true"
 
 

@@ -1380,3 +1380,91 @@ class TestLeadStartRecordsTheLiveModelFirst:
         with mock.patch.object(relay, "_lead_live_model", return_value=None):
             run_main(relay, "lead-start", "lead-1", "--no-rename")
         assert relay.lead_guard.read_marker(relay.STATE_ROOT, "lead-1")["model"] == "claude-fable-5-1"
+
+
+class TestSendConfirmedProvesTheSubmit:
+    """A typed line is proven submitted by the target's own transcript gaining a user line with
+    the text. Never seen + target idle → one more Enter (press_enter) and a `submit_retry` ledger
+    row; never seen + target mid-turn → left queued (None); no transcript → unverifiable (None)."""
+
+    def _transcript(self, relay, monkeypatch, tmp_path, sid, mtime_ago=600):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        d = tmp_path / "cfg" / "projects" / "-p"; d.mkdir(parents=True)
+        t = d / f"{sid}.jsonl"
+        t.write_text(json.dumps({"type": "assistant", "message": {"model": "m", "content": "old"}}) + "\n")
+        old = time.time() - mtime_ago
+        os.utime(t, (old, old))
+        return t
+
+    def _fast(self, relay, monkeypatch):
+        monkeypatch.setattr(relay, "SUBMIT_CONFIRM_SECONDS", 0.3)
+        monkeypatch.setattr(relay, "SUBMIT_RETRY_CONFIRM_SECONDS", 0.3)
+        monkeypatch.setattr(relay.time, "sleep", lambda s: None)
+
+    def _bk(self, terms, on_send=None, on_enter=None):
+        calls = {"enter": 0}
+        class BK:
+            def send(self, label, prompt, handle=None, pid=None):
+                terms.sends.append({"label": label, "prompt": prompt, "handle": handle, "pid": pid})
+                if on_send: on_send()
+                return True
+            def press_enter(self, label, handle=None, pid=None):
+                calls["enter"] += 1
+                if on_enter: on_enter()
+                return True
+        return BK(), calls
+
+    def _append_user(self, t, text):
+        with open(t, "a") as f:
+            f.write(json.dumps({"type": "user", "message": {"role": "user", "content": text}},
+                               ensure_ascii=False) + "\n")
+
+    def test_seen_in_transcript_confirms_without_retry(self, relay, terms, monkeypatch, tmp_path):
+        self._fast(relay, monkeypatch)
+        t = self._transcript(relay, monkeypatch, tmp_path, "exec-uuid")
+        msg = "executor 'e1' reported (packet 001) while you were idle — review it."
+        bk, calls = self._bk(terms, on_send=lambda: self._append_user(t, msg))
+        assert relay._send_confirmed(bk, "[Exec] e1", msg, "w0:X", None, "exec-uuid") == (True, True)
+        assert calls["enter"] == 0
+
+    def test_never_seen_and_idle_presses_enter_once_more(self, relay, terms, monkeypatch, tmp_path):
+        self._fast(relay, monkeypatch)
+        t = self._transcript(relay, monkeypatch, tmp_path, "exec-uuid")
+        msg = "Task — fix it. Read and follow the work packet at /p/001-packet.md"
+        bk, calls = self._bk(terms, on_enter=lambda: self._append_user(t, msg))
+        assert relay._send_confirmed(bk, "[Exec] e1", msg, "w0:X", None, "exec-uuid") == (True, True)
+        assert calls["enter"] == 1
+        rows = [json.loads(l) for l in (relay.STATE_ROOT / "sessions.jsonl").read_text().splitlines()]
+        assert any(r["event"] == "submit_retry" and r["session_id"] == "exec-uuid" for r in rows)
+
+    def test_retry_that_still_never_lands_reports_false(self, relay, terms, monkeypatch, tmp_path):
+        self._fast(relay, monkeypatch)
+        self._transcript(relay, monkeypatch, tmp_path, "exec-uuid")
+        bk, calls = self._bk(terms)
+        assert relay._send_confirmed(bk, "[Exec] e1", "hello", "w0:X", None, "exec-uuid") == (True, False)
+        assert calls["enter"] == 1
+
+    def test_mid_turn_target_is_left_queued_no_retry(self, relay, terms, monkeypatch, tmp_path):
+        self._fast(relay, monkeypatch)
+        self._transcript(relay, monkeypatch, tmp_path, "lead-1", mtime_ago=1)  # written a second ago
+        bk, calls = self._bk(terms)
+        assert relay._send_confirmed(bk, "[Lead] x", "review it", "w0:X", None, "lead-1") == (True, None)
+        assert calls["enter"] == 0
+
+    def test_no_transcript_is_unverifiable_not_a_failure(self, relay, terms, monkeypatch, tmp_path):
+        self._fast(relay, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg-empty"))
+        bk, calls = self._bk(terms)
+        assert relay._send_confirmed(bk, "[Exec] e1", "hello", "w0:X", None, "exec-uuid") == (True, None)
+        assert calls["enter"] == 0
+
+    def test_backend_without_press_enter_is_unverifiable(self, relay, terms, monkeypatch, tmp_path):
+        self._fast(relay, monkeypatch)
+        self._transcript(relay, monkeypatch, tmp_path, "exec-uuid")
+        assert relay._send_confirmed(terms, "[Exec] e1", "hello", "w0:X", None, "exec-uuid") == (True, None)
+
+    def test_nudge_lead_output_names_the_submit_verdict(self, relay, terms, monkeypatch, capsys):
+        arm_lead(relay, "lead-1", "webapp", iterm_session="w0t0p0:L", backend="iterm")
+        with mock.patch.object(relay, "_send_confirmed", return_value=(True, True)):
+            run_main(relay, "nudge-lead", "lead-1", "review it")
+        assert "nudged: sent message to idle lead 'lead-1' (tab '[Lead] webapp') — submitted" in capsys.readouterr().out

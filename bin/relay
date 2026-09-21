@@ -2547,8 +2547,14 @@ def cmd_send(args):
     # Row 58: snapshot billed usage BEFORE the pointer lands, so none of this packet's own turns
     # leak into the hand-off baseline. None (→ `usage: null`) when unreadable; never fails the send.
     handoff_usage = _usage_snapshot(s)
-    ok = False if (tab_gone or mcp_relaunch) else term_backend(s).send(s["tab_label"], pointer,
-                                                                       s.get("iterm_session"), s.get("pid"))
+    ok, submitted = False, None
+    if not (tab_gone or mcp_relaunch):
+        ok, submitted = _send_confirmed(term_backend(s), s["tab_label"], pointer, s.get("iterm_session"),
+                                        s.get("pid"), s.get("claude_session"))
+    if ok and submitted is False:
+        print(c(f"  ⚠ packet text typed into '{s['tab_label']}' but its submit was never seen in the "
+                f"executor's transcript (Enter pressed twice) — look at the tab's input box; if the "
+                f"text is sitting there, press Enter.", "red"))
     if not ok:
         # (B) The tab is gone. If we pinned this session's Claude conversation at spawn, don't
         # force a cold spawn — RESUME the conversation and deliver the new packet in one shot via
@@ -7531,6 +7537,95 @@ def _lead_tab_target(marker):
     return bk, label, handle
 
 
+# ── confirmed submit for text typed into a running session ───────────────────────────────────────
+SUBMIT_CONFIRM_SECONDS = 2.5     # how long a typed line gets to show up in the target's transcript
+SUBMIT_RETRY_CONFIRM_SECONDS = 2.0
+SUBMIT_BUSY_WINDOW_SECONDS = 10  # a transcript written this recently means the target is mid-turn
+
+
+def _transcript_size(path):
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _transcript_has_user_line_since(path, offset, needle):
+    """True if the transcript at `path` gained, after byte `offset`, a `user` line whose content
+    carries `needle` (the head of the typed text, JSON-escaped the way the CLI writes it)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return False
+    for line in data.decode("utf-8", errors="replace").split("\n"):
+        if '"user"' not in line or needle not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") == "user":
+            return True
+    return False
+
+
+def _submit_needle(text):
+    """The first 40 characters of `text` as they appear inside the transcript's JSON string."""
+    return json.dumps((text or "")[:40], ensure_ascii=False)[1:-1]
+
+
+def _send_confirmed(bk, label, prompt, handle, pid, claude_session):
+    """Type `prompt` into the live tab (bk.send) and then PROVE it submitted: the target's own
+    transcript must gain a user line carrying the text within SUBMIT_CONFIRM_SECONDS. If it doesn't
+    and the target is not mid-turn, press Enter once more (the one-burst-reads-as-paste failure
+    leaves the text sitting in the input box, so a second bare Enter submits it; on an empty prompt
+    it is a no-op) and watch again. Returns (typed, confirmed): `typed` is bk.send's own verdict (a
+    tab matched); `confirmed` is True (seen in the transcript), False (typed, never seen, retry
+    exhausted), or None (unverifiable: no session id / no transcript / backend can't press Enter,
+    or the target is busy and the line is legitimately queued until its turn ends)."""
+    typed = bool(label) and bk.send(label, prompt, handle, pid)
+    if not typed:
+        return False, None
+    path = _find_transcript_path(claude_session) if claude_session else None
+    if path is None or not hasattr(bk, "press_enter"):
+        return True, None
+    before = _transcript_size(path)
+    if before is None:
+        return True, None
+    needle = _submit_needle(prompt)
+    # The send itself may have grown the file before we measured (the write completes inside
+    # bk.send); look from the last 4KiB before the measured size so that race can't hide the line.
+    start = max(0, before - 4096)
+    def seen():
+        return _transcript_has_user_line_since(path, start, needle)
+    deadline = time.time() + SUBMIT_CONFIRM_SECONDS
+    while time.time() < deadline:
+        if seen():
+            return True, True
+        time.sleep(0.25)
+    try:
+        mid_turn = (time.time() - path.stat().st_mtime) < SUBMIT_BUSY_WINDOW_SECONDS
+    except OSError:
+        mid_turn = False
+    if mid_turn:
+        return True, None  # queued in a busy session's input box; submits at turn end — not a failure
+    bk.press_enter(label, handle, pid)
+    append_ledger("submit_retry", session_id=claude_session, label=label, text=(prompt or "")[:80])
+    deadline = time.time() + SUBMIT_RETRY_CONFIRM_SECONDS
+    while time.time() < deadline:
+        if seen():
+            return True, True
+        time.sleep(0.25)
+    return True, False
+
+
+def _submit_note(confirmed):
+    return {True: "submitted", False: "NOT confirmed submitted — check the tab's input box",
+            None: "typed"}[confirmed]
+
+
 def cmd_nudge_lead(args):
     """`relay send` pointed at a LEAD's own tab instead of an executor's (wake-watch design §9) —
     the push primitive the executor-side escalation hook calls to wake an idle lead. ALWAYS sends,
@@ -7557,8 +7652,9 @@ def cmd_nudge_lead(args):
         bk = backend.by_name(recorded) or iterm
     else:
         bk = _probe_backend_for_tab(label, handle) or iterm  # last resort: ambient guess, as before
+    confirmed = None
     try:
-        ok = bool(label) and bk.send(label, args.message, handle)
+        ok, confirmed = _send_confirmed(bk, label, args.message, handle, None, sid)
     except Exception:
         ok = False
     if not ok:
@@ -7579,7 +7675,7 @@ def cmd_nudge_lead(args):
                      f"and the desktop notification.")
         sys.exit(f"no-live-tab: could not find a live tab for lead '{sid}' (label '{label}').")
 
-    print(f"nudged: sent message to idle lead '{sid}' (tab '{label}')")
+    print(f"nudged: sent message to idle lead '{sid}' (tab '{label}') — {_submit_note(confirmed)}")
 
 
 def _resolve_whoami(token):

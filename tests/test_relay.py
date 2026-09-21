@@ -1584,7 +1584,7 @@ class TestNudgeLead:
         self._lead(relay, state="idle")
         with mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="wake up"))
-        send.assert_called_once_with("[Lead] alpha", "wake up", None)
+        send.assert_called_once_with("[Lead] alpha", "wake up", None, None)
 
     def test_no_state_defaults_and_nudges(self, relay):
         self._lead(relay)  # no state stamped at all
@@ -1652,7 +1652,7 @@ class TestNudgeLead:
         with mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
         assert not decoy_calls, "ambient (wrong) backend was used instead of the marker's recorded one"
-        send.assert_called_once_with("[Lead] alpha", "hi", None)
+        send.assert_called_once_with("[Lead] alpha", "hi", None, None)
 
     def test_backend_missing_probes_and_sends_via_the_one_with_a_live_tab(self, relay):
         # D3.2: a marker armed before D2 has backend=None — every currently-armed lead on a real
@@ -1662,7 +1662,7 @@ class TestNudgeLead:
              mock.patch.object(relay.backend.by_name("iterm"), "is_alive", return_value=True), \
              mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
-        send.assert_called_once_with("[Lead] alpha", "hi", None)
+        send.assert_called_once_with("[Lead] alpha", "hi", None, None)
 
     def test_backend_missing_and_ambiguous_probe_falls_back_to_ambient(self, relay, monkeypatch):
         # Both backends claim a live tab (shouldn't normally happen, but the probe must degrade to

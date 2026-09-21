@@ -999,3 +999,45 @@ class TestBuildClaudeCmdMcpFlags:
 
     def test_inherit_adds_nothing(self):
         assert "mcp" not in iterm.build_claude_cmd("x", mcp_flags=lead_guard.mcp_cli_flags("inherit"))
+
+
+class TestTypedLinesAreTwoWrites:
+    """Every line typed into a RUNNING Claude Code is text (`newline NO`) + a beat + a bare Enter:
+    one burst reads as a paste and sits unsubmitted (send, 2026-07; the /rename typed at spawn and
+    handoff, and wake nudges, 2026-09-19). The beat scales with the text and never drops below
+    ENTER_GAP_MIN."""
+
+    def test_enter_gap_scales_with_length_within_bounds(self):
+        assert iterm.enter_gap("") == iterm.ENTER_GAP_MIN
+        assert iterm.enter_gap("x" * 400) > iterm.ENTER_GAP_MIN
+        assert iterm.enter_gap("x" * 100000) == iterm.ENTER_GAP_MAX
+
+    def test_send_gap_is_no_longer_the_fixed_0_3(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run:
+            iterm.send("[Exec] e1", "review it", "w1t5p0:SOME-UUID")
+        script = osa_run.call_args[0][0]
+        assert 'write text "review it" newline NO' in script
+        assert "delay 0.3\n" not in script and f"delay {iterm.enter_gap('review it')}" in script
+        assert script.index("newline NO") < script.index('write text ""')
+
+    def test_rename_by_id_is_two_writes(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run:
+            assert iterm.rename_by_id("w1t8p0:LEAD-UUID", "[Lead] relay") is True
+        script = osa_run.call_args[0][0]
+        assert 'write text "/rename [Lead] relay" newline NO' in script
+        assert 'write text ""' in script and 'write text "/rename [Lead] relay"\n' not in script
+
+    def test_spawn_rename_is_two_writes(self, tmp_path):
+        with mock.patch.object(iterm, "run_osascript",
+                               return_value=_ok("OK\nSID-1\nfront")) as osa_run:
+            iterm.spawn(str(tmp_path), "hello", "[Exec] e1", str(tmp_path / "pid"))
+        script = osa_run.call_args[0][0]
+        assert 'write text "/rename [Exec] e1" newline NO' in script
+        assert 'write text "/rename [Exec] e1"\n' not in script
+
+    def test_press_enter_targets_the_handle_and_writes_only_a_newline(self):
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("true")) as osa_run:
+            assert iterm.press_enter("[Lead] x", "w1t5p0:SOME-UUID") is True
+        script = osa_run.call_args[0][0]
+        assert 'id of s) is "SOME-UUID"' in script and 'write text ""' in script
+        assert "newline NO" not in script
