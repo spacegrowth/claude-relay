@@ -3630,6 +3630,58 @@ class TestVerifyForAutocommit:
         assert "NOT-CLEARED-BECAUSE-signoff-gated-path-touched" in out
         assert "hooks/hook.py" in out
 
+    def _rename_repo(self, tmp_path, old, new):
+        """A repo with `old` committed as the baseline (the setup commit IS the base), then
+        `git mv old new` staged — the shape that `--name-only` reports as the NEW path only."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        tv = TestVerify()
+        tv._git(repo, "init", "-q")
+        (repo / old).parent.mkdir(parents=True, exist_ok=True)
+        (repo / old).write_text("one\ntwo\nthree\nfour\nfive\n")
+        tv._git(repo, "add", "-A")
+        tv._git(repo, "commit", "-m", "init")
+        (repo / new).parent.mkdir(parents=True, exist_ok=True)
+        tv._git(repo, "mv", old, new)
+        return repo
+
+    def _rename_report(self, claimed):
+        return TestVerify.REPORT.replace("- src.py:1 — changed it.",
+                                         f"- {claimed}:1 — moved it.") \
+                                .replace("Changed: src.py", f"Changed: {claimed}")
+
+    def test_rename_out_of_a_gated_path_blocks_the_gate(self, relay, tmp_path, capsys):
+        """`git diff --cached --name-only` lists only a rename's NEW path, so moving hooks/hook.py
+        to a non-gated path used to leave condition 4 with nothing gated to see. --no-renames
+        lists the deletion at the old path too."""
+        repo = self._rename_repo(tmp_path, "hooks/hook.py", "plain.py")
+        TestVerify()._mk(relay, "e1", repo, self._rename_report("plain.py"))
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) != 0
+        out = capsys.readouterr().out
+        assert "NOT-CLEARED-BECAUSE-signoff-gated-path-touched" in out
+        assert "hooks/hook.py" in out
+
+    def test_rename_into_a_gated_path_blocks_the_gate(self, relay, tmp_path, capsys):
+        repo = self._rename_repo(tmp_path, "plain.py", "hooks/hook.py")
+        TestVerify()._mk(relay, "e1", repo, self._rename_report("hooks/hook.py"))
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) != 0
+        out = capsys.readouterr().out
+        assert "NOT-CLEARED-BECAUSE-signoff-gated-path-touched" in out
+        assert "hooks/hook.py" in out
+
+    def test_rename_between_two_non_gated_paths_is_not_a_gate_hit(self, relay, tmp_path, capsys):
+        """A plain rename whose report claims only the new path: verdict and clearance are what
+        they were before --no-renames (COUNTS-MATCH, CLEARED). The old path now also lists as a
+        staged file the report did not claim, which verify treats as advisory ("reports
+        summarise"), never a finding."""
+        repo = self._rename_repo(tmp_path, "plain.py", "renamed.py")
+        TestVerify()._mk(relay, "e1", repo, self._rename_report("renamed.py"))
+        assert self._run(relay, "e1", in_plan=True, diff_reviewed=True) == 0
+        out = capsys.readouterr().out
+        assert "COUNTS-MATCH" in out and "AUTO-COMMIT: CLEARED" in out
+        assert "no sign-off-gated path in the staged set" in out
+        assert "staged, not claimed:  1 (advisory" in out
+
     def _write_signoff_config(self, relay, value):
         cfg_path = relay.lead_guard.config_path(relay.STATE_ROOT)
         cfg_path.parent.mkdir(parents=True, exist_ok=True)

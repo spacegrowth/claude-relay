@@ -6124,7 +6124,9 @@ def cmd_verify(args):
 
     text = rp.read_text()
     reality = {
-        "staged": _git_lines(worktree, "diff", "--cached", "--name-only"),
+        # --no-renames: default rename detection lists only a rename's NEW path, hiding the
+        # sign-off-gated path that lost the file from condition 4 (`git mv hooks/x.py elsewhere.py`).
+        "staged": _git_lines(worktree, "diff", "--cached", "--name-only", "--no-renames"),
         "modified": _git_lines(worktree, "diff", "--name-only"),
         "untracked": _git_lines(worktree, "ls-files", "--others", "--exclude-standard"),
         # Top-level repo entries, so an extension-less claim like `bin/relay` stays checkable
