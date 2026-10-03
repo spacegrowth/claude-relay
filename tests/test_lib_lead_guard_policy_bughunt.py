@@ -581,6 +581,15 @@ class TestExecutorAgent:
         assert a["disallowedTools"] == ["Agent"]
         assert "STAGE, NEVER COMMIT" in a["prompt"] and a["description"]
 
+    def test_the_agent_prompt_keeps_its_context_hygiene_section(self):
+        """The CONTEXT HYGIENE rules keep executors from filling their window with raw tool
+        output; they must not be silently dropped from the shipped prompt."""
+        prompt = lg.load_executor_agent(REPO_ROOT)[lg.EXECUTOR_AGENT_NAME]["prompt"]
+        assert "CONTEXT HYGIENE" in prompt
+        for phrase in ("line range", "grep", "screenshot"):
+            assert phrase in prompt
+        assert prompt.index("GATES") < prompt.index("CONTEXT HYGIENE") < prompt.index("REPORT FORMAT")
+
     def test_the_launch_flags_keep_the_git_denies_as_one_argument(self, tmp_path):
         """'The denies are ONE comma-joined argument on purpose: `--disallowedTools` is variadic
         and would otherwise swallow the prompt positional that follows it.'"""

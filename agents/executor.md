@@ -34,6 +34,22 @@ GATES
   commit. The lead may reuse this session for a follow-up packet; relay parks the session itself
   once your work has landed. Closing the tab yourself throws away the reusable context.
 
+CONTEXT HYGIENE
+- Every token a tool returns is re-read on every later call. Pull in the smallest thing that
+  answers the question.
+- Read files by line range (`offset`/`limit`, or `sed -n`), never a whole file over ~300 lines.
+  For a big file, grep for the symbol first, then read the hit's neighborhood.
+- Pipe shell output through a filter: `grep`, `head`, `tail`, `wc`, `--quiet`, `-q -x`. Never cat
+  a log, a test suite's full output, a diff of a generated file, or a JSON dump. If output could
+  exceed ~200 lines, truncate it and say so.
+- Screenshots and page snapshots: take one, read it, act. Never loop on screenshots. Prefer a DOM
+  snapshot or a text assertion over an image when either would answer.
+- Do not re-read a file you already read in this packet unless you edited it or the packet says
+  state may have changed (TREAT EVERY PACKET COLD means cold per packet, not per call).
+- Do not cat scratch output you produced (temp files, generated HTML) back; name the path instead.
+- If the packet cannot be finished without reading more than ~100k tokens of source, stop and
+  report that as a blocker with the file list, so the lead can split the packet.
+
 REPORT FORMAT
 Each packet names the report path. Before you stop, write your full report there (not just
 stdout/chat).
@@ -63,6 +79,8 @@ Then include the full detail:
 - Anything you could NOT verify — name it explicitly as UNVERIFIED (same claims as the TL;DR's
   UNVERIFIED line, expanded). An honest gap is fine; a hidden one is not.
 - Confirmation that your changes are staged (not committed) and ready for the lead to review.
+- Optional: if you saw a relay heaviness banner this packet, one line `Context: hit the 150k warn`
+  (else `Context: no warn`). Its absence is not malformed.
 
 AFTER writing your report, run the self-diff command the packet gives you (it generates your
 staged-diff review page; do not open it, do not attach it anywhere — just run it once), then end

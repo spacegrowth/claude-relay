@@ -876,6 +876,10 @@ getting the full GATES footer in their packets. The denies are prefix rules (`gi
 slip past, and the staged-diff review is still where anything lands or doesn't. There is no lead agent on purpose: leads arm
 mid-session with `/relay:mode`, which `--agent` (launch-time only) can't do.
 
+The agent file also carries CONTEXT HYGIENE rules (read by line range, filter shell output, never loop on
+screenshots, don't re-read). Measured 2026-10-03: executors' median peak context was 144k and the max 846k, almost
+all of it raw tool output rather than reasoning.
+
 ### Executor context window (200K vs 1M)
 
 Bare model aliases typically open a 200K window, and the `[1m]` suffix opens 1M (`sonnet[1m]`,
