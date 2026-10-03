@@ -103,7 +103,8 @@ def main():
                 # relay-lead-id-changes-on-resume.md): this resume's own $CLAUDE_CODE_SESSION_ID came
                 # back different from the one its lead armed under, while the iTerm TAB is unchanged.
                 # Look for whichever lead marker still claims THIS tab (same identity lead-start itself
-                # records — os.environ["TERM_SESSION_ID"], compared by exact string equality, no
+                # records — lg.env_tab_id(): $TERM_SESSION_ID, or the "tmux:%N" pane handle under
+                # tmux — compared by exact string equality, no
                 # subprocess needed) AND the same project directory (fix-list 002: a shared tab alone
                 # isn't proof — a brand-new unrelated session started later in that tab must not
                 # inherit an old lead; a payload with no cwd can't prove same-project either way, so
@@ -114,7 +115,7 @@ def main():
                 # lead's tab from one of relay's own headless probes, not a genuine resume.
                 poll_seconds = lg.load_config(STATE_ROOT).get(
                     "poll_seconds", lg.LEAD_DEFAULTS["poll_seconds"])
-                old_sid = lg.safe_migrate_by_tab(STATE_ROOT, os.environ.get("TERM_SESSION_ID"),
+                old_sid = lg.safe_migrate_by_tab(STATE_ROOT, lg.env_tab_id(),
                                                  payload.get("cwd"), sid, poll_seconds)
                 if old_sid:
                     revived = True

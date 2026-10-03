@@ -529,16 +529,24 @@ def _target_by_session_id_block(uuid):
 BOOTSTRAP_FILENAME = "bootstrap.sh"
 
 
-def bootstrap_file_content(cmd):
+DEFAULT_SID_EXPR = "${ITERM_SESSION_ID:-$TERM_SESSION_ID}"
+
+
+def bootstrap_file_content(cmd, sid_expr=DEFAULT_SID_EXPR):
     """The full contents of the per-launch bootstrap file. Quotes and blocks are fine here — this
     text is never typed into a terminal, so the wedge-proof constraints of the inline era don't
-    apply; only the SHORT launch line is typed, and that stays quote-free."""
+    apply; only the SHORT launch line is typed, and that stays quote-free.
+
+    `sid_expr` is the shell expression the guard reads the RECEIVING session's own id from. The
+    default reproduces the iTerm guard; the tmux backend passes '$TMUX_PANE' because
+    inside tmux on a Mac the iTerm variables are inherited from the outer shell — present and wrong."""
     return (
         "#!/bin/sh\n"
         "# relay bootstrap — written per launch by relay (see scripts/iterm.py, §15b).\n"
-        "# Invoked as: sh <this file> <intended iTerm session id>. A copy run anywhere else\n"
-        "# (or with a truncated/missing id) prints one line and exits 0 — inert by construction.\n"
-        '_relay_sid="${ITERM_SESSION_ID:-$TERM_SESSION_ID}"\n'
+        "# Invoked as: sh <this file> <intended terminal session id (iTerm session id, or a tmux pane id)>.\n"
+        "# A copy run anywhere else (or with a truncated/missing id) prints one line and exits 0 —\n"
+        "# inert by construction.\n"
+        f'_relay_sid="{sid_expr}"\n'
         'if [ "x${_relay_sid##*:}" != "x$1" ] || [ "x$1" = "x" ]; then\n'
         '  echo "relay: ignored a mis-delivered bootstrap meant for session ${1:-<missing>}"\n'
         "  exit 0\n"
@@ -547,12 +555,13 @@ def bootstrap_file_content(cmd):
     )
 
 
-def write_bootstrap_file(pidfile, cmd):
+def write_bootstrap_file(pidfile, cmd, sid_expr=DEFAULT_SID_EXPR):
     """Write the bootstrap next to the session's pidfile (the per-session dir relay already owns),
-    mode 0700, overwritten on every launch. Returns the file's absolute path."""
+    mode 0700, overwritten on every launch. Returns the file's absolute path. `sid_expr`: see
+    bootstrap_file_content."""
     path = os.path.join(os.path.dirname(os.path.abspath(pidfile)), BOOTSTRAP_FILENAME)
     with open(path, "w") as f:
-        f.write(bootstrap_file_content(cmd))
+        f.write(bootstrap_file_content(cmd, sid_expr))
     os.chmod(path, 0o700)
     return path
 

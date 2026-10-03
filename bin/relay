@@ -90,9 +90,18 @@ def _paint_tab(bk, handle, color):
     terminal (a hook or this CLI). `tab_color` at spawn only covers tabs relay is opening; a tab
     that changed owner, or that a tidy is re-grouping, is already open.
 
-    Best-effort and never raises: no-ops for a non-iTerm backend, a missing handle/color, a tab
-    whose id no longer resolves, or an unwritable tty. Returns True only if the escape was written."""
-    if not color or not handle or getattr(bk, "NAME", "") != "iterm":
+    Best-effort and never raises: no-ops for Terminal.app (no tab colors), a missing handle/color,
+    a tab whose id no longer resolves, or an unwritable tty. Returns True only if the escape was
+    written. A tmux pane has no tab-color escape: its WINDOW's status-bar style is set instead
+    (tmux_backend.paint_tab) — the same grouping, in tmux's own vocabulary."""
+    if not color or not handle:
+        return False
+    if getattr(bk, "NAME", "") == "tmux":
+        try:
+            return bool(bk.paint_tab(handle, color))
+        except Exception:
+            return False
+    if getattr(bk, "NAME", "") != "iterm":
         return False
     try:
         tty = bk.tty_by_id(handle)
@@ -1519,8 +1528,15 @@ def _lead_alive(lead_sid):
         if pid_file.exists() and pid_alive(int(pid_file.read_text().strip())):
             return True
         iterm_session = marker.get("iterm_session")
-        if iterm_session and iterm.tty_by_id(iterm_session):
-            return True
+        # The marker's OWN backend (term_backend), never this invocation's ambient one — a tmux
+        # lead's "tmux:%N" handle means nothing to iTerm's AppleScript, and vice versa.
+        bk = term_backend(marker)
+        tty = bk.tty_by_id(iterm_session) if iterm_session else None
+        if tty:
+            # A tmux pane outlives its claude (spawn leaves a shell behind, like an iTerm tab), so
+            # for tmux "the pane exists" is not enough: a claude must still be on the pane's tty.
+            if getattr(bk, "NAME", None) != "tmux" or bk.pids_on_tty(tty):
+                return True
         return False
     except Exception:
         return False
@@ -1621,12 +1637,14 @@ def _live_lead_handle(lead_sid, marker):
     is the live tab, while the marker's `iterm_session` is whatever was captured at arm time — and
     goes stale when iTerm restarts and restores the tab under a new UUID (backlog row 89), which
     sent `try_create_adjacent_tab` and the AppleScript fallback looking for a tab that no longer
-    exists. Any other caller gets the marker's handle, as before."""
+    exists. Any other caller gets the marker's handle, as before. The live value comes from
+    `backend.live_handle_from_env` (the one place that knows a live handle's shape): $TMUX_PANE as
+    "tmux:%N" under tmux, an iTerm-shaped $ITERM_SESSION_ID/$TERM_SESSION_ID under iTerm."""
     recorded = (marker or {}).get("iterm_session")
     if lead_sid and os.environ.get("CLAUDE_CODE_SESSION_ID") == lead_sid \
             and not os.environ.get("RELAY_HEADLESS"):
-        env = os.environ.get("ITERM_SESSION_ID") or os.environ.get("TERM_SESSION_ID")
-        if env and re.match(r"^w\d+t\d+p\d+:[0-9A-Fa-f-]{36}$", env):
+        env = backend.live_handle_from_env(iterm)
+        if env and backend.is_live_handle(env):
             return env
     return recorded
 
@@ -1941,6 +1959,9 @@ def maybe_tidy_tabs(after):
     were actually reordered."""
     if os.environ.get("RELAY_NO_TIDY"):
         return False
+    if getattr(iterm, "NAME", None) == "tmux":
+        return False   # tidy reorders iTerm tabs only; a tmux-hosted event has nothing to tidy —
+                       # silently, not with the "tab tidy skipped" line meant for an iTerm miss
     try:
         cfg = lead_guard.load_config(STATE_ROOT)
         if not cfg.get("tidy_tabs", True):
@@ -3172,6 +3193,7 @@ def _headless_env():
     env = dict(os.environ)
     env.pop("TERM_SESSION_ID", None)
     env.pop("ITERM_SESSION_ID", None)
+    env.pop("TMUX_PANE", None)   # a tmux lead's tab identity (backend.tab_id_from_env)
     env["RELAY_HEADLESS"] = "1"
     return env
 
@@ -3642,6 +3664,17 @@ def cmd_doctor(args):
     cfg = lead_guard.load_config(STATE_ROOT)
     add("config loads", True, f"auto_close={cfg.get('auto_close')} escalation={cfg.get('executor_escalation')} "
         f"default_model={cfg.get('executor_default_model')} ceiling={cfg.get('executor_model_ceiling')}")
+    # Which terminal this invocation drives, and the tmux facts that decide whether the tmux
+    # backend can work here — advisory only (always PASS; nothing is gated on it).
+    try:
+        tmux_mod = backend.by_name("tmux")
+        tmux_ver = tmux_mod.version() if shutil.which("tmux") else None
+    except Exception as e:
+        tmux_ver = f"(error: {e})"
+    add("terminal backend", True,
+        f"selected: {getattr(iterm, 'NAME', '?')} · tmux: {tmux_ver or 'not on PATH'} · "
+        f"$TMUX={os.environ.get('TMUX') or '(unset)'} · "
+        f"$RELAY_TMUX_SOCKET={os.environ.get('RELAY_TMUX_SOCKET') or '(unset)'}")
     # Backlog row 60: the opt-in fallback config is easy to never discover on your own — one
     # advisory SKIP line when it's unset, naming what it's for and where it's documented; PASS with
     # the resolved (normalized) value(s) once it's set. Never FAILs either way — this is purely
@@ -4735,7 +4768,7 @@ def cmd_status(args):
     # stays exactly as read-only as the rest of the function: find_lead_by_tab never writes a
     # marker, and log_ambiguous=False means it won't even append the (rare) ambiguity ledger event
     # here — no migration happens from --statusline, ever, per this docstring's own contract.
-    tab_sid = lead_guard.find_lead_by_tab(STATE_ROOT, iterm_session=os.environ.get("TERM_SESSION_ID"),
+    tab_sid = lead_guard.find_lead_by_tab(STATE_ROOT, iterm_session=backend.tab_id_from_env(iterm),
                                           cwd=os.getcwd(), log_ambiguous=False)
     if tab_sid:
         tab_marker = lead_guard.read_marker(STATE_ROOT, tab_sid)
@@ -6579,7 +6612,8 @@ def cmd_lead_start(args):
     # straight to this session's own tty via OSC 777 — see _notify in hooks/stop_lead_watch.py).
     # Terminal.app leads have no such tier: their banners fall back to osascript's built-in
     # notification, which is not clickable.
-    if lead_guard.load_config(STATE_ROOT).get("notify_on_wake", True) \
+    # tmux leads get a status-line message on their own pane instead (lead_guard.notify_banner).
+    if lead_guard.load_config(STATE_ROOT).get("notify_on_wake", True) and iterm.NAME != "tmux" \
             and not (iterm.NAME == "iterm" and os.environ.get("TERM_SESSION_ID")):
         print("NOTE: desktop banners in Terminal.app use macOS's built-in notification and are not "
               "clickable.", file=sys.stderr)
@@ -6622,7 +6656,9 @@ def cmd_lead_start(args):
             print(f"NOTE: '{project}' is taken by a live lead ({(clash_sid or '?')[:8]}) — armed as "
                   f"'{resolved_project}' instead.", file=sys.stderr)
         project = resolved_project
-    iterm_session = os.environ.get("TERM_SESSION_ID")  # the lead's own iTerm session ("w#t#p#:UUID")
+    # The lead's own tab identity: its iTerm session ("w#t#p#:UUID", the raw $TERM_SESSION_ID) or,
+    # under tmux, its pane handle ("tmux:%N") — never the $TERM_SESSION_ID a tmux pane inherits.
+    iterm_session = backend.tab_id_from_env(iterm)
     # Give the lead tab a stable, relay-controlled title (like executors get) so `relay focus <lead>`
     # and notification click-through can land on it. Rename via /rename into the lead's OWN session,
     # matched by its iTerm id. Best-effort — if it doesn't take, focus just won't find the lead tab.
@@ -7046,7 +7082,8 @@ def cmd_close_predecessor(args):
     # Belt and braces: never the caller's own tab, whatever else says yes. A HARD stop, checked
     # before any backend call — compared on the tab's stable identity (the iTerm UUID / Terminal
     # window id), against both the caller's recorded handle and the tab it is running in right now.
-    own = {_tab_identity(h) for h in (marker.get("iterm_session"), os.environ.get("TERM_SESSION_ID"))
+    own = {_tab_identity(h) for h in (marker.get("iterm_session"), os.environ.get("TERM_SESSION_ID"),
+                                      backend.tab_id_from_env(iterm))
            if _tab_identity(h)}
     if _tab_identity(pred_handle) in own:
         sys.exit(f"close-predecessor: REFUSING — predecessor tab handle {pred_handle} is THIS "

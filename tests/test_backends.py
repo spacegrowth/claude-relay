@@ -1,7 +1,8 @@
 """
 Layer 1 (pure Python, no real AppleScript, CI-able) unit tests for the terminal backends:
 iterm.py's shared command builder + tab-color escapes, terminal_app.py's window-id addressing
-(osascript mocked, scripts inspected), and backend.py's selection order.
+(osascript mocked, scripts inspected), tmux_backend.py's pane-id addressing (its one `_tmux` seam
+mocked, argv inspected), and backend.py's selection order + live-handle helpers.
 
 Run: pytest tests/test_backends.py -v
 """
@@ -20,6 +21,7 @@ sys.path.insert(0, str(REPO_ROOT / "lib"))
 import backend      # noqa: E402
 import iterm        # noqa: E402
 import terminal_app  # noqa: E402
+import tmux_backend  # noqa: E402
 import lead_guard   # noqa: E402
 
 
@@ -580,8 +582,110 @@ class TestBackendSelection:
     def test_by_name_and_unknown(self):
         assert backend.by_name("iterm") is iterm
         assert backend.by_name("terminal") is terminal_app
+        assert backend.by_name("tmux") is tmux_backend
         assert backend.by_name(None) is None
         assert backend.by_name("kitty") is None
+
+    def _no_override(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("RELAY_TERMINAL", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))   # empty config — the real one can't interfere
+
+    def test_tmux_env_selects_tmux(self, monkeypatch, tmp_path):
+        self._no_override(monkeypatch, tmp_path)
+        monkeypatch.setenv("TERM_PROGRAM", "iTerm.app")   # tmux pane on a Mac inherits this
+        monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,123,0")
+        assert backend.select() is tmux_backend
+
+    def test_tmux_beats_apple_terminal(self, monkeypatch, tmp_path):
+        self._no_override(monkeypatch, tmp_path)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+        monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,123,0")
+        assert backend.select() is tmux_backend
+
+    def test_term_program_tmux_selects_tmux(self, monkeypatch, tmp_path):
+        self._no_override(monkeypatch, tmp_path)
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.setenv("TERM_PROGRAM", "tmux")
+        assert backend.select() is tmux_backend
+
+    def test_env_override_beats_tmux(self, monkeypatch):
+        monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,123,0")
+        monkeypatch.setenv("RELAY_TERMINAL", "iterm")
+        assert backend.select() is iterm
+        monkeypatch.setenv("RELAY_TERMINAL", "tmux")
+        assert backend.select() is tmux_backend
+
+    def test_config_tmux_selects_tmux(self, monkeypatch, tmp_path):
+        self._no_override(monkeypatch, tmp_path)
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.setenv("TERM_PROGRAM", "iTerm.app")
+        cfg = lead_guard.config_path(tmp_path / ".relay-tasks")
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('{"terminal_app": "tmux"}')
+        assert backend.select() is tmux_backend
+
+    def test_config_beats_tmux_env(self, monkeypatch, tmp_path):
+        self._no_override(monkeypatch, tmp_path)
+        monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,123,0")
+        cfg = lead_guard.config_path(tmp_path / ".relay-tasks")
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('{"terminal_app": "iterm"}')
+        assert backend.select() is iterm
+
+
+class TestLiveHandleFromEnv:
+    """backend.live_handle_from_env / is_live_handle / tab_id_from_env — the ONE place that knows
+    what a live handle looks like, for all three shapes."""
+
+    ITERM = "w1t2p0:11111111-2222-3333-4444-555555555555"
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        for k in ("TMUX", "TMUX_PANE", "ITERM_SESSION_ID", "TERM_SESSION_ID", "RELAY_TERMINAL"):
+            monkeypatch.delenv(k, raising=False)
+
+    def test_is_live_handle_shapes(self):
+        assert backend.is_live_handle(self.ITERM)
+        assert backend.is_live_handle("tmux:%12")
+        for bad in (None, "", "twid:4", "tmux:12", "tmux:%x", "%12", "w1t2p0:SHORT",
+                    "0F0E-A-UUID-from-Terminal-app"):
+            assert not backend.is_live_handle(bad), bad
+
+    def test_tmux_reads_tmux_pane_not_the_inherited_iterm_vars(self, monkeypatch):
+        monkeypatch.setenv("TMUX_PANE", "%7")
+        monkeypatch.setenv("ITERM_SESSION_ID", self.ITERM)   # inherited from the outer iTerm tab
+        assert backend.live_handle_from_env(tmux_backend) == "tmux:%7"
+        assert backend.tab_id_from_env(tmux_backend) == "tmux:%7"
+
+    def test_tmux_without_a_pane_is_none(self, monkeypatch):
+        monkeypatch.setenv("TERM_SESSION_ID", self.ITERM)
+        assert backend.live_handle_from_env(tmux_backend) is None
+        assert backend.tab_id_from_env(tmux_backend) is None
+        monkeypatch.setenv("TMUX_PANE", "garbage")
+        assert backend.live_handle_from_env(tmux_backend) is None
+
+    def test_iterm_is_shape_checked(self, monkeypatch):
+        monkeypatch.setenv("TERM_SESSION_ID", self.ITERM)
+        assert backend.live_handle_from_env(iterm) == self.ITERM
+        monkeypatch.setenv("ITERM_SESSION_ID", "not-a-handle")
+        assert backend.live_handle_from_env(iterm) is None   # ITERM_SESSION_ID wins, and is bad
+        monkeypatch.delenv("ITERM_SESSION_ID")
+        monkeypatch.setenv("TERM_SESSION_ID", "not-a-handle")
+        assert backend.live_handle_from_env(iterm) is None
+
+    def test_terminal_app_has_no_live_handle_but_keeps_its_raw_tab_id(self, monkeypatch):
+        # Terminal.app sets TERM_SESSION_ID to a bare UUID; migrate-by-tab for Terminal leads keys
+        # off exactly that raw value, so tab_id_from_env must keep returning it unfiltered.
+        monkeypatch.setenv("TERM_SESSION_ID", "0F0E5D2C-1234-4321-ABCD-0123456789AB")
+        assert backend.live_handle_from_env(terminal_app) is None
+        assert backend.tab_id_from_env(terminal_app) == "0F0E5D2C-1234-4321-ABCD-0123456789AB"
+        assert backend.tab_id_from_env(iterm) == "0F0E5D2C-1234-4321-ABCD-0123456789AB"
+
+    def test_default_backend_is_the_selected_one(self, monkeypatch):
+        monkeypatch.setenv("RELAY_TERMINAL", "tmux")
+        monkeypatch.setenv("TMUX_PANE", "%3")
+        assert backend.live_handle_from_env() == "tmux:%3"
+        assert backend.tab_id_from_env() == "tmux:%3"
 
 
 # ================================================================================================
@@ -1041,3 +1145,389 @@ class TestTypedLinesAreTwoWrites:
         script = osa_run.call_args[0][0]
         assert 'id of s) is "SOME-UUID"' in script and 'write text ""' in script
         assert "newline NO" not in script
+
+
+# ================================================================================================
+# tmux backend — pane-id addressing through ONE `_tmux` seam (argv inspected, nothing real runs)
+# ================================================================================================
+
+class _FakeTmux:
+    """Stands in for tmux_backend._tmux: records every argv, answers per subcommand. `answers` maps
+    a subcommand (args[0]) — or a (subcommand, fmt) pair for display-message — to (rc, stdout,
+    stderr) or a callable(args) returning one. Unlisted calls succeed with empty output."""
+
+    def __init__(self, answers=None, events=None):
+        self.calls = []
+        self.answers = answers or {}
+        self.events = events if events is not None else []
+
+    def __call__(self, args, timeout=5):
+        args = [str(a) for a in args]
+        self.calls.append(args)
+        self.events.append(("tmux", args))
+        key = args[0]
+        if key == "display-message" and "-p" in args:
+            key = ("display-message", args[-1])
+        ans = self.answers.get(key, (0, "", ""))
+        if callable(ans):
+            ans = ans(args)
+        rc, out, err = ans
+        return subprocess.CompletedProcess(["tmux"] + args, rc, out, err)
+
+    def subcommands(self):
+        return [c[0] for c in self.calls]
+
+    def find(self, sub):
+        return [c for c in self.calls if c[0] == sub]
+
+
+FOREIGN_HANDLES = [None, "", "w0t0p0:11111111-2222-3333-4444-555555555555", "twid:4",
+                   "tmux:12", "tmux:%x", "%12"]
+
+
+class TestTmuxBackend:
+    H = "tmux:%7"
+
+    @pytest.fixture
+    def fake(self, monkeypatch):
+        events = []
+        f = _FakeTmux(events=events)
+        monkeypatch.setattr(tmux_backend, "_tmux", f)
+        monkeypatch.setattr(tmux_backend.time, "sleep", lambda s: events.append(("sleep", s)))
+        return f
+
+    def test_pane_parses_only_own_handles(self):
+        assert tmux_backend._pane("tmux:%12") == "%12"
+        for h in FOREIGN_HANDLES:
+            assert tmux_backend._pane(h) is None, h
+
+    @pytest.mark.parametrize("handle", FOREIGN_HANDLES)
+    def test_foreign_handles_run_nothing(self, fake, handle):
+        assert tmux_backend.send("l", "hi", handle) is False
+        assert tmux_backend.press_enter("l", handle) is False
+        assert tmux_backend.is_alive("l", handle) is False
+        assert tmux_backend.exists_by_id(handle) is False
+        assert tmux_backend.close("l", handle) is False
+        assert tmux_backend.close_by_id(handle) is False
+        assert tmux_backend.focus("l", handle) is False
+        assert tmux_backend.rename_by_id(handle, "x") is False
+        assert tmux_backend.tty_by_id(handle) is None
+        assert tmux_backend.title_by_id(handle) is None
+        assert tmux_backend.notify(handle, "t", "b") is False
+        assert tmux_backend.paint_tab(handle, (1, 2, 3)) is False
+        assert fake.calls == []
+
+    def test_send_is_literal_text_then_a_separate_enter_after_the_gap(self, fake):
+        text = "Read and follow the work packet at /x/001-packet.md; then report"
+        assert tmux_backend.send("[Exec] e1", text, self.H) is True
+        assert fake.events == [
+            ("tmux", ["send-keys", "-t", "%7", "-l", "--", text]),
+            ("sleep", iterm.enter_gap(text)),
+            ("tmux", ["send-keys", "-t", "%7", "Enter"]),
+        ]
+
+    def test_send_into_a_gone_pane_is_false_and_skips_enter(self, fake):
+        fake.answers["send-keys"] = (1, "", "can't find pane: %7")
+        assert tmux_backend.send("l", "hi", self.H) is False
+        assert len(fake.calls) == 1
+
+    def test_press_enter_is_one_enter_by_id(self, fake):
+        assert tmux_backend.press_enter("l", self.H) is True
+        assert fake.calls == [["send-keys", "-t", "%7", "Enter"]]
+
+    def test_is_alive_and_exists_by_id_check_list_panes(self, fake):
+        fake.answers["list-panes"] = (0, "%1\n%7\n%70\n", "")
+        assert tmux_backend.is_alive("l", self.H) is True
+        assert tmux_backend.exists_by_id(self.H) is True
+        assert fake.calls[0] == ["list-panes", "-a", "-F", "#{pane_id}"]
+        fake.answers["list-panes"] = (0, "%1\n%70\n", "")
+        assert tmux_backend.is_alive("l", self.H) is False      # no prefix match on %70
+        fake.answers["list-panes"] = (1, "", "no server running")
+        assert tmux_backend.exists_by_id(self.H) is False
+
+    def test_close_kills_the_pane_by_id(self, fake):
+        assert tmux_backend.close("[Exec] e1", self.H) is True
+        assert tmux_backend.close_by_id(self.H) is True
+        assert fake.calls == [["kill-pane", "-t", "%7"]] * 2
+
+    def test_tty_and_title_by_id(self, fake):
+        fake.answers[("display-message", "#{pane_tty}")] = (0, "/dev/pts/3\n", "")
+        fake.answers[("display-message", "#{pane_title}")] = (0, "[Exec] e1 — working\n", "")
+        assert tmux_backend.tty_by_id(self.H) == "/dev/pts/3"
+        assert tmux_backend.title_by_id(self.H) == "[Exec] e1 — working"
+        assert fake.calls == [["display-message", "-p", "-t", "%7", "#{pane_tty}"],
+                              ["display-message", "-p", "-t", "%7", "#{pane_title}"]]
+        fake.answers[("display-message", "#{pane_tty}")] = (1, "", "can't find pane")
+        assert tmux_backend.tty_by_id(self.H) is None
+
+    def test_focus_switches_client_only_when_the_session_differs(self, fake):
+        fake.answers[("display-message", "#{session_id}")] = (
+            lambda a: (0, "$2\n", "") if "-t" in a else (0, "$0\n", ""))
+        assert tmux_backend.focus("l", self.H) is True
+        assert fake.subcommands() == ["display-message", "display-message", "switch-client",
+                                      "select-window", "select-pane"]
+        assert ["switch-client", "-t", "$2"] in fake.calls
+        assert ["select-window", "-t", "%7"] in fake.calls and ["select-pane", "-t", "%7"] in fake.calls
+        fake.calls.clear()
+        fake.answers[("display-message", "#{session_id}")] = (0, "$2\n", "")
+        assert tmux_backend.focus("l", self.H) is True
+        assert "switch-client" not in fake.subcommands()
+
+    def test_focus_on_a_gone_pane_is_false(self, fake):
+        fake.answers[("display-message", "#{session_id}")] = (
+            lambda a: (1, "", "can't find pane") if "-t" in a else (0, "$0\n", ""))
+        assert tmux_backend.focus("l", self.H) is False
+        assert "select-pane" not in fake.subcommands()
+
+    def test_rename_by_id_renames_the_window_and_types_rename_as_two_writes(self, fake):
+        fake.answers[("display-message", "#{window_panes}")] = (0, "1\n", "")
+        assert tmux_backend.rename_by_id(self.H, "[closed] e1") is True
+        assert ["rename-window", "-t", "%7", "--", "[closed] e1"] in fake.calls
+        assert ["set-option", "-w", "-t", "%7", "automatic-rename", "off"] in fake.calls
+        assert fake.events[-3:] == [
+            ("tmux", ["send-keys", "-t", "%7", "-l", "--", "/rename [closed] e1"]),
+            ("sleep", iterm.enter_gap("/rename [closed] e1")),
+            ("tmux", ["send-keys", "-t", "%7", "Enter"]),
+        ]
+
+    def test_rename_by_id_leaves_a_shared_window_alone(self, fake):
+        # A split-pane executor shares its LEAD's window — renaming "its" window would retitle the
+        # lead's status-bar entry.
+        fake.answers[("display-message", "#{window_panes}")] = (0, "2\n", "")
+        assert tmux_backend.rename_by_id(self.H, "[closed] e1") is True
+        assert "rename-window" not in fake.subcommands()
+
+    def test_notify_is_a_status_line_message_with_hashes_escaped(self, fake):
+        assert tmux_backend.notify(self.H, "relay · proj", "e1 reported — 50% #3 done") is True
+        assert fake.calls == [["display-message", "-t", "%7", "-d", "4000", "--",
+                               "relay · proj — e1 reported — 50% ##3 done"]]
+
+    def test_paint_tab_sets_window_status_style(self, fake):
+        assert tmux_backend.paint_tab(self.H, (255, 105, 97)) is True
+        assert fake.calls == [["set-option", "-w", "-t", "%7", "window-status-style", "bg=#ff6961"]]
+
+    # ── spawn ──────────────────────────────────────────────────────────────────────────────────
+    def _spawn(self, fake, tmp_path, **kw):
+        fake.answers.setdefault("new-window", (0, "%9\n", ""))
+        fake.answers.setdefault(("display-message", "#{window_panes}"), (0, "1\n", ""))
+        handle_file = tmp_path / "iterm_id"
+        out = tmux_backend.spawn(cwd="/work/tree", prompt="Read the packet", label="[Exec] e1",
+                                 pidfile=str(tmp_path / "pid"), iterm_id_file=str(handle_file),
+                                 session_uuid="u-1", **kw)
+        return out, handle_file
+
+    def test_spawn_plain_new_window_and_launch_by_id(self, fake, tmp_path):
+        out, handle_file = self._spawn(fake, tmp_path)
+        assert out == {"ok": True, "reason": "ok", "session_id": "tmux:%9", "front_title": None}
+        assert fake.calls[0] == ["new-window", "-P", "-F", "#{pane_id}", "-n", "[Exec] e1",
+                                 "-c", "/work/tree"]
+        assert handle_file.read_text() == "tmux:%9"
+        assert ["rename-window", "-t", "%9", "--", "[Exec] e1"] in fake.calls
+        assert ["set-option", "-w", "-t", "%9", "automatic-rename", "off"] in fake.calls
+        boot = tmp_path / iterm.BOOTSTRAP_FILENAME
+        typed = [c[-1] for c in fake.calls if c[:2] == ["send-keys", "-t"] and "-l" in c]
+        assert typed == [f"sh {boot} %9", "/rename [Exec] e1"]
+        # every text write is followed by a separate Enter, every write addresses the new pane
+        for c in fake.find("send-keys"):
+            assert c[1:3] == ["-t", "%9"]
+        body = boot.read_text()
+        assert '_relay_sid="$TMUX_PANE"' in body
+        assert "exec claude --session-id u-1 'Read the packet'" in body
+        assert "cd /work/tree && echo $$ > " in body
+        assert "echo $TMUX_PANE" not in body and "ITERM_SESSION_ID" not in body.split("fi\n", 1)[1]
+
+    def test_spawn_launch_line_is_two_writes_after_a_sacrificial_enter(self, fake, tmp_path):
+        self._spawn(fake, tmp_path)
+        boot = tmp_path / iterm.BOOTSTRAP_FILENAME
+        line = f"sh {boot} %9"
+        sends = [e for e in fake.events if e[0] == "sleep" or e[1][0] == "send-keys"]
+        assert sends[:5] == [
+            ("tmux", ["send-keys", "-t", "%9", "Enter"]),           # sacrificial blank line
+            ("sleep", 0.2),
+            ("tmux", ["send-keys", "-t", "%9", "-l", "--", line]),
+            ("sleep", iterm.enter_gap(line)),
+            ("tmux", ["send-keys", "-t", "%9", "Enter"]),
+        ]
+        assert ("sleep", 1.5) in fake.events   # rename_delay before /rename
+
+    def test_spawn_tab_with_lead_handle_lands_after_the_leads_window(self, fake, tmp_path):
+        fake.answers[("display-message", "#{window_id}")] = (0, "@4\n", "")
+        out, _ = self._spawn(fake, tmp_path, lead_handle="tmux:%3")
+        assert out["ok"]
+        assert fake.calls[0] == ["display-message", "-p", "-t", "%3", "#{window_id}"]
+        assert fake.calls[1] == ["new-window", "-a", "-t", "@4", "-P", "-F", "#{pane_id}",
+                                 "-n", "[Exec] e1", "-c", "/work/tree"]
+
+    def test_spawn_tab_lead_lookup_miss_degrades_to_plain_new_window(self, fake, tmp_path):
+        fake.answers[("display-message", "#{window_id}")] = (1, "", "can't find pane: %3")
+        out, _ = self._spawn(fake, tmp_path, lead_handle="tmux:%3")
+        assert out["ok"]
+        assert fake.calls[1] == ["new-window", "-P", "-F", "#{pane_id}", "-n", "[Exec] e1",
+                                 "-c", "/work/tree"]
+
+    def test_spawn_pane_layout_splits_the_leads_pane(self, fake, tmp_path):
+        fake.answers["split-window"] = (0, "%11\n", "")
+        fake.answers[("display-message", "#{window_panes}")] = (0, "2\n", "")
+        out, handle_file = self._spawn(fake, tmp_path, lead_handle="tmux:%3", layout="pane",
+                                       tab_color=(1, 2, 3))
+        assert out["session_id"] == "tmux:%11" and handle_file.read_text() == "tmux:%11"
+        assert fake.calls[0] == ["split-window", "-h", "-t", "%3", "-P", "-F", "#{pane_id}",
+                                 "-c", "/work/tree"]
+        # shares the lead's window → neither renames nor recolors it
+        assert "rename-window" not in fake.subcommands()
+        assert not [c for c in fake.find("set-option") if "window-status-style" in c]
+
+    def test_spawn_pane_layout_split_failure_degrades_to_new_window(self, fake, tmp_path):
+        fake.answers["split-window"] = (1, "", "no space for new pane")
+        out, _ = self._spawn(fake, tmp_path, lead_handle="tmux:%3", layout="pane")
+        assert out["ok"] and out["session_id"] == "tmux:%9"
+        assert fake.subcommands()[:2] == ["split-window", "new-window"]
+
+    def test_spawn_pane_layout_without_lead_handle_is_a_plain_window(self, fake, tmp_path):
+        self._spawn(fake, tmp_path, layout="pane")
+        assert "split-window" not in fake.subcommands()
+        assert fake.calls[0][0] == "new-window" and "-a" not in fake.calls[0]
+
+    def test_spawn_foreign_lead_handle_is_ignored(self, fake, tmp_path):
+        self._spawn(fake, tmp_path, lead_handle="w1t2p0:LEAD-UUID", layout="pane")
+        assert fake.calls[0] == ["new-window", "-P", "-F", "#{pane_id}", "-n", "[Exec] e1",
+                                 "-c", "/work/tree"]
+
+    def test_spawn_tab_color_becomes_window_status_style(self, fake, tmp_path):
+        self._spawn(fake, tmp_path, tab_color=(255, 105, 97))
+        assert ["set-option", "-w", "-t", "%9", "window-status-style", "bg=#ff6961"] in fake.calls
+        boot = (tmp_path / iterm.BOOTSTRAP_FILENAME).read_text()
+        assert "printf" not in boot           # no iTerm escape — tmux would swallow it anyway
+
+    def test_spawn_tmux_failure_is_script_failed_with_stderr(self, fake, tmp_path):
+        fake.answers["new-window"] = (1, "", "no server running on /tmp/tmux-501/default")
+        out, handle_file = self._spawn(fake, tmp_path)
+        assert out == {"ok": False, "reason": "script-failed", "session_id": None,
+                       "front_title": None, "error": "no server running on /tmp/tmux-501/default"}
+        assert not handle_file.exists()
+        assert "send-keys" not in fake.subcommands()   # nothing typed anywhere
+
+    def test_spawn_pane_gone_before_launch_is_target_gone(self, fake, tmp_path):
+        fake.answers["send-keys"] = (1, "", "can't find pane: %9")
+        out, _ = self._spawn(fake, tmp_path)
+        assert out["ok"] is False and out["reason"] == "target-gone"
+        assert out["session_id"] == "tmux:%9" and out["front_title"] is None and out["error"]
+
+    def test_spawn_accepts_the_full_shared_signature(self, fake, tmp_path):
+        import inspect
+        assert (list(inspect.signature(tmux_backend.spawn).parameters)
+                == list(inspect.signature(iterm.spawn).parameters))
+        out, _ = self._spawn(fake, tmp_path, model="sonnet", skip_perms=True, rename_delay=0,
+                             env_prefix='PATH="/tmp/fakebin:$PATH" ', resume_id=None,
+                             settings_file="/s.json", mcp_flags=["--strict-mcp-config"],
+                             agent_flags=["--agent", "relay-executor"], effort="high")
+        assert out["ok"]
+        body = (tmp_path / iterm.BOOTSTRAP_FILENAME).read_text()
+        assert 'PATH="/tmp/fakebin:$PATH" echo $$' in body
+        for frag in ("--dangerously-skip-permissions", "--settings /s.json", "--strict-mcp-config",
+                     "--agent relay-executor", "--effort high", "--model sonnet"):
+            assert frag in body
+
+    # ── the one seam ───────────────────────────────────────────────────────────────────────────
+    def test_tmux_seam_is_argv_only_with_socket_and_separator_escaping(self, monkeypatch):
+        monkeypatch.setenv("RELAY_TMUX_SOCKET", "relay-test-1")
+        with mock.patch.object(tmux_backend.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            tmux_backend._tmux(["send-keys", "-t", "%1", "-l", "--", "a; b;"])
+        argv = run.call_args[0][0]
+        assert argv == ["tmux", "-L", "relay-test-1", "send-keys", "-t", "%1", "-l", "--", r"a; b\;"]
+        assert "shell" not in run.call_args[1]
+
+    def test_tmux_seam_without_socket(self, monkeypatch):
+        monkeypatch.delenv("RELAY_TMUX_SOCKET", raising=False)
+        with mock.patch.object(tmux_backend.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            tmux_backend._tmux(["list-sessions"])
+        assert run.call_args[0][0] == ["tmux", "list-sessions"]
+
+    def test_tmux_seam_never_raises(self, monkeypatch):
+        with mock.patch.object(tmux_backend.subprocess, "run", side_effect=FileNotFoundError("tmux")):
+            r = tmux_backend._tmux(["list-sessions"])
+        assert r.returncode == 127 and "unavailable" in r.stderr
+        with mock.patch.object(tmux_backend.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("tmux", 5)):
+            r = tmux_backend._tmux(["list-sessions"])
+        assert r.returncode == 1 and "timed out" in r.stderr
+        with mock.patch.object(tmux_backend.subprocess, "run", side_effect=FileNotFoundError("tmux")):
+            assert tmux_backend.running() is False
+            assert tmux_backend.version() is None
+
+    def test_parity_with_terminal_app_by_introspection(self):
+        """The shared backend contract can't drift silently: every public function terminal_app
+        defines (plus NAME) exists on the tmux module, with the same parameter names."""
+        import inspect
+        contract = [n for n, v in vars(terminal_app).items()
+                    if not n.startswith("_") and inspect.isfunction(v)
+                    and v.__module__ == terminal_app.__name__]
+        assert contract  # sanity: introspection found the surface
+        missing = [n for n in contract + ["NAME"] if not hasattr(tmux_backend, n)]
+        assert missing == []
+        for n in contract:
+            assert (list(inspect.signature(getattr(tmux_backend, n)).parameters)
+                    == list(inspect.signature(getattr(terminal_app, n)).parameters)), n
+        # and everything bin/relay reaches through a SELECTED backend outside an iTerm-only guard
+        for n in ("press_enter", "exists_by_id", "close_by_id", "tty_by_id", "pids_on_tty",
+                  "pid_on_tty", "paint_tab", "title_by_id", "notify"):
+            assert callable(getattr(tmux_backend, n)), n
+
+
+# The bootstrap as it stood before `sid_expr` existed (scripts/iterm.py at b9ef33c), with only the
+# header comment's wording updated to name tmux pane ids — the default must reproduce the iTerm
+# guard and everything else byte-for-byte.
+PRE_SID_EXPR_BOOTSTRAP = (
+    "#!/bin/sh\n"
+    "# relay bootstrap — written per launch by relay (see scripts/iterm.py, §15b).\n"
+    "# Invoked as: sh <this file> <intended terminal session id (iTerm session id, or a tmux pane id)>.\n"
+    "# A copy run anywhere else (or with a truncated/missing id) prints one line and exits 0 —\n"
+    "# inert by construction.\n"
+    '_relay_sid="${ITERM_SESSION_ID:-$TERM_SESSION_ID}"\n'
+    'if [ "x${_relay_sid##*:}" != "x$1" ] || [ "x$1" = "x" ]; then\n'
+    '  echo "relay: ignored a mis-delivered bootstrap meant for session ${1:-<missing>}"\n'
+    "  exit 0\n"
+    "fi\n"
+    "CMD --here\n"
+)
+
+
+class TestBootstrapSidExpr:
+    def test_default_is_byte_identical_to_the_pre_parameter_text(self, tmp_path):
+        assert iterm.bootstrap_file_content("CMD --here") == PRE_SID_EXPR_BOOTSTRAP
+        p = iterm.write_bootstrap_file(str(tmp_path / "pid"), "CMD --here")
+        assert Path(p).read_text() == PRE_SID_EXPR_BOOTSTRAP
+
+    def test_tmux_variant_only_swaps_the_sid_expression(self):
+        tm = iterm.bootstrap_file_content("CMD --here", sid_expr="$TMUX_PANE")
+        assert tm == PRE_SID_EXPR_BOOTSTRAP.replace("${ITERM_SESSION_ID:-$TERM_SESSION_ID}",
+                                                    "$TMUX_PANE")
+
+    def _boot(self, tmp_path):
+        marker, pidfile = tmp_path / "claude-ran", tmp_path / "pid"
+        cmd = f"echo $$ > {shlex.quote(str(pidfile))} && touch {shlex.quote(str(marker))}"
+        return iterm.write_bootstrap_file(str(pidfile), cmd, sid_expr=tmux_backend.SID_EXPR), marker
+
+    def _run(self, boot, arg, env_extra):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("TMUX_PANE", "ITERM_SESSION_ID", "TERM_SESSION_ID")}
+        env.update(env_extra)
+        return subprocess.run(["sh", boot, arg], capture_output=True, text=True, env=env, timeout=30)
+
+    def test_tmux_guard_runs_in_its_own_pane(self, tmp_path):
+        boot, marker = self._boot(tmp_path)
+        r = self._run(boot, "%9", {"TMUX_PANE": "%9"})
+        assert r.returncode == 0 and marker.exists()
+
+    @pytest.mark.parametrize("env_extra", [
+        {"TMUX_PANE": "%8"},                                       # a different pane
+        {},                                                        # not in tmux at all
+        # the Mac case: iTerm ids inherited by the pane, no TMUX_PANE — must NOT satisfy the guard
+        {"ITERM_SESSION_ID": "w0t0p0:%9", "TERM_SESSION_ID": "w0t0p0:%9"},
+    ])
+    def test_tmux_guard_is_inert_anywhere_else(self, tmp_path, env_extra):
+        boot, marker = self._boot(tmp_path)
+        r = self._run(boot, "%9", env_extra)
+        assert r.returncode == 0 and not marker.exists() and "mis-delivered" in r.stdout

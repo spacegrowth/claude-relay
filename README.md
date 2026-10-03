@@ -57,6 +57,8 @@ wakes you when an executor finishes.
 | `relay close` | closes the tab | window may linger (Cmd-W it) |
 | Lead push-wake (`nudge-lead`) | yes | no — Terminal.app can't inject text into a running process; a Terminal-hosted lead degrades to its own at-Stop check + desktop notification |
 
+**tmux** is the backend for Linux / SSH leads and for anyone running `claude` inside tmux. It is selected by `RELAY_TERMINAL=tmux`, by `terminal_app: tmux` in config, or automatically when `$TMUX` is set. Sessions are addressed by pane id, so handles look like `tmux:%N`. Executors appear as windows (or split panes) named by relay in the status bar, and a lead's color is applied through `window-status-style` instead of a tab color. `RELAY_TMUX_SOCKET=<name>` points relay at a named tmux server (`tmux -L <name>`). `relay doctor` shows the selected backend and the tmux version. Linux-only hardening elsewhere in the CLI is still to come.
+
 **Why the lead's own model matters**: this role's value is judgment calls (what to delegate, when
 to reuse a session, whether a report is truly mergeable) — that needs a strong reasoning model, and
 no skill can switch it programmatically, so `/relay:mode` has the session say its own tier out loud
@@ -834,7 +836,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_default_model` | "sonnet" | Model an executor launches with when `--model` is omitted — relay's own policy, never the CLI's personal `/model` default. An alias (`sonnet`/`opus`/`haiku`/`fable`, optionally `[1m]`) is **resolved through this machine's Claude Code at spawn** and the executor is launched with the concrete id (`claude-sonnet-5[1m]`), so the same alias can't mean different models on different machines and `[1m]` always rides a full id; cached per CLI version in `~/.relay-tasks/models.json`, shown in `relay doctor`. A full id is passed through untouched; an unrecognised model is refused before any tab opens |
 | `executor_model_ceiling` | "opus" | Spawn refuses a requested executor model above this tier unless `--model-override "<reason>"` is passed (recorded in the ledger) |
 | `executor_default_effort` | "high" | Thinking effort an executor launches with when neither `--effort` nor a packet `EFFORT:` line pins one — relay's own policy (the CLI default), never your personal `effortLevel` from `~/.claude/settings.json`. Validated against `--effort`'s own levels (`low`\|`medium`\|`high`\|`xhigh`\|`max`); an invalid value is refused at spawn |
-| `terminal_app` | "auto" | "iterm" \| "terminal" \| "auto" (auto-detect via `$TERM_PROGRAM`; iTerm default) |
+| `terminal_app` | "auto" | "iterm" \| "terminal" \| "tmux" \| "auto" (auto-detect: tmux when `$TMUX` is set, else via `$TERM_PROGRAM`; iTerm default) |
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
 | `tidy_tabs` | true | iTerm only; after a spawn/rotate/handoff/close-predecessor/resume/restart, re-order the tab bar into `[Lead] [Exec…] [Lead 2] [Exec…]` and re-apply each lead's color to its group (see [Telling tabs apart](#telling-tabs-apart)). Needs the optional `iterm2` package + iTerm's Python API; degrades to one dim line without them. `relay tidy` runs regardless of this key |
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
@@ -942,7 +944,7 @@ spawn ceiling still applies.
 (No config key — on purpose.) Executors launch with **zero** MCP servers (`--strict-mcp-config`) — no connector/plugin/user/project MCPs, so their tool rosters and instruction blocks never enter the executor's context (a real per-turn token saving, and one less side-effect surface). The packet itself declares what it needs — a line `MCP: linear` (comma-separate several; strict allowlist) or `MCP: inherit` — and `relay spawn` launches accordingly (precedence: `--mcp` flag > packet line > none). On `relay send`, a packet declaring a server the executor lacks makes relay relaunch the executor's **same conversation** (`--resume`) with the widened set before delivering — MCP servers load at process start and `--resume` doesn't restore `--mcp-config` (verified live: `tests/test_e2e_mcp.py`). `relay resume|restart --mcp SPEC` changes the set by hand. The resolved set is recorded on the session; an allowlist naming a server no config file defines refuses rather than launching an executor missing its tool.
 
 **Environment variable overrides:**
-- `RELAY_TERMINAL`: force "iterm" or "terminal" (beats `terminal_app` in config)
+- `RELAY_TERMINAL`: force "iterm", "terminal" or "tmux" (beats `terminal_app` in config)
 - `RELAY_NO_NOTIFY`: suppress all notification banners (useful for tests, CI)
 
 ## Troubleshooting

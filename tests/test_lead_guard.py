@@ -3449,7 +3449,7 @@ class TestTombstone:
         assert tty_calls == []                           # no AppleScript call at all
 
     def test_revive_ignores_a_live_value_that_does_not_look_like_a_real_iterm_handle(self, root, monkeypatch):
-        """A live env var that isn't shaped like a real iTerm session id (LIVE_ITERM_SESSION_RE —
+        """A live env var that isn't shaped like a real iTerm session id (`backend.is_live_handle` —
         the same check bin/relay's `_live_lead_handle` trusts) must never overwrite a recorded
         `iterm_session` — e.g. a stray/malformed value, or a Terminal.app session."""
         lg.write_marker(root, "lead-1", project="proj", iterm_session="w1t2p0:11111111-1111-1111-"
@@ -4835,3 +4835,126 @@ class TestAutoCloseDecisionLandedTriState:
 
     def test_false_does_not_land(self):
         assert self._d(False) != ("close", "landed")
+
+
+class TestTmuxLeadGuard:
+    """tmux backend wiring in lead_guard: revive_lead picks up a tmux lead's live pane handle,
+    `_tty_by_id` dispatches on the handle's shape, and notify_banner's tier 1 for a tmux lead is a
+    status-line message — with the osascript tier still reached, and silent where it can't run."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        for k in ("TMUX", "TMUX_PANE", "ITERM_SESSION_ID", "TERM_SESSION_ID"):
+            monkeypatch.delenv(k, raising=False)
+
+    def test_revive_lead_refreshes_to_the_live_tmux_pane(self, root, monkeypatch):
+        import tmux_backend
+        lg.write_marker(root, "lead-1", project="proj", iterm_session="tmux:%3", cwd="/tmp/x",
+                        backend="tmux", tty="/dev/pts/3")
+        lg.tombstone_lead(root, "lead-1", reason="exit")
+        monkeypatch.setenv("RELAY_TERMINAL", "tmux")
+        monkeypatch.setenv("TMUX_PANE", "%12")
+        # inherited from an outer iTerm tab — must NOT be what gets recorded
+        monkeypatch.setenv("TERM_SESSION_ID", "w9t9p0:11111111-2222-3333-4444-555555555555")
+        calls = []
+        monkeypatch.setattr(tmux_backend, "tty_by_id", lambda h: calls.append(h) or "/dev/pts/12")
+        assert lg.revive_lead(root, "lead-1") is True
+        after = lg.read_marker(root, "lead-1")
+        assert after["iterm_session"] == "tmux:%12"
+        assert after["tty"] == "/dev/pts/12"
+        assert calls == ["tmux:%12"]          # tty captured through the tmux backend, by shape
+        assert after["backend"] == "tmux"
+
+    def test_revive_lead_same_pane_is_untouched(self, root, monkeypatch):
+        lg.write_marker(root, "lead-1", project="proj", iterm_session="tmux:%3", cwd="/tmp/x",
+                        backend="tmux", tty="/dev/pts/3")
+        lg.tombstone_lead(root, "lead-1", reason="exit")
+        monkeypatch.setenv("RELAY_TERMINAL", "tmux")
+        monkeypatch.setenv("TMUX_PANE", "%3")
+        monkeypatch.setattr(lg, "_tty_by_id", lambda h: (_ for _ in ()).throw(AssertionError(h)))
+        assert lg.revive_lead(root, "lead-1") is True
+        after = lg.read_marker(root, "lead-1")
+        assert after["iterm_session"] == "tmux:%3" and after["tty"] == "/dev/pts/3"
+
+    def test_tty_by_id_dispatches_on_handle_shape(self, monkeypatch):
+        import tmux_backend
+        monkeypatch.setattr(tmux_backend, "tty_by_id", lambda h: f"/dev/pts/for-{h}")
+        monkeypatch.setattr(iterm, "tty_by_id", lambda h: f"/dev/ttys-for-{h}")
+        assert lg._tty_by_id("tmux:%4") == "/dev/pts/for-tmux:%4"
+        assert lg._tty_by_id("w1t1p0:X") == "/dev/ttys-for-w1t1p0:X"
+
+    def test_tty_by_id_tmux_failure_is_none(self, monkeypatch):
+        import tmux_backend
+        monkeypatch.setattr(tmux_backend, "tty_by_id",
+                            lambda h: (_ for _ in ()).throw(RuntimeError("tmux gone")))
+        assert lg._tty_by_id("tmux:%4") is None
+
+    def test_capture_tty_for_a_tmux_lead(self, monkeypatch):
+        import tmux_backend
+        monkeypatch.setattr(tmux_backend, "tty_by_id", lambda h: "/dev/pts/7")
+        assert lg._capture_tty("tmux:%7") == "/dev/pts/7"
+
+    def _notify_mocks(self, monkeypatch, posted=True):
+        import tmux_backend
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        notes, osa, osc = [], [], []
+        monkeypatch.setattr(tmux_backend, "notify",
+                            lambda h, t, b: notes.append((h, t, b)) or posted)
+        monkeypatch.setattr(iterm, "notify_via_tty", lambda *a: osc.append(a) or True)
+        monkeypatch.setattr(iterm, "tty_by_id", lambda h: osc.append(("lookup", h)) or "/dev/x")
+        monkeypatch.setattr(lg.subprocess, "run", lambda *a, **k: osa.append(list(a[0])))
+        return notes, osa, osc
+
+    def _fallbacks(self, root):
+        p = root / "sessions.jsonl"
+        if not p.exists():
+            return []
+        return [e for e in (json.loads(l) for l in p.read_text().splitlines())
+                if e["event"] == "banner_fallback"]
+
+    def test_notify_banner_tmux_tier_returns_on_success(self, root, monkeypatch):
+        notes, osa, osc = self._notify_mocks(monkeypatch)
+        lg.notify_banner({}, "relay · p", "e1 reported", "review it", lead_sid="lead-1",
+                         iterm_session="tmux:%5", tty="/dev/pts/5", state_root=root)
+        assert notes == [("tmux:%5", "relay · p", "e1 reported — review it")]
+        assert osc == []                          # never the OSC 777 tty write for a tmux lead
+        assert osa == []                          # posted → returns; no second osascript banner
+        assert self._fallbacks(root) == []
+
+    def test_notify_banner_tmux_failure_ledgers_write_failed(self, root, monkeypatch):
+        notes, osa, osc = self._notify_mocks(monkeypatch, posted=False)
+        lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", iterm_session="tmux:%5",
+                         state_root=root)
+        fb = self._fallbacks(root)
+        assert len(fb) == 1 and fb[0]["reason"] == "write-failed" and fb[0]["session_id"] == "lead-1"
+        assert len(osa) == 1
+
+    def test_notify_banner_osascript_config_skips_tmux_tier(self, root, monkeypatch):
+        notes, osa, osc = self._notify_mocks(monkeypatch)
+        lg.notify_banner({"notify_via": "osascript"}, "t", "s", "m", iterm_session="tmux:%5",
+                         state_root=root)
+        assert notes == [] and len(osa) == 1
+
+    @pytest.mark.parametrize("handle", ["tmux:%5", None])
+    def test_notify_banner_silent_without_osascript_or_tmux(self, root, monkeypatch, tmp_path,
+                                                            handle):
+        """Linux over SSH without tmux on PATH: both tiers' binaries are missing. The REAL chain
+        (no mocks) must swallow FileNotFoundError and return silently."""
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        empty = tmp_path / "emptybin"
+        empty.mkdir()
+        monkeypatch.setenv("PATH", str(empty))
+        import shutil
+        assert shutil.which("osascript") is None and shutil.which("tmux") is None
+        assert lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", iterm_session=handle,
+                                state_root=root) is None
+        if handle:
+            assert [f["reason"] for f in self._fallbacks(root)] == ["write-failed"]
+
+    def test_env_tab_id_is_the_pane_under_tmux_and_raw_term_session_otherwise(self, monkeypatch):
+        monkeypatch.setenv("TERM_SESSION_ID", "RAW-TERMINAL-UUID")
+        monkeypatch.setenv("RELAY_TERMINAL", "terminal")
+        assert lg.env_tab_id() == "RAW-TERMINAL-UUID"
+        monkeypatch.setenv("RELAY_TERMINAL", "tmux")
+        monkeypatch.setenv("TMUX_PANE", "%2")
+        assert lg.env_tab_id() == "tmux:%2"

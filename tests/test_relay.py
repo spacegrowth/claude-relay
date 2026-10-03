@@ -8604,3 +8604,121 @@ class TestSuccessorName:
             relay.cmd_send(SimpleNamespace(session_id=sid, packet=str(nxt), rotate=True, name="relay-fix"))
         assert relay.read_session("relay-fix") and relay.read_session("relay-fix")["topic"] == "t"
         assert relay.read_session(sid)["status"] == "superseded"
+
+
+class TestTmuxHostedSessions:
+    """The `bk.NAME` guard audit for the tmux backend (packet tmux-backend 001 §4): every tab op on a
+    tmux-hosted session goes through the tmux backend or skips cleanly — never osascript. relay is
+    loaded with RELAY_TERMINAL=tmux pinned, and tmux itself is stubbed at its one `_tmux` seam."""
+
+    @pytest.fixture
+    def trelay(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RELAY_TERMINAL", "tmux")
+        mod = load_relay_module(tmp_path / ".relay-tasks")
+        assert mod.iterm.NAME == "tmux"
+        return mod
+
+    @pytest.fixture
+    def no_osascript(self, monkeypatch):
+        import iterm as real_iterm
+
+        def boom(*a, **k):
+            raise AssertionError(f"osascript reached for a tmux session: {a!r}")
+        monkeypatch.setattr(real_iterm, "run_osascript", boom)
+        return boom
+
+    def _tmux(self, trelay, monkeypatch, panes="%4\n"):
+        tb = trelay.backend.by_name("tmux")
+        calls = []
+
+        def fake(args, timeout=5):
+            calls.append(list(args))
+            out = panes if args[0] == "list-panes" else ""
+            return trelay.subprocess.CompletedProcess(["tmux"] + list(args), 0, out, "")
+        monkeypatch.setattr(tb, "_tmux", fake)
+        monkeypatch.setattr(tb.time, "sleep", lambda s: None)
+        return tb, calls
+
+    def test_ensure_tab_label_on_a_tmux_session_runs_no_osascript(self, trelay, monkeypatch,
+                                                                    no_osascript):
+        tb, calls = self._tmux(trelay, monkeypatch)
+        popen = mock.MagicMock()
+        monkeypatch.setattr(trelay.subprocess, "Popen", popen)
+        assert trelay._ensure_tab_label(tb, "tmux:%4", "[Exec] e1", delay=0) is True
+        assert calls == [["list-panes", "-a", "-F", "#{pane_id}"]]
+        popen.assert_not_called()          # no iTerm-only background label loop either
+
+    def test_auto_tidy_is_skipped_silently_for_tmux(self, trelay, monkeypatch, capsys):
+        monkeypatch.delenv("RELAY_NO_TIDY", raising=False)
+        run = mock.MagicMock(side_effect=AssertionError("tidy subprocess spawned under tmux"))
+        monkeypatch.setattr(trelay.subprocess, "run", run)
+        capsys.readouterr()
+        assert trelay.maybe_tidy_tabs("spawn") is False
+        assert capsys.readouterr().out == ""
+        run.assert_not_called()
+
+    def test_tidy_groups_leave_tmux_leads_and_executors_out(self, trelay):
+        trelay.lead_guard.write_marker(trelay.STATE_ROOT, "lead-t", project="p", cwd="/w",
+                                       iterm_session="tmux:%1", backend="tmux")
+        trelay.write_session("ex-t", {"session_id": "ex-t", "owner_lead": "lead-t",
+                                      "iterm_session": "tmux:%2", "backend": "tmux",
+                                      "status": "busy", "created": trelay.now()})
+        assert trelay.tidy_groups() == []
+
+    def test_lead_alive_for_a_tmux_lead_needs_the_pane_and_a_claude_on_its_tty(self, trelay,
+                                                                                monkeypatch,
+                                                                                no_osascript):
+        trelay.lead_guard.write_marker(trelay.STATE_ROOT, "lead-t", project="p", cwd="/w",
+                                       iterm_session="tmux:%4", backend="tmux")
+        tb = trelay.backend.by_name("tmux")
+        monkeypatch.setattr(tb, "tty_by_id", lambda h: "/dev/pts/4" if h == "tmux:%4" else None)
+        monkeypatch.setattr(tb, "pids_on_tty", lambda tty: [4242] if tty == "/dev/pts/4" else [])
+        assert trelay._lead_alive("lead-t") is True
+        monkeypatch.setattr(tb, "pids_on_tty", lambda tty: [])      # shell left, claude gone
+        assert trelay._lead_alive("lead-t") is False
+        monkeypatch.setattr(tb, "tty_by_id", lambda h: None)        # pane gone
+        assert trelay._lead_alive("lead-t") is False
+
+    def test_lead_alive_uses_the_markers_backend_not_the_ambient_one(self, relay, monkeypatch):
+        # relay here is loaded under the AMBIENT (non-tmux) selection; a tmux lead's marker must
+        # still be probed through the tmux backend.
+        relay.lead_guard.write_marker(relay.STATE_ROOT, "lead-t", project="p", cwd="/w",
+                                      iterm_session="tmux:%4", backend="tmux")
+        tb = relay.backend.by_name("tmux")
+        monkeypatch.setattr(tb, "tty_by_id", lambda h: "/dev/pts/4")
+        monkeypatch.setattr(tb, "pids_on_tty", lambda tty: [4242])
+        monkeypatch.setattr(relay.backend.by_name("iterm"), "tty_by_id",
+                            lambda h: (_ for _ in ()).throw(AssertionError("iTerm probed")))
+        assert relay._lead_alive("lead-t") is True
+
+    def test_relay_list_term_cell_shows_tmux(self, trelay, monkeypatch, capsys, no_osascript):
+        self._tmux(trelay, monkeypatch, panes="%4\n")
+        trelay.lead_guard.write_marker(trelay.STATE_ROOT, "lead-t", project="tmuxproj", cwd="/w",
+                                       iterm_session="tmux:%4", backend="tmux",
+                                       tab_label="[Lead] tmuxproj")
+        assert trelay._lead_term_cell(trelay.lead_guard.read_marker(trelay.STATE_ROOT, "lead-t")) == "tmux"
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        capsys.readouterr()
+        trelay.cmd_list(SimpleNamespace(lead=None, all=True, json=False, closed=False))
+        out = capsys.readouterr().out
+        header = [l for l in out.splitlines() if "TERM" in l][0]
+        row = [l for l in out.splitlines() if l.startswith("tmuxproj")][0]
+        assert row.split()[header.split().index("TERM")] == "tmux"
+        assert row.split()[header.split().index("LIVE")] == "live"   # pane %4 exists
+
+    def test_paint_tab_goes_through_the_tmux_backend(self, trelay, monkeypatch):
+        tb, calls = self._tmux(trelay, monkeypatch)
+        assert trelay._paint_tab(tb, "tmux:%4", [255, 105, 97]) is True
+        assert calls == [["set-option", "-w", "-t", "%4", "window-status-style", "bg=#ff6961"]]
+
+    def test_live_lead_handle_is_the_tmux_pane_for_the_lead_itself(self, trelay, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-t")
+        monkeypatch.delenv("RELAY_HEADLESS", raising=False)
+        monkeypatch.setenv("TMUX_PANE", "%9")
+        monkeypatch.setenv("ITERM_SESSION_ID", "w1t1p0:11111111-2222-3333-4444-555555555555")
+        assert trelay._live_lead_handle("lead-t", {"iterm_session": "tmux:%1"}) == "tmux:%9"
+        assert trelay._live_lead_handle("other", {"iterm_session": "tmux:%1"}) == "tmux:%1"
+
+    def test_headless_env_strips_the_tmux_pane(self, trelay, monkeypatch):
+        monkeypatch.setenv("TMUX_PANE", "%9")
+        assert "TMUX_PANE" not in trelay._headless_env()

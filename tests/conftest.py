@@ -30,3 +30,11 @@ import pytest
 def _relay_no_notify_by_default(monkeypatch):
     monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
     monkeypatch.setenv("RELAY_NO_TIDY", "1")
+    # Backend selection auto-picks tmux inside a tmux pane (scripts/backend.py). The suite must
+    # behave the same whether or not it happens to run inside tmux, so the ambient tmux identity is
+    # stripped here; a test about tmux sets these itself (or pins RELAY_TERMINAL=tmux).
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    monkeypatch.delenv("RELAY_TMUX_SOCKET", raising=False)
+    if __import__("os").environ.get("TERM_PROGRAM") == "tmux":
+        monkeypatch.delenv("TERM_PROGRAM", raising=False)

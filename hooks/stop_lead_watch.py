@@ -336,7 +336,7 @@ def main():
         # exact unconditional migrate-on-tab-match was the other path into that incident.
         if not sid or not (lg.is_lead(STATE_ROOT, sid)
                             or (payload.get("cwd") and lg.safe_migrate_by_tab(
-                                STATE_ROOT, os.environ.get("TERM_SESSION_ID"), payload.get("cwd"),
+                                STATE_ROOT, lg.env_tab_id(), payload.get("cwd"),
                                 sid, lg.load_config(STATE_ROOT).get(
                                     "poll_seconds", lg.LEAD_DEFAULTS["poll_seconds"])))):
             sys.exit(0)  # not a lead session → silent, zero impact

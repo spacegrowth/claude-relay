@@ -45,7 +45,7 @@ LEAD_DEFAULTS = {
                                  # OSC tier for a clean title/subtitle. A legacy "terminal-notifier"
                                  # value (pre-drop) is treated as "osascript" — no error, no retitle.
     "executor_skip_permissions": False,  # spawn executors with --dangerously-skip-permissions
-    "terminal_app": "auto",      # "iterm" | "terminal" | "auto" ($TERM_PROGRAM decides; iTerm default)
+    "terminal_app": "auto",      # "iterm" | "terminal" | "tmux" | "auto" ($TMUX, then $TERM_PROGRAM; iTerm default)
     "tab_colors": True,          # iTerm only: color each lead's tab + its executors' tabs alike
     "tidy_tabs": True,           # iTerm only (backlog row 64): after every event that changes which
                                   # tabs exist or who owns them — spawn, `send --rotate/--upgrade`,
@@ -325,7 +325,11 @@ def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=No
     Both now call this ONE function, so a lead's tab-native OSC banner (zero deps, native
     click-to-focus) fires for every relay notification, not only Stop-hook wakes.
 
-    1. iTerm native (OSC 777, written straight to the lead's own tty) — zero external deps, and
+    1. Native in-terminal tier, by the lead's backend:
+       - tmux lead (`iterm_session` is a "tmux:%N" handle): a status-line message on the lead's own
+         pane (`tmux_backend.notify`). Posted → return; not posted → `banner_fallback`
+         ("write-failed") and on to tier 2.
+       - otherwise iTerm native (OSC 777, written straight to the lead's own tty) — zero external deps, and
        clicking it focuses the POSTING session natively. `tty` (from the caller's marker — the tty
        recorded ONCE at arm/re-arm time, backlog row 91) is used directly when given, so a normal
        banner never needs a live AppleScript call at all; only when `tty` is absent does this fall
@@ -361,7 +365,21 @@ def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=No
     notify_via = (cfg or {}).get("notify_via", "auto")
     if notify_via == "terminal-notifier":  # legacy config value (pre-drop) — treat as osascript
         notify_via = "osascript"
-    if (tty or iterm_session) and notify_via != "osascript":
+    if str(iterm_session or "").startswith("tmux:") and notify_via != "osascript":
+        # tmux lead: tier 1 is a status-line message on the lead's own pane (tmux swallows OSC 777,
+        # so the tty write below would post nothing). A successful post RETURNS, exactly as the
+        # iTerm OSC tier does — no second osascript banner on a Mac. A failed post falls through
+        # to osascript (a no-op where osascript doesn't exist — Linux) with a `banner_fallback`.
+        try:
+            posted = _scripts_module("tmux_backend").notify(iterm_session, title,
+                                                            subtitle + " — " + message[:180])
+        except Exception:
+            posted = False
+        if posted:
+            return
+        if state_root is not None:
+            append_ledger(state_root, "banner_fallback", session_id=lead_sid, reason="write-failed")
+    elif (tty or iterm_session) and notify_via != "osascript":
         resolved_tty = tty
         reason = None
         if not resolved_tty:
@@ -1045,11 +1063,11 @@ def revive_lead(state_root, session_id):
     Row 89/91 follow-up: an iTerm restart gives every restored tab a NEW session UUID while a
     tombstoned marker keeps the old one, so `_lead_alive`/`relay focus`/tidy/tier-1 banners all
     quietly miss the (still very much alive) resumed lead. This process inherits the SAME
-    environment the SessionStart hook that called us was invoked with, so when the live
-    `$ITERM_SESSION_ID`/`$TERM_SESSION_ID` looks like a real iTerm handle (`LIVE_ITERM_SESSION_RE`
-    — the exact shape check bin/relay's `_live_lead_handle` trusts) AND differs from what's
-    recorded, this refreshes `iterm_session` and re-captures `tty` (`_capture_tty`) in the SAME
-    write. Left untouched when it matches (the common case — no needless AppleScript call on every
+    environment the SessionStart hook that called us was invoked with, so when the live handle
+    (`backend.live_handle_from_env` — $TMUX_PANE under tmux, an iTerm-shaped $ITERM_SESSION_ID/
+    $TERM_SESSION_ID under iTerm; the exact check bin/relay's `_live_lead_handle` trusts) AND
+    differs from what's recorded, this refreshes `iterm_session` and re-captures `tty`
+    (`_capture_tty`) in the SAME write. Left untouched when it matches (the common case — no needless AppleScript call on every
     ordinary resume) or when the live value isn't a real iTerm handle at all (Terminal.app, or a
     revive that isn't happening from inside the lead's own tab). Additive to the caller's contract:
     still no ledger event for the refresh itself, exactly as before."""
@@ -1061,8 +1079,13 @@ def revive_lead(state_root, session_id):
         m.pop("ended_at", None)
         m.pop("ended_reason", None)
         m["last_active"] = now()
-        live = os.environ.get("ITERM_SESSION_ID") or os.environ.get("TERM_SESSION_ID")
-        if live and LIVE_ITERM_SESSION_RE.match(live) and live != m.get("iterm_session"):
+        try:
+            bk_mod = _scripts_module("backend")
+            live = bk_mod.live_handle_from_env()
+            live = live if bk_mod.is_live_handle(live) else None
+        except Exception:
+            live = None
+        if live and live != m.get("iterm_session"):
             m["iterm_session"] = live
             m["tty"] = _capture_tty(live)
         marker_path(state_root, session_id).write_text(json.dumps(m, indent=2))
@@ -1082,26 +1105,38 @@ def revive_lead(state_root, session_id):
 # question — the id changed, the LEAD didn't). find_lead_by_tab + migrate_lead below answer the
 # right question instead: "is there a lead marker for the tab this process is actually running in?"
 
+def _scripts_module(name):
+    """Lazily import a scripts/ module (iterm, tmux_backend, backend) — lead_guard keeps no hard
+    terminal-backend dependency. Raises on failure; every caller is inside its own try."""
+    scripts_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import importlib
+    return importlib.import_module(name)
+
+
 def _tty_by_id(iterm_session_id):
-    """/dev/ttysNNN for an iTerm session id ($TERM_SESSION_ID, "w#t#p#:UUID"), or None — a thin,
-    mockable indirection over scripts/iterm.tty_by_id (lazily imported: lead_guard stays free of a
-    hard terminal-backend dependency, matching every other function in this file). Tests monkeypatch
-    THIS function directly rather than reaching into iterm's AppleScript/subprocess plumbing. Any
-    failure (module missing, AppleScript failure, no live match) degrades to None. Never raises."""
+    """/dev/ttysNNN (or /dev/pts/N) for a lead's tab handle, or None — a thin, mockable indirection
+    over the backend's tty_by_id, dispatched on the handle's SHAPE: "tmux:%N" → scripts/tmux_backend,
+    anything else (an iTerm "w#t#p#:UUID") → scripts/iterm (lazily imported: lead_guard stays free
+    of a hard terminal-backend dependency, matching every other function in this file). Tests
+    monkeypatch THIS function directly rather than reaching into the backends' plumbing. Any failure
+    (module missing, AppleScript/tmux failure, no live match) degrades to None. Never raises."""
     try:
-        scripts_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "scripts")
-        if scripts_dir not in sys.path:
-            sys.path.insert(0, scripts_dir)
-        import iterm as _iterm
-        return _iterm.tty_by_id(iterm_session_id)
+        is_tmux = str(iterm_session_id or "").startswith("tmux:")
+        return _scripts_module("tmux_backend" if is_tmux else "iterm").tty_by_id(iterm_session_id)
     except Exception:
         return None
 
 
-# Same shape check bin/relay's `_live_lead_handle` uses to trust a live $ITERM_SESSION_ID/
-# $TERM_SESSION_ID value (row 89) — reused here so a re-arm's "does the live tab differ from what's
-# recorded" comparison and that function's own live-tab check can never quietly drift apart.
-LIVE_ITERM_SESSION_RE = re.compile(r"^w\d+t\d+p\d+:[0-9A-Fa-f-]{36}$")
+def env_tab_id():
+    """This process's own tab identity as a lead marker records it (`backend.tab_id_from_env`) — the
+    value the hooks hand to `safe_migrate_by_tab`/`find_lead_by_tab`. Falls back to the raw
+    $TERM_SESSION_ID (the pre-tmux behaviour) if the backend module can't be loaded. Never raises."""
+    try:
+        return _scripts_module("backend").tab_id_from_env()
+    except Exception:
+        return os.environ.get("TERM_SESSION_ID")
 
 
 def _capture_tty(iterm_session):
