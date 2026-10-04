@@ -60,6 +60,9 @@ HANDLE_PREFIX = "tmux:"
 SID_EXPR = "$TMUX_PANE"   # the bootstrap guard's runtime pane id (see the module docstring)
 _PANE_RE = re.compile(r"^%\d+$")
 DEFAULT_TIMEOUT = 5
+# `_tmux`'s stderr for a subprocess timeout — `wait` reads it to tell "nobody signalled within the
+# interval" (the normal tick) from a real failure (no server, no tmux).
+TIMED_OUT = "tmux timed out"
 
 
 def _tmux(args, timeout=DEFAULT_TIMEOUT):
@@ -77,7 +80,7 @@ def _tmux(args, timeout=DEFAULT_TIMEOUT):
     try:
         return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(argv, 1, "", "tmux timed out")
+        return subprocess.CompletedProcess(argv, 1, "", TIMED_OUT)
     except (FileNotFoundError, OSError) as e:
         return subprocess.CompletedProcess(argv, 127, "", f"tmux unavailable: {e}")
 
@@ -352,3 +355,125 @@ def version():
     """`tmux -V` output, or None when tmux isn't on PATH (for `relay doctor`)."""
     r = _tmux(["-V"])
     return (r.stdout or "").strip() if _ok(r) else None
+
+
+# ── seeing an executor: screen reads, instant wake, pane transcripts ────────────────────────────
+# Three tmux-only primitives behind `relay peek` / `relay check`'s screen line, the lead poller's
+# instant wake, and the per-session pane.log. Every one is best-effort and handle-only like the
+# rest of this module: a foreign/absent handle runs NOTHING and answers None/False.
+
+WAKE_CHANNEL_PREFIX = "relay-wake-"
+
+
+def capture(handle, lines=40):
+    """The pane's screen plus `lines` lines of scrollback above it, as text: `capture-pane -p -J -t
+    %N -S -<lines>` (-J joins tmux-wrapped lines back into one). None on a foreign handle or any
+    tmux failure (pane gone, no server)."""
+    pane = _pane(handle)
+    if not pane:
+        return None
+    try:
+        n = max(0, int(lines))
+    except (TypeError, ValueError):
+        n = 40
+    r = _tmux(["capture-pane", "-p", "-J", "-t", pane, "-S", f"-{n}"])
+    return r.stdout if _ok(r) else None
+
+
+def current_command(handle):
+    """`#{pane_current_command}` — the name of the pane's foreground process (a shell once the
+    launched claude has exited), or None when the pane doesn't resolve."""
+    pane = _pane(handle)
+    if not pane:
+        return None
+    return _display(pane, "#{pane_current_command}")
+
+
+def wake_channel(lead_sid):
+    """The `wait-for` channel a lead's Stop-hook poller blocks on and an executor signals."""
+    return f"{WAKE_CHANNEL_PREFIX}{lead_sid}"
+
+
+def wait(channel, timeout):
+    """Block on `tmux wait-for <channel>` for at most `timeout` seconds. Returns "signalled" (someone
+    ran `wait-for -S <channel>`, or a signal was already stored for it — tmux keeps one for a
+    channel nobody waits on, so a signal sent between two waits still lands), "timeout" (the
+    interval passed quietly — the normal tick), or "error" (no tmux / no server / any failure; the
+    caller falls back to a plain sleep). Never raises."""
+    if not channel:
+        return "error"
+    try:
+        r = _tmux(["wait-for", str(channel)], timeout=max(0.1, float(timeout)))
+    except Exception:
+        return "error"
+    if _ok(r):
+        return "signalled"
+    if r is not None and (r.stderr or "") == TIMED_OUT:
+        return "timeout"
+    return "error"
+
+
+def signal(channel):
+    """`tmux wait-for -S <channel>` — wake whoever waits on it. True iff tmux accepted it; never
+    raises."""
+    if not channel:
+        return False
+    try:
+        return _ok(_tmux(["wait-for", "-S", str(channel)]))
+    except Exception:
+        return False
+
+
+class WakeWaiter:
+    """One lead poller's wait, ticked once per poll interval: `tick(interval)` blocks on the lead's
+    wake channel for up to `interval` and returns True when it WAITED (signalled or timed out), or
+    False when the caller must do its own `time.sleep(interval)` instead — on any tmux error, and
+    for the rest of this poller's life once `wait-for` keeps returning instantly (a stub `tmux`, or
+    anything else that would turn the loop into a hot spin)."""
+
+    FAST = 0.05        # a "signalled" return quicker than this counts as instant
+    MAX_FAST = 3       # this many instant returns in a row → give up on wait-for for this poller
+
+    def __init__(self, channel):
+        self.channel = channel
+        self.fast = 0
+        self.disabled = False
+
+    def tick(self, interval):
+        if self.disabled:
+            return False
+        t0 = time.time()
+        res = wait(self.channel, interval)
+        if res == "timeout":
+            self.fast = 0
+            return True
+        if res == "signalled":
+            self.fast = self.fast + 1 if time.time() - t0 < self.FAST else 0
+            if self.fast >= self.MAX_FAST:
+                self.disabled = True
+            return True
+        self.disabled = True   # "error": tmux can't serve this poller — sleep from now on
+        return False
+
+
+def pipe_pane(handle, log_path):
+    """Make sure everything the pane prints is appended to `log_path`: `pipe-pane -o -t %N 'cat >>
+    <path>'` (path shlex-quoted; tmux runs the command through /bin/sh). A pane that is ALREADY
+    piped (`#{pane_pipe}` is 1) is left alone and answers True: `-o` alone is not enough, because
+    on a piped pane tmux's `-o` CLOSES the existing pipe (it is a toggle — verified live), so a
+    second call would silently stop the transcript. True iff the pane ends up piped."""
+    pane = _pane(handle)
+    if not pane or not log_path:
+        return False
+    if _display(pane, "#{pane_pipe}") == "1":
+        return True
+    return _ok(_tmux(["pipe-pane", "-o", "-t", pane, f"cat >> {shlex.quote(str(log_path))}"]))
+
+
+def unpipe_pane(handle):
+    """Close the pane's pipe (`pipe-pane -t %N` with no command) — used before re-opening it onto a
+    freshly rotated log. True iff tmux accepted it."""
+    pane = _pane(handle)
+    if not pane:
+        return False
+    return _ok(_tmux(["pipe-pane", "-t", pane]))

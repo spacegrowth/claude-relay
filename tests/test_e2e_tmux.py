@@ -95,6 +95,16 @@ def test_tmux_backend_against_real_tmux(tmux_server, tmp_path, monkeypatch):
         # The stub received the prompt: it echoes the report path it extracted from the pointer.
         assert _poll(lambda: f"report_path={report_path}" in _capture(pane)), _capture(pane)
 
+        # --- watch: capture() reads the stub's screen; pipe-pane starts the transcript ----------
+        screen = tmux_backend.capture(handle)
+        assert screen is not None and f"report_path={report_path}" in screen, screen
+        assert tmux_backend.current_command(handle)          # the stub's process, whatever its name
+        pane_log = session_dir / "pane log.txt"              # a space: proves the path is quoted
+        assert tmux_backend.pipe_pane(handle, str(pane_log)) is True
+        # A second call must NOT close it (tmux's `-o` alone would toggle the pipe off).
+        assert tmux_backend.pipe_pane(handle, str(pane_log)) is True
+        assert tmux_backend._display(pane, "#{pane_pipe}") == "1"
+
         # --- liveness / tty -------------------------------------------------------------------
         assert tmux_backend.exists_by_id(handle) is True
         assert tmux_backend.is_alive("[Exec] e2e-tmux", handle) is True
@@ -123,6 +133,10 @@ def test_tmux_backend_against_real_tmux(tmux_server, tmp_path, monkeypatch):
         assert sends[0][-1] == "hello from e2e" and "-l" in sends[0]
         assert sends[1][-1] == "Enter" and "-l" not in sends[1]
         assert _poll(lambda: "[fake_claude] got: hello from e2e" in _capture(pane)), _capture(pane)
+        # pane.log received the text the send produced (pipe-pane started above).
+        assert _poll(lambda: pane_log.exists() and
+                     "[fake_claude] got: hello from e2e" in pane_log.read_text(errors="replace")), \
+            (pane_log.exists() and repr(pane_log.read_bytes()[-600:]))
 
         # --- rename_by_id retitles the window and keeps automatic-rename off ---------------------
         assert tmux_backend.rename_by_id(handle, "[Exec] renamed") is True
@@ -161,3 +175,27 @@ def test_tmux_backend_against_real_tmux(tmux_server, tmp_path, monkeypatch):
         assert tmux_backend.send("x", "gone", handle) is False
     finally:
         tmux_backend._tmux(["kill-pane", "-t", pane])
+
+
+def test_signal_unblocks_a_wait_within_a_second(tmux_server):
+    """The lead poller's instant wake on a real server: a `wait` blocked on a channel returns
+    "signalled" as soon as another client runs `signal` on it — not at its timeout."""
+    import threading
+    channel = tmux_backend.wake_channel(f"e2e-{os.getpid()}")
+    out = {}
+
+    def waiter():
+        t0 = time.time()
+        out["res"] = tmux_backend.wait(channel, 10)
+        out["took"] = time.time() - t0
+
+    t = threading.Thread(target=waiter, daemon=True)
+    t.start()
+    time.sleep(0.3)                     # let the waiter reach the server
+    t_sig = time.time()
+    assert tmux_backend.signal(channel) is True
+    t.join(timeout=5)
+    assert out.get("res") == "signalled", out
+    assert time.time() - t_sig < 1.0 and out["took"] < 2.0, out
+    # A quiet channel is a timeout (the normal tick), not an error.
+    assert tmux_backend.wait(tmux_backend.wake_channel(f"quiet-{os.getpid()}"), 0.5) == "timeout"

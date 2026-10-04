@@ -310,6 +310,20 @@ def _notify_summary(lines):
     return "new relay activity — review when ready"
 
 
+def _wake_waiter(lg, sid):
+    """Under tmux only: a tmux_backend.WakeWaiter on this lead's `relay-wake-<sid>` channel, so the
+    poller's per-tick wait ends the instant an executor's Stop hook signals a report (see
+    executor_escalation.py) instead of after the full poll_interval. None when the lead's marker
+    records any other backend, or on any error — the caller then sleeps exactly as before."""
+    try:
+        if (lg.read_marker(STATE_ROOT, sid) or {}).get("backend") != "tmux":
+            return None
+        import tmux_backend
+        return tmux_backend.WakeWaiter(tmux_backend.wake_channel(sid))
+    except Exception:
+        return None
+
+
 def main():
     # THE INCIDENT (2026-09-05 22:18:50) — see sessionstart_lead_rearm.py's main() for the full
     # account: a headless `claude -p` relay itself launches inherits the LEAD's own tab env, and
@@ -477,8 +491,10 @@ def main():
             sys.exit(0)  # a poller is already watching
         try:
             deadline = time.time() + max(1, int(cfg.get("poll_seconds", 1800)))
+            waiter = _wake_waiter(lg, sid)  # None off tmux → the plain sleep below, unchanged
             while time.time() < deadline:
-                time.sleep(interval)
+                if not (waiter and waiter.tick(interval)):
+                    time.sleep(interval)
                 lg.heartbeat_poll_lock(STATE_ROOT, sid)  # proof of life every tick
                 if not lg.is_lead(STATE_ROOT, sid):
                     sys.exit(0)  # lead stepped down / session ended while we waited

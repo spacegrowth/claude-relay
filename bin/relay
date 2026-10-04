@@ -875,6 +875,163 @@ def _transcript_stalled(s):
     return age is not None and age > _stall_threshold_seconds()
 
 
+# ── tmux only: reading an executor's SCREEN (relay check's `screen:` line, list's stuck:*, peek) ──
+# A transcript can only say "nothing was written for 45 minutes"; the pane says WHY, right now.
+# Everything here answers None off tmux, so iTerm/Terminal sessions are untouched.
+#
+# Claude Code's on-screen chrome for "I am waiting on YOU to choose" — ONE tuple, each entry with
+# where it comes from. A screen reads as `prompt` only when at least TWO distinct entries match in
+# its bottom rows (a real dialog always shows a header + options or options + footer), so one
+# stray phrase in the model's own prose can't flip it.
+PROMPT_PATTERNS = (
+    # Permission-dialog header: "Do you want to proceed?" (Bash), "Do you want to make this edit to
+    # X?" (Edit), "Do you want to create X?" (Write), "Do you want to allow …" (WebFetch/MCP).
+    re.compile(r"\bDo you want to\b"),
+    # The dialog's numbered first option, with or without the "❯"/">" selection cursor before it.
+    re.compile(r"^[\s│❯>]*1\.\s+Yes\b"),
+    # Its "No" option, which names the escape key: "3. No, and tell Claude what to do differently (esc)".
+    re.compile(r"^[\s│❯>]*\d\.\s+No\b"),
+    # Footer of permission and selection dialogs: "Esc to cancel · Tab to add additional instructions".
+    re.compile(r"\bEsc to cancel\b", re.IGNORECASE),
+    # Footer of the AskUserQuestion / selection list: "Enter to select · ↑/↓ to navigate".
+    re.compile(r"\bEnter to select\b", re.IGNORECASE),
+    # ExitPlanMode approval ("Would you like to proceed?") and the first-launch workspace-trust
+    # dialog ("Do you trust the files in this folder?").
+    re.compile(r"\bWould you like to proceed\?"),
+    re.compile(r"\bDo you trust the files in this folder\?"),
+)
+# The spinner line Claude Code shows for the whole of a turn: "✻ Thinking… (12s · esc to interrupt)".
+SCREEN_WORKING_RE = re.compile(r"\besc to interrupt\b", re.IGNORECASE)
+# `#{pane_current_command}` values that mean claude is gone and the pane's shell is back. A SET of
+# shells, not "anything but claude/node": a native Claude Code install runs as a binary named after
+# its version (e.g. "2.0.14"), which "not claude" would misread as a crash.
+SCREEN_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh", "ash",
+                           "login"})
+# The input box's top/bottom border: a plain rule ("────") or a rounded box edge ("╭───╮"/"╰───╯").
+_SCREEN_RULE_RE = re.compile(r"^\s*[╭╰]?─{8,}[╮╯]?\s*$")
+SCREEN_TAIL_ROWS = 20   # bottom non-blank rows the prompt/working checks look at
+# Statuses whose pane is not worth reading: nothing is running there any more (or never started).
+_SCREEN_SKIP_STATUSES = ("closed", "superseded", "dead", LAUNCH_FAILED)
+
+
+def _screen_clean(line, width=90):
+    """One screen row as a one-line excerpt: box-drawing borders and surrounding space stripped."""
+    t = (line or "").strip().strip("│").strip()
+    return t if len(t) <= width else t[:width - 1] + "…"
+
+
+def _screen_input_box(lines):
+    """The text inside Claude Code's input box — the rows between the LAST two rule lines on screen,
+    with the box's "│" sides and the "> "/"❯ " prompt glyph removed, joined by spaces. None when no
+    box is visible. Only the bottom-most box counts: a submitted message also renders with a "> "
+    prefix, but up in the scrollback, above the box."""
+    rules = [i for i, ln in enumerate(lines) if _SCREEN_RULE_RE.match(ln)]
+    if len(rules) < 2:
+        return None
+    rows = []
+    for ln in lines[rules[-2] + 1:rules[-1]]:
+        t = ln.strip().strip("│").strip()
+        t = re.sub(r"^[>❯]\s?", "", t)
+        if t:
+            rows.append(t)
+    return " ".join(rows)
+
+
+def _classify_screen(screen, command=None, needles=()):
+    """Pure: (verdict, excerpt) for one captured screen. Checked in this order —
+      crashed  `command` (the pane's foreground process) is a shell: claude has exited;
+      prompt   ≥2 PROMPT_PATTERNS entries in the bottom rows: a permission/selection dialog waits;
+      working  the "esc to interrupt" spinner is showing: mid-turn;
+      unsent   the input box still holds one of `needles` (the last typed packet pointer) and no
+               turn is running — the line was typed but never submitted;
+      unknown  none of the above (idle at an empty prompt, or chrome this doesn't recognise)."""
+    lines = (screen or "").splitlines()
+    nonblank = [ln for ln in lines if ln.strip()]
+    tail = nonblank[-SCREEN_TAIL_ROWS:]
+    last = _screen_clean(nonblank[-1]) if nonblank else ""
+    cmd = (command or "").strip().lstrip("-").lower()
+    if cmd and cmd in SCREEN_SHELLS:
+        return "crashed", f"[{cmd}] {last}".rstrip()
+    hits = [(p, ln) for p in PROMPT_PATTERNS for ln in tail if p.search(ln)]
+    if len({p.pattern for p, _ in hits}) >= 2:
+        # The dialog's question when it has one; else the topmost matched row (a selection
+        # list's footer).
+        header = (PROMPT_PATTERNS[0], PROMPT_PATTERNS[5], PROMPT_PATTERNS[6])
+        head = next((ln for p, ln in hits if p in header),
+                    min((ln for _, ln in hits), key=tail.index))
+        return "prompt", _screen_clean(head)
+    working = next((ln for ln in reversed(tail) if SCREEN_WORKING_RE.search(ln)), None)
+    if working is not None:
+        return "working", _screen_clean(working)
+    box = _screen_input_box(lines)
+    if box:
+        squashed = box.replace(" ", "")
+        if any(n and (n in box or n.replace(" ", "") in squashed) for n in needles):
+            return "unsent", _screen_clean(box)
+    return "unknown", last
+
+
+def _screen_needles(s):
+    """Text that, sitting in the input box, means the current packet's pointer was never submitted:
+    the pointer's fixed phrase and the packet file's own name (build_pointer_message)."""
+    n = s.get("current_packet")
+    out = ["Read and follow the work packet at"]
+    if isinstance(n, int):
+        out.append(f"{n:03d}-packet.md")
+    return tuple(out)
+
+
+def _screen_verdict(s, lines=40):
+    """{"verdict", "excerpt"} for a TMUX session whose pane can be captured, else None (any other
+    backend, no handle, pane gone) — callers print/flag nothing on None."""
+    bk = term_backend(s)
+    if getattr(bk, "NAME", "") != "tmux" or not s.get("iterm_session"):
+        return None
+    try:
+        screen = bk.capture(s["iterm_session"], lines=lines)
+        if screen is None:
+            return None
+        verdict, excerpt = _classify_screen(screen, bk.current_command(s["iterm_session"]),
+                                            _screen_needles(s))
+    except Exception:
+        return None
+    return {"verdict": verdict, "excerpt": excerpt}
+
+
+# ── tmux only: the per-session pane transcript (<session dir>/pane.log) ────────────────────────
+PANE_LOG_MAX_BYTES = 20 * 1024 * 1024
+
+
+def pane_log_path(session_id):
+    return session_dir(session_id) / "pane.log"
+
+
+def _pane_log_maintain(bk, session_id, handle):
+    """Keep `session_id`'s pane piped into pane.log — called at tmux spawn/relaunch (after the pane
+    exists) and before every send. One size check, no daemon: past PANE_LOG_MAX_BYTES the log moves
+    to pane.log.1 (replacing any older one) and the pane's pipe is closed and re-opened onto a fresh
+    pane.log (the old pipe's `cat` still holds the moved file open). tmux_backend.pipe_pane leaves
+    an already-piped pane alone, so calling this on every send is safe. No-op off tmux, with no
+    handle, or with config `tmux_pane_log` false. Best-effort; never raises."""
+    try:
+        if getattr(bk, "NAME", "") != "tmux" or not handle:
+            return False
+        if not lead_guard.load_config(STATE_ROOT).get("tmux_pane_log", True):
+            return False
+        log = pane_log_path(session_id)
+        try:
+            big = log.stat().st_size > PANE_LOG_MAX_BYTES
+        except OSError:
+            big = False
+        if big:
+            os.replace(log, log.with_name("pane.log.1"))
+            bk.unpipe_pane(handle)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        return bool(bk.pipe_pane(handle, str(log)))
+    except Exception:
+        return False
+
+
 def _resume_restart_alive(s):
     """Aliveness for the resume/restart "refuse a second live copy" guard: a pid recorded by a
     previous restore, ELSE (only when there is NO pid at all) the marker's relay-controlled tab
@@ -1345,6 +1502,7 @@ def cmd_spawn(args):
         )
         pid = read_pid(session_id)
         handle = read_iterm_id(session_id)  # backend handle (iTerm session id / Terminal "twid:N")
+        _pane_log_maintain(iterm, session_id, handle)  # tmux only: start pane.log
         return pid, handle, _ensure_tab_label(iterm, handle, label), outcome
 
     pid, iterm_session, label_ok, outcome = launch_attempt()
@@ -1503,6 +1661,7 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     s["pid"] = pid
     s["pid_started"] = pid_start_time(pid) if pid else None
     s["iterm_session"] = read_iterm_id(session_id)
+    _pane_log_maintain(bk, session_id, s["iterm_session"])  # tmux only: re-pipe the NEW pane
     _ensure_tab_label(bk, s["iterm_session"], label)
     if session_uuid:  # restart minted a fresh conversation; resume keeps the existing claude_session
         s["claude_session"] = session_uuid
@@ -2577,6 +2736,7 @@ def cmd_send(args):
     handoff_usage = _usage_snapshot(s)
     ok, submitted = False, None
     if not (tab_gone or mcp_relaunch):
+        _pane_log_maintain(term_backend(s), args.session_id, s.get("iterm_session"))  # rotate check
         ok, submitted = _send_confirmed(term_backend(s), s["tab_label"], pointer, s.get("iterm_session"),
                                         s.get("pid"), s.get("claude_session"))
     if ok and submitted is False:
@@ -4529,6 +4689,10 @@ def cmd_check(args):
         if "error" not in s:
             _mark_report_surfaced(s)  # the lead just looked at this report — dedup it (§5b)
             s["queued"] = len(read_queue(s["session_id"]))
+            if s.get("status") not in _SCREEN_SKIP_STATUSES:
+                scr = _screen_verdict(s)   # tmux only — None everywhere else
+                if scr:
+                    s["screen"] = scr
     # Auto-close (lead_guard "auto-close policy"): check is the lead's own "where are things"
     # beat, so finished executors get parked here too. The sweep re-reads sessions from disk, so
     # the freshly-stamped surfaced set above is already visible to it; the result rows keep the
@@ -4567,6 +4731,11 @@ def cmd_check(args):
         if u:
             q_c += c(f"  · tokens {lead_guard.usage_cell(u)} over {u['requests']} requests", "dim")
         print(f"{s['session_id']}: status={status_c} packet={n:03d} {rep_c}{q_c}")
+        scr = s.get("screen")
+        if scr:
+            v = scr["verdict"]
+            v_c = c(v, "red", "bold") if v in ("prompt", "crashed", "unsent") else c(v, "dim")
+            print(f"  screen: {v_c} — {scr['excerpt'] or '(blank)'}")
     for s in results:
         if "error" in s:
             continue
@@ -5718,6 +5887,12 @@ def cmd_list(args):
             st = f"{st[:6]} (auto)"   # "closed (auto)" / "supers (auto)" — fits the STATUS cap
         elif st == "reported" and s.get("keep"):
             st = "reported \U0001f4cc"  # pinned: auto-close leaves it alone
+        if s["status"] in ("busy", "stalled", "idle"):
+            # tmux only: the pane itself says it's stuck — shown regardless of the transcript
+            # stall threshold (a permission prompt is stuck from its first second).
+            scr = _screen_verdict(s)
+            if scr and scr["verdict"] in ("prompt", "crashed"):
+                st = f"stuck:{scr['verdict']}"
         rendered_statuses.append(st)
     # §6e e1: one transcript-MB reading per executor, computed up front (same memoize-once
     # rationale the LEADS liveness column uses above) — kept as the heaviness gate's fallback
@@ -5786,7 +5961,8 @@ def cmd_list(args):
         status = rendered_statuses[i]
         # Color the padded cell (pad first via cell(), then wrap — ANSI codes have zero display width,
         # so padding before c() keeps the columns aligned).
-        status_cell = c(cell(status, exec_widths["STATUS"]), *_STATUS_STYLE.get(base, ()))
+        status_cell = c(cell(status, exec_widths["STATUS"]),
+                        *(("red", "bold") if status.startswith("stuck:") else _STATUS_STYLE.get(base, ())))
         rep = "yes" if s["reported"] else "no"
         rep_cell = c(cell(rep, exec_widths["REPORTED"]), "green", "bold") if s["reported"] else c(cell(rep, exec_widths["REPORTED"]), "dim")
         row_parts = [
@@ -5971,6 +6147,43 @@ def cmd_report(args):
     print(c(bar, "green", "bold"))
     if s.get("worktree") and _has_staged_diff(s["worktree"]):
         print(c(f"  📄 review the staged diff: relay diff {args.session_id} --open", "dim"))
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()*+][0-9A-Za-z]|[@-Z\\-_])")
+
+
+def cmd_peek(args):
+    """`relay peek <sid> [--lines N] [--log]` — what an executor's pane shows RIGHT NOW (tmux
+    `capture-pane`: the screen plus N lines of scrollback), or with --log the last N lines of its
+    pane.log transcript (escape sequences stripped). tmux only: under any other backend it says so
+    in one line and exits 1."""
+    s = read_session(args.session_id)
+    if not s:
+        sys.exit(f"no such session: {args.session_id}")
+    bk = term_backend(s)
+    if getattr(bk, "NAME", "") != "tmux":
+        sys.exit(f"relay peek needs the tmux backend — '{args.session_id}' runs under "
+                 f"{getattr(bk, 'NAME', '?')}.")
+    lines = max(1, args.lines)
+    if args.log:
+        log = pane_log_path(args.session_id)
+        try:
+            with open(log, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 256 * 1024))   # the tail is all we print; never slurp 20 MB
+                raw = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            sys.exit(f"no pane log for '{args.session_id}' at {log} (config tmux_pane_log off, or "
+                     f"spawned before pane logging existed)")
+        text = _ANSI_ESCAPE_RE.sub("", raw).replace("\r\n", "\n").replace("\r", "\n")
+        rows = [ln.rstrip() for ln in text.split("\n")]
+        print("\n".join([ln for ln in rows if ln.strip()][-lines:]))
+        return
+    screen = bk.capture(s.get("iterm_session"), lines=lines)
+    if screen is None:
+        sys.exit(f"could not read the pane for '{args.session_id}' "
+                 f"({s.get('iterm_session') or 'no handle'}) — it may be closed.")
+    print(screen.rstrip("\n"))
 
 
 def cmd_msg_failed(args):
@@ -8173,6 +8386,14 @@ def main():
     rpt.add_argument("--packet", type=int)
     rpt.set_defaults(func=cmd_report)
 
+    pk = sub.add_parser("peek", help="tmux only: print an executor's current screen (or, with "
+                        "--log, the tail of its pane.log transcript)")
+    pk.add_argument("session_id")
+    pk.add_argument("--lines", type=int, default=40,
+                    help="scrollback lines above the screen (with --log: lines of the log tail)")
+    pk.add_argument("--log", action="store_true", help="tail <session>/pane.log instead")
+    pk.set_defaults(func=cmd_peek)
+
     mf = sub.add_parser("msg-failed", help="record that a transport-v2 prototype report message "
                         "could not be sent (#28 phase 1) — ledger only, always exits 0")
     mf.add_argument("session_id")
@@ -8295,6 +8516,7 @@ def main():
         "retire": ["session_id"], "queue": ["session_id"], "_deliver-queued": ["session_id"],
         "keep": ["session_id"], "_auto-close-sweep": ["lead"],
         "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
+        "peek": ["session_id"],
         "auto": ["session"], "tier": ["session"], "plan": ["session", "sid"],
         "diff": ["session_id"], "verify": ["session_id"], "focus": ["session_id"],
         "restart": ["session_id"],

@@ -138,6 +138,24 @@ def _already_handled(lg, sid, packet, owner_lead):
     return False   # sent, unconfirmed, still unsurfaced → re-arm rather than burn the one shot
 
 
+def _signal_lead_wake(lg, sid, owner_lead):
+    """Under tmux only: `tmux wait-for -S relay-wake-<owner lead>` — ends the owning lead's Stop-hook
+    poller's current wait at once (stop_lead_watch._wake_waiter), so a report this executor just
+    finished is surfaced now rather than at the poller's next tick. Fires on every report-present
+    Stop, before any once-per-packet gate: a repeat only makes the poller re-run its own
+    (deduplicated) report check early. Best-effort; off tmux, or on any error, does nothing."""
+    try:
+        if not owner_lead or (lg.read_session_json(STATE_ROOT, sid) or {}).get("backend") != "tmux":
+            return
+        scripts = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import tmux_backend
+        tmux_backend.signal(tmux_backend.wake_channel(owner_lead))
+    except Exception:
+        pass
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -177,6 +195,7 @@ def main():
         n = int(who.get("current_packet", 1))
         if not who.get("report_exists"):
             sys.exit(0)  # idle mid-work, nothing written yet → nothing to push
+        _signal_lead_wake(lg, sid, who.get("owner_lead"))  # tmux only: wake its poller now
 
         owner_lead = who.get("owner_lead")
         if _already_handled(lg, sid, n, owner_lead):

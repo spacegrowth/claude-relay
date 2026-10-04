@@ -1463,6 +1463,111 @@ class TestTmuxBackend:
             assert tmux_backend.running() is False
             assert tmux_backend.version() is None
 
+
+class TestTmuxWatchPrimitives:
+    """capture / current_command / wait / signal / pipe-pane — the tmux-only primitives behind
+    `relay peek`, the screen verdict, the lead poller's instant wake and pane.log. Argv inspected
+    through the one `_tmux` seam; nothing real runs."""
+    H = "tmux:%7"
+
+    @pytest.fixture
+    def fake(self, monkeypatch):
+        f = _FakeTmux()
+        monkeypatch.setattr(tmux_backend, "_tmux", f)
+        return f
+
+    def test_capture_argv_and_text(self, fake):
+        fake.answers["capture-pane"] = (0, "line one\nline two\n", "")
+        assert tmux_backend.capture(self.H) == "line one\nline two\n"
+        assert fake.calls == [["capture-pane", "-p", "-J", "-t", "%7", "-S", "-40"]]
+        tmux_backend.capture(self.H, lines=5)
+        assert fake.calls[-1][-2:] == ["-S", "-5"]
+
+    def test_capture_miss_is_none(self, fake):
+        fake.answers["capture-pane"] = (1, "", "can't find pane: %7")
+        assert tmux_backend.capture(self.H) is None
+
+    def test_current_command(self, fake):
+        fake.answers[("display-message", "#{pane_current_command}")] = (0, "zsh\n", "")
+        assert tmux_backend.current_command(self.H) == "zsh"
+        assert fake.calls == [["display-message", "-p", "-t", "%7", "#{pane_current_command}"]]
+
+    @pytest.mark.parametrize("handle", FOREIGN_HANDLES)
+    def test_foreign_handles_run_nothing(self, fake, handle):
+        assert tmux_backend.capture(handle) is None
+        assert tmux_backend.current_command(handle) is None
+        assert tmux_backend.pipe_pane(handle, "/tmp/x/pane.log") is False
+        assert tmux_backend.unpipe_pane(handle) is False
+        assert fake.calls == []
+
+    def test_wake_channel(self):
+        assert tmux_backend.wake_channel("lead-1") == "relay-wake-lead-1"
+
+    def test_wait_signalled_timeout_error(self, monkeypatch):
+        seen = []
+
+        def answer(rc, err):
+            def f(args, timeout=5):
+                seen.append((list(args), timeout))
+                return subprocess.CompletedProcess(args, rc, "", err)
+            return f
+        monkeypatch.setattr(tmux_backend, "_tmux", answer(0, ""))
+        assert tmux_backend.wait("relay-wake-L", 5) == "signalled"
+        assert seen[-1] == (["wait-for", "relay-wake-L"], 5.0)
+        monkeypatch.setattr(tmux_backend, "_tmux", answer(1, tmux_backend.TIMED_OUT))
+        assert tmux_backend.wait("relay-wake-L", 5) == "timeout"
+        monkeypatch.setattr(tmux_backend, "_tmux", answer(1, "no server running"))
+        assert tmux_backend.wait("relay-wake-L", 5) == "error"
+        monkeypatch.setattr(tmux_backend, "_tmux", answer(127, "tmux unavailable: x"))
+        assert tmux_backend.wait("relay-wake-L", 5) == "error"
+        assert tmux_backend.wait("", 5) == "error"
+
+    def test_wait_timeout_comes_from_the_seam_timeout(self, monkeypatch):
+        """A real subprocess timeout inside `_tmux` is what `wait` reads as the quiet tick."""
+        with mock.patch.object(tmux_backend.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("tmux", 1)) as run:
+            assert tmux_backend.wait("relay-wake-L", 1) == "timeout"
+        assert run.call_args[1]["timeout"] == 1.0
+
+    def test_signal_argv(self, fake):
+        assert tmux_backend.signal("relay-wake-L") is True
+        assert fake.calls == [["wait-for", "-S", "relay-wake-L"]]
+        fake.answers["wait-for"] = (1, "", "no server")
+        assert tmux_backend.signal("relay-wake-L") is False
+        assert tmux_backend.signal("") is False
+
+    def test_pipe_pane_argv_quotes_the_path(self, fake):
+        fake.answers[("display-message", "#{pane_pipe}")] = (0, "0\n", "")
+        assert tmux_backend.pipe_pane(self.H, "/tmp/my dir/pane.log") is True
+        assert fake.calls == [["display-message", "-p", "-t", "%7", "#{pane_pipe}"],
+                              ["pipe-pane", "-o", "-t", "%7", "cat >> '/tmp/my dir/pane.log'"]]
+
+    def test_pipe_pane_leaves_an_already_piped_pane_alone(self, fake):
+        """tmux's `-o` on a piped pane CLOSES the pipe (a toggle) — so a piped pane is never sent
+        a second pipe-pane."""
+        fake.answers[("display-message", "#{pane_pipe}")] = (0, "1\n", "")
+        assert tmux_backend.pipe_pane(self.H, "/tmp/pane.log") is True
+        assert "pipe-pane" not in fake.subcommands()
+
+    def test_unpipe_pane_argv(self, fake):
+        assert tmux_backend.unpipe_pane(self.H) is True
+        assert fake.calls[-1] == ["pipe-pane", "-t", "%7"]
+
+    def test_wake_waiter_waits_and_falls_back(self, monkeypatch):
+        results = iter(["timeout", "signalled", "error"])
+        monkeypatch.setattr(tmux_backend, "wait", lambda ch, t: next(results))
+        w = tmux_backend.WakeWaiter("relay-wake-L")
+        assert w.tick(5) is True and w.tick(5) is True
+        assert w.tick(5) is False          # error → caller sleeps
+        assert w.tick(5) is False          # …and keeps sleeping for the rest of this poller
+
+    def test_wake_waiter_gives_up_on_a_hot_spin(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(tmux_backend, "wait", lambda ch, t: calls.append(1) or "signalled")
+        w = tmux_backend.WakeWaiter("relay-wake-L")
+        assert [w.tick(5) for _ in range(5)] == [True, True, True, False, False]
+        assert len(calls) == tmux_backend.WakeWaiter.MAX_FAST
+
     def test_parity_with_terminal_app_by_introspection(self):
         """The shared backend contract can't drift silently: every public function terminal_app
         defines (plus NAME) exists on the tmux module, with the same parameter names."""

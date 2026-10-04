@@ -46,6 +46,8 @@ LEAD_DEFAULTS = {
                                  # value (pre-drop) is treated as "osascript" — no error, no retitle.
     "executor_skip_permissions": False,  # spawn executors with --dangerously-skip-permissions
     "terminal_app": "auto",      # "iterm" | "terminal" | "tmux" | "auto" ($TMUX, then $TERM_PROGRAM; iTerm default)
+    "tmux_pane_log": True,       # tmux only: pipe each executor pane's output to <session>/pane.log
+                                 # (rotated to pane.log.1 past 20 MB at spawn/send; `relay peek --log`)
     "tab_colors": True,          # iTerm only: color each lead's tab + its executors' tabs alike
     "tidy_tabs": True,           # iTerm only (backlog row 64): after every event that changes which
                                   # tabs exist or who owns them — spawn, `send --rotate/--upgrade`,

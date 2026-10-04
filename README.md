@@ -59,6 +59,14 @@ wakes you when an executor finishes.
 
 **tmux** is the backend for Linux / SSH leads and for anyone running `claude` inside tmux. It is selected by `RELAY_TERMINAL=tmux`, by `terminal_app: tmux` in config, or automatically when `$TMUX` is set. Sessions are addressed by pane id, so handles look like `tmux:%N`. Executors appear as windows (or split panes) named by relay in the status bar, and a lead's color is applied through `window-status-style` instead of a tab color. `RELAY_TMUX_SOCKET=<name>` points relay at a named tmux server (`tmux -L <name>`). `relay doctor` shows the selected backend and the tmux version. On Linux relay uses `xdg-open` (for `--open`), `xclip` or `wl-copy` (clipboard) and `notify-send` (the banner fallback) when they are installed; none is required, and without one relay prints the path or text instead.
 
+**Under tmux** the lead can also see its executors, not just talk to them:
+
+- **Screen reads.** `relay check <sid>` adds a line `screen: <verdict> — <excerpt>`, read from the pane itself: `prompt` (a permission or selection dialog is waiting), `crashed` (claude exited and the pane is back at a shell), `unsent` (the packet pointer is still sitting in the input box), `working`, or `unknown`. `relay list` shows `stuck:prompt` / `stuck:crashed` in STATUS as soon as the screen says so, without waiting for the 45-minute stall threshold. `relay peek <sid> [--lines N]` prints the pane's current screen.
+- **Instant wake.** The lead's background poller waits on `tmux wait-for relay-wake-<lead>` instead of sleeping, and an executor's Stop hook signals that channel when its report is in, so the lead wakes immediately instead of on the next 5-second tick. A timeout is just the next tick, and any tmux error falls back to the plain sleep.
+- **Pane transcripts.** Each executor pane is piped (`pipe-pane`) into `<session dir>/pane.log`, which rotates to `pane.log.1` past 20 MB (checked at spawn and send). `relay peek <sid> --log` prints its tail. Set `tmux_pane_log: false` to turn it off.
+
+Under iTerm and Terminal.app none of this applies: `check` and `list` behave as before, and `peek` says it needs the tmux backend.
+
 **Why the lead's own model matters**: this role's value is judgment calls (what to delegate, when
 to reuse a session, whether a report is truly mergeable) — that needs a strong reasoning model, and
 no skill can switch it programmatically, so `/relay:mode` has the session say its own tier out loud
@@ -838,6 +846,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `executor_model_ceiling` | "opus" | Spawn refuses a requested executor model above this tier unless `--model-override "<reason>"` is passed (recorded in the ledger) |
 | `executor_default_effort` | "high" | Thinking effort an executor launches with when neither `--effort` nor a packet `EFFORT:` line pins one — relay's own policy (the CLI default), never your personal `effortLevel` from `~/.claude/settings.json`. Validated against `--effort`'s own levels (`low`\|`medium`\|`high`\|`xhigh`\|`max`); an invalid value is refused at spawn |
 | `terminal_app` | "auto" | "iterm" \| "terminal" \| "tmux" \| "auto" (auto-detect: tmux when `$TMUX` is set, else via `$TERM_PROGRAM`; iTerm default) |
+| `tmux_pane_log` | true | tmux only: pipe each executor pane's output to `<session dir>/pane.log` (rotated to `pane.log.1` past 20 MB; read with `relay peek <sid> --log`) |
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
 | `tidy_tabs` | true | iTerm only; after a spawn/rotate/handoff/close-predecessor/resume/restart, re-order the tab bar into `[Lead] [Exec…] [Lead 2] [Exec…]` and re-apply each lead's color to its group (see [Telling tabs apart](#telling-tabs-apart)). Needs the optional `iterm2` package + iTerm's Python API; degrades to one dim line without them. `relay tidy` runs regardless of this key |
 | `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm and tmux, split into lead's window) |
