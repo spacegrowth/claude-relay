@@ -161,8 +161,10 @@ def build_claude_cmd(prompt, model=None, skip_perms=False, session_uuid=None, re
     base += " " + shlex.quote(prompt)
     # An executor's finished turns are its lead's to handle. Cue (the desktop app that shows which
     # agent sessions need you) reads this label and keeps the executor out of its Waiting list.
+    # Through `env`, not a bare `VAR=x` prefix: every backend runs this as `exec <base>`, and `exec`
+    # takes a command, not an assignment — `exec VAR=x claude` fails with "VAR=x: not found".
     if agent_flags:
-        base = "CUE_DRIVEN_BY=" + shlex.quote("its relay lead") + " " + base
+        base = "env CUE_DRIVEN_BY=" + shlex.quote("its relay lead") + " " + base
     return base
 
 

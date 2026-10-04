@@ -7376,9 +7376,23 @@ class TestExecutorAgentWiring:
     def test_build_claude_cmd_labels_executors_for_cue(self, relay, tmp_path):
         cap = self._spawn(relay, tmp_path)
         cmd = relay.iterm.build_claude_cmd("x", model="sonnet", session_uuid="u", agent_flags=cap["agent_flags"])
-        assert cmd.startswith("CUE_DRIVEN_BY='its relay lead' ")   # Cue keeps executors out of Waiting
+        assert cmd.startswith("env CUE_DRIVEN_BY='its relay lead' ")   # Cue keeps executors out of Waiting
         plain = relay.iterm.build_claude_cmd("x", model="sonnet", session_uuid="u")
         assert "CUE_DRIVEN_BY" not in plain                       # leads and probes stay unlabelled
+
+    def test_executor_cmd_survives_exec_in_sh(self, relay, tmp_path):
+        """Every backend launches `exec <cmd>` under sh. A bare `VAR=x claude` prefix makes sh exec a
+        command literally named `VAR=x` (127, claude never starts) — the 2026-10-04 spawn outage."""
+        cap = self._spawn(relay, tmp_path)
+        cmd = relay.iterm.build_claude_cmd("x", model="sonnet", session_uuid="u", agent_flags=cap["agent_flags"])
+        fakebin = tmp_path / "fakebin"
+        fakebin.mkdir()
+        (fakebin / "claude").write_text('#!/bin/sh\necho "label=$CUE_DRIVEN_BY"\n')
+        (fakebin / "claude").chmod(0o755)
+        env = dict(os.environ, PATH=f"{fakebin}:{os.environ['PATH']}")
+        r = subprocess.run(["sh", "-c", "exec " + cmd], capture_output=True, text=True, env=env, timeout=10)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "label=its relay lead"
 
     def test_no_agent_file_falls_back_to_full_gates(self, relay, tmp_path):
         with mock.patch.object(relay.lead_guard, "executor_agent_flags", return_value=[]):
