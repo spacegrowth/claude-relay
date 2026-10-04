@@ -15,6 +15,7 @@ import shlex
 import subprocess
 
 import iterm_pyapi
+import platform_cmds
 
 NAME = "iterm"  # backend key (see scripts/backend.py)
 ITERM_APP_NAME = "iTerm"
@@ -333,18 +334,59 @@ def title_by_id(iterm_id):
     return (r.stdout or "").strip() or None
 
 
+def _tty_name(t):
+    """The bare tty name `ps` prints: "/dev/ttys010" -> "ttys010", "/dev/pts/3" -> "pts/3" (macOS
+    ps shows ttysNNN, Linux ps shows pts/N). Strips a leading "/dev/" from either side."""
+    return str(t or "").removeprefix("/dev/")
+
+
+_SCRIPT_RUNNERS = ("node", "nodejs", "bun", "deno")
+
+
+def _args_match(args, binary_suffix):
+    """Linux: does a `ps args=` line name `binary_suffix` as the program? `comm` can't answer this
+    on Linux — a `#!/usr/bin/env node` shim execs `node`, so comm is "node", not "claude" — so match
+    the basename of argv[0], or, when argv[0] is a script runner (node/bun/...), of the script it
+    runs (the first non-flag argument; the npm package's cli.js counts when it lives under a
+    claude-code directory)."""
+    try:
+        toks = shlex.split(args)
+    except ValueError:
+        toks = args.split()
+    if not toks:
+        return False
+    base = os.path.basename(toks[0])
+    if base.endswith(binary_suffix):
+        return True
+    if base in _SCRIPT_RUNNERS:
+        for t in toks[1:]:
+            if t.startswith("-"):
+                continue
+            tb = os.path.basename(t)
+            return tb.endswith(binary_suffix) or (binary_suffix == CLAUDE_BIN and "claude-code" in t)
+    return False
+
+
 def pids_on_tty(tty_path, binary_suffix=CLAUDE_BIN):
     """ALL pids of processes named `binary_suffix` (default "claude") attached to `tty_path`
-    (a "/dev/ttysNNN" from tty_by_id), in `ps` listing order — [] if there are none, the tty
-    doesn't resolve, or the `ps` call itself fails. Unlike `pid_on_tty` (which answers "is there
-    ANY match"), callers that need to tell one matching process apart from another — e.g.
+    (a "/dev/ttysNNN" or "/dev/pts/N" from tty_by_id), in `ps` listing order — [] if there are none,
+    the tty doesn't resolve, or the `ps` call itself fails. Unlike `pid_on_tty` (which answers "is
+    there ANY match"), callers that need to tell one matching process apart from another — e.g.
     lead_guard._tab_has_live_claude excluding the calling process's own ancestry from "is a
-    DIFFERENT claude live on this tab's tty" — need the full list, not just the first hit."""
+    DIFFERENT claude live on this tab's tty" — need the full list, not just the first hit.
+
+    Both sides are compared as bare tty names (`_tty_name`), so macOS "ttys010" and Linux "pts/3"
+    both work. macOS matches the `comm=` column; Linux matches `args=` (see `_args_match`) because
+    a node-shim claude reports comm "node"."""
     if not tty_path:
         return []
-    tty_name = tty_path.removeprefix("/dev/")
+    tty_name = _tty_name(tty_path)
+    linux = platform_cmds.is_linux()
+    # Linux: `-e` (every process) — procps's `-a` would drop session leaders, and a claude exec'd
+    # straight as a pane's command is one. macOS keeps its long-standing `-axo ... comm=`.
+    argv = ["ps", "-eo", "pid=,tty=,args="] if linux else ["ps", "-axo", "pid=,tty=,comm="]
     try:
-        r = subprocess.run(["ps", "-axo", "pid=,tty=,comm="], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
     except Exception:
         return []
     if r.returncode != 0:
@@ -354,8 +396,10 @@ def pids_on_tty(tty_path, binary_suffix=CLAUDE_BIN):
         parts = line.split(None, 2)
         if len(parts) != 3:
             continue
-        pid_s, tty, comm = parts
-        if tty == tty_name and comm.endswith(binary_suffix):
+        pid_s, tty, rest = parts
+        if _tty_name(tty) != tty_name:
+            continue
+        if _args_match(rest, binary_suffix) if linux else rest.endswith(binary_suffix):
             try:
                 out.append(int(pid_s))
             except ValueError:

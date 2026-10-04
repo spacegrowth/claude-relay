@@ -1531,3 +1531,152 @@ class TestBootstrapSidExpr:
         boot, marker = self._boot(tmp_path)
         r = self._run(boot, "%9", env_extra)
         assert r.returncode == 0 and not marker.exists() and "mis-delivered" in r.stdout
+
+
+# ── Linux portability: platform seam + tty/comm matching (Linux is MOCKED, never executed) ──────
+import platform_cmds  # noqa: E402
+
+
+def _platform(monkeypatch, system):
+    monkeypatch.setattr(platform_cmds.platform, "system", lambda: system)
+
+
+class _Runs:
+    """Records every subprocess.run argv (and kwargs) made through platform_cmds / iterm."""
+    def __init__(self, rc=0, stdout=""):
+        self.calls, self.kw, self.rc, self.stdout = [], [], rc, stdout
+
+    def __call__(self, argv, **kw):
+        self.calls.append(list(argv))
+        self.kw.append(kw)
+        return subprocess.CompletedProcess(argv, self.rc, self.stdout, "")
+
+
+class TestPlatformCmds:
+    def test_is_linux(self, monkeypatch):
+        _platform(monkeypatch, "Linux")
+        assert platform_cmds.is_linux() and not platform_cmds.is_macos()
+        _platform(monkeypatch, "Darwin")
+        assert platform_cmds.is_macos() and not platform_cmds.is_linux()
+
+    def test_open_path_macos_uses_open(self, monkeypatch):
+        _platform(monkeypatch, "Darwin")
+        run = _Runs()
+        monkeypatch.setattr(platform_cmds.subprocess, "run", run)
+        assert platform_cmds.open_path("/tmp/x.html") is True
+        assert run.calls == [["open", "/tmp/x.html"]]
+
+    def test_open_path_linux_uses_xdg_open_when_present(self, monkeypatch):
+        _platform(monkeypatch, "Linux")
+        monkeypatch.setattr(platform_cmds.shutil, "which",
+                            lambda n: "/usr/bin/xdg-open" if n == "xdg-open" else None)
+        run = _Runs()
+        monkeypatch.setattr(platform_cmds.subprocess, "run", run)
+        assert platform_cmds.open_path("/tmp/x.html") is True
+        assert run.calls == [["xdg-open", "/tmp/x.html"]]
+
+    def test_open_path_linux_without_xdg_open_is_false_and_runs_nothing(self, monkeypatch):
+        _platform(monkeypatch, "Linux")
+        monkeypatch.setattr(platform_cmds.shutil, "which", lambda n: None)
+        run = _Runs()
+        monkeypatch.setattr(platform_cmds.subprocess, "run", run)
+        assert platform_cmds.open_path("/tmp/x.html") is False
+        assert run.calls == []
+
+    def test_open_path_never_raises(self, monkeypatch):
+        _platform(monkeypatch, "Darwin")
+        def boom(*a, **k):
+            raise OSError("nope")
+        monkeypatch.setattr(platform_cmds.subprocess, "run", boom)
+        assert platform_cmds.open_path("/tmp/x") is False
+
+    def test_clipboard_macos_pbcopy(self, monkeypatch):
+        _platform(monkeypatch, "Darwin")
+        run = _Runs()
+        monkeypatch.setattr(platform_cmds.subprocess, "run", run)
+        assert platform_cmds.copy_to_clipboard("hello") is True
+        assert run.calls == [["pbcopy"]] and run.kw[0]["input"] == "hello"
+
+    @pytest.mark.parametrize("present,argv", [
+        ({"xclip", "wl-copy"}, ["xclip", "-selection", "clipboard"]),   # xclip wins
+        ({"wl-copy"}, ["wl-copy"]),
+    ])
+    def test_clipboard_linux_helpers(self, monkeypatch, present, argv):
+        _platform(monkeypatch, "Linux")
+        monkeypatch.setattr(platform_cmds.shutil, "which", lambda n: f"/usr/bin/{n}" if n in present else None)
+        run = _Runs()
+        monkeypatch.setattr(platform_cmds.subprocess, "run", run)
+        assert platform_cmds.copy_to_clipboard("hello") is True
+        assert run.calls == [argv]
+
+    def test_clipboard_linux_with_no_helper_is_false(self, monkeypatch):
+        _platform(monkeypatch, "Linux")
+        monkeypatch.setattr(platform_cmds.shutil, "which", lambda n: None)
+        run = _Runs()
+        monkeypatch.setattr(platform_cmds.subprocess, "run", run)
+        assert platform_cmds.copy_to_clipboard("hello") is False
+        assert run.calls == []
+
+    def test_linux_helpers_reports_presence(self, monkeypatch):
+        monkeypatch.setattr(platform_cmds.shutil, "which", lambda n: "/x" if n == "notify-send" else None)
+        assert platform_cmds.linux_helpers() == {"xdg-open": False, "xclip": False,
+                                                 "wl-copy": False, "notify-send": True}
+
+
+class TestPidsOnTtyPlatforms:
+    """`ps` output shapes per platform. macOS: `-axo pid=,tty=,comm=` against /dev/ttysNNN.
+    Linux: `-eo pid=,tty=,args=` against /dev/pts/N — comm is NOT usable there because a
+    `#!/usr/bin/env node` claude shim execs `node` (comm "node"), so args decide."""
+
+    def _ps(self, monkeypatch, system, out):
+        _platform(monkeypatch, system)
+        run = _Runs(stdout=out)
+        monkeypatch.setattr(iterm.subprocess, "run", run)
+        return run
+
+    def test_macos_argv_and_match_unchanged(self, monkeypatch):
+        run = self._ps(monkeypatch, "Darwin", "  1 ttys010 login\n  2 ttys010 claude\n  3 ttys011 claude\n")
+        assert iterm.pids_on_tty("/dev/ttys010") == [2]
+        assert run.calls == [["ps", "-axo", "pid=,tty=,comm="]]
+
+    def test_macos_bare_name_and_dev_prefix_both_match(self, monkeypatch):
+        self._ps(monkeypatch, "Darwin", "  2 ttys010 claude\n")
+        assert iterm.pids_on_tty("ttys010") == [2]
+        assert iterm.pids_on_tty("/dev/ttys010") == [2]
+
+    def test_macos_comm_node_is_not_claude(self, monkeypatch):
+        self._ps(monkeypatch, "Darwin", "  2 ttys010 node\n")
+        assert iterm.pids_on_tty("/dev/ttys010") == []
+
+    def test_linux_argv_and_pts_tty(self, monkeypatch):
+        run = self._ps(monkeypatch, "Linux",
+                       "  10 pts/3 -bash\n  11 pts/3 claude --resume abc\n  12 pts/4 claude\n  13 ? sshd\n")
+        assert iterm.pids_on_tty("/dev/pts/3") == [11]
+        assert run.calls == [["ps", "-eo", "pid=,tty=,args="]]
+        assert iterm.pids_on_tty("pts/3") == [11]          # bare name too
+
+    def test_linux_native_binary_by_path(self, monkeypatch):
+        self._ps(monkeypatch, "Linux", "  11 pts/3 /home/u/.local/bin/claude --model sonnet\n")
+        assert iterm.pids_on_tty("/dev/pts/3") == [11]
+
+    def test_linux_node_shim_matches_by_script_basename(self, monkeypatch):
+        # comm for this process is "node"; only args= names claude.
+        self._ps(monkeypatch, "Linux",
+                 "  11 pts/3 node /usr/local/bin/claude --resume abc\n"
+                 "  12 pts/3 node /srv/app/server.js\n")
+        assert iterm.pids_on_tty("/dev/pts/3") == [11]
+
+    def test_linux_node_shim_resolved_to_package_cli_js(self, monkeypatch):
+        self._ps(monkeypatch, "Linux",
+                 "  11 pts/3 node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js\n")
+        assert iterm.pids_on_tty("/dev/pts/3") == [11]
+
+    def test_linux_unrelated_node_and_empty_tty(self, monkeypatch):
+        run = self._ps(monkeypatch, "Linux", "  12 pts/3 node /srv/app/server.js\n")
+        assert iterm.pids_on_tty("/dev/pts/3") == []
+        assert iterm.pids_on_tty(None) == []
+        assert len(run.calls) == 1                         # None never ran ps
+
+    def test_linux_pid_on_tty_is_first_match(self, monkeypatch):
+        self._ps(monkeypatch, "Linux", "  11 pts/3 claude\n  15 pts/3 node /x/claude\n")
+        assert iterm.pid_on_tty("/dev/pts/3") == 11

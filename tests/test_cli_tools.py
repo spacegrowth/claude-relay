@@ -837,6 +837,21 @@ class TestDoctor:
         assert checks["state root writable"]["status"] == "PASS"
         assert checks["config loads"]["status"] == "PASS"
 
+    def test_linux_helpers_row_only_on_linux(self, relay, terms, probes, capsys, monkeypatch):
+        import platform_cmds
+        monkeypatch.setattr(platform_cmds.shutil, "which",
+                            lambda n: f"/usr/bin/{n}" if n in ("xdg-open", "wl-copy") else None)
+        monkeypatch.setattr(platform_cmds.platform, "system", lambda: "Linux")
+        run_main(relay, "doctor", "--offline", "--json")
+        checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)}
+        row = checks["linux helpers"]
+        assert row["status"] == "PASS"            # advisory — never a FAIL
+        d = row["detail"]
+        assert "xdg-open: yes" in d and "clipboard: wl-copy" in d and "notify-send: no" in d
+        monkeypatch.setattr(platform_cmds.platform, "system", lambda: "Darwin")
+        run_main(relay, "doctor", "--offline", "--json")
+        assert "linux helpers" not in {c["check"] for c in json.loads(capsys.readouterr().out)}
+
     def test_the_plumbing_checks_see_this_plugin_checkout(self, relay, terms, probes, capsys):
         run_main(relay, "doctor", "--offline", "--json")
         checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)}
@@ -1109,6 +1124,23 @@ class TestBoard:
         assert pkt["gist"] == "GOAL — split the layout."
         assert pkt["tldr"]["status"] == "clean"
         assert pkt["tldr"]["outcome"].startswith("Split the layout behind a flag")
+
+    @pytest.mark.parametrize("system,which,expect", [
+        ("Darwin", set(), "open"), ("Linux", {"xdg-open"}, "xdg-open"), ("Linux", set(), None)])
+    def test_open_goes_through_the_platform_seam(self, relay, terms, tmp_path, capsys, monkeypatch,
+                                                  system, which, expect):
+        import platform_cmds
+        monkeypatch.setattr(platform_cmds.platform, "system", lambda: system)
+        monkeypatch.setattr(platform_cmds.shutil, "which", lambda n: f"/usr/bin/{n}" if n in which else None)
+        ran = []
+        monkeypatch.setattr(platform_cmds.subprocess, "run",
+                            lambda argv, **k: ran.append(list(argv)) or subprocess.CompletedProcess(argv, 0, b"", b""))
+        make_session(relay, "e1")
+        out = tmp_path / "board.html"
+        run_main(relay, "board", "--out", str(out), "--open")   # headless Linux must not fail
+        printed = capsys.readouterr().out
+        assert ran == ([[expect, str(out)]] if expect else [])
+        assert ("no opener available" in printed) == (expect is None)
 
     def test_out_writes_a_self_contained_page(self, relay, terms, tmp_path, capsys):
         make_session(relay, "e1")

@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -3204,7 +3205,9 @@ class TestDiff:
         assert expected.exists()
         assert str(expected) in capsys.readouterr().out
 
-    def test_open_flag_calls_open(self, relay, tmp_path):
+    def test_open_flag_calls_open(self, relay, tmp_path, monkeypatch):
+        import platform_cmds
+        monkeypatch.setattr(platform_cmds.platform, "system", lambda: "Darwin")  # host-independent
         repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a"})
         self._mk_session(relay, "e1", repo, report_text="a.py changed.")
         real_run = relay.subprocess.run
@@ -3219,6 +3222,40 @@ class TestDiff:
         with mock.patch.object(relay.subprocess, "run", side_effect=spy):
             relay.cmd_diff(SimpleNamespace(session_id="e1", open=True, all=False))
         assert opened == [["open", str(relay.packets_dir("e1") / "001-diff.html")]]
+
+    def _open_run(self, relay, tmp_path, monkeypatch, system, which, capsys):
+        import platform_cmds
+        monkeypatch.setattr(platform_cmds.platform, "system", lambda: system)
+        monkeypatch.setattr(platform_cmds.shutil, "which", lambda n: f"/usr/bin/{n}" if n in which else None)
+        repo = self._repo_with_staged_changes(tmp_path, {"a.py": "a"})
+        self._mk_session(relay, "e1", repo, report_text="a.py changed.")
+        real_run = relay.subprocess.run
+        opened = []
+
+        def spy(cmd, *a, **kw):
+            if cmd[0] in ("open", "xdg-open"):
+                opened.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, b"", b"")
+            return real_run(cmd, *a, **kw)
+
+        with mock.patch.object(relay.subprocess, "run", side_effect=spy):
+            relay.cmd_diff(SimpleNamespace(session_id="e1", open=True, all=False))
+        return opened, capsys.readouterr().out, str(relay.packets_dir("e1") / "001-diff.html")
+
+    def test_open_flag_linux_uses_xdg_open(self, relay, tmp_path, monkeypatch, capsys):
+        opened, out, page = self._open_run(relay, tmp_path, monkeypatch, "Linux", {"xdg-open"}, capsys)
+        assert opened == [["xdg-open", page]]
+        assert "no opener" not in out
+
+    def test_open_flag_linux_headless_prints_path_and_does_not_fail(self, relay, tmp_path, monkeypatch, capsys):
+        opened, out, page = self._open_run(relay, tmp_path, monkeypatch, "Linux", set(), capsys)
+        assert opened == []
+        assert "no opener available" in out and page in out
+
+    def test_open_flag_macos_unchanged(self, relay, tmp_path, monkeypatch, capsys):
+        opened, out, page = self._open_run(relay, tmp_path, monkeypatch, "Darwin", {"xdg-open"}, capsys)
+        assert opened == [["open", page]]
+        assert "no opener" not in out
 
     def test_unknown_session_errors(self, relay):
         with pytest.raises(SystemExit):

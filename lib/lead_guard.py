@@ -340,6 +340,7 @@ def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=No
        itself failed, in which case this falls through to tier 2 (see `banner_fallback` below).
     2. osascript's built-in `display notification` — same info, NOT clickable, no coalescing.
        Always available on macOS, so this is the unconditional fallback (no PATH probe needed).
+       On Linux the same slot is `notify-send` when it is on PATH (same title/body), else silence.
 
     Every fall-through to tier 2 that happened because tier 1 was EXPECTED to work (a `tty` or
     `iterm_session` was actually given) appends one `banner_fallback` ledger event — `state_root`,
@@ -369,7 +370,7 @@ def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=No
         # tmux lead: tier 1 is a status-line message on the lead's own pane (tmux swallows OSC 777,
         # so the tty write below would post nothing). A successful post RETURNS, exactly as the
         # iTerm OSC tier does — no second osascript banner on a Mac. A failed post falls through
-        # to osascript (a no-op where osascript doesn't exist — Linux) with a `banner_fallback`.
+        # to tier 2 (osascript on a Mac, notify-send on Linux) with a `banner_fallback`.
         try:
             posted = _scripts_module("tmux_backend").notify(iterm_session, title,
                                                             subtitle + " — " + message[:180])
@@ -402,6 +403,20 @@ def notify_banner(cfg, title, subtitle, message, lead_sid=None, iterm_session=No
                 reason = "write-failed"
         if state_root is not None:
             append_ledger(state_root, "banner_fallback", session_id=lead_sid, reason=reason)
+    try:
+        linux = _scripts_module("platform_cmds").is_linux()
+    except Exception:
+        linux = False
+    if linux:
+        # Tier 2 on Linux: osascript doesn't exist; `notify-send` (libnotify) is the equivalent,
+        # best-effort — absent on PATH (a headless box) means silence, as before.
+        try:
+            if shutil.which("notify-send"):
+                subprocess.run(["notify-send", title, subtitle + " — " + message[:180]],
+                               capture_output=True, timeout=5)
+        except Exception:
+            pass
+        return
     try:
         # Tier 2 / only tier without iTerm: macOS's built-in banner via osascript. Same information
         # but degraded: NOT clickable and no per-lead coalescing.

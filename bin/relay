@@ -53,6 +53,7 @@ import diff_render
 import board_render
 import lead_guard
 import report_verify
+import platform_cmds  # the one macOS/Linux seam: open_path, copy_to_clipboard, is_linux
 import iterm as iterm_backend  # the REAL scripts/iterm.py module, always -- distinct from the
                                # `iterm` name below (this invocation's SELECTED backend, which can
                                # resolve to terminal_app). _background_label_loop is iTerm-specific
@@ -1777,7 +1778,7 @@ def _ttys_of_pids(pids):
     out = {}
     for line in r.stdout.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[0].isdigit() and parts[1] not in ("??", "-"):
+        if len(parts) == 2 and parts[0].isdigit() and parts[1] not in ("??", "?", "-"):
             out[int(parts[0])] = parts[1]
     return out
 
@@ -3675,6 +3676,13 @@ def cmd_doctor(args):
         f"selected: {getattr(iterm, 'NAME', '?')} · tmux: {tmux_ver or 'not on PATH'} · "
         f"$TMUX={os.environ.get('TMUX') or '(unset)'} · "
         f"$RELAY_TMUX_SOCKET={os.environ.get('RELAY_TMUX_SOCKET') or '(unset)'}")
+    if platform_cmds.is_linux():
+        # Optional Linux helpers (advisory — relay prints the path/text when one is missing).
+        helpers = platform_cmds.linux_helpers()
+        add("linux helpers", True,
+            f"xdg-open: {'yes' if helpers['xdg-open'] else 'no'} (--open) · "
+            f"clipboard: {'xclip' if helpers['xclip'] else 'wl-copy' if helpers['wl-copy'] else 'no'} · "
+            f"notify-send: {'yes' if helpers['notify-send'] else 'no'} (banner fallback) — none required")
     # Backlog row 60: the opt-in fallback config is easy to never discover on your own — one
     # advisory SKIP line when it's unset, naming what it's for and where it's documented; PASS with
     # the resolved (normalized) value(s) once it's set. Never FAILs either way — this is purely
@@ -4119,6 +4127,14 @@ def cmd_refresh_board(args):
     refresh_live_board()
 
 
+def _open_or_print(path):
+    """`--open`: hand `path` to the platform's opener (platform_cmds.open_path). No opener (a
+    headless Linux box has no xdg-open) or it failed → say so in one line and show the path/URL
+    instead; never an error, the page is already written."""
+    if not platform_cmds.open_path(path):
+        print(f"(no opener available — open it yourself: {path_to_file_url(path)})")
+
+
 def cmd_board(args):
     cfg = lead_guard.load_config(STATE_ROOT)
     live_arg = getattr(args, "live", None)
@@ -4157,7 +4173,7 @@ def cmd_board(args):
     print(str(out))
     print(path_to_file_url(out))
     if args.open:
-        subprocess.run(["open", str(out)])
+        _open_or_print(out)
 
 
 # ── relay stats: (model, effort) → outcome, joined across every packet ever sent ────────────────
@@ -6040,7 +6056,7 @@ def cmd_diff(args):
     print(str(out_path))
     print(path_to_file_url(out_path))
     if args.open:
-        subprocess.run(["open", str(out_path)])
+        _open_or_print(out_path)
 
 
 # ── verify: machine-check a report against staged reality (backlog §6b / #7) ──────────────────

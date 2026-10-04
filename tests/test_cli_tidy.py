@@ -1208,6 +1208,13 @@ class TestTidyTtyHints:
         assert relay._ttys_of_pids([101, 202]) == {101: "ttys001"}
         assert relay._ttys_of_pids([]) == {}
 
+    def test_ps_output_linux_shapes(self, relay, monkeypatch):
+        # Linux: pts/N for a tty, "?" for none (macOS prints "??").
+        out = " 101 pts/3\n 202 ?\n"
+        monkeypatch.setattr(relay.subprocess, "run",
+                            lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=out))
+        assert relay._ttys_of_pids([101, 202]) == {101: "pts/3"}
+
 
 class TestSpawnLeadHandle:
     """Row 89: the tab is created next to the lead's LIVE tab — the caller's own

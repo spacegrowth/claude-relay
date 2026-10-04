@@ -4958,3 +4958,45 @@ class TestTmuxLeadGuard:
         monkeypatch.setenv("RELAY_TERMINAL", "tmux")
         monkeypatch.setenv("TMUX_PANE", "%2")
         assert lg.env_tab_id() == "tmux:%2"
+
+
+class TestNotifyTier2Linux:
+    """notify_banner's tier 2: osascript on macOS (unchanged), `notify-send` on Linux when on PATH,
+    silence otherwise. Platform and subprocess are mocked — Linux is never executed."""
+
+    def _run(self, monkeypatch, system, which):
+        import platform_cmds
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        monkeypatch.setattr(platform_cmds.platform, "system", lambda: system)
+        monkeypatch.setattr(lg.shutil, "which", lambda n: f"/usr/bin/{n}" if n in which else None)
+        calls = []
+        monkeypatch.setattr(lg.subprocess, "run", lambda *a, **k: calls.append(list(a[0])))
+        lg.notify_banner({}, "relay · p", "e1 reported", "review it", lead_sid="lead-1")
+        return calls
+
+    def test_linux_with_notify_send(self, monkeypatch):
+        calls = self._run(monkeypatch, "Linux", {"notify-send"})
+        assert calls == [["notify-send", "relay · p", "e1 reported — review it"]]
+
+    def test_linux_without_notify_send_is_silent(self, monkeypatch):
+        assert self._run(monkeypatch, "Linux", set()) == []
+
+    def test_linux_never_runs_osascript(self, monkeypatch):
+        calls = self._run(monkeypatch, "Linux", {"notify-send", "osascript"})
+        assert all(c[0] != "osascript" for c in calls)
+
+    def test_macos_still_osascript(self, monkeypatch):
+        calls = self._run(monkeypatch, "Darwin", {"notify-send"})
+        assert len(calls) == 1 and calls[0][:2] == ["osascript", "-e"]
+        assert "display notification" in calls[0][2]
+
+    def test_linux_tmux_failure_falls_through_to_notify_send(self, monkeypatch, tmp_path):
+        import platform_cmds, tmux_backend
+        monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
+        monkeypatch.setattr(platform_cmds.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(lg.shutil, "which", lambda n: f"/usr/bin/{n}" if n == "notify-send" else None)
+        monkeypatch.setattr(tmux_backend, "notify", lambda h, t, b: False)
+        calls = []
+        monkeypatch.setattr(lg.subprocess, "run", lambda *a, **k: calls.append(list(a[0])))
+        lg.notify_banner({}, "t", "s", "m", lead_sid="lead-1", iterm_session="tmux:%5", state_root=tmp_path)
+        assert calls == [["notify-send", "t", "s — m"]]
