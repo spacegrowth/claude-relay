@@ -813,7 +813,8 @@ def _read_spawn_outcome(r):
                         happened mid-send, which callers must report as indeterminate.
     Callers use `front_title` for the incident's Ask 2 (tell the human which tab to inspect)."""
     if r.returncode != 0:
-        return {"ok": False, "reason": "script-failed", "session_id": None, "front_title": None}
+        return {"ok": False, "reason": "script-failed", "session_id": None, "front_title": None,
+                "error": (r.stderr or "").strip() or None}
     lines = (r.stdout or "").splitlines()
     verdict = lines[0].strip() if lines else ""
     sid = lines[1].strip() if len(lines) > 1 else ""

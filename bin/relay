@@ -1116,7 +1116,13 @@ def _misfire_locator(outcome):
         return (f"\n  The send was ABORTED before typing anything: the target session could not be "
                 f"resolved ({reason}), so no payload was typed into any tab.{where}")
     if reason == "script-failed":
-        return ("\n  The terminal script itself failed, so where the payload got to is INDETERMINATE "
+        err = (outcome.get("error") or "").strip()
+        if "-1743" in err:  # macOS Automation (TCC) consent missing: nothing ran, nothing was typed
+            return (f"\n  osascript said: {err}\n  macOS is denying Apple events to iTerm — nothing was "
+                    "typed anywhere. Re-grant System Settings > Privacy & Security > Automation, or "
+                    "run `tccutil reset AppleEvents com.googlecode.iterm2` and retry.")
+        seen = f"\n  osascript said: {err}" if err else ""
+        return (seen + "\n  The terminal script itself failed, so where the payload got to is INDETERMINATE "
                 "— check the tab that was frontmost during the spawn for a stray `cd … && exec claude` "
                 "line (it is guarded and inert, but it may sit in a tab's input).")
     if outcome.get("ok"):

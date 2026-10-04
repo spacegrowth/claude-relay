@@ -8759,3 +8759,8 @@ class TestTmuxHostedSessions:
     def test_headless_env_strips_the_tmux_pane(self, trelay, monkeypatch):
         monkeypatch.setenv("TMUX_PANE", "%9")
         assert "TMUX_PANE" not in trelay._headless_env()
+def test_misfire_locator_names_automation_denial(relay):
+    out = {"ok": False, "reason": "script-failed", "session_id": None, "front_title": None,
+           "error": "36:52: execution error: Not authorized to send Apple events to iTerm. (-1743)"}
+    msg = relay._misfire_locator(out)
+    assert "-1743" in msg and "tccutil reset AppleEvents" in msg and "INDETERMINATE" not in msg
