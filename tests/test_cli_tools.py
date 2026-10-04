@@ -837,6 +837,41 @@ class TestDoctor:
         assert checks["state root writable"]["status"] == "PASS"
         assert checks["config loads"]["status"] == "PASS"
 
+    def _doctor_rows(self, relay, capsys):
+        run_main(relay, "doctor", "--offline", "--json")
+        return {c["check"]: c for c in json.loads(capsys.readouterr().out)}
+
+    def test_iterm_tmux_cc_advisory_only_under_tmux_in_iterm(self, relay, terms, probes, capsys,
+                                                              monkeypatch):
+        tb = relay.backend.by_name("tmux")
+        monkeypatch.setattr(tb, "version", lambda: "tmux 3.6a")
+        monkeypatch.setattr(tb, "_tmux", lambda a, timeout=5: subprocess.CompletedProcess(
+            a, 0, "1\n" if a[0] == "list-clients" else "", ""))
+        monkeypatch.setattr(relay.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.delenv("LC_TERMINAL", raising=False)
+        # not under tmux → no row
+        monkeypatch.setenv("TERM_PROGRAM", "iTerm.app")
+        assert "iTerm tmux integration" not in self._doctor_rows(relay, capsys)
+        # under tmux, outer terminal iTerm, client in control mode → "detected"
+        monkeypatch.setenv("TMUX", "/tmp/tmux-1/default,1,0")
+        row = self._doctor_rows(relay, capsys)["iTerm tmux integration"]
+        assert row["status"] == "PASS"
+        assert "iTerm tmux integration (-CC) detected: executors will appear as native tabs" in row["detail"]
+        # a plain (non -CC) client → "possible"
+        monkeypatch.setattr(tb, "_tmux", lambda a, timeout=5: subprocess.CompletedProcess(
+            a, 0, "0\n", ""))
+        row = self._doctor_rows(relay, capsys)["iTerm tmux integration"]
+        assert "(-CC) possible: executors will appear as native tabs" in row["detail"]
+        # tmux sets TERM_PROGRAM=tmux itself; iTerm's LC_TERMINAL is the second signal
+        monkeypatch.setenv("TERM_PROGRAM", "tmux")
+        assert "iTerm tmux integration" not in self._doctor_rows(relay, capsys)
+        monkeypatch.setenv("LC_TERMINAL", "iTerm2")
+        assert "iTerm tmux integration" in self._doctor_rows(relay, capsys)
+        # outside iTerm entirely → no row
+        monkeypatch.delenv("LC_TERMINAL")
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+        assert "iTerm tmux integration" not in self._doctor_rows(relay, capsys)
+
     def test_linux_helpers_row_only_on_linux(self, relay, terms, probes, capsys, monkeypatch):
         import platform_cmds
         monkeypatch.setattr(platform_cmds.shutil, "which",

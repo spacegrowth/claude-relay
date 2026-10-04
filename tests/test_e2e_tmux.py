@@ -199,3 +199,40 @@ def test_signal_unblocks_a_wait_within_a_second(tmux_server):
     assert time.time() - t_sig < 1.0 and out["took"] < 2.0, out
     # A quiet channel is a timeout (the normal tick), not an error.
     assert tmux_backend.wait(tmux_backend.wake_channel(f"quiet-{os.getpid()}"), 0.5) == "timeout"
+
+
+def test_tmux_setup_apply_and_status_line_against_real_tmux(tmux_server, tmp_path):
+    """`relay tmux-setup --apply` sets status-right + the popup bindings on the PRIVATE server, and
+    `relay status-line --tmux` output (a real fixture session) is accepted by tmux as a format."""
+    import json
+    home = tmp_path / "home"
+    sess = home / ".relay-tasks" / "e2e-exec"
+    (sess / "packets").mkdir(parents=True)
+    (sess / "session.json").write_text(json.dumps(
+        {"session_id": "e2e-exec", "status": "busy", "current_packet": 1}))
+    env = {**os.environ, "HOME": str(home), "RELAY_TMUX_SOCKET": tmux_server}
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
+    relay = [sys.executable, str(REPO_ROOT / "bin" / "relay")]
+
+    r = subprocess.run(relay + ["tmux-setup", "--apply"], env=env, capture_output=True, text=True,
+                       timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert "applied to the running tmux server" in r.stdout
+    right = tmux_backend._tmux(["show-options", "-gv", "status-right"]).stdout.strip()
+    assert right.startswith("#(") and "status-line --tmux" in right and str(REPO_ROOT / "bin" / "relay") in right
+    assert tmux_backend._tmux(["show-options", "-gv", "status-interval"]).stdout.strip() == "5"
+    keys = tmux_backend._tmux(["list-keys", "-T", "prefix"]).stdout
+    assert any(ln.split()[3:4] == ["R"] and "display-popup" in ln for ln in keys.splitlines())
+    assert any(ln.split()[3:4] == ["D"] and "command-prompt" in ln and "diff %%" in ln
+               for ln in keys.splitlines())
+
+    pane = tmux_backend._tmux(["list-panes", "-a", "-F", "#{pane_id}"]).stdout.split()[0]
+    s = subprocess.run(relay + ["status-line", "--tmux", "--pane", pane], env=env,
+                       capture_output=True, text=True, timeout=30)
+    assert s.returncode == 0 and s.stderr == ""
+    line = s.stdout.strip()
+    assert "e2e-exec:busy" in line and line.startswith("#[fg=")
+    shown = tmux_backend._tmux(["display-message", "-p", "-t", pane, line])
+    assert shown.returncode == 0, shown.stderr
+    assert "e2e-exec:busy" in shown.stdout

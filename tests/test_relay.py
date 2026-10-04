@@ -8785,3 +8785,214 @@ def test_misfire_locator_names_automation_denial(relay):
            "error": "36:52: execution error: Not authorized to send Apple events to iTerm. (-1743)"}
     msg = relay._misfire_locator(out)
     assert "-1743" in msg and "tccutil reset AppleEvents" in msg and "INDETERMINATE" not in msg
+
+
+# ── tmux status bar, setup and popups ───────────────────────────────────────────────────────────
+
+class TestTmuxUi:
+    def _sess(self, relay, sid, status, owner=None, packet=1, report=False):
+        relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
+        relay.write_session(sid, {"session_id": sid, "status": status, "current_packet": packet,
+                                  "owner_lead": owner, "topic": "t", "scope": "t",
+                                  "tab_label": f"relay-{sid}"})
+        if report:
+            (relay.packets_dir(sid) / f"{packet:03d}-report.md").write_text("done")
+
+    def _line(self, relay, capsys, **kw):
+        args = SimpleNamespace(tmux=True, lead=kw.get("lead"), pane=kw.get("pane"))
+        relay.cmd_status_line(args)
+        return capsys.readouterr().out
+
+    def test_status_line_states_map_to_colours(self, relay, capsys):
+        self._sess(relay, "e-busy", "busy")
+        self._sess(relay, "e-rep", "reported")
+        self._sess(relay, "e-idle", "busy", report=True)       # report on disk → reported
+        self._sess(relay, "e-stall", "stalled")
+        self._sess(relay, "e-dead", "dead")
+        self._sess(relay, "e-closed", "closed")                # not shown
+        out = self._line(relay, capsys)
+        assert out.count("\n") == 1
+        assert "#[fg=colour245]relay 5#[default]" in out
+        assert "#[fg=yellow]e-busy:busy#[default]" in out
+        assert "#[fg=green]e-rep:reported#[default]" in out
+        assert "#[fg=green]e-idle:reported#[default]" in out
+        assert "#[fg=colour208]e-stall:stalled#[default]" in out
+        assert "#[fg=red]e-dead:dead#[default]" in out
+        assert "e-closed" not in out
+
+    def test_status_line_empty_is_empty(self, relay, capsys):
+        assert self._line(relay, capsys) == ""
+        self._sess(relay, "gone", "closed")
+        assert self._line(relay, capsys) == ""
+
+    def test_status_line_corrupt_session_file_never_raises(self, relay, capsys):
+        self._sess(relay, "ok", "busy")
+        bad = relay.session_dir("bad")
+        bad.mkdir(parents=True)
+        (bad / "session.json").write_text("{not json")
+        out = self._line(relay, capsys)
+        assert "ok:busy" in out and "bad" not in out
+        # And an outright failure inside the renderer prints nothing, not a traceback.
+        relay._tmux_status_text = lambda leads=None: 1 / 0
+        assert self._line(relay, capsys) == ""
+
+    def test_status_line_hash_in_name_is_escaped_and_long_list_collapses(self, relay, capsys):
+        self._sess(relay, "a#b", "busy")
+        for i in range(10):
+            self._sess(relay, f"x{i:02d}", "busy")
+        out = self._line(relay, capsys)
+        assert "a##b:busy" in out and "relay 11" in out and "+3" in out
+
+    def test_status_line_scopes_to_lead_and_needs_the_flag(self, relay, capsys):
+        self._sess(relay, "mine", "busy", owner="L1")
+        self._sess(relay, "theirs", "busy", owner="L2")
+        out = self._line(relay, capsys, lead="L1")
+        assert "mine:busy" in out and "theirs" not in out and "relay 1" in out
+        relay.cmd_status_line(SimpleNamespace(tmux=False, lead=None, pane=None))
+        assert capsys.readouterr().out == ""
+
+    def test_status_line_resolves_lead_from_panes_of_the_same_tmux_session(self, relay, capsys,
+                                                                            monkeypatch):
+        import lead_guard
+        self._sess(relay, "mine", "busy", owner="L1")
+        self._sess(relay, "theirs", "busy", owner="L2")
+        monkeypatch.setattr(lead_guard, "list_leads", lambda root: [
+            {"session_id": "L1", "iterm_session": "tmux:%3"},
+            {"session_id": "L2", "iterm_session": "tmux:%9"},
+            {"session_id": "L3", "iterm_session": "tmux:%4", "ended": "x"},
+            {"session_id": "bro", "broken": True}])
+        tb = relay.backend.by_name("tmux")
+        seen = []
+        monkeypatch.setattr(tb, "_tmux", lambda a, timeout=5: seen.append(a) or
+                            subprocess.CompletedProcess(a, 0, "%3\n%4\n%5\n", ""))
+        out = self._line(relay, capsys, pane="%5")
+        assert seen == [["list-panes", "-s", "-t", "%5", "-F", "#{pane_id}"]]
+        assert "mine:busy" in out and "theirs" not in out
+        # No lead in that session → every lead's executors.
+        monkeypatch.setattr(tb, "_tmux", lambda a, timeout=5:
+                            subprocess.CompletedProcess(a, 0, "%77\n", ""))
+        out = self._line(relay, capsys, pane="%77")
+        assert "mine:busy" in out and "theirs:busy" in out
+
+    def test_tmux_setup_prints_the_lines_and_applies_nothing_by_default(self, relay, capsys,
+                                                                         monkeypatch):
+        tb = relay.backend.by_name("tmux")
+        monkeypatch.setattr(tb, "_tmux", lambda *a, **k: pytest.fail("must not run tmux"))
+        relay.cmd_tmux_setup(SimpleNamespace(apply=False))
+        out = capsys.readouterr().out
+        bin_path = str(REPO_ROOT / "bin" / "relay")
+        assert f"set -g status-right '#({bin_path} status-line --tmux" in out
+        assert "set -g status-interval 5" in out
+        assert "bind R display-popup" in out and "bind D command-prompt -p session" in out
+        assert "~/.tmux.conf" in out
+
+    def test_tmux_setup_apply_runs_each_command_through_the_seam(self, relay, capsys, monkeypatch):
+        tb = relay.backend.by_name("tmux")
+        calls = []
+        monkeypatch.setattr(tb, "_tmux", lambda a, timeout=5: calls.append(a) or
+                            subprocess.CompletedProcess(a, 0, "", ""))
+        relay.cmd_tmux_setup(SimpleNamespace(apply=True))
+        assert calls == tb.setup_commands(str(REPO_ROOT / "bin" / "relay"))
+        assert "applied to the running tmux server" in capsys.readouterr().out
+
+    def test_tmux_setup_apply_failure_exits_nonzero(self, relay, capsys, monkeypatch):
+        tb = relay.backend.by_name("tmux")
+        monkeypatch.setattr(tb, "_tmux", lambda a, timeout=5:
+                            subprocess.CompletedProcess(a, 1, "", "no server running"))
+        with pytest.raises(SystemExit) as e:
+            relay.cmd_tmux_setup(SimpleNamespace(apply=True))
+        assert e.value.code == 1
+        assert "no server running" in capsys.readouterr().err
+
+    # --- --popup ---
+
+    def _repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(repo), *cmd], check=True)
+        (repo / "a.py").write_text("x = 1\n")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        return repo
+
+    def test_popup_off_tmux_says_so_and_falls_back(self, relay, tmp_path, capsys, monkeypatch):
+        monkeypatch.delenv("TMUX", raising=False)
+        tb = relay.backend.by_name("tmux")
+        monkeypatch.setattr(tb, "popup", lambda *a, **k: pytest.fail("no popup off tmux"))
+        # diff → still writes the HTML page
+        repo = self._repo(tmp_path)
+        self._sess(relay, "e1", "reported")
+        s = relay.read_session("e1")
+        s["worktree"] = str(repo)
+        relay.write_session("e1", s)
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=True, popup=True,
+                                       popup_inner=False))
+        out = capsys.readouterr().out
+        assert "--popup needs tmux" in out
+        assert (relay.packets_dir("e1") / "001-diff.html").exists()
+        # check → normal status line follows
+        relay._check_one = lambda sid: relay.read_session(sid)   # no real liveness probe
+        relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=False, popup=True,
+                                        popup_inner=False))
+        out = capsys.readouterr().out
+        assert "--popup needs tmux" in out and "e1: status=" in out
+        # list → the normal table follows
+        relay.cmd_list(SimpleNamespace(json=False, closed=False, lead=None, all=False,
+                                       all_leads=False, plan=False, popup=True, popup_inner=False))
+        out = capsys.readouterr().out
+        assert out.count("--popup needs tmux") == 1 and "SESSION" in out.upper()
+
+    def test_popup_under_tmux_pops_relay_inner_over_the_pane(self, relay, tmp_path, capsys,
+                                                               monkeypatch):
+        monkeypatch.setenv("TMUX", "/tmp/tmux-1/default,1,0")
+        monkeypatch.setattr(relay.shutil, "which", lambda n: f"/usr/bin/{n}")
+        tb = relay.backend.by_name("tmux")
+        shown = []
+        monkeypatch.setattr(tb, "popup", lambda cmd, title=None, **k: shown.append((cmd, title)) or True)
+        self._sess(relay, "e1", "reported", report=True)
+        relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=False, popup=True,
+                                        popup_inner=False))
+        relay.cmd_list(SimpleNamespace(json=False, closed=False, lead=None, all=False,
+                                       all_leads=False, plan=False, popup=True, popup_inner=False))
+        s = relay.read_session("e1")
+        s["worktree"] = str(self._repo(tmp_path))
+        relay.write_session("e1", s)
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=False, popup=True,
+                                       popup_inner=False))
+        rel = str(REPO_ROOT / "bin" / "relay")
+        assert shown == [(f"{rel} check e1 --popup-inner", "report: e1"),
+                         (f"{rel} list --popup-inner", "relay list"),
+                         (f"{rel} diff e1 --popup-inner", "diff: e1")]
+        assert capsys.readouterr().out == ""        # nothing printed to the pane itself
+        assert not (relay.packets_dir("e1") / "001-diff.html").exists()
+
+    def test_popup_check_without_a_report_says_so(self, relay, capsys, monkeypatch):
+        monkeypatch.setenv("TMUX", "x")
+        monkeypatch.setattr(relay.shutil, "which", lambda n: f"/usr/bin/{n}")
+        tb = relay.backend.by_name("tmux")
+        monkeypatch.setattr(tb, "popup", lambda *a, **k: pytest.fail("nothing to show"))
+        self._sess(relay, "e1", "busy")
+        relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=False, popup=True,
+                                        popup_inner=False))
+        assert "no report yet" in capsys.readouterr().out
+
+    def test_popup_inner_pages_the_staged_diff_and_the_report(self, relay, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path)
+        monkeypatch.setattr(relay.shutil, "which", lambda n: "/usr/bin/less")
+        paged = []
+        monkeypatch.setattr(relay.subprocess, "run", lambda argv, **k: paged.append((argv, k)) or
+                            subprocess.CompletedProcess(argv, 0, "OUT", ""))
+        self._sess(relay, "e1", "reported", report=True)
+        s = relay.read_session("e1")
+        s["worktree"] = str(repo)
+        relay.write_session("e1", s)
+        monkeypatch.delenv("RELAY_FORCE_COLOR", raising=False)
+        relay.cmd_diff(SimpleNamespace(session_id="e1", open=False, all=False, popup=False,
+                                       popup_inner=True))
+        assert paged[0][0] == ["git", "-C", str(repo), "diff", "--cached", "--color=always"]
+        assert paged[1][0] == ["/usr/bin/less", "-R"] and paged[1][1]["input"] == "OUT"
+        paged.clear()
+        relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=False, popup=False,
+                                        popup_inner=True))
+        assert paged[0][0][0] == "cat" and paged[1][0] == ["/usr/bin/less", "-R"]
+        assert os.environ.pop("RELAY_FORCE_COLOR") == "1"   # popup pager keeps colour

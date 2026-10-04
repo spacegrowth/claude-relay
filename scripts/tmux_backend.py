@@ -477,3 +477,82 @@ def unpipe_pane(handle):
     if not pane:
         return False
     return _ok(_tmux(["pipe-pane", "-t", pane]))
+
+
+# ── popups, status bar and the setup lines (the human-facing tmux UI) ─────────────────────────────
+_VERSION_PARSED = None   # cached (major, minor) of `tmux -V`; (0, 0) when unknown (tmux missing)
+
+
+def version_tuple():
+    """(major, minor) from `tmux -V` ("tmux 3.6a" → (3, 6), "tmux next-3.5" → (3, 5)), cached for
+    the life of the process — one subprocess, ever. (0, 0) when tmux is missing/unparsable."""
+    global _VERSION_PARSED
+    if _VERSION_PARSED is None:
+        m = re.search(r"(\d+)\.(\d+)", version() or "")
+        _VERSION_PARSED = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    return _VERSION_PARSED
+
+
+def popup_supports_title():
+    """`display-popup -T` exists from tmux 3.3 (3.2 has display-popup but no title flag)."""
+    return version_tuple() >= (3, 3)
+
+
+def popup(cmd, title=None, width="80%", height="80%"):
+    """Show `cmd` (a shell command STRING — display-popup runs it through the shell) in a popup over
+    the current client: `display-popup -E -w W -h H [-T title] <cmd>`. `-E` closes the popup when
+    the command exits. `-T` is omitted on tmux < 3.3. The title is a tmux format, so '#' is doubled.
+    Blocks until the popup closes (no timeout: a human is reading it). True iff tmux accepted it."""
+    argv = ["display-popup", "-E", "-w", str(width), "-h", str(height)]
+    if title and popup_supports_title():
+        argv += ["-T", str(title).replace("#", "##")]
+    argv.append(cmd)
+    try:
+        return _ok(_tmux(argv, timeout=None))
+    except Exception:
+        return False
+
+
+def _sh_word(path):
+    """`path` as one shell word: bare when it is plain, else double-quoted (never single quotes —
+    these words end up INSIDE single-quoted tmux strings below)."""
+    if re.match(r"^[A-Za-z0-9_./:@%+=,-]+$", path):
+        return path
+    return '"' + re.sub(r'(["\\$`])', r"\\\1", path) + '"'
+
+
+def _conf_word(word):
+    """One argv word as tmux.conf text: bare if plain, single-quoted if it has no `'`, else
+    double-quoted with `\\`, `"` and `$` escaped (tmux expands $VAR inside double quotes)."""
+    if re.match(r"^[A-Za-z0-9_./:@%+=,-]+$", word):
+        return word
+    if "'" not in word:
+        return "'" + word + "'"
+    return '"' + re.sub(r'(["\\$])', r"\\\1", word) + '"'
+
+
+def setup_commands(relay_path, interval=5):
+    """The tmux commands `relay tmux-setup` prints (one per line, tmux.conf syntax) and applies,
+    as a list of argv lists (the form `_tmux` takes):
+      - status-right: the live executor strip (`relay status-line --tmux`; `--pane #{pane_id}` lets
+        it find the lead whose pane shares the active pane's tmux session — a `#()` job has no
+        $TMUX_PANE of its own) and status-interval so it refreshes;
+      - prefix R: the session list in a popup;
+      - prefix D: prompt for a session name, then its staged diff in a popup (overrides tmux's
+        default `D` = choose-client)."""
+    r = _sh_word(relay_path)
+    popup_flags = ["display-popup", "-E", "-w", "80%", "-h", "80%"]
+    return [
+        ["set-option", "-g", "status-right", f"#({r} status-line --tmux --pane #{{pane_id}})"],
+        ["set-option", "-g", "status-interval", str(interval)],
+        ["bind-key", "R"] + popup_flags + [f"{r} list --popup-inner"],
+        ["bind-key", "D", "command-prompt", "-p", "session",
+         " ".join(popup_flags) + f" '{r} diff %% --popup-inner'"],
+    ]
+
+
+def setup_conf_lines(relay_path, interval=5):
+    """`setup_commands` as tmux.conf lines (set-option/bind-key spelled `set`/`bind`, `-g` kept)."""
+    short = {"set-option": "set", "bind-key": "bind"}
+    return [" ".join(_conf_word(w) for w in [short.get(a[0], a[0])] + a[1:])
+            for a in setup_commands(relay_path, interval)]

@@ -3157,7 +3157,10 @@ _STATUS_STYLE = {"reported": ("green", "bold"), "busy": ("yellow",), "stalled": 
 
 
 def _color_on():
-    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    # RELAY_FORCE_COLOR: set by the tmux popup pagers (_pager_run) so output piped into `less -R`
+    # keeps its colours. NO_COLOR still wins.
+    return (sys.stdout.isatty() or bool(os.environ.get("RELAY_FORCE_COLOR"))) \
+        and not os.environ.get("NO_COLOR")
 
 
 def c(text, *styles):
@@ -3842,6 +3845,21 @@ def cmd_doctor(args):
         f"selected: {getattr(iterm, 'NAME', '?')} · tmux: {tmux_ver or 'not on PATH'} · "
         f"$TMUX={os.environ.get('TMUX') or '(unset)'} · "
         f"$RELAY_TMUX_SOCKET={os.environ.get('RELAY_TMUX_SOCKET') or '(unset)'}")
+    if os.environ.get("TMUX") and (os.environ.get("TERM_PROGRAM") == "iTerm.app"
+                                   or os.environ.get("LC_TERMINAL") == "iTerm2"):
+        # Under tmux, but the outer terminal is iTerm: advisory only. tmux itself sets
+        # TERM_PROGRAM=tmux inside its panes, so LC_TERMINAL (which iTerm sets and forwards) is the
+        # second signal. `client_control_mode` says whether this client really IS `tmux -CC`.
+        try:
+            tbk = backend.by_name("tmux")
+            lc = tbk._tmux(["list-clients", "-F", "#{client_control_mode}"])
+            cc = tbk._ok(lc) and "1" in (lc.stdout or "").split()
+        except Exception:
+            cc = False
+        add("iTerm tmux integration", True,
+            f"iTerm tmux integration (-CC) {'detected' if cc else 'possible'}: executors will "
+            f"appear as native tabs (tab colors and `relay tidy` do not apply; see README "
+            f"\"Mac: one backend via tmux -CC\")")
     if platform_cmds.is_linux():
         # Optional Linux helpers (advisory — relay prints the path/text when one is missing).
         helpers = platform_cmds.linux_helpers()
@@ -4293,6 +4311,51 @@ def cmd_refresh_board(args):
     refresh_live_board()
 
 
+# ── tmux popups (`--popup` on check / diff / list) ───────────────────────────────────────────────
+# `--popup` hands the command to tmux's display-popup, which re-runs `relay <cmd> --popup-inner`
+# inside the popup; the inner mode pages the content through `less -R`. Off tmux there is no popup
+# to show, so one line says so and the normal output follows.
+def _popup_wanted(args, what):
+    """True when `--popup` was given AND a tmux client is here to show it (the caller then pops up).
+    `--popup` without tmux prints one line and returns False (caller falls back to normal output)."""
+    if not getattr(args, "popup", False):
+        return False
+    if os.environ.get("TMUX") and shutil.which("tmux"):
+        return True
+    print(f"(--popup needs tmux — run relay inside a tmux session; showing {what} here instead)")
+    return False
+
+
+def _popup_relay(argv, title):
+    """Pop `relay <argv…> --popup-inner` up over the current tmux client."""
+    cmd = " ".join([shlex.quote(str(_plugin_root() / "bin" / "relay"))] + [shlex.quote(a) for a in argv]
+                   + ["--popup-inner"])
+    if not backend.by_name("tmux").popup(cmd, title=title):
+        print("(tmux refused the popup — is a client attached to this session?)")
+        return False
+    return True
+
+
+def _pager_run(render=None, argv=None):
+    """Inner half of a popup: page `render()`'s stdout (or the stdout of `argv`) through `less -R`,
+    coloured. No `less` → print it and wait for Enter so the popup does not vanish unread."""
+    less = shutil.which("less")
+    os.environ["RELAY_FORCE_COLOR"] = "1"
+    if argv is not None:
+        text = subprocess.run(argv, capture_output=True, text=True).stdout
+    else:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            render()
+        text = buf.getvalue()
+    if not less:
+        print(text)
+        with contextlib.suppress(EOFError, OSError):
+            input("[Enter to close] ")
+        return
+    subprocess.run([less, "-R"], input=text, text=True)
+
+
 def _open_or_print(path):
     """`--open`: hand `path` to the platform's opener (platform_cmds.open_path). No opener (a
     headless Linux box has no xdg-open) or it failed → say so in one line and show the path/URL
@@ -4667,7 +4730,36 @@ def cmd_auto_close_sweep(args):
         pass
 
 
+def _popup_check(args):
+    """`check <sid> --popup[-inner]`: the session's current report in a tmux popup (`less -R`).
+    Returns True when handled (the caller returns), False to fall through to the normal check."""
+    inner = getattr(args, "popup_inner", False)
+    if not (inner or getattr(args, "popup", False)) or not args.session_id or args.all:
+        return False
+    s = read_session(args.session_id)
+    if not s:
+        print(f"{args.session_id}: no such session")
+        return True
+    report = packets_dir(args.session_id) / f"{s.get('current_packet', 1):03d}-report.md"
+    if inner:
+        if report.exists():
+            _mark_report_surfaced(s)
+            _pager_run(argv=["cat", str(report)])
+        else:
+            print(f"{args.session_id}: no report yet")
+        return True
+    if not _popup_wanted(args, "the check"):
+        return False
+    if not report.exists():
+        print(f"{args.session_id}: no report yet")
+        return True
+    _popup_relay(["check", args.session_id], f"report: {args.session_id}")
+    return True
+
+
 def cmd_check(args):
+    if _popup_check(args):
+        return
     ids = all_session_ids() if args.all else [args.session_id]
     # The NET delivery trigger for the --when-idle queue. The PRIMARY one is the executor's own
     # escalation Stop hook (fires the instant it goes idle, with no lead involvement — see
@@ -4967,6 +5059,104 @@ def cmd_status(args):
             line = _lead_status_line(tab_sid, tab_marker, transcript_path, statusline=statusline_mode)
             if line:
                 print(line)
+
+
+# ── tmux status bar (`relay status-line --tmux`) and its setup (`relay tmux-setup`) ───────────────
+# state → tmux colour. `idle` is not a stored status today but a hand-edited/older record may carry
+# it; anything unknown renders dim rather than breaking the strip.
+_TMUX_STATE_STYLE = {"busy": "yellow", "paused": "yellow", "idle": "cyan", "reported": "green",
+                     "stalled": "colour208", "dead": "red", LAUNCH_FAILED: "red"}
+_TMUX_STATUS_MAX = 8      # executors named before the strip collapses the rest to "+N"
+
+
+def _tmux_scope_leads(args):
+    """The set of lead ids whose executors the strip shows: `--lead`, else the live leads whose
+    pane sits in the same tmux SESSION as `--pane`/$TMUX_PANE (a `#()` job has no $TMUX_PANE of its
+    own, so tmux-setup passes `--pane #{pane_id}`); None = every lead (no pane, or no lead there)."""
+    if getattr(args, "lead", None):
+        return {args.lead}
+    pane = getattr(args, "pane", None) or os.environ.get("TMUX_PANE")
+    if not pane:
+        return None
+    tb = backend.by_name("tmux")
+    r = tb._tmux(["list-panes", "-s", "-t", pane, "-F", "#{pane_id}"])
+    if not tb._ok(r):
+        return None
+    handles = {tb.handle_for(p) for p in (r.stdout or "").split()}
+    leads = {m["session_id"] for m in lead_guard.list_leads(STATE_ROOT)
+             if isinstance(m, dict) and not m.get("broken") and m.get("session_id")
+             and m.get("iterm_session") in handles and not lead_guard.is_tombstoned(m)}
+    return leads or None
+
+
+def _tmux_status_text(leads=None):
+    """tmux format text for one lead scope: `relay N` then each live executor as `name:state`
+    coloured by state. Reads session.json files and report-file existence ONLY — no liveness probe,
+    no subprocess, no network, no write — so it is cheap at `status-interval` cadence; the state is
+    the STORED one (`relay list`/`check` refresh it). "" when there is nothing to show."""
+    rows = []
+    for sid in all_session_ids():
+        s = read_session(sid)
+        if not s or s.get("status") in ("closed", "superseded"):
+            continue
+        if leads is not None and s.get("owner_lead") not in leads:
+            continue
+        state = s.get("status") or "?"
+        try:
+            n = int(s.get("current_packet", 1))
+            if state in ("busy", "idle") and (packets_dir(sid) / f"{n:03d}-report.md").exists():
+                state = "reported"
+        except (TypeError, ValueError):
+            pass
+        rows.append((str(sid), str(state)))
+    if not rows:
+        return ""
+    esc = lambda t: str(t).replace("#", "##")          # '#' starts a tmux format
+    parts = [f"#[fg=colour245]relay {len(rows)}#[default]"]
+    for sid, state in rows[:_TMUX_STATUS_MAX]:
+        parts.append(f"#[fg={_TMUX_STATE_STYLE.get(state, 'colour245')}]{esc(sid[:18])}:{esc(state)}#[default]")
+    if len(rows) > _TMUX_STATUS_MAX:
+        parts.append(f"#[fg=colour245]+{len(rows) - _TMUX_STATUS_MAX}#[default]")
+    return " ".join(parts)
+
+
+def cmd_status_line(args):
+    """`relay status-line --tmux [--lead SID] [--pane %N]`: one line for tmux `status-right`. Never
+    raises and never prints a traceback — on any error it prints nothing (an empty status segment
+    beats a broken bar)."""
+    try:
+        if not getattr(args, "tmux", False):
+            return
+        text = _tmux_status_text(_tmux_scope_leads(args))
+        if text:
+            print(text)
+    except Exception:
+        return
+
+
+def cmd_tmux_setup(args):
+    """`relay tmux-setup [--apply]`: print the tmux.conf lines for the live status bar and the
+    popup key bindings; with --apply also run them against the current tmux server (honours
+    $RELAY_TMUX_SOCKET). It NEVER edits ~/.tmux.conf — paste the lines there to make them stick."""
+    tb = backend.by_name("tmux")
+    relay_path = str(_plugin_root() / "bin" / "relay")
+    print("# relay tmux integration — paste into ~/.tmux.conf (relay never edits it for you)")
+    for line in tb.setup_conf_lines(relay_path):
+        print(line)
+    if not getattr(args, "apply", False):
+        print("# (run `relay tmux-setup --apply` to apply these to the running tmux server now)")
+        return
+    failed = []
+    for argv in tb.setup_commands(relay_path):
+        r = tb._tmux(argv)
+        if not tb._ok(r):
+            failed.append(f"tmux {argv[0]} {argv[1] if len(argv) > 1 else ''}: "
+                          f"{(r.stderr or '').strip() or 'failed'}")
+    if failed:
+        print("applied with errors:\n  " + "\n  ".join(failed), file=sys.stderr)
+        sys.exit(1)
+    print("applied to the running tmux server (lasts until it exits; paste the lines above into "
+          "~/.tmux.conf to keep them)")
 
 
 def _lead_age_cell(m):
@@ -5512,6 +5702,11 @@ def _print_list_plan(args, lead_caller):
 
 
 def cmd_list(args):
+    if getattr(args, "popup_inner", False):
+        return _pager_run(render=lambda: cmd_list(SimpleNamespace(**{**vars(args), "popup": False,
+                                                                    "popup_inner": False})))
+    if _popup_wanted(args, "the list") and _popup_relay(["list"], "relay list"):
+        return
     # LEADS: every lead is a candidate row — you generally want to see/restore any project. The one
     # exception is row 70 item 8's dead weight (ghost/paused leads on OTHER projects), collapsed
     # below. Executor scoping is separate (further down).
@@ -6219,6 +6414,13 @@ def cmd_diff(args):
     n = s.get("current_packet", 1)
     report_path = packets_dir(args.session_id) / f"{n:03d}-report.md"
     _mark_report_surfaced(s)  # the lead is reviewing this report's diff — dedup it (§5b)
+
+    # tmux popup: the staged diff, coloured, in `less -R` over the lead's pane (no HTML page).
+    if getattr(args, "popup_inner", False):
+        return _pager_run(argv=["git", "-C", worktree, "diff", "--cached", "--color=always"])
+    if _popup_wanted(args, "the HTML diff page") and _popup_relay(["diff", args.session_id],
+                                                                  f"diff: {args.session_id}"):
+        return
 
     report_text = None
     if report_path.exists():
@@ -8262,7 +8464,24 @@ def main():
     ck.add_argument("session_id", nargs="?")
     ck.add_argument("--all", action="store_true")
     ck.add_argument("--json", action="store_true")
+    ck.add_argument("--popup", action="store_true", help="show the session's report in a tmux popup "
+                    "(less -R); off tmux, says so and prints normally")
+    ck.add_argument("--popup-inner", dest="popup_inner", action="store_true", help=argparse.SUPPRESS)
     ck.set_defaults(func=cmd_check)
+
+    stl = sub.add_parser("status-line", help="one line of status-bar text for a terminal's status "
+                         "segment (--tmux: tmux format text for `status-right`)")
+    stl.add_argument("--tmux", action="store_true", help="emit tmux format text (#[fg=…])")
+    stl.add_argument("--lead", help="only this lead's executors (default: the lead in the active "
+                     "pane's tmux session, else all)")
+    stl.add_argument("--pane", help="tmux pane id (%%N) to resolve the lead from (default $TMUX_PANE)")
+    stl.set_defaults(func=cmd_status_line)
+
+    tsu = sub.add_parser("tmux-setup", help="print (and with --apply, run) the tmux commands for "
+                         "relay's status bar and popup key bindings")
+    tsu.add_argument("--apply", action="store_true", help="apply to the running tmux server too "
+                     "(never edits ~/.tmux.conf)")
+    tsu.set_defaults(func=cmd_tmux_setup)
 
     stt = sub.add_parser("status")
     stt.add_argument("session_id", nargs="?")
@@ -8282,6 +8501,9 @@ def main():
                     "ghost/paused leads of other projects that are otherwise collapsed to one line")
     ls.add_argument("--plan", action="store_true", help="after EXECUTORS, print the calling lead's "
                     "plan table (no-op without an armed lead)")
+    ls.add_argument("--popup", action="store_true", help="show the list in a tmux popup (less -R); "
+                    "off tmux, says so and prints normally")
+    ls.add_argument("--popup-inner", dest="popup_inner", action="store_true", help=argparse.SUPPRESS)
     ls.set_defaults(func=cmd_list)
 
     cl = sub.add_parser("close")
@@ -8406,6 +8628,10 @@ def main():
     df.add_argument("--open", action="store_true", help="open the generated HTML page after writing it")
     df.add_argument("--all", action="store_true", help="render the whole staged diff, unfiltered "
                     "(default: scoped to files mentioned in the session's current packet report)")
+    df.add_argument("--popup", action="store_true", help="show the staged diff in a tmux popup "
+                    "(git diff --cached | less -R) instead of an HTML page; off tmux, says so and "
+                    "writes the page as usual")
+    df.add_argument("--popup-inner", dest="popup_inner", action="store_true", help=argparse.SUPPRESS)
     df.set_defaults(func=cmd_diff)
 
     vf = sub.add_parser("verify", help="machine-check an executor's report against its staged "

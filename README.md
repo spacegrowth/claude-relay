@@ -67,6 +67,28 @@ wakes you when an executor finishes.
 
 Under iTerm and Terminal.app none of this applies: `check` and `list` behave as before, and `peek` says it needs the tmux backend.
 
+**tmux status bar and popups.** Under tmux, relay can put the executors in the status bar and show reports, diffs and the list in popups over the lead's pane (popups need tmux 3.2+; the popup title needs 3.3+):
+
+```
+relay tmux-setup           # print the lines to paste into ~/.tmux.conf
+relay tmux-setup --apply   # also apply them to the running tmux server now
+```
+
+`tmux-setup` never edits `~/.tmux.conf`; `--apply` lasts until the tmux server exits, so paste the printed lines to keep them. They are:
+
+- `status-right` runs `relay status-line --tmux`, refreshed every `status-interval 5` seconds. It prints each executor as `name:state`, coloured (yellow busy, green reported, orange stalled, red dead), plus a count. It scopes to the lead whose pane is in the active pane's tmux session, else shows every executor. It reads session files only, with no liveness probe, so the state is the last one `relay list` or `relay check` wrote; on any error it prints nothing.
+- `prefix R` opens the session list in a popup. `prefix D` prompts for a session name and opens its staged diff in a popup (this replaces tmux's default `D`, choose-client).
+- The same popups are available from the command line: `relay check <session> --popup` (the report, in `less -R`), `relay diff <session> --popup` (`git diff --cached` in `less -R`, instead of the HTML page) and `relay list --popup`. Outside tmux, `--popup` says it needs tmux and prints the normal output.
+
+**Mac: one backend via `tmux -CC`.** iTerm's tmux integration shows tmux windows as native iTerm tabs. Because `$TMUX` is set inside it, relay picks the tmux backend, so the Mac and a Linux box run the same code path:
+
+```
+tmux -CC new -s work       # start; run claude (and /relay:mode) inside it
+tmux -CC attach -t work    # reattach later, even after closing the window
+```
+
+What works: spawn (each executor is a tmux window, so an iTerm tab), `relay focus` (`select-window`), `relay send`, `relay close`, auto-wake. What does not: tab colors (relay sets tmux's `window-status-style`, which iTerm ignores in `-CC` mode, so executors do not wear the lead's color) and `relay tidy` (a no-op under tmux). iTerm draws no tmux status line in `-CC` mode, so the status bar strip and the lead's wake banner (a tmux status-line message) are not shown there, and popups are not something to rely on either; use `relay list`, `relay board` and `relay diff` (the HTML page) in the lead's pane instead. The OSC 777 banner tier is not used for tmux leads. `relay doctor` prints an advisory line when it sees iTerm around tmux. The status bar and popups are for a plain terminal attached to tmux, such as a Linux box over SSH.
+
 **Why the lead's own model matters**: this role's value is judgment calls (what to delegate, when
 to reuse a session, whether a report is truly mergeable) — that needs a strong reasoning model, and
 no skill can switch it programmatically, so `/relay:mode` has the session say its own tier out loud

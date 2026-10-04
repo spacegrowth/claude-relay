@@ -1791,3 +1791,64 @@ class TestPidsOnTtyPlatforms:
     def test_linux_pid_on_tty_is_first_match(self, monkeypatch):
         self._ps(monkeypatch, "Linux", "  11 pts/3 claude\n  15 pts/3 node /x/claude\n")
         assert iterm.pid_on_tty("/dev/pts/3") == 11
+
+
+class TestTmuxPopupAndSetup:
+    """display-popup argv (with/without -T by tmux version) and the tmux-setup command set."""
+
+    @pytest.fixture
+    def fake(self, monkeypatch):
+        f = _FakeTmux(events=[])
+        monkeypatch.setattr(tmux_backend, "_tmux", f)
+        return f
+
+    def _version(self, monkeypatch, text):
+        monkeypatch.setattr(tmux_backend, "_VERSION_PARSED", None)
+        monkeypatch.setattr(tmux_backend, "version", lambda: text)
+
+    @pytest.mark.parametrize("text,expect", [("tmux 3.6a", (3, 6)), ("tmux 3.2a", (3, 2)),
+                                             ("tmux next-3.5", (3, 5)), (None, (0, 0))])
+    def test_version_tuple_parses_and_caches(self, monkeypatch, text, expect):
+        calls = []
+        monkeypatch.setattr(tmux_backend, "_VERSION_PARSED", None)
+        monkeypatch.setattr(tmux_backend, "version", lambda: calls.append(1) or text)
+        assert tmux_backend.version_tuple() == expect
+        assert tmux_backend.version_tuple() == expect
+        assert len(calls) == 1                      # `tmux -V` runs once
+
+    def test_popup_with_title_on_3_3_plus(self, fake, monkeypatch):
+        self._version(monkeypatch, "tmux 3.4")
+        assert tmux_backend.popup("less -R f", title="report #1") is True
+        assert fake.calls == [["display-popup", "-E", "-w", "80%", "-h", "80%",
+                               "-T", "report ##1", "less -R f"]]
+
+    def test_popup_omits_title_on_3_2(self, fake, monkeypatch):
+        self._version(monkeypatch, "tmux 3.2a")
+        assert tmux_backend.popup("less -R f", title="report", width="90%", height="50%") is True
+        assert fake.calls == [["display-popup", "-E", "-w", "90%", "-h", "50%", "less -R f"]]
+
+    def test_popup_reports_tmux_refusal(self, monkeypatch):
+        self._version(monkeypatch, "tmux 3.4")
+        monkeypatch.setattr(tmux_backend, "_tmux",
+                            lambda a, timeout=5: subprocess.CompletedProcess(a, 1, "", "no client"))
+        assert tmux_backend.popup("x") is False
+
+    def test_setup_commands_and_conf_lines(self):
+        cmds = tmux_backend.setup_commands("/opt/relay/bin/relay")
+        assert cmds[0] == ["set-option", "-g", "status-right",
+                           "#(/opt/relay/bin/relay status-line --tmux --pane #{pane_id})"]
+        assert cmds[1] == ["set-option", "-g", "status-interval", "5"]
+        assert cmds[2][:2] == ["bind-key", "R"] and cmds[2][-1] == "/opt/relay/bin/relay list --popup-inner"
+        assert cmds[3][:5] == ["bind-key", "D", "command-prompt", "-p", "session"]
+        assert cmds[3][-1].endswith("'/opt/relay/bin/relay diff %% --popup-inner'")
+        lines = tmux_backend.setup_conf_lines("/opt/relay/bin/relay")
+        assert lines[0].startswith("set -g status-right '#(/opt/relay/bin/relay status-line --tmux")
+        assert lines[1] == "set -g status-interval 5"
+        assert lines[2].startswith("bind R display-popup -E -w 80% -h 80% ")
+        assert lines[3].startswith("bind D command-prompt -p session ")
+
+    def test_setup_path_with_a_space_is_quoted(self):
+        cmds = tmux_backend.setup_commands("/my dir/relay")
+        assert cmds[0][-1].startswith('#("/my dir/relay" status-line')
+        assert cmds[2][-1] == '"/my dir/relay" list --popup-inner'
+        assert cmds[3][-1].endswith("'\"/my dir/relay\" diff %% --popup-inner'")
