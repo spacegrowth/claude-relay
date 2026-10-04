@@ -622,6 +622,22 @@ successor's first `send`/`resume` — nothing to re-wire. Once settled, the succ
 `/relay:mode` to verify the pin held (idempotent), then asks you whether to close the predecessor's
 now-unarmed tab — say yes and it runs `relay close-predecessor`.
 
+#### In-place rotation (tmux)
+
+On the tmux backend a lead can shed its context **without a new tab**: write the handoff md as
+usual, run `relay handoff --here <handoff.md>`, and end the turn. Once the lead is idle, relay
+types `/clear` into the lead's own pane, and the successor comes up in that same pane. It keeps the
+same tab label, colour and project, its executors are re-parented with their seen-report stamps,
+and lead mode is already armed. Relay then types a one-line pointer at its copy of the handoff
+file. `relay list` shows one lead row for the project: the new session id, with low CTX.
+
+It is **tmux-only**. The lead's marker must say `tmux`, and the command must run in the pane the
+lead armed in. On iTerm or Terminal.app it refuses and points you at the ordinary new-tab
+`relay handoff <handoff.md>`. What tells relay's hooks this `/clear` is a rotation is a short-lived
+marker (`~/.relay-tasks/lead/rotation-pending/<pane>.json`). It **expires after 10 minutes**, and
+if the turn doesn't end within 5 minutes relay gives up, leaves the lead untouched and says so on
+the pane. An ordinary `/clear` with no marker still unarms the lead, exactly as before.
+
 This is a different tool from `relay resume`/`restart`: **resume/restart is for CRASH
 recovery** (reopens the identical conversation, same context back). **Handoff is for WEIGHT**
 (deliberately starts a fresh context on a NEW session id). Use whichever matches the problem —

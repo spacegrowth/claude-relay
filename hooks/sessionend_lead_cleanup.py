@@ -27,6 +27,7 @@ neither policy below, so "nothing happened" is a statement, not an inference fro
 """
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
@@ -44,8 +45,28 @@ STATE_ROOT = os.path.join(os.path.expanduser("~"), ".relay-tasks")
 #
 # Any other reason (e.g. "other", which is what headless `claude -p` produces) → touch nothing,
 # same fail-safe-in-favour-of-staying-armed policy as before.
+#
+# ONE exception to `clear` → hard clear: the /clear that `relay handoff --here` itself types into a
+# tmux lead's pane. It is recognised ONLY by an unexpired rotation marker for this pane naming this
+# exact session as predecessor (lead_guard.rotation_marker_valid), and tombstones with reason
+# `rotated_in_place` so sessionstart_lead_rearm.py can arm the new session id as the successor. An
+# ordinary /clear — no marker — still unarms exactly as before.
 HARD_CLEAR_REASONS = {"clear", "logout"}
 PAUSE_REASONS = {"exit", "prompt_input_exit"}
+
+
+def _rotation_pending_for(lg, sid):
+    """True iff this pane ($TMUX_PANE) holds an UNEXPIRED in-place rotation marker whose
+    predecessor is exactly `sid` (lead_guard.rotation_marker_valid). Anything else — not tmux, no
+    marker, expired, another session's marker, any error — is False, which leaves the ordinary
+    /clear hard-clear path untouched."""
+    try:
+        pane = os.environ.get("TMUX_PANE", "")
+        if not re.match(r"^%\d+$", pane):
+            return False
+        return lg.rotation_marker_valid(lg.read_rotation_marker(STATE_ROOT, pane), predecessor=sid)
+    except Exception:
+        return False
 
 
 def main():
@@ -68,7 +89,13 @@ def main():
             was_lead = lg.is_lead(STATE_ROOT, sid)
             lg.append_ledger(STATE_ROOT, "session_end", session_id=sid, reason=reason, was_lead=was_lead)
 
-        if sid and reason in HARD_CLEAR_REASONS:
+        if sid and reason == "clear" and _rotation_pending_for(lg, sid):
+            # `relay handoff --here` (tmux): this /clear IS the in-place rotation relay itself typed
+            # into the pane. Keep the predecessor's identity on disk — tombstoned, not deleted — so
+            # the SessionStart hook can carry its project/label/colour/executors onto the new
+            # session id. notify=False: a rotation is not an "ended — run /relay:mode" event.
+            lg.tombstone_lead(STATE_ROOT, sid, reason="rotated_in_place", notify=False)
+        elif sid and reason in HARD_CLEAR_REASONS:
             lg.clear_lead(STATE_ROOT, sid)  # no-op if the subtree doesn't exist
         elif sid and reason in PAUSE_REASONS:
             # Resumable: keep the identity, drop the arming. SessionStart(source="resume") revives

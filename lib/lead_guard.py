@@ -1721,6 +1721,112 @@ def carry_forward_surfaced(state_root, from_sid, to_sid, only_executors=None):
         pass
 
 
+def reparent_executors(state_root, old_owner, new_owner, new_owner_project, recolor=None,
+                       ledger=None):
+    """Re-parent every non-terminal executor owned by `old_owner` to `new_owner` — the body of
+    bin/relay's `_reparent_executors`, extracted so the SessionStart hook's in-place rotation
+    (`relay handoff --here`) runs the SAME logic rather than a copy. bin/relay's wrapper passes its
+    own `_recolor_executor_tab` as `recolor` and its own `append_ledger` as `ledger`, so its
+    behaviour is byte-identical to before the extraction: same sorted walk over dirs holding a
+    session.json, same skip of closed/superseded and unreadable records, same fields stamped, same
+    atomic session.json write (sibling .tmp + os.replace, indent=2), same per-executor
+    `carry_forward_surfaced`, same `adopted` ledger event. `recolor=None` skips the tab repaint
+    (the hook's case: an in-place rotation keeps the lead's colour, so there is nothing to
+    repaint); `ledger=None` uses this module's `append_ledger` (same record shape). Returns the
+    re-parented session ids. Raises whatever a session write raises, exactly as the bin/relay
+    original did — callers decide whether to fail open."""
+    log = ledger if ledger is not None else (
+        lambda event, **fields: append_ledger(state_root, event, **fields))
+    root = Path(state_root)
+    moved = []
+    if not root.exists():
+        return moved
+    for sid in sorted(d.name for d in root.iterdir() if (d / "session.json").exists()):
+        p = root / sid / "session.json"
+        try:
+            s = json.loads(p.read_text())
+        except Exception:
+            continue
+        if not isinstance(s, dict) or s.get("owner_lead") != old_owner \
+                or s.get("status") in ("closed", "superseded"):
+            continue
+        s["owner_lead"] = new_owner
+        s["owner_project"] = new_owner_project
+        s["updated"] = now()
+        tmp = root / sid / "session.json.tmp"
+        tmp.write_text(json.dumps(s, indent=2))
+        os.replace(tmp, p)
+        if recolor is not None:
+            recolor(s)   # ownership moved, so the tab's color moves with it
+        carry_forward_surfaced(state_root, old_owner, new_owner, only_executors=[sid])
+        log("adopted", session_id=sid, from_lead=old_owner, to_lead=new_owner, forced=False)
+        moved.append(sid)
+    return moved
+
+
+# ---- in-place rotation marker (`relay handoff --here`, tmux only) -------------------------------
+# `relay handoff --here` rotates a lead WITHOUT a new tab: it writes this marker, a detached helper
+# types `/clear` into the lead's own pane once its turn ends, and the SessionEnd/SessionStart hooks
+# read the marker to tell that /clear apart from an ordinary one (which still unarms). Keyed by the
+# tmux pane id, because the pane is the one identity that survives the /clear — the session id does
+# not. Short-lived on purpose: a marker older than ROTATION_TTL_SECONDS is stale and ignored, so a
+# helper that died can never make some much later /clear in that pane re-arm anything.
+
+ROTATION_TTL_SECONDS = 600
+
+
+def rotation_dir(state_root):
+    """~/.relay-tasks/lead/rotation-pending — no marker.json inside, so `list_leads` skips it."""
+    return Path(state_root) / "lead" / "rotation-pending"
+
+
+def rotation_marker_path(state_root, pane):
+    return rotation_dir(state_root) / f"{pane}.json"
+
+
+def write_rotation_marker(state_root, pane, data):
+    """Atomic write of the rotation marker for `pane` (tmp + os.replace). Raises on failure — the
+    caller (`relay handoff --here`) must refuse rather than launch a helper with no marker."""
+    rotation_dir(state_root).mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(rotation_marker_path(state_root, pane), data)
+
+
+def read_rotation_marker(state_root, pane):
+    """The rotation marker dict for `pane`, or {} when absent/unreadable/not a dict. Never raises."""
+    try:
+        p = rotation_marker_path(state_root, pane)
+        if not p.exists():
+            return {}
+        m = json.loads(p.read_text())
+        return m if isinstance(m, dict) else {}
+    except Exception:
+        return {}
+
+
+def delete_rotation_marker(state_root, pane):
+    """Remove `pane`'s rotation marker. True iff a file was removed. Never raises."""
+    try:
+        rotation_marker_path(state_root, pane).unlink()
+        return True
+    except Exception:
+        return False
+
+
+def rotation_marker_valid(rm, predecessor=None, now_ts=None):
+    """True iff `rm` is a usable rotation marker: has a predecessor and an `expires_at` epoch that
+    is still in the future, and (when `predecessor` is given) names exactly that predecessor sid.
+    Pure; any bad input → False."""
+    try:
+        if not isinstance(rm, dict) or not rm.get("predecessor"):
+            return False
+        if predecessor is not None and rm.get("predecessor") != predecessor:
+            return False
+        t = time.time() if now_ts is None else now_ts
+        return float(rm.get("expires_at")) > t
+    except Exception:
+        return False
+
+
 # ---- #23: WHOSE continuation is this? (relay's own delivery receipt) ---------------------------
 # Field incident 2026-07-22 (~/.relay-tasks/incident-wake-miss-2026-07-22.md — diagnosis by the
 # field lead, credited): #22 above read the harness's GLOBAL `stop_hook_active` flag as proof that
