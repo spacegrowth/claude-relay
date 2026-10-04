@@ -7373,6 +7373,13 @@ class TestExecutorAgentWiring:
         assert "--agent relay-executor" in cmd and "--disallowedTools 'Bash(git commit*),Bash(git push*)'" in cmd
         assert cmd.rstrip().endswith(" x")                   # prompt still last, not swallowed
 
+    def test_build_claude_cmd_labels_executors_for_cue(self, relay, tmp_path):
+        cap = self._spawn(relay, tmp_path)
+        cmd = relay.iterm.build_claude_cmd("x", model="sonnet", session_uuid="u", agent_flags=cap["agent_flags"])
+        assert cmd.startswith("CUE_DRIVEN_BY='its relay lead' ")   # Cue keeps executors out of Waiting
+        plain = relay.iterm.build_claude_cmd("x", model="sonnet", session_uuid="u")
+        assert "CUE_DRIVEN_BY" not in plain                       # leads and probes stay unlabelled
+
     def test_no_agent_file_falls_back_to_full_gates(self, relay, tmp_path):
         with mock.patch.object(relay.lead_guard, "executor_agent_flags", return_value=[]):
             cap = self._spawn(relay, tmp_path, name="legacy")
