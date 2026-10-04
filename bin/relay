@@ -7939,10 +7939,10 @@ def main():
     sp.add_argument("--no-skip-perms", dest="skip_perms", action="store_false",
                     help="force this executor to prompt for permissions (overrides config)")
     # Tri-state, same pattern as --skip-perms/--no-skip-perms: neither flag → None → use config's
-    # executor_layout. --pane forces a split pane in the lead's window (iTerm only, falls back to
-    # a tab if the lead's session can't be located); --tab forces a separate tab.
+    # executor_layout. --pane forces a split pane in the lead's window (iTerm and tmux; falls back to
+    # a tab/window if the lead's session can't be located); --tab forces a separate tab.
     sp.add_argument("--pane", dest="pane", action="store_true", default=None,
-                    help="open this executor as a split pane in the lead's window (overrides config; iTerm only)")
+                    help="open this executor as a split pane in the lead's window (overrides config; iTerm and tmux)")
     sp.add_argument("--tab", dest="pane", action="store_false",
                     help="open this executor as a separate tab (overrides config)")
     sp.set_defaults(func=cmd_spawn)

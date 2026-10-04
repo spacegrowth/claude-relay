@@ -58,7 +58,7 @@ LEAD_DEFAULTS = {
                                   # False here is only for someone who arranges their own tab bar.
                                   # `relay tidy` runs regardless — this key governs the AUTOMATIC
                                   # tidy only.
-    "executor_layout": "tab",    # "tab" | "pane" (pane: iTerm only, split into the lead's window)
+    "executor_layout": "tab",    # "tab" | "pane" (pane: iTerm and tmux, split into the lead's window)
     "handoff_nudge": True,       # suggest handing off when the lead transcript gets heavy
     "handoff_nudge_mb": 5,       # SESSION-AGE signal (MB on disk, a compaction proxy) for BOTH
                                  # leads and executors: MB never shrinks, so a big number means

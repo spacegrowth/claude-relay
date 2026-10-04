@@ -804,10 +804,11 @@ Closing is parking, not loss: the report is on disk, staged work stays in the wo
   stale), so tidy re-resolves a stale id by the tab's own tty instead of losing track of it, and
   `--dry-run`/the `tidy` ledger line report the tabs that would actually move, not just every id it
   looked at (row 89).
-- **Pane layout** (iTerm only): set `"executor_layout": "pane"` (or pass `--pane` at spawn) to open
+- **Pane layout** (iTerm and tmux): set `"executor_layout": "pane"` (or pass `--pane` at spawn) to open
   executors as split panes inside the lead's own tab instead of separate tabs; `--tab` forces a
-  tab for one spawn regardless of config. Falls back to a tab if the lead's iTerm session can't be
-  located. `relay focus` selects the exact pane, not just the tab (Terminal.app: always a window).
+  tab for one spawn regardless of config. Falls back to a tab if the lead's session can't be
+  located. Under tmux the pane is a side-by-side split of the lead's pane. `relay focus` selects
+  the exact pane, not just the tab (Terminal.app: always a window).
 - **True adjacent-tab placement** (iTerm only, optional nicety): for `layout="tab"` spawns,
   AppleScript alone can only put a new tab in the lead's window, never truly next to it — install
   `pip3 install --user iterm2` and enable iTerm's Settings → General → Magic → "Enable Python API"
@@ -839,7 +840,7 @@ Settings live in `~/.relay-tasks/lead/config.json`. If absent, relay creates it 
 | `terminal_app` | "auto" | "iterm" \| "terminal" \| "tmux" \| "auto" (auto-detect: tmux when `$TMUX` is set, else via `$TERM_PROGRAM`; iTerm default) |
 | `tab_colors` | true | iTerm only; color each lead's tab and its executors' tabs uniformly |
 | `tidy_tabs` | true | iTerm only; after a spawn/rotate/handoff/close-predecessor/resume/restart, re-order the tab bar into `[Lead] [Exec…] [Lead 2] [Exec…]` and re-apply each lead's color to its group (see [Telling tabs apart](#telling-tabs-apart)). Needs the optional `iterm2` package + iTerm's Python API; degrades to one dim line without them. `relay tidy` runs regardless of this key |
-| `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm only, split into lead's window) |
+| `executor_layout` | "tab" | "tab" \| "pane" (pane = iTerm and tmux, split into lead's window) |
 | `handoff_nudge` | true | Suggest handing off once when the lead's transcript gets heavy |
 | `handoff_nudge_mb` | 5 | Transcript-size threshold (MB) — the secondary "session age" (compaction-count) signal for **both** leads and executors: MB on disk never shrinks, so a big number alone means several compactions in even when live context currently looks fine. Fires the lead's handoff nudge/statusline segment alongside tokens, and is the executor fallback reading (`relay send`'s gate, `relay list`'s heavy footnote) only when a transcript can't be parsed for real usage at all |
 | `context_warn_tokens` | 120000 | Backlog row 57: an EARLIER, one-shot desktop banner for **executors**, well below `context_nudge_tokens`'s rotate line, so a rotate can be planned instead of discovered in a footnote. Fires once per executor session (via the same two-tier `notify_banner` chain and `claim_notification` stamp every other relay banner uses) the first time live context crosses this line, and adds the session to `relay list`'s yellow `⚠ approaching heavy:` line and an amber `approaching heavy · <ctx>k` chip on the board. Set at/above `context_nudge_tokens` to disable it — that's a no-op, not an error |

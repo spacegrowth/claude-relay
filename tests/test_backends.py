@@ -7,6 +7,7 @@ mocked, argv inspected), and backend.py's selection order + live-handle helpers.
 Run: pytest tests/test_backends.py -v
 """
 import os
+import shutil
 import shlex
 import subprocess
 import sys
@@ -23,6 +24,11 @@ import iterm        # noqa: E402
 import terminal_app  # noqa: E402
 import tmux_backend  # noqa: E402
 import lead_guard   # noqa: E402
+
+# The bootstrap guard must hold under both interactive shells a tab can run. zsh is the macOS
+# default but is not installed on stock Ubuntu, so its case skips there instead of failing.
+SHELLS = ["bash", pytest.param("zsh", marks=pytest.mark.skipif(
+    shutil.which("zsh") is None, reason="zsh not installed"))]
 
 
 def _ok(stdout):
@@ -903,7 +909,7 @@ class TestBootstrapInertWhenMisdelivered:
         return subprocess.run([shell, "-c", typed], capture_output=True, text=True, env=env,
                               timeout=30)
 
-    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    @pytest.mark.parametrize("shell", SHELLS)
     @pytest.mark.parametrize("wrong_session", [
         "w1t3p0:LEAD-DATA-PROVIDER-SESSION",   # the incident: a different live tab
         "",                                    # variable present but empty
@@ -917,7 +923,7 @@ class TestBootstrapInertWhenMisdelivered:
         assert r.returncode == 0, "a mis-delivered payload must be harmless, not an error"
         assert "mis-delivered" in r.stdout
 
-    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    @pytest.mark.parametrize("shell", SHELLS)
     def test_truncated_sid_argument_is_also_inert(self, tmp_path, shell):
         # §15b: truncation can now only shorten the TYPED line. A clipped trailing $1 must
         # mismatch the guard and no-op — even when delivered to the CORRECT tab.
@@ -927,7 +933,7 @@ class TestBootstrapInertWhenMisdelivered:
         assert r.returncode == 0
         assert "mis-delivered" in r.stdout
 
-    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    @pytest.mark.parametrize("shell", SHELLS)
     def test_positive_control_the_real_tab_still_runs_it(self, tmp_path, shell):
         # The other half of the same run: the guard must not break healthy spawns. Same typed
         # line, delivered to the tab whose $ITERM_SESSION_ID carries the target id.
@@ -1045,7 +1051,7 @@ class TestGuardDoesNotWedgeVictimShell:
         assert marker in payload
         return payload[:payload.index(marker) + len(marker)]
 
-    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    @pytest.mark.parametrize("shell", SHELLS)
     def test_repro_old_shape_swallows_the_rename_line(self, shell):
         old = self.OLD_SHAPE % ("TARGET-UUID", "cd /tmp && exec claude --session-id 290f5187", "TARGET-UUID")
         r = self._feed(self._truncated(old, "was"), shell)
@@ -1054,7 +1060,7 @@ class TestGuardDoesNotWedgeVictimShell:
             f"expected an unterminated-quote wedge, got: {blob!r}"
         assert "/rename" not in blob, "the rename line should have been swallowed by the open quote"
 
-    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    @pytest.mark.parametrize("shell", SHELLS)
     def test_typed_line_cut_at_every_offset_never_wedges(self, shell, tmp_path):
         # §15b: the only thing typed now is `sh <file> <sid>`. Cut it at EVERY offset, feed it
         # plus the /rename line to a real shell: no truncation point may leave a quote or block
@@ -1074,7 +1080,7 @@ class TestGuardDoesNotWedgeVictimShell:
                 f"offset {cut}: the rename line was swallowed — {blob!r}"
             assert not marker.exists(), f"offset {cut}: a truncated line RAN the bootstrap"
 
-    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    @pytest.mark.parametrize("shell", SHELLS)
     def test_misdelivered_typed_line_exits_zero(self, shell, tmp_path):
         # The full typed line in a wrong shell (no matching $ITERM_SESSION_ID): notice once,
         # rc 0 — a victim shell must not be left with a non-zero $? for a no-op it never asked for.
