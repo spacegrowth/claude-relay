@@ -433,7 +433,7 @@ def test_the_poller_sleeps_off_tmux(tmp_path, monkeypatch, backend):
     seen = _poller_case(tmp_path, monkeypatch, backend)
     run = H.run_hook_inproc(STOP, H.stop_payload(tmp_path), tmp_path)
     assert run.returncode == H.WAKE and "landed via sleep" in run.stderr
-    assert seen["wait"] == [] and seen["sleep"][0] == 3
+    assert seen["wait"] == [] and 3 in seen["sleep"]   # interval sleep ran (Linux adds a 1 ms one first)
 
 
 def test_the_poller_falls_back_to_sleep_when_wait_for_errors(tmp_path, monkeypatch):
@@ -442,7 +442,7 @@ def test_the_poller_falls_back_to_sleep_when_wait_for_errors(tmp_path, monkeypat
                         lambda ch, t: seen["wait"].append((ch, t)) or "error")
     run = H.run_hook_inproc(STOP, H.stop_payload(tmp_path), tmp_path)
     assert run.returncode == H.WAKE and "landed via sleep" in run.stderr
-    assert seen["wait"] == [("relay-wake-lead-1", 3)] and seen["sleep"][0] == 3
+    assert seen["wait"] == [("relay-wake-lead-1", 3)] and 3 in seen["sleep"]
 
 
 @pytest.mark.parametrize("drv", H.DRIVERS, ids=H.DRIVER_IDS)
