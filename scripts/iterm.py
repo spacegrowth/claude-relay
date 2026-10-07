@@ -788,7 +788,8 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
         "set targetFound to false\n"
         "set didWrite to false\n"
         f'tell application "{ITERM_APP_NAME}"\n'
-        "  activate\n"
+        # No `activate`: the new tab opens behind whatever you are in, so a spawn never takes your focus
+        # (it's typed into by its own session, not the front one). `relay focus` brings it forward.
         f"{target_block}"
         '  if not targetFound then return "NOTARGET" & linefeed & "" & linefeed & frontTitle\n'
         "  set sid to id of targetSession\n"

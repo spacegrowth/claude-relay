@@ -71,6 +71,12 @@ class TestTabColor:
         boot = (tmp_path / iterm.BOOTSTRAP_FILENAME).read_text()
         assert "printf '\\033]6;1;bg;red;brightness;9" in boot
 
+    def test_spawn_never_brings_iterm_to_the_front(self, tmp_path):
+        # A new executor opens behind whatever you're in: no `activate` (that's focus()'s job).
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run:
+            iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile=str(tmp_path / "pid"), rename_delay=0)
+        assert "activate" not in osa_run.call_args_list[0][0][0]
+
     def test_spawn_omits_printf_without_color(self, tmp_path):
         with mock.patch.object(iterm, "run_osascript", return_value=_ok("")) as osa_run:
             iterm.spawn(cwd="/tmp", prompt="p", label="l", pidfile=str(tmp_path / "pid"),
@@ -499,6 +505,12 @@ class TestTerminalAppBackend:
         assert terminal_app._wid("w0t0p0:UUID") is None   # foreign (iTerm) handle
         assert terminal_app._wid(None) is None
         assert terminal_app._wid("twid:nope") is None
+
+    def test_spawn_never_brings_terminal_to_the_front(self, tmp_path):
+        with mock.patch.object(terminal_app, "run_osascript", return_value=_ok("77\n")) as osa_run, \
+             mock.patch.object(terminal_app, "rename_by_id", return_value=True):
+            terminal_app.spawn(cwd="/tmp", prompt="p", label="[Exec] e1", pidfile=str(tmp_path / "pid"))
+        assert "activate" not in osa_run.call_args_list[0][0][0]
 
     def test_spawn_captures_window_id_to_handle_file(self, tmp_path):
         handle_file = tmp_path / "handle"

@@ -65,7 +65,8 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     # `tty` is unique, so: take the new tab's tty, then find the window owning that tty.
     script = (
         f'tell application "{APP}"\n'
-        "  activate\n"
+        # No `activate`: the new tab opens behind whatever you are in, so a spawn never takes your focus
+        # (`do script` runs it in the new window either way). `relay focus` brings it forward.
         f'  set t to do script "{osa(cmd)}"\n'
         "  set theTty to tty of t\n"
         "  repeat with w in windows\n"
