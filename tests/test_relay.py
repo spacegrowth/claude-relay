@@ -1310,6 +1310,58 @@ class TestCmdList:
         ids = {e["session_id"] for e in data["executors"]}
         assert ids == {"live-1", "closed-1"}
 
+    # ── --json per-executor packet fields: goal / outcome / verify (open executors only) ─────────
+    def _packet_files(self, relay, sid, packet="GOAL: ship the widget\nmore detail\n", report=None):
+        d = relay.packets_dir(sid)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "001-packet.md").write_text(packet)
+        if report is not None:
+            (d / "001-report.md").write_text(report)
+
+    def _json_rows(self, relay, capsys):
+        relay.cmd_list(self._args(json=True))
+        return {e["session_id"]: e for e in json.loads(capsys.readouterr().out)["executors"]}
+
+    def test_json_open_executor_carries_goal_outcome_and_latest_verify(self, relay, capsys):
+        self._exec(relay, "e1")
+        self._packet_files(relay, "e1", packet="\n## GOAL: ship the widget\nmore detail\n",
+                           report="\nWidget shipped; 4 new tests, suite green, staged.\nStatus: clean\n")
+        relay.append_ledger("report_verify", session_id="e1", packet=1, verdict="MISMATCH",
+                            rerun=False, mismatches=2)
+        relay.append_ledger("report_verify", session_id="e1", packet=1, verdict="COUNTS-MATCH",
+                            rerun=True, mismatches=0)
+        relay.append_ledger("report_verify", session_id="e1", packet=2, verdict="MALFORMED",
+                            rerun=False, mismatches=0)       # another packet: not this one's
+        relay.append_ledger("report_verify", session_id="other", packet=1, verdict="MALFORMED",
+                            rerun=False, mismatches=0)       # another session: not this one's
+        row = self._json_rows(relay, capsys)["e1"]
+        assert row["goal"] == "ship the widget"               # heading + "GOAL:" dropped
+        assert row["outcome"] == "Widget shipped; 4 new tests, suite green, staged."
+        assert row["verify"]["verdict"] == "COUNTS-MATCH"     # the LAST event for packet 1
+        assert row["verify"]["rerun"] is True and row["verify"]["mismatches"] == 0
+        assert row["verify"]["ts"]
+        assert row["status"] and row["session_id"] == "e1"    # existing keys untouched
+
+    def test_json_open_executor_without_report_or_verify(self, relay, capsys):
+        self._exec(relay, "e1")
+        self._packet_files(relay, "e1", packet="GOAL: " + "x" * 400 + "\n")
+        row = self._json_rows(relay, capsys)["e1"]
+        assert row["outcome"] == "" and row["verify"] is None
+        assert len(row["goal"]) == 300 and row["goal"].endswith("…")
+
+    @pytest.mark.parametrize("status", ["closed", "superseded", "dead"])
+    def test_json_closed_executor_has_no_packet_fields(self, relay, capsys, status):
+        self._exec(relay, "gone", status=status)
+        self._packet_files(relay, "gone", report="All done.\n")
+        relay.append_ledger("report_verify", session_id="gone", packet=1, verdict="COUNTS-MATCH",
+                            rerun=False, mismatches=0)
+        self._exec(relay, "open-1")
+        self._packet_files(relay, "open-1")
+        rows = self._json_rows(relay, capsys)
+        assert rows["gone"]["status"] == status
+        assert not {"goal", "outcome", "verify"} & set(rows["gone"])
+        assert rows["open-1"]["goal"] == "ship the widget"
+
     def test_footer_absent_when_no_terminal_rows(self, relay, capsys):
         # No footer if there are no terminal sessions to hide
         self._exec(relay, "live-1", status="busy")
@@ -2463,6 +2515,62 @@ class TestSend:
         s = relay.read_session("e1")
         assert s["status"] == "busy" and s["current_packet"] == 2  # new packet is now in flight
 
+    @pytest.mark.parametrize("state, says", [
+        ("trust", "folder trust"),                         # the known trust dialog
+        ("starting", "isn't ready yet"),                    # an unknown dialog / not drawn yet
+        (None, "isn't ready yet"),                          # the screen can't be read
+    ])
+    # None = conversation_transcript_exists can't tell (no/unreadable projects root): no evidence
+    # claude got past startup, so it is gated exactly like "no transcript".
+    @pytest.mark.parametrize("transcript", [False, None])
+    def test_send_types_nothing_unless_the_input_box_is_ready(self, relay, tmp_path, state, says,
+                                                              transcript):
+        # A live tab whose conversation never started (no transcript): it may sit on a dialog —
+        # Claude Code's trust prompt or one relay doesn't recognise — where typing the pointer
+        # would answer it. Without POSITIVE evidence of a live input box nothing is sent, queued,
+        # resumed or closed; the lead gets a clear refusal (non-zero exit).
+        self._mk(relay, status="reported", pid=os.getpid(), report=True)
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send, \
+             mock.patch.object(relay.iterm, "press_enter", return_value=True) as enter, \
+             mock.patch.object(relay.iterm, "spawn") as spawn, \
+             mock.patch.object(relay.iterm, "close") as close, \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay, "conversation_transcript_exists", return_value=transcript), \
+             mock.patch.object(relay.iterm, "screen_state", return_value=state) as probe:
+            with pytest.raises(SystemExit) as ei:
+                relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        assert says in str(ei.value) and "nothing sent" in str(ei.value)
+        assert ei.value.code not in (0, None)
+        probe.assert_called_once_with("w0t0p0:OLD")
+        send.assert_not_called(); enter.assert_not_called()
+        spawn.assert_not_called(); close.assert_not_called()
+        assert relay.read_session("e1")["current_packet"] == 1
+        assert relay.read_queue("e1") == []
+        assert not (relay.packets_dir("e1") / "002-packet.md").exists()
+
+    @pytest.mark.parametrize("transcript", [False, None])
+    def test_send_types_once_the_input_box_is_ready(self, relay, tmp_path, transcript):
+        self._mk(relay, status="reported", pid=os.getpid(), report=True)
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send, \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay, "conversation_transcript_exists", return_value=transcript), \
+             mock.patch.object(relay.iterm, "screen_state", return_value="ready") as probe:
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        probe.assert_called_once_with("w0t0p0:OLD")
+        send.assert_called_once()
+        assert relay.read_session("e1")["current_packet"] == 2
+
+    def test_send_skips_the_screen_probe_once_the_conversation_exists(self, relay, tmp_path):
+        # A transcript on disk means claude got past startup — today's behavior: no screen read.
+        self._mk(relay, status="reported", pid=os.getpid(), report=True)
+        with mock.patch.object(relay.iterm, "send", return_value=True) as send, \
+             mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay, "conversation_transcript_exists", return_value=True), \
+             mock.patch.object(relay.iterm, "screen_state", return_value="starting") as probe:
+            relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
+        probe.assert_not_called()
+        send.assert_called_once()
+
     def test_genuinely_busy_still_refused(self, relay, tmp_path):
         # A process-alive, no-report session is really mid-turn → still refused (no mid-turn inject).
         self._mk(relay, status="busy", pid=os.getpid(), report=False)
@@ -2549,8 +2657,11 @@ class TestSend:
         (relay.packets_dir("e1") / "002-report.md").write_text("done")
         monkeypatch.delenv("RELAY_NO_NOTIFY", raising=False)
         calls = []
+        # cmd_send's folder-trust probe (no transcript for cs-x here) reads the tab's screen through
+        # osascript — stubbed, so the only osascript call left to count is the banner itself.
         with mock.patch.object(relay.iterm, "send", return_value=True), \
              mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay, "_trust_prompt_showing", return_value=False), \
              mock.patch.object(relay.subprocess, "run", side_effect=lambda a, **k: calls.append(a)):
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
         banners = [a for a in calls if a and a[0] == "osascript"]
@@ -2567,8 +2678,11 @@ class TestSend:
         (relay.packets_dir("e1") / "002-report.md").write_text("done")
         monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
         calls = []
+        # cmd_send's folder-trust probe (no transcript for cs-x here) reads the tab's screen through
+        # osascript — stubbed, so the only osascript call left to count is the banner itself.
         with mock.patch.object(relay.iterm, "send", return_value=True), \
              mock.patch.object(relay.iterm, "is_alive", return_value=True), \
+             mock.patch.object(relay, "_trust_prompt_showing", return_value=False), \
              mock.patch.object(relay.subprocess, "run", side_effect=lambda a, **k: calls.append(a)):
             relay.cmd_send(SimpleNamespace(session_id="e1", packet=self._packet(relay, tmp_path)))
         assert not [a for a in calls if a and a[0] == "osascript"]
@@ -6518,6 +6632,39 @@ class TestEnsureTabLabelBackgroundHandoff:
         assert ok is False
         launch.assert_called_once_with(bk, "h1", "[Exec] e1")
 
+    @pytest.mark.parametrize("state", ["trust", "starting", None])
+    def test_retries_type_no_rename_unless_the_input_box_is_ready(self, relay, state):
+        # The iTerm retry path: label not live and the tab shows the folder-trust dialog, a dialog
+        # relay doesn't know ("starting"), or can't be read → the /rename (digits + Enter) is
+        # never typed; the label simply isn't fixed yet.
+        bk = mock.Mock(NAME="iterm")
+        bk.is_alive.return_value = False
+        bk.screen_state.return_value = state
+        with mock.patch.object(relay, "_launch_background_label_assert"), \
+             mock.patch.object(relay.time, "sleep"):
+            ok = relay._ensure_tab_label(bk, "h1", "[Exec] e1", attempts=3, delay=0)
+        assert ok is False
+        assert bk.screen_state.call_count == 3
+        bk.rename_by_id.assert_not_called()
+
+    def test_retries_rename_once_the_input_box_is_ready(self, relay):
+        bk = mock.Mock(NAME="iterm")
+        bk.is_alive.return_value = False
+        bk.screen_state.side_effect = ["starting", "ready"]
+        with mock.patch.object(relay, "_launch_background_label_assert"), \
+             mock.patch.object(relay.time, "sleep"):
+            relay._ensure_tab_label(bk, "h1", "[Exec] e1", attempts=2, delay=0)
+        bk.rename_by_id.assert_called_once_with("h1", "[Exec] e1")
+
+    def test_a_backend_without_a_screen_probe_still_renames(self, relay):
+        # Terminal.app: its rename_by_id sets tab chrome, never a keystroke into claude.
+        bk = mock.Mock(spec=["NAME", "is_alive", "rename_by_id"], NAME="terminal")
+        bk.is_alive.return_value = False
+        with mock.patch.object(relay, "_launch_background_label_assert"), \
+             mock.patch.object(relay.time, "sleep"):
+            relay._ensure_tab_label(bk, "twid:5", "[Exec] e1", attempts=2, delay=0)
+        assert bk.rename_by_id.call_count == 2
+
     def test_no_handle_never_launches(self, relay):
         bk = mock.Mock(NAME="iterm")
         with mock.patch.object(relay, "_launch_background_label_assert") as launch:
@@ -6658,6 +6805,30 @@ class TestBackgroundLabelLoop:
     """_background_label_loop: the polling logic that runs inside the detached `relay
     _ensure-label` subprocess. Uses injectable clock_fn/sleep_fn so the bounded window is
     exercised without a real ~30s wait."""
+
+    @pytest.mark.parametrize("state", ["trust", "starting", None])
+    def test_never_renames_unless_the_input_box_is_ready(self, relay, monkeypatch, state):
+        # (conftest stubs the probe to "ready" for every test; this one pins the unready states.)
+        monkeypatch.setattr(relay.iterm_backend, "screen_state", lambda handle: state)
+        with mock.patch.object(relay.iterm_backend, "title_by_id", return_value="claude"), \
+             mock.patch.object(relay.iterm_backend, "rename_by_id") as rename:
+            ok = relay._background_label_loop(
+                "h1", "[Exec] e1", window=10, interval=3,
+                clock_fn=self._fake_clock([0, 3, 6, 9, 12]), sleep_fn=lambda s: None)
+        assert ok is False
+        rename.assert_not_called()
+
+    def test_renames_once_the_input_box_is_ready(self, relay, monkeypatch):
+        states = iter(["starting", "starting", "ready"])
+        monkeypatch.setattr(relay.iterm_backend, "screen_state", lambda handle: next(states, "ready"))
+        with mock.patch.object(relay.iterm_backend, "title_by_id", return_value="claude"), \
+             mock.patch.object(relay.iterm_backend, "rename_by_id") as rename:
+            relay._background_label_loop(
+                "h1", "[Exec] e1", window=10, interval=3,
+                clock_fn=self._fake_clock([0, 3, 6, 9, 12]), sleep_fn=lambda s: None)
+        # window 10 over ticks 3/6/9 = three polls: only the third ("ready") renames
+        assert rename.call_count == 1
+        rename.assert_called_with("h1", "[Exec] e1")
 
     def _fake_clock(self, ticks):
         """ticks: a list of times consumed one per clock_fn() call; the last value repeats once
@@ -7419,6 +7590,7 @@ class TestExecutorAgentWiring:
         nxt = tmp_path / "n.md"; nxt.write_text("# next\nmore")
         for agent, marker in (("relay-executor", "REPORT: write your full report"), (None, "STAGE, NEVER COMMIT")):
             s = relay.read_session("a1"); s["agent"] = agent; s["status"] = "reported"; s["pid"] = os.getpid()
+            s["iterm_session"] = "w0t0p0:A1"   # what a real spawn captures (read_iterm_id)
             relay.write_session("a1", s)
             with mock.patch.object(relay.iterm, "send", return_value=True), mock.patch.object(relay.iterm, "is_alive", return_value=True):
                 relay.cmd_send(SimpleNamespace(session_id="a1", packet=str(nxt)))
@@ -7523,7 +7695,7 @@ class TestSendRotate:
         relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
         relay.write_session(sid, {"session_id": sid, "worktree": str(tmp_path), "topic": "parser", "scope": "p",
             "tab_label": "x", "model": "sonnet", "mcp": ["linear"], "context": "200k", "agent": "relay-executor",
-            "pid": None, "claude_session": "cs-h", "status": "reported", "current_packet": 1, "owner_lead": "lead-1",
+            "pid": None, "iterm_session": "w0t0p0:H", "claude_session": "cs-h", "status": "reported", "current_packet": 1, "owner_lead": "lead-1",
             "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
         (relay.packets_dir(sid) / "001-packet.md").write_text("first")
         (relay.packets_dir(sid) / "001-report.md").write_text("Done.\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: x")
@@ -7551,7 +7723,7 @@ class TestSendRotate:
         relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
         relay.write_session(sid, {"session_id": sid, "worktree": str(tmp_path), "topic": "parser", "scope": "p",
             "tab_label": "x", "model": model, "mcp": None, "context": "1m", "agent": "relay-executor",
-            "pid": None, "claude_session": "cs-u", "status": "reported", "current_packet": 1, "owner_lead": "lead-1",
+            "pid": None, "iterm_session": "w0t0p0:H", "claude_session": "cs-u", "status": "reported", "current_packet": 1, "owner_lead": "lead-1",
             "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
         (relay.packets_dir(sid) / "001-packet.md").write_text("first")
         (relay.packets_dir(sid) / "001-report.md").write_text("Done.\nStatus: partial\nRisk flags: none\nUNVERIFIED: none\nChanged: x")
@@ -7596,7 +7768,7 @@ class TestSendRotate:
         sid = "heavy2"
         relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
         relay.write_session(sid, {"session_id": sid, "worktree": str(tmp_path), "topic": "t", "scope": "t", "tab_label": "x",
-            "model": "sonnet", "pid": None, "claude_session": "cs-h2", "status": "reported", "current_packet": 1,
+            "model": "sonnet", "pid": None, "iterm_session": "w0t0p0:H", "claude_session": "cs-h2", "status": "reported", "current_packet": 1,
             "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
         (relay.packets_dir(sid) / "001-packet.md").write_text("first"); (relay.packets_dir(sid) / "001-report.md").write_text("done")
         nxt = tmp_path / "n.md"; nxt.write_text("next")
@@ -8649,7 +8821,7 @@ class TestSuccessorName:
         relay.packets_dir(sid).mkdir(parents=True, exist_ok=True)
         relay.write_session(sid, {"session_id": sid, "worktree": str(tmp_path), "topic": "t", "scope": "s",
             "tab_label": "x", "model": "sonnet", "mcp": None, "context": "1m", "agent": "relay-executor",
-            "pid": None, "claude_session": "cs-h2", "status": "reported", "current_packet": 1, "owner_lead": "lead-1",
+            "pid": None, "iterm_session": "w0t0p0:H", "claude_session": "cs-h2", "status": "reported", "current_packet": 1, "owner_lead": "lead-1",
             "busy_since": relay.now(), "created": relay.now(), "updated": relay.now()})
         (relay.packets_dir(sid) / "001-packet.md").write_text("first")
         (relay.packets_dir(sid) / "001-report.md").write_text("Done.\nStatus: clean\nRisk flags: none\nUNVERIFIED: none\nChanged: x")
@@ -8996,3 +9168,27 @@ class TestTmuxUi:
                                         popup_inner=True))
         assert paged[0][0][0] == "cat" and paged[1][0] == ["/usr/bin/less", "-R"]
         assert os.environ.pop("RELAY_FORCE_COLOR") == "1"   # popup pager keeps colour
+
+
+class TestRetitleIsGatedOnReadiness:
+    """retitle_tab types `/rename` (iTerm, tmux), so it only does so on a "ready" screen."""
+
+    @pytest.mark.parametrize("state", ["trust", "starting", "shell", None])
+    def test_unready_pane_gets_no_keys(self, relay, state, capsys):
+        bk = mock.Mock()
+        bk.screen_state.return_value = state
+        assert relay.retitle_tab(bk, "tmux:%7", "[closed] e1") is False
+        bk.rename_by_id.assert_not_called()
+        assert "retitle" in capsys.readouterr().err
+
+    def test_ready_pane_is_retitled(self, relay):
+        bk = mock.Mock()
+        bk.screen_state.return_value = "ready"
+        bk.rename_by_id.return_value = True
+        assert relay.retitle_tab(bk, "tmux:%7", "[closed] e1") is True
+        bk.rename_by_id.assert_called_once_with("tmux:%7", "[closed] e1")
+
+    def test_backend_without_a_probe_still_retitles(self, relay):
+        bk = mock.Mock(spec=["rename_by_id"])
+        bk.rename_by_id.return_value = True
+        assert relay.retitle_tab(bk, "twid:3", "[closed] e1") is True

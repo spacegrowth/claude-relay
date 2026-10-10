@@ -53,6 +53,7 @@ import diff_render
 import board_render
 import lead_guard
 import report_verify
+import trust_prompt  # Claude Code's folder-trust dialog, as seen on a screen (scripts/)
 import platform_cmds  # the one macOS/Linux seam: open_path, copy_to_clipboard, is_linux
 import iterm as iterm_backend  # the REAL scripts/iterm.py module, always -- distinct from the
                                # `iterm` name below (this invocation's SELECTED backend, which can
@@ -157,6 +158,16 @@ def retitle_tab(bk, handle, new_title):
     """Best-effort tab retitle. Returns True only if the backend confirms it. NEVER raises and
     never fails its caller: a handoff or a close must not break because a tab title didn't take."""
     if not handle:
+        return False
+    # iTerm and tmux retitle by TYPING `/rename <title>` into the session, so the retitle is a
+    # keystroke like any other: only on POSITIVE evidence that claude's input box is live (or the
+    # mid-turn spinner, where the line queues). A trust prompt, an unknown dialog, a shell left
+    # behind by a dead claude or an unreadable screen skips it — the title is cosmetic; a stray
+    # line answering a dialog is not. Terminal.app (no screen probe) sets chrome, never types.
+    state = _screen_state(bk, handle)
+    if state not in ("ready", SCREEN_NO_PROBE):
+        print(c(f"  (tab retitle to {new_title!r} skipped: {_screen_state_reason(state)} — "
+                f"relay types nothing into a pane it can't vouch for)", "dim"), file=sys.stderr)
         return False
     try:
         return bool(bk.rename_by_id(handle, new_title))
@@ -964,6 +975,7 @@ def _screen_input_box(lines):
 def _classify_screen(screen, command=None, needles=()):
     """Pure: (verdict, excerpt) for one captured screen. Checked in this order —
       crashed  `command` (the pane's foreground process) is a shell: claude has exited;
+      trust    Claude Code's folder-trust dialog is up (scripts/trust_prompt.py): waiting on a human;
       prompt   ≥2 PROMPT_PATTERNS entries in the bottom rows: a permission/selection dialog waits;
       working  the "esc to interrupt" spinner is showing: mid-turn;
       unsent   the input box still holds one of `needles` (the last typed packet pointer) and no
@@ -976,6 +988,8 @@ def _classify_screen(screen, command=None, needles=()):
     cmd = (command or "").strip().lstrip("-").lower()
     if cmd and cmd in SCREEN_SHELLS:
         return "crashed", f"[{cmd}] {last}".rstrip()
+    if trust_prompt.is_live(screen):
+        return "trust", trust_prompt.WAITING_TEXT
     hits = [(p, ln) for p in PROMPT_PATTERNS for ln in tail if p.search(ln)]
     if len({p.pattern for p, _ in hits}) >= 2:
         # The dialog's question when it has one; else the topmost matched row (a selection
@@ -1006,10 +1020,20 @@ def _screen_needles(s):
 
 
 def _screen_verdict(s, lines=40):
-    """{"verdict", "excerpt"} for a TMUX session whose pane can be captured, else None (any other
-    backend, no handle, pane gone) — callers print/flag nothing on None."""
+    """{"verdict", "excerpt"} for a TMUX session whose pane can be captured, else None (no handle,
+    pane gone) — callers print/flag nothing on None. Any other backend answers only the "trust"
+    verdict (folder-trust dialog up), else None."""
     bk = term_backend(s)
-    if getattr(bk, "NAME", "") != "tmux" or not s.get("iterm_session"):
+    if not s.get("iterm_session"):
+        return None
+    if getattr(bk, "NAME", "") != "tmux":
+        # Off tmux the screen is read for ONE thing only: the folder-trust dialog, and only while
+        # the pinned conversation has no transcript yet (claude never got past startup — the
+        # dialog's signature), so a healthy iTerm executor costs no extra osascript call.
+        if conversation_transcript_exists(s.get("claude_session")) is not False:
+            return None
+        if _trust_prompt_showing(bk, s["iterm_session"]):
+            return {"verdict": "trust", "excerpt": trust_prompt.WAITING_TEXT}
         return None
     try:
         screen = bk.capture(s["iterm_session"], lines=lines)
@@ -1146,7 +1170,8 @@ def _ensure_tab_label(bk, handle, label, attempts=3, delay=1.5):
         if bk.is_alive(label, handle):
             _launch_background_label_assert(bk, handle, label)
             return True
-        bk.rename_by_id(handle, label)
+        if _ready_to_type(bk, handle):  # only into a live input box — never onto a dialog
+            bk.rename_by_id(handle, label)
         time.sleep(delay)
     ok = bk.is_alive(label, handle)
     _launch_background_label_assert(bk, handle, label)
@@ -1226,9 +1251,72 @@ def _background_label_loop(handle, label, window=27.0, interval=3.0, hold_checks
                 return True
         else:
             consecutive = 0
-            iterm_backend.rename_by_id(handle, label)
+            # Typed only on POSITIVE evidence of a live input box (_ready_to_type): onto Claude
+            # Code's folder-trust dialog — or any dialog relay doesn't know — the /rename's digits
+            # + Enter would answer it. A skipped poll renames on a later one once the box is up.
+            if _ready_to_type(iterm_backend, handle):
+                iterm_backend.rename_by_id(handle, label)
         sleep_fn(interval)
     return consecutive >= hold_checks
+
+
+def _trust_prompt_showing(bk, handle):
+    """Is the session behind `handle` parked on Claude Code's folder-trust dialog right now
+    (scripts/trust_prompt.py)? Asks the backend's own `trust_prompt_live` (tmux: capture-pane;
+    iTerm: the session's screen contents); a backend without one (Terminal.app — it never types
+    into a running claude) or any failure reads as False."""
+    probe = getattr(bk, "trust_prompt_live", None)
+    if not handle or probe is None:
+        return False
+    try:
+        return bool(probe(handle))
+    except Exception:
+        return False
+
+
+# _screen_state's answer for a backend with no screen probe (Terminal.app): nothing it does types
+# into a running claude — its rename_by_id sets a custom tab title and its send always routes
+# through the resume fallback — so there is no keystroke for readiness to guard.
+SCREEN_NO_PROBE = "no-probe"
+
+
+def _screen_state(bk, handle):
+    """The backend's `screen_state(handle)` (scripts/trust_prompt.launch_state of the session's
+    screen): "ready" | "trust" | "starting" (tmux also "shell"); None when there is no handle, the
+    screen can't be read or the probe fails; SCREEN_NO_PROBE for a backend without one."""
+    probe = getattr(bk, "screen_state", None)
+    if probe is None:
+        return SCREEN_NO_PROBE
+    if not handle:
+        return None
+    try:
+        return probe(handle)
+    except Exception:
+        return None
+
+
+def _screen_state_reason(state):
+    """A short human phrase for a non-ready _screen_state — why relay typed nothing."""
+    return {None: "its screen can't be read", "shell": "claude isn't running in it",
+            "starting": "no live Claude input box on screen",
+            "trust": "it is on Claude Code's folder-trust prompt"}.get(state, f"screen: {state}")
+
+
+def _ready_to_type(bk, handle):
+    """May relay type a line (a /rename) into this session right now? Only on POSITIVE evidence
+    that claude's input box is live (screen state "ready"). "trust", "starting" (a dialog relay
+    doesn't recognise included), "shell" and an unreadable screen all read as NO — absence of a
+    known dialog is never readiness. A backend that never types into claude (SCREEN_NO_PROBE) is
+    let through: its rename is tab chrome, not a keystroke."""
+    return _screen_state(bk, handle) in ("ready", SCREEN_NO_PROBE)
+
+
+def _warn_trust_prompt(session_id):
+    """The spawn/relaunch line when the new tab opened on the folder-trust dialog. Relay typed
+    NOTHING into it (accepting trust is the owner's security decision) — the human answers it."""
+    print(c(f"  ⚠ '{session_id}' is {trust_prompt.WAITING_TEXT} (relay focus {session_id}). Relay "
+            f"typed nothing into it; once trusted, claude starts the packet on its own.", "yellow"),
+          file=sys.stderr)
 
 
 def cmd_ensure_label(args):
@@ -1596,7 +1684,9 @@ def cmd_spawn(args):
         print(f"spawned session '{session_id}' (tab '{label}') with packet {n:03d} — WARNING: could not read PID, aliveness/stall detection will rely on tab title only")
     else:
         print(f"spawned session '{session_id}' (tab '{label}', pid {pid}) with packet {n:03d}")
-    if not label_ok:
+    if (outcome or {}).get("trust_prompt"):
+        _warn_trust_prompt(session_id)
+    elif not label_ok:
         print(f"WARNING: tab title '{label}' didn't take — send/close/focus may not find this tab "
               f"(retry with: relay focus {session_id})", file=sys.stderr)
     # The new tab landed at the end of its window; put it back beside the rest of its lead's group.
@@ -1660,7 +1750,7 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
             sys.exit(f"relaunch: {e}")
         s["effort"] = effort
         print(f"  effort: legacy session had no pinned effort — stamping executor_default_effort ({effort})")
-    bk.spawn(
+    outcome = bk.spawn(
         cwd=s["worktree"],
         prompt=prompt,
         label=label,
@@ -1687,6 +1777,8 @@ def _relaunch(session_id, s, prompt, resume_id=None, session_uuid=None):
     s["iterm_session"] = read_iterm_id(session_id)
     _pane_log_maintain(bk, session_id, s["iterm_session"])  # tmux only: re-pipe the NEW pane
     _ensure_tab_label(bk, s["iterm_session"], label)
+    if isinstance(outcome, dict) and outcome.get("trust_prompt"):
+        _warn_trust_prompt(session_id)
     if session_uuid:  # restart minted a fresh conversation; resume keeps the existing claude_session
         s["claude_session"] = session_uuid
     s["status"] = "busy"
@@ -2621,6 +2713,24 @@ def cmd_send(args):
     if tab_gone and not s.get("claude_session"):
         sys.exit(f"session '{args.session_id}' is {prev_status} with no captured Claude session to "
                  f"resume — use `relay spawn` for a fresh one")
+    # A live tab whose conversation never started (no transcript yet): claude may be parked on a
+    # dialog — the folder-trust one, or one relay doesn't recognise — where typing the pointer would
+    # answer it (its digits pick an option, its Enter confirms), and a refused write would read as
+    # "tab gone" below and kill + resume a conversation that never existed. So the pointer is typed
+    # only on POSITIVE evidence that the input box is live (screen state "ready"); anything else
+    # refuses, sending and queueing nothing. With a transcript, claude got past startup: unchanged.
+    # An UNKNOWN answer (None: the projects root is missing or unreadable) is no evidence claude
+    # got past startup either, so it is gated exactly like "no transcript" — only True skips it.
+    if not tab_gone and conversation_transcript_exists(s.get("claude_session")) is not True:
+        state = _screen_state(term_backend(s), s.get("iterm_session"))
+        if state == "trust":
+            sys.exit(f"session '{args.session_id}' is {trust_prompt.WAITING_TEXT} — nothing sent "
+                     f"(relay focus {args.session_id}); send again once it is past the prompt.")
+        if state not in ("ready", SCREEN_NO_PROBE):
+            sys.exit(f"session '{args.session_id}': executor's screen isn't ready yet "
+                     f"({_screen_state_reason(state)}) — "
+                     f"nothing sent or queued. Check its tab (relay focus {args.session_id}), then "
+                     f"send again.")
 
     # (§6e e2) Heaviness gate: mirrors executor_model_ceiling above (refuse unless an override with
     # a ledgered reason) — but the WORDING must NUDGE, not scold (§9): heaviness is not degradation,
@@ -4845,7 +4955,7 @@ def cmd_check(args):
         scr = s.get("screen")
         if scr:
             v = scr["verdict"]
-            v_c = c(v, "red", "bold") if v in ("prompt", "crashed", "unsent") else c(v, "dim")
+            v_c = c(v, "red", "bold") if v in ("prompt", "crashed", "unsent", "trust") else c(v, "dim")
             print(f"  screen: {v_c} — {scr['excerpt'] or '(blank)'}")
     for s in results:
         if "error" in s:
@@ -5720,6 +5830,67 @@ def _print_list_plan(args, lead_caller):
         print_plan_table(plan_rows(lead_caller))
 
 
+# `relay list --json`'s per-executor packet fields (goal / outcome / verify) are for OPEN executors
+# only — a closed/superseded/dead row is history, and stats/board already tell that story.
+LIST_JSON_NO_PACKET_FIELDS = ("closed", "superseded", "dead")
+LIST_JSON_GIST_LIMIT = 300
+
+
+def _gist_line(text, limit=LIST_JSON_GIST_LIMIT):
+    """First non-empty line of a packet/report as one line (packet_summary's de-heading and
+    whitespace collapse), a leading "GOAL:" dropped, cut to at most `limit` chars ("…" included).
+    "" when there is none."""
+    line = packet_summary(text or "", limit=len(text or "") + 1)
+    line = re.sub(r"^GOAL:\s*", "", line, flags=re.IGNORECASE)
+    return line[: limit - 1] + "…" if len(line) > limit else line
+
+
+def _latest_verify_by_packet():
+    """{(session_id, packet): {"verdict", "ts", "rerun", "mismatches"}} — the LAST `report_verify`
+    ledger event per packet (what `relay verify` records; same rule as _packet_verdict). Streams the
+    ledger and json-parses only the lines that can be one, since it is read on every `list --json`.
+    Never raises: an unreadable ledger is simply "no verdicts"."""
+    out = {}
+    try:
+        with open(LEDGER) as f:
+            for line in f:
+                if '"report_verify"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("event") != "report_verify" or not d.get("session_id"):
+                    continue
+                out[(d["session_id"], d.get("packet"))] = {
+                    "verdict": d.get("verdict"), "ts": d.get("ts"),
+                    "rerun": d.get("rerun"), "mismatches": d.get("mismatches")}
+    except OSError:
+        pass
+    return out
+
+
+def _list_packet_fields(s, verifies):
+    """`goal` (the current packet's first line), `outcome` (its report's first line, "" until a
+    report exists) and `verify` (relay verify's last verdict for that packet, else None) for one
+    executor row of `relay list --json` — what a remote reader (Cue, over SSH) shows per executor
+    without opening any file itself. Missing/unreadable files read as ""."""
+    sid, n = s.get("session_id"), s.get("current_packet")
+
+    def first_line(path):
+        try:
+            return _gist_line(path.read_text(errors="replace"))
+        except OSError:
+            return ""
+
+    if not sid or not isinstance(n, int):
+        return {"goal": "", "outcome": "", "verify": None}
+    d = packets_dir(sid)
+    return {"goal": first_line(d / f"{n:03d}-packet.md"),
+            "outcome": first_line(d / f"{n:03d}-report.md"),
+            "verify": verifies.get((sid, n))}
+
+
 def cmd_list(args):
     if getattr(args, "popup_inner", False):
         return _pager_run(render=lambda: cmd_list(SimpleNamespace(**{**vars(args), "popup": False,
@@ -5802,9 +5973,12 @@ def cmd_list(args):
 
     if args.json:
         # --json: fully unfiltered (programmatic surface, filtering is human-display concern)
+        verifies = _latest_verify_by_packet()
         for r in rows:
             r["usage"] = _usage_for_session(r)
             r["launch"] = lead_guard.launch_cell(r)
+            if r.get("status") not in LIST_JSON_NO_PACKET_FIELDS:
+                r.update(_list_packet_fields(r, verifies))
         # Broken executors get the same {"session_id", "broken": true} shape list_leads uses for a
         # broken lead marker — so a scripted consumer (the board included) sees the same truth the
         # human table does, instead of the row just disappearing from --json too.
@@ -6109,7 +6283,7 @@ def cmd_list(args):
             # tmux only: the pane itself says it's stuck — shown regardless of the transcript
             # stall threshold (a permission prompt is stuck from its first second).
             scr = _screen_verdict(s)
-            if scr and scr["verdict"] in ("prompt", "crashed"):
+            if scr and scr["verdict"] in ("prompt", "crashed", "trust"):
                 st = f"stuck:{scr['verdict']}"
         rendered_statuses.append(st)
     # §6e e1: one transcript-MB reading per executor, computed up front (same memoize-once
@@ -7132,7 +7306,9 @@ def cmd_lead_start(args):
         if existing.get("tab_label") == f"{tab_label}{_successor_label_suffix(args.session_id)}":
             tab_label = existing["tab_label"]
     if not getattr(args, "no_rename", False):
-        iterm.rename_by_id(iterm_session, tab_label)
+        # Through retitle_tab: the /rename is typed into the lead's own pane, so it is gated on the
+        # pane being ready (normally the mid-turn spinner of the turn running this command).
+        retitle_tab(iterm, iterm_session, tab_label)
     # Stable per-lead tab color; this lead's executors inherit it at spawn so its tabs group
     # visually. Paint the lead's OWN tab by writing the escape to its tty (found via the session
     # id — this CLI process has no controlling terminal, so /dev/tty is unavailable). iTerm only.
@@ -7494,6 +7670,27 @@ ROTATE_POLL_SECONDS = 1.0
 # while the stamp-to-prompt gap stays well under 2s (unverified live); upgrade path: have the lead's
 # Stop hook write an explicit "turn ended" receipt as its last act and wait on that instead.
 ROTATE_SETTLE_SECONDS = 2.0
+# How long each typed step of the rotation waits for the pane to positively show Claude's input
+# box (or its mid-turn spinner) before refusing — covers the redraw right after the settle beat and
+# after /clear. A trust prompt or a shell refuses at once; only "not drawn yet" is waited out.
+ROTATE_READY_CAP_SECONDS = 10
+
+
+def _rotation_pane_unready(tmux, handle):
+    """None when the rotation may type into the lead's pane — its screen state is "ready":
+    trust_prompt.input_ready's positive evidence of a live input box, which includes the busy
+    spinner of a conversation mid-turn. Otherwise a short reason, after waiting up to
+    ROTATE_READY_CAP_SECONDS for a pane that is merely "starting" (or unreadable) to draw. A trust
+    prompt, an unknown dialog and a shell are never typed into: /clear's Enter would answer a
+    dialog, and the pointer line would run as a shell command."""
+    deadline = time.time() + ROTATE_READY_CAP_SECONDS
+    while True:
+        state = _screen_state(tmux, handle)
+        if state == "ready":
+            return None
+        if state in ("trust", "shell") or time.time() >= deadline:
+            return _screen_state_reason(state)
+        time.sleep(ROTATE_POLL_SECONDS)
 
 
 def _rotation_handoff_refusal(caller, marker, pane):
@@ -7700,6 +7897,13 @@ def cmd_rotate_here(args):
         time.sleep(ROTATE_POLL_SECONDS)
     time.sleep(ROTATE_SETTLE_SECONDS)
 
+    unready = _rotation_pane_unready(tmux, handle)
+    if unready:
+        return _abandon_rotation(
+            pane, handle, pred_sid,
+            f"refused to type /clear into pane {pane}: {unready} — relay types into a lead's pane "
+            f"only when Claude's input box is live. Nothing was cleared; deal with what is on the "
+            f"pane, then run relay handoff --here again", memo_copy)
     if not tmux.send(None, "/clear", handle):
         return _abandon_rotation(pane, handle, pred_sid,
                                  f"could not type /clear into pane {pane}", memo_copy)
@@ -7723,7 +7927,16 @@ def cmd_rotate_here(args):
     succ_sid = successor.get("session_id")
     succ_memo = lead_guard.lead_dir(STATE_ROOT, succ_sid) / "handoff.md"
     memo = str(succ_memo) if succ_memo.is_file() else memo_copy
-    tmux.send(None, f"Successor lead (in-place rotation). Read {memo} and continue.", handle)
+    pointer = f"Successor lead (in-place rotation). Read {memo} and continue."
+    unready = _rotation_pane_unready(tmux, handle)
+    if unready:
+        # The successor IS armed — only the pointer line is withheld, so the memo copy is kept
+        # (memo_copy=None) for the human to point the successor at by hand.
+        return _abandon_rotation(
+            pane, handle, pred_sid,
+            f"successor {succ_sid} is armed, but relay refused to type its pointer into pane "
+            f"{pane}: {unready}. Once Claude's input box is up, tell it: {pointer}")
+    tmux.send(None, pointer, handle)
     append_ledger("lead_rotated_in_place", predecessor=pred_sid, successor=succ_sid, pane=pane,
                   project=successor.get("project"), memo=memo)
     print(f"rotate-here {pane}: rotated {pred_sid} → {succ_sid}")

@@ -43,6 +43,18 @@ OLD_STAMP = "2026-01-01T00:00:00"
 
 # ---- fixtures -----------------------------------------------------------------------------------
 
+# Claude Code's idle input box (two rule lines, prompt glyph inside), its folder-trust dialog, and
+# a selector dialog relay has never seen — what the rotation's readiness check reads off the pane.
+READY_SCREEN = ("╭" + "─" * 40 + "╮\n│ > " + " " * 37 + "│\n╰" + "─" * 40 + "╯\n"
+                "  ? for shortcuts\n")
+BUSY_SCREEN = "✻ Thinking… (12s · esc to interrupt)\n"
+TRUST_SCREEN = ("\n Quick safety check: Is this a project you created or one you trust?\n\n"
+                " ❯ 1. Yes, I trust this folder\n   2. No, exit\n\n"
+                " Enter to confirm · Esc to cancel\n")
+UNKNOWN_DIALOG_SCREEN = ("\n Before you continue: allow this workspace's hooks to run?\n\n"
+                         " ❯ 1. Allow\n   2. Deny and quit\n\n Enter to confirm\n")
+
+
 class FakeTmux:
     """Stands in for the tmux CLI under `tmux_backend._tmux`: records argv, answers the pane-exists
     probe for live panes, fails everything else harmlessly. `on_send` lets a test react to a typed
@@ -52,6 +64,9 @@ class FakeTmux:
         self.calls = []
         self.live = {PANE}
         self.on_send = None
+        # What `capture-pane` shows: Claude's idle input box unless a test says otherwise — every
+        # typed rotation step checks the pane is "ready" first (bin/relay _rotation_pane_unready).
+        self.screen = READY_SCREEN
 
     def __call__(self, args, timeout=None):
         self.calls.append(list(args))
@@ -68,6 +83,10 @@ class FakeTmux:
                 self.on_send(args[-1])
         elif args[:1] == ["list-panes"]:
             out = "\n".join(sorted(self.live))
+        elif args[:1] == ["capture-pane"]:
+            pane = args[args.index("-t") + 1]
+            ok = pane in self.live and self.screen is not None
+            out = (self.screen(self) if callable(self.screen) else self.screen) if ok else ""
         elif args[:1] == ["display-message"]:
             ok = True
         else:
@@ -447,6 +466,7 @@ class TestSessionStartRotation:
 def fast(relay, monkeypatch):
     monkeypatch.setattr(relay, "ROTATE_POLL_SECONDS", 0)
     monkeypatch.setattr(relay, "ROTATE_SETTLE_SECONDS", 0)
+    monkeypatch.setattr(relay, "ROTATE_READY_CAP_SECONDS", 0)
     return relay
 
 
@@ -545,6 +565,79 @@ class TestRotateHereHelper:
         assert not lg.read_rotation_marker(root, PANE)
         ab = [e for e in ledger_events(home) if e["event"] == "rotate_here_abandoned"]
         assert ab and "/relay:mode" in ab[0]["reason"]
+
+    # -- readiness gate: /clear and the pointer are typed only into a pane showing Claude's input
+    # box (or its busy spinner); a trust prompt or a dialog relay doesn't know is refused. --------
+
+    @pytest.mark.parametrize("screen,why", [(TRUST_SCREEN, "folder-trust prompt"),
+                                            (UNKNOWN_DIALOG_SCREEN, "no live Claude input box")])
+    def test_clear_refused_on_a_dialog(self, fast, home, monkeypatch, fake_tmux, screen, why):
+        relay = fast
+        root = arm_pred(home)
+        rm = write_rotation(home)
+        fake_tmux.screen = screen
+        self._turn_ends_on_first_poll(relay, home, monkeypatch)
+        sys.argv = ["relay", "_rotate-here", PANE]
+        relay.main()
+        assert fake_tmux.typed() == [], "no keystroke into a dialog"
+        assert not [a for a in fake_tmux.calls if a[:1] == ["send-keys"]], "not even a bare Enter"
+        ab = [e for e in ledger_events(home) if e["event"] == "rotate_here_abandoned"]
+        assert ab and "refused to type /clear" in ab[0]["reason"] and why in ab[0]["reason"]
+        assert lg.is_lead(root, PRED), "the lead is untouched"
+        assert not lg.read_rotation_marker(root, PANE)
+        assert not Path(rm["memo_copy"]).exists()
+        msgs = fake_tmux.messages()
+        assert msgs and any("refused" in " ".join(m) for m in msgs), "the lead's pane is told why"
+
+    def test_clear_typed_on_the_busy_spinner(self, fast, home, monkeypatch, fake_tmux):
+        relay = fast
+        arm_pred(home)
+        write_rotation(home)
+        fake_tmux.screen = BUSY_SCREEN
+        self._turn_ends_on_first_poll(relay, home, monkeypatch)
+        monkeypatch.setattr(relay, "ROTATE_CONSUME_CAP_SECONDS", 0)
+        sys.argv = ["relay", "_rotate-here", PANE]
+        relay.main()
+        assert fake_tmux.typed()[:1] == [(PANE, "/clear")], "the spinner is positive evidence"
+
+    def test_clear_waits_for_the_input_box_to_draw(self, fast, home, monkeypatch, fake_tmux):
+        relay = fast
+        arm_pred(home)
+        write_rotation(home)
+        monkeypatch.setattr(relay, "ROTATE_READY_CAP_SECONDS", 60)
+        monkeypatch.setattr(relay, "ROTATE_CONSUME_CAP_SECONDS", 0)
+        screens = iter(["", "", READY_SCREEN])
+        fake_tmux.screen = lambda f: next(screens, READY_SCREEN)
+        self._turn_ends_on_first_poll(relay, home, monkeypatch)
+        sys.argv = ["relay", "_rotate-here", PANE]
+        relay.main()
+        assert fake_tmux.typed()[:1] == [(PANE, "/clear")]
+
+    def test_pointer_refused_when_the_pane_shows_a_dialog_after_clear(self, fast, home,
+                                                                     monkeypatch, fake_tmux):
+        relay = fast
+        root = arm_pred(home)
+        write_rotation(home)
+
+        def on_send(text):
+            if text == "/clear":
+                H.run_hook_inproc(END, {"session_id": PRED, "reason": "clear"}, home,
+                                  env_extra=hook_env())
+                H.run_hook_inproc(START, {"session_id": SUCC, "source": "clear",
+                                          "cwd": str(home)}, home, env_extra=hook_env())
+                fake_tmux.screen = UNKNOWN_DIALOG_SCREEN
+        fake_tmux.on_send = on_send
+        self._turn_ends_on_first_poll(relay, home, monkeypatch)
+        sys.argv = ["relay", "_rotate-here", PANE]
+        relay.main()
+        assert fake_tmux.typed() == [(PANE, "/clear")], "no pointer typed onto the dialog"
+        assert lg.is_lead(root, SUCC), "the successor stays armed"
+        ab = [e for e in ledger_events(home) if e["event"] == "rotate_here_abandoned"]
+        assert ab and "refused to type its pointer" in ab[0]["reason"] \
+            and "Successor lead (in-place rotation)" in ab[0]["reason"]
+        assert not [e for e in ledger_events(home) if e["event"] == "lead_rotated_in_place"]
+        memo = ab[0]["reason"].split("Read ")[1].split(" and continue")[0]
+        assert Path(memo).is_file(), "the memo the human is pointed at is still on disk"
 
     def test_no_marker_is_a_no_op(self, fast, home, fake_tmux):
         sys.argv = ["relay", "_rotate-here", PANE]

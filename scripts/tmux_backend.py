@@ -54,6 +54,7 @@ import time
 from iterm import (build_claude_cmd, write_bootstrap_file, enter_gap, pids_on_tty, pid_on_tty,
                    CLAUDE_BIN)  # noqa: F401 — pids_on_tty/pid_on_tty/CLAUDE_BIN re-exported: the
                                 # ps-by-tty match is terminal-agnostic (/dev/pts/N → "pts/N")
+import trust_prompt
 
 NAME = "tmux"  # backend key (see scripts/backend.py)
 HANDLE_PREFIX = "tmux:"
@@ -63,6 +64,14 @@ DEFAULT_TIMEOUT = 5
 # `_tmux`'s stderr for a subprocess timeout — `wait` reads it to tell "nobody signalled within the
 # interval" (the normal tick) from a real failure (no server, no tmux).
 TIMED_OUT = "tmux timed out"
+# Spawn-time /rename readiness (see _rename_when_ready): how long to wait, past `rename_delay`, for
+# a just-launched claude to draw either its REPL or the folder-trust dialog, and how often to look.
+RENAME_READY_TIMEOUT = 10.0
+RENAME_READY_POLL = 0.5
+# `#{pane_current_command}` values meaning the pane's foreground is a shell (claude has exited), so
+# whatever the screen shows is scrollback, not a live dialog. Mirrors bin/relay's SCREEN_SHELLS.
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh", "ash",
+                     "login"})
 
 
 def _tmux(args, timeout=DEFAULT_TIMEOUT):
@@ -227,8 +236,66 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
     if not _type_line(pane, f"sh {boot_path} {pane}"):
         return _fail("script-failed", "send-keys of the launch line failed", handle)
     time.sleep(rename_delay)
-    _type_line(pane, "/rename " + label)   # best-effort — _ensure_tab_label owns label retries
-    return {"ok": True, "reason": "ok", "session_id": handle, "front_title": None}
+    # Never typed blind: landing on Claude Code's folder-trust dialog, the /rename's digits + Enter
+    # answer it "No, exit" (scripts/trust_prompt.py). Best-effort: the window is already named.
+    state = _rename_when_ready(pane, label)
+    return {"ok": True, "reason": "ok", "session_id": handle, "front_title": None,
+            "trust_prompt": state == "trust"}
+
+
+def _rename_when_ready(pane, label, timeout=None, poll=None, sleep_fn=time.sleep,
+                       clock_fn=time.time):
+    """Type the spawn-time `/rename <label>` only once the new claude's screen says it is safe:
+    poll `capture-pane` until trust_prompt.launch_state reads "ready" (REPL drawn → type it) or
+    "trust" (the folder-trust dialog is up → type NOTHING: any keystroke there risks answering it,
+    and accepting trust is the owner's call). A screen still "starting" when RENAME_READY_TIMEOUT
+    runs out gets NOTHING typed either: it may be a trust dialog worded in a way
+    trust_prompt.HEADERS doesn't know, and a blind keystroke must never answer one. What is lost is
+    cosmetic: the window name is already set (rename-window above), only Claude Code's own
+    conversation title stays unset. Returns the state
+    acted on: "ready" (typed) | "trust" | "timeout" | "gone" (the pane can't be read) — only
+    "ready" typed anything."""
+    timeout = RENAME_READY_TIMEOUT if timeout is None else timeout
+    poll = RENAME_READY_POLL if poll is None else poll
+    deadline = clock_fn() + timeout
+    handle = handle_for(pane)
+    while True:
+        screen = capture(handle)
+        if screen is None:
+            return "gone"
+        state = trust_prompt.launch_state(screen)
+        if state == "trust":
+            return "trust"
+        if state == "ready":
+            _type_line(pane, "/rename " + label)
+            return "ready"
+        if clock_fn() >= deadline:
+            return "timeout"
+        sleep_fn(poll)
+
+
+def screen_state(handle):
+    """trust_prompt.launch_state of this pane right now — "ready" (positive evidence claude's input
+    box is live: typing is safe), "trust" (the folder-trust dialog) or "starting" (anything else,
+    a dialog relay doesn't know included) — "shell" when the pane's foreground is a shell (claude
+    is gone; whatever is on screen is scrollback), or None when the pane can't be read."""
+    screen = capture(handle)
+    if screen is None:
+        return None
+    cmd = (current_command(handle) or "").strip().lstrip("-").lower()
+    if cmd in _SHELLS:
+        return "shell"
+    return trust_prompt.launch_state(screen)
+
+
+def trust_prompt_live(handle):
+    """Is this pane parked on Claude Code's folder-trust dialog right now? False for a pane whose
+    foreground is a shell (claude is gone, so the dialog text is scrollback) or can't be read."""
+    screen = capture(handle)
+    if not screen or not trust_prompt.is_live(screen):
+        return False   # the common case costs one capture-pane, no second tmux call
+    cmd = (current_command(handle) or "").strip().lstrip("-").lower()
+    return cmd not in _SHELLS
 
 
 def _rename_window(pane, name):
@@ -260,13 +327,18 @@ def send(label, prompt, handle=None, pid=None):
     pane = _pane(handle)
     if not pane:
         return False
+    if trust_prompt_live(handle):
+        return False   # never type into the folder-trust dialog (scripts/trust_prompt.py)
     return _type_line(pane, prompt)
 
 
 def press_enter(label, handle=None, pid=None):
-    """One bare Enter into the pane — the retry when a typed line didn't submit."""
+    """One bare Enter into the pane — the retry when a typed line didn't submit. Never on the
+    folder-trust dialog, where a bare Enter confirms its selected option."""
     pane = _pane(handle)
     if not pane:
+        return False
+    if trust_prompt_live(handle):
         return False
     return _ok(_tmux(["send-keys", "-t", pane, "Enter"]))
 
@@ -276,12 +348,15 @@ def rename_by_id(handle, new_name):
     what the human sees; skipped when the pane shares its window with others, i.e. a split-pane
     executor inside its lead's window) AND Claude Code's own title, by typing `/rename <new_name>`
     as two writes (what `title_by_id` reads). iTerm does only the latter, Terminal.app only the
-    former; tmux needs both. True iff the pane exists and the /rename landed."""
+    former; tmux needs both. True iff the pane exists and the /rename landed. The /rename is NOT
+    typed while the pane sits on the folder-trust dialog (scripts/trust_prompt.py) — False then."""
     pane = _pane(handle)
     if not pane:
         return False
     if _display(pane, "#{window_panes}") in (None, "1"):
         _rename_window(pane, new_name)
+    if trust_prompt_live(handle):
+        return False
     return _type_line(pane, "/rename " + new_name)
 
 

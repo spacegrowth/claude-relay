@@ -13,9 +13,11 @@ aliveness, the title/id match as a secondary confirmation.
 import os
 import shlex
 import subprocess
+import time
 
 import iterm_pyapi
 import platform_cmds
+import trust_prompt
 
 NAME = "iterm"  # backend key (see scripts/backend.py)
 ITERM_APP_NAME = "iTerm"
@@ -251,6 +253,11 @@ ENTER_GAP_MIN = 0.6
 ENTER_GAP_MAX = 2.0
 ENTER_GAP_PER_100_CHARS = 0.05
 
+# Spawn-time /rename readiness: after `rename_delay`, how long spawn keeps polling the new tab's
+# screen for claude's input box or the folder-trust dialog, and how often (_rename_when_ready).
+RENAME_READY_TIMEOUT = 10.0
+RENAME_READY_POLL = 0.5
+
 
 def enter_gap(text):
     """Seconds to wait between typing `text` and pressing Enter (see the block comment above)."""
@@ -338,6 +345,30 @@ def title_by_id(iterm_id):
     if r.returncode != 0:
         return None
     return (r.stdout or "").strip() or None
+
+
+def capture(iterm_id, lines=40):
+    """The visible screen text of the iTerm session whose id matches `iterm_id` (`contents of s`),
+    or None (no id, no match, osascript failure). `lines` is accepted for signature parity with
+    tmux_backend.capture and ignored: iTerm returns the visible screen only. Read-only — the input
+    to every "may relay type here?" decision (screen_state, trust_prompt_live, _rename_when_ready)."""
+    if not iterm_id:
+        return None
+    uuid = iterm_id.split(":")[-1]
+    script = (_for_session_by_id(uuid, "          return (contents of s) as text\n")
+              + 'return "__RELAY_NO_SESSION__"')
+    r = run_osascript(script, timeout=5)
+    if r.returncode != 0:
+        return None
+    out = r.stdout or ""
+    return None if out.strip() == "__RELAY_NO_SESSION__" else out
+
+
+def trust_prompt_live(iterm_id):
+    """Is this session parked on Claude Code's folder-trust dialog right now (scripts/
+    trust_prompt.py)? False when the screen can't be read."""
+    screen = capture(iterm_id)
+    return bool(screen) and trust_prompt.is_live(screen)
 
 
 def _tty_name(t):
@@ -641,9 +672,10 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
           iterm_id_file=None, session_uuid=None, resume_id=None, tab_color=None, lead_handle=None,
           layout="tab", settings_file=None, mcp_flags=None, agent_flags=None, effort=None):
     """Open a new iTerm tab (or pane), cd into `cwd`, launch `claude [--model X] <prompt>`, then
-    (after a delay for claude to finish starting) send `/rename <label>` into the SAME session — one
-    AppleScript call that resolves the target ONCE to a session id and then addresses every write by
-    that id, so nothing that happens to focus or window order in between can redirect the payload.
+    (after a delay for claude to finish starting, and only once its screen shows a live input box —
+    _rename_when_ready) send `/rename <label>` into the SAME session by id. The launch itself is
+    one AppleScript call that resolves the target ONCE to a session id and then addresses every
+    write by that id, so nothing that happens to focus or window order in between can redirect it.
 
     TARGET-OR-ABORT + INERT PAYLOAD (2026-08-01/02 spawn-misfire incident, write-up at
     ~/.relay-tasks/incident-spawn-misfire-2026-08-01.md — a lead's bootstrap, `exec claude
@@ -768,21 +800,6 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
         "    end repeat\n"
         "  end repeat\n"
     )
-    write_rename = (
-        "  repeat with w in windows\n"
-        "    repeat with t in tabs of w\n"
-        "      repeat with s in sessions of t\n"
-        "        if (id of s) is sid then\n"
-        # Two writes (typed_line_action): a one-burst `/rename …` reads as a PASTE in a claude that
-        # is already up and sits unsubmitted in its input box — the "rename stuck in the input
-        # area" seen on handoffs (2026-09-19). In a shell that hasn't exec'd claude yet, the bare
-        # second write is just an empty Enter.
-        f"{typed_line_action('/rename ' + label)}"
-        "        end if\n"
-        "      end repeat\n"
-        "    end repeat\n"
-        "  end repeat\n"
-    )
     script = (
         'set frontTitle to ""\n'
         "set targetFound to false\n"
@@ -798,18 +815,62 @@ def spawn(cwd, prompt, label, pidfile, model=None, skip_perms=False, rename_dela
         "  end try\n"
         f"{write_payload}"
         '  if not didWrite then return "GONE" & linefeed & sid & linefeed & frontTitle\n'
-        f"  delay {rename_delay}\n"
-        f"{write_rename}"
         '  return "OK" & linefeed & sid & linefeed & frontTitle\n'
         "end tell"
     )
-    r = run_osascript(script, timeout=rename_delay + enter_gap('/rename ' + label) + 5)
-    return _read_spawn_outcome(r)
+    r = run_osascript(script, timeout=enter_gap('/rename ' + label) + 5)
+    out = _read_spawn_outcome(r)
+    out["trust_prompt"] = False
+    if out["ok"]:
+        # The spawn-time /rename is NOT part of the AppleScript: it is typed only on POSITIVE
+        # evidence that claude's input box is live (trust_prompt.launch_state == "ready"), which
+        # only Python can judge from the screen. Landing on Claude Code's folder-trust dialog — or
+        # any dialog relay doesn't know — its digits + Enter would answer it.
+        time.sleep(rename_delay)
+        out["trust_prompt"] = _rename_when_ready(out["session_id"], label) == "trust"
+    return out
+
+
+def _rename_when_ready(iterm_id, label, timeout=None, poll=None, sleep_fn=None, clock_fn=None):
+    """Type the spawn-time `/rename <label>` (rename_by_id: by id, two writes) only once the new
+    session's screen (`capture`) reads trust_prompt.launch_state "ready" — positive evidence that
+    claude's input box is live. "trust" (the folder-trust dialog) → type NOTHING and report it;
+    still "starting" when RENAME_READY_TIMEOUT runs out → type NOTHING either (it may be a dialog
+    relay doesn't recognise); relay's _ensure_tab_label / background label loop retry the label
+    later under the same readiness rule. Returns "ready" (typed) | "trust" | "timeout" | "gone"
+    (the screen can't be read). Only "ready" typed anything."""
+    timeout = RENAME_READY_TIMEOUT if timeout is None else timeout
+    poll = RENAME_READY_POLL if poll is None else poll
+    sleep_fn = sleep_fn or time.sleep
+    clock_fn = clock_fn or time.time
+    deadline = clock_fn() + timeout
+    while True:
+        screen = capture(iterm_id)
+        if screen is None:
+            return "gone"
+        state = trust_prompt.launch_state(screen)
+        if state == "trust":
+            return "trust"
+        if state == "ready":
+            rename_by_id(iterm_id, label)
+            return "ready"
+        if clock_fn() >= deadline:
+            return "timeout"
+        sleep_fn(poll)
+
+
+def screen_state(iterm_id):
+    """trust_prompt.launch_state of this session's screen right now — "ready" (positive evidence
+    claude's input box is live: typing is safe), "trust" (the folder-trust dialog) or "starting"
+    (anything else, a dialog relay doesn't know included) — or None when the screen can't be read.
+    What relay asks before typing into an executor whose readiness it can't otherwise vouch for."""
+    screen = capture(iterm_id)
+    return None if screen is None else trust_prompt.launch_state(screen)
 
 
 def _read_spawn_outcome(r):
     """Parse spawn()'s three-line AppleScript verdict into the dict spawn() returns:
-    `{"ok", "reason", "session_id", "front_title"}`.
+    `{"ok", "reason", "session_id", "front_title"}` (spawn adds `trust_prompt`).
 
     `ok` is True only for a payload typed into a re-checked target session. Reasons:
     - "ok"            — typed into `session_id`; `front_title` is what was frontmost at send time.

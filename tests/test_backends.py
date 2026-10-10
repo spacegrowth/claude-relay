@@ -23,6 +23,7 @@ import backend      # noqa: E402
 import iterm        # noqa: E402
 import terminal_app  # noqa: E402
 import tmux_backend  # noqa: E402
+import trust_prompt  # noqa: E402
 import lead_guard   # noqa: E402
 
 # The bootstrap guard must hold under both interactive shells a tab can run. zsh is the macOS
@@ -33,6 +34,19 @@ SHELLS = ["bash", pytest.param("zsh", marks=pytest.mark.skipif(
 
 def _ok(stdout):
     return subprocess.CompletedProcess(["osascript"], 0, stdout, "")
+
+
+# iTerm spawn types its /rename only after polling the new tab's screen for a live input box
+# (iterm._rename_when_ready → capture → osascript). Tests about the launch script stub
+# run_osascript with ONE answer and inspect its LAST call, so that poll is stubbed out here — it
+# would otherwise read the verdict as a screen, spin out the 10s wait and add osascript calls.
+# TestTrustPromptNeverAnswered exercises the real one via REAL_ITERM_RENAME_WHEN_READY.
+REAL_ITERM_RENAME_WHEN_READY = iterm._rename_when_ready
+
+
+@pytest.fixture(autouse=True)
+def _iterm_spawn_rename_poll_stubbed(monkeypatch):
+    monkeypatch.setattr(iterm, "_rename_when_ready", lambda iterm_id, label: "timeout")
 
 
 class TestBuildClaudeCmd:
@@ -1149,11 +1163,17 @@ class TestTypedLinesAreTwoWrites:
         assert 'write text "/rename [Lead] relay" newline NO' in script
         assert 'write text ""' in script and 'write text "/rename [Lead] relay"\n' not in script
 
-    def test_spawn_rename_is_two_writes(self, tmp_path):
-        with mock.patch.object(iterm, "run_osascript",
-                               return_value=_ok("OK\nSID-1\nfront")) as osa_run:
-            iterm.spawn(str(tmp_path), "hello", "[Exec] e1", str(tmp_path / "pid"))
-        script = osa_run.call_args[0][0]
+    def test_spawn_rename_is_two_writes(self, tmp_path, monkeypatch):
+        # The spawn-time /rename is its own osascript call now (typed by id once the screen shows a
+        # live input box): launch verdict, then the screen read, then the rename.
+        monkeypatch.setattr(iterm, "_rename_when_ready", REAL_ITERM_RENAME_WHEN_READY)
+        answers = iter([_ok("OK\nSID-1\nfront"), _ok(READY_SCREEN), _ok("true")])
+        with mock.patch.object(iterm, "run_osascript", side_effect=lambda *a, **k: next(answers)) \
+                as osa_run, mock.patch.object(iterm.time, "sleep"):
+            out = iterm.spawn(str(tmp_path), "hello", "[Exec] e1", str(tmp_path / "pid"))
+        assert out["ok"] is True and out["trust_prompt"] is False
+        script = osa_run.call_args_list[-1][0][0]
+        assert 'id of s) is "SID-1"' in script
         assert 'write text "/rename [Exec] e1" newline NO' in script
         assert 'write text "/rename [Exec] e1"\n' not in script
 
@@ -1203,13 +1223,33 @@ FOREIGN_HANDLES = [None, "", "w0t0p0:11111111-2222-3333-4444-555555555555", "twi
                    "tmux:12", "tmux:%x", "%12"]
 
 
+# What a capture-pane of a claude whose REPL is up shows: the input box (two rule lines). Every
+# typing path probes the screen for the folder-trust dialog first (scripts/trust_prompt.py), and
+# spawn polls it until the REPL is drawn — the fake answers this unless a test says otherwise.
+READY_SCREEN = ("╭" + "─" * 40 + "╮\n│ > " + " " * 37 + "│\n╰" + "─" * 40 + "╯\n"
+                "  ? for shortcuts\n")
+# Claude Code's folder-trust dialog, as a fresh claude in an untrusted folder draws it.
+TRUST_SCREEN = ("\n Quick safety check: Is this a project you created or one you trust?\n\n"
+                " ❯ 1. Yes, I trust this folder\n   2. No, exit\n\n"
+                " Enter to confirm · Esc to cancel\n")
+# A selector dialog relay has never seen (no trust HEADER): numbered options, no input box.
+UNKNOWN_DIALOG_SCREEN = ("\n Before you continue: allow this workspace's hooks to run?\n\n"
+                         " ❯ 1. Allow\n   2. Deny and quit\n\n Enter to confirm\n")
+# The same, drawn in a bordered box — two rule lines, which a "contains a rule" check took as ready.
+BORDERED_UNKNOWN_DIALOG = ("╭" + "─" * 40 + "╮\n│ Allow this workspace's hooks to run?" + " " * 3
+                           + "│\n│ ❯ 1. Allow" + " " * 30 + "│\n│   2. Deny and quit"
+                           + " " * 22 + "│\n╰" + "─" * 40 + "╯\n")
+# The pane's screen probe, as every typing path issues it.
+CAPTURE_7 = ["capture-pane", "-p", "-J", "-t", "%7", "-S", "-40"]
+
+
 class TestTmuxBackend:
     H = "tmux:%7"
 
     @pytest.fixture
     def fake(self, monkeypatch):
         events = []
-        f = _FakeTmux(events=events)
+        f = _FakeTmux(answers={"capture-pane": (0, READY_SCREEN, "")}, events=events)
         monkeypatch.setattr(tmux_backend, "_tmux", f)
         monkeypatch.setattr(tmux_backend.time, "sleep", lambda s: events.append(("sleep", s)))
         return f
@@ -1239,19 +1279,21 @@ class TestTmuxBackend:
         text = "Read and follow the work packet at /x/001-packet.md; then report"
         assert tmux_backend.send("[Exec] e1", text, self.H) is True
         assert fake.events == [
+            ("tmux", CAPTURE_7),                    # the folder-trust probe, before any key
             ("tmux", ["send-keys", "-t", "%7", "-l", "--", text]),
             ("sleep", iterm.enter_gap(text)),
             ("tmux", ["send-keys", "-t", "%7", "Enter"]),
         ]
 
     def test_send_into_a_gone_pane_is_false_and_skips_enter(self, fake):
+        fake.answers["capture-pane"] = (1, "", "can't find pane: %7")
         fake.answers["send-keys"] = (1, "", "can't find pane: %7")
         assert tmux_backend.send("l", "hi", self.H) is False
-        assert len(fake.calls) == 1
+        assert fake.calls == [CAPTURE_7, ["send-keys", "-t", "%7", "-l", "--", "hi"]]
 
     def test_press_enter_is_one_enter_by_id(self, fake):
         assert tmux_backend.press_enter("l", self.H) is True
-        assert fake.calls == [["send-keys", "-t", "%7", "Enter"]]
+        assert fake.calls == [CAPTURE_7, ["send-keys", "-t", "%7", "Enter"]]
 
     def test_is_alive_and_exists_by_id_check_list_panes(self, fake):
         fake.answers["list-panes"] = (0, "%1\n%7\n%70\n", "")
@@ -1336,7 +1378,8 @@ class TestTmuxBackend:
 
     def test_spawn_plain_new_window_and_launch_by_id(self, fake, tmp_path):
         out, handle_file = self._spawn(fake, tmp_path)
-        assert out == {"ok": True, "reason": "ok", "session_id": "tmux:%9", "front_title": None}
+        assert out == {"ok": True, "reason": "ok", "session_id": "tmux:%9", "front_title": None,
+                       "trust_prompt": False}
         assert fake.calls[0] == ["new-window", "-P", "-F", "#{pane_id}", "-n", "[Exec] e1",
                                  "-c", "/work/tree"]
         assert handle_file.read_text() == "tmux:%9"
@@ -1474,6 +1517,253 @@ class TestTmuxBackend:
         with mock.patch.object(tmux_backend.subprocess, "run", side_effect=FileNotFoundError("tmux")):
             assert tmux_backend.running() is False
             assert tmux_backend.version() is None
+
+
+class TestTrustPromptNeverAnswered:
+    """Claude Code's folder-trust dialog is a one-key selector (a digit picks, Enter confirms) and
+    relay's spawn-time `/rename [Exec] <topic>-HHMMSS` + Enter answered it "No, exit". No relay
+    keystroke may land while it is up — nor after a readiness wait that never saw the REPL, since
+    a dialog worded in a way trust_prompt.HEADERS doesn't know must not be answered blind either.
+    Backends stubbed throughout: nothing real runs."""
+    H = "tmux:%7"
+
+    @pytest.fixture
+    def fake(self, monkeypatch):
+        events = []
+        f = _FakeTmux(answers={"capture-pane": (0, TRUST_SCREEN, "")}, events=events)
+        monkeypatch.setattr(tmux_backend, "_tmux", f)
+        monkeypatch.setattr(tmux_backend.time, "sleep", lambda s: events.append(("sleep", s)))
+        return f
+
+    @staticmethod
+    def _keys_after_first_capture(fake):
+        first = next(i for i, c in enumerate(fake.calls) if c[0] == "capture-pane")
+        return [c for c in fake.calls[first:] if c[0] == "send-keys"]
+
+    def _spawn(self, fake, tmp_path):
+        fake.answers.setdefault("new-window", (0, "%9\n", ""))
+        fake.answers.setdefault(("display-message", "#{window_panes}"), (0, "1\n", ""))
+        return tmux_backend.spawn(cwd="/w", prompt="Read the packet", label="[Exec] e1-131415",
+                                  pidfile=str(tmp_path / "pid"),
+                                  iterm_id_file=str(tmp_path / "iterm_id"), session_uuid="u-1")
+
+    # ── tmux ───────────────────────────────────────────────────────────────────────────────────
+    def test_tmux_spawn_on_the_trust_dialog_types_no_rename(self, fake, tmp_path):
+        out = self._spawn(fake, tmp_path)
+        assert out["ok"] is True and out["trust_prompt"] is True
+        typed = [c[-1] for c in fake.find("send-keys") if "-l" in c]
+        assert typed == [f"sh {tmp_path / iterm.BOOTSTRAP_FILENAME} %9"]   # the launch line only
+        assert self._keys_after_first_capture(fake) == []                  # not even an Enter
+
+    def test_tmux_spawn_readiness_timeout_types_nothing(self, fake, tmp_path, monkeypatch):
+        # A screen that never shows the REPL (nor a dialog relay recognises) within the wait.
+        fake.answers["capture-pane"] = (0, "\n  some unrecognised startup screen\n", "")
+        monkeypatch.setattr(tmux_backend, "RENAME_READY_TIMEOUT", 0.0)
+        out = self._spawn(fake, tmp_path)
+        assert out["ok"] is True and out["trust_prompt"] is False
+        assert fake.find("capture-pane")                                   # it did look
+        assert self._keys_after_first_capture(fake) == []
+        assert not [c for c in fake.find("send-keys") if c[-1].startswith("/rename")]
+
+    def test_tmux_rename_when_ready_polls_until_the_deadline_then_gives_up_silently(self, fake):
+        fake.answers["capture-pane"] = (0, "", "")
+        t = [0.0]
+        naps = []
+        state = tmux_backend._rename_when_ready(
+            "%7", "[Exec] e1", timeout=2.0, poll=0.5,
+            sleep_fn=lambda s: (naps.append(s), t.__setitem__(0, t[0] + s)), clock_fn=lambda: t[0])
+        assert state == "timeout"
+        assert naps == [0.5] * 4 and len(fake.find("capture-pane")) == 5
+        assert fake.find("send-keys") == []
+
+    def test_tmux_rename_when_ready_types_once_the_repl_is_drawn(self, fake):
+        screens = iter(["", "", READY_SCREEN])
+        fake.answers["capture-pane"] = lambda a: (0, next(screens), "")
+        state = tmux_backend._rename_when_ready("%7", "[Exec] e1", sleep_fn=lambda s: None)
+        assert state == "ready"
+        assert [c[-1] for c in fake.find("send-keys")] == ["/rename [Exec] e1", "Enter"]
+
+    def test_tmux_rename_when_ready_stops_when_the_dialog_appears(self, fake):
+        screens = iter(["", TRUST_SCREEN, READY_SCREEN])
+        fake.answers["capture-pane"] = lambda a: (0, next(screens), "")
+        assert tmux_backend._rename_when_ready("%7", "l", sleep_fn=lambda s: None) == "trust"
+        assert fake.find("send-keys") == []
+
+    @pytest.mark.parametrize("screen", [UNKNOWN_DIALOG_SCREEN, BORDERED_UNKNOWN_DIALOG],
+                             ids=["selector", "bordered"])
+    def test_tmux_spawn_on_an_unknown_dialog_types_nothing(self, fake, tmp_path, screen,
+                                                          monkeypatch):
+        # No trust HEADER, so not "trust" — but no live input box either: never typed into. (The
+        # full-length wait is pinned by the fake-clock _rename_when_ready test above.)
+        monkeypatch.setattr(tmux_backend, "RENAME_READY_TIMEOUT", 0.0)
+        fake.answers["capture-pane"] = (0, screen, "")
+        out = self._spawn(fake, tmp_path)
+        assert out["ok"] is True and out["trust_prompt"] is False
+        assert self._keys_after_first_capture(fake) == []
+
+    def test_tmux_screen_state(self, fake):
+        fake.answers[("display-message", "#{pane_current_command}")] = (0, "claude\n", "")
+        for screen, want in [(READY_SCREEN, "ready"), (TRUST_SCREEN, "trust"),
+                             (UNKNOWN_DIALOG_SCREEN, "starting"),
+                             (BORDERED_UNKNOWN_DIALOG, "starting")]:
+            fake.answers["capture-pane"] = (0, screen, "")
+            assert tmux_backend.screen_state(self.H) == want, screen
+        fake.answers[("display-message", "#{pane_current_command}")] = (0, "bash\n", "")
+        fake.answers["capture-pane"] = (0, READY_SCREEN, "")
+        assert tmux_backend.screen_state(self.H) == "shell"     # scrollback of an exited claude
+        fake.answers["capture-pane"] = (1, "", "can't find pane: %7")
+        assert tmux_backend.screen_state(self.H) is None
+        assert fake.find("send-keys") == []
+
+    def test_tmux_send_press_enter_and_rename_refuse_on_the_dialog(self, fake):
+        fake.answers[("display-message", "#{pane_current_command}")] = (0, "claude\n", "")
+        fake.answers[("display-message", "#{window_panes}")] = (0, "1\n", "")
+        assert tmux_backend.send("l", "Read and follow the work packet at /p", self.H) is False
+        assert tmux_backend.press_enter("l", self.H) is False
+        assert tmux_backend.rename_by_id(self.H, "[Exec] e1-131415") is False
+        assert fake.find("send-keys") == []
+        assert ["rename-window", "-t", "%7", "--", "[Exec] e1-131415"] in fake.calls  # not a key
+
+    def test_tmux_dialog_text_under_a_shell_is_scrollback_not_live(self, fake):
+        # claude already exited (shell in the foreground): the dialog on screen is history.
+        fake.answers[("display-message", "#{pane_current_command}")] = (0, "-zsh\n", "")
+        assert tmux_backend.trust_prompt_live(self.H) is False
+        assert tmux_backend.send("l", "echo hi", self.H) is True
+
+    # ── iTerm ──────────────────────────────────────────────────────────────────────────────────
+    def test_iterm_trust_prompt_live_reads_the_session_screen(self, monkeypatch):
+        # conftest stubs the probe suite-wide (no test may read the real iTerm); restore the real
+        # function here, with run_osascript stubbed below.
+        from conftest import REAL_ITERM_TRUST_PROMPT_LIVE
+        monkeypatch.setattr(iterm, "trust_prompt_live", REAL_ITERM_TRUST_PROMPT_LIVE)
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok(TRUST_SCREEN)) as osa:
+            assert iterm.trust_prompt_live("w0t1p0:UUID-1") is True
+        assert "contents of s" in osa.call_args[0][0] and "UUID-1" in osa.call_args[0][0]
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok(READY_SCREEN)):
+            assert iterm.trust_prompt_live("w0t1p0:UUID-1") is False
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("__RELAY_NO_SESSION__\n")):
+            assert iterm.trust_prompt_live("w0t1p0:UUID-1") is False
+        with mock.patch.object(iterm, "run_osascript",
+                               return_value=subprocess.CompletedProcess(["osascript"], 1, "", "x")):
+            assert iterm.trust_prompt_live("w0t1p0:UUID-1") is False
+
+    def _iterm_spawn(self, monkeypatch, *screens, rename_delay=0):
+        """iterm.spawn with the REAL readiness poll: run_osascript answers the launch verdict, then
+        each of `screens` in turn as the new tab's screen, then "true" for anything after (a
+        rename). The fake clock advances one RENAME_READY_POLL per sleep, so the 10s wait is
+        exercised in full without real time."""
+        monkeypatch.setattr(iterm, "_rename_when_ready", REAL_ITERM_RENAME_WHEN_READY)
+        t = [0.0]
+        monkeypatch.setattr(iterm.time, "time", lambda: t[0])
+        monkeypatch.setattr(iterm.time, "sleep", lambda s: t.__setitem__(0, t[0] + s))
+        answers = iter([_ok("OK\nSID-1\nfront")] + [_ok(sc) for sc in screens])
+        scripts = []
+
+        def osa(script, timeout=None):
+            scripts.append(script)
+            return next(answers, _ok(screens[-1] if screens else "true"))
+        with mock.patch.object(iterm, "run_osascript", side_effect=osa):
+            out = iterm.spawn(cwd="/tmp", prompt="p", label="[Exec] e1-131415",
+                              pidfile="/tmp/pid", rename_delay=rename_delay)
+        return out, scripts
+
+    @staticmethod
+    def _renames(scripts):
+        return [sc for sc in scripts if 'write text "/rename' in sc]
+
+    def test_iterm_spawn_launch_script_never_types_the_rename(self, monkeypatch):
+        # The launch AppleScript can't judge readiness, so it no longer carries the /rename at all.
+        out, scripts = self._iterm_spawn(monkeypatch, READY_SCREEN)
+        assert "/rename" not in scripts[0]
+        assert out["ok"] is True
+
+    def test_iterm_spawn_on_the_trust_dialog_types_nothing(self, monkeypatch):
+        out, scripts = self._iterm_spawn(monkeypatch, TRUST_SCREEN)
+        assert out["trust_prompt"] is True
+        assert self._renames(scripts) == []
+        assert not any("write text" in sc for sc in scripts[1:])        # screen reads only
+
+    def test_iterm_spawn_unknown_dialog_times_out_typing_nothing(self, monkeypatch):
+        out, scripts = self._iterm_spawn(monkeypatch, UNKNOWN_DIALOG_SCREEN)
+        assert out["ok"] is True and out["trust_prompt"] is False
+        polls = int(iterm.RENAME_READY_TIMEOUT / iterm.RENAME_READY_POLL) + 1
+        assert len(scripts) == 1 + polls                                 # launch + every poll
+        assert not any("write text" in sc for sc in scripts[1:])
+
+    def test_iterm_spawn_renames_once_the_input_box_is_live(self, monkeypatch):
+        out, scripts = self._iterm_spawn(monkeypatch, "", BORDERED_UNKNOWN_DIALOG, READY_SCREEN,
+                                         "true")
+        assert out["trust_prompt"] is False
+        renames = self._renames(scripts)
+        assert len(renames) == 1 and scripts[-1] is renames[0]
+        assert 'id of s) is "SID-1"' in renames[0]
+        assert 'write text "/rename [Exec] e1-131415" newline NO' in renames[0]
+
+    def test_iterm_screen_state_reads_the_session_screen(self, monkeypatch):
+        from conftest import REAL_ITERM_SCREEN_STATE
+        monkeypatch.setattr(iterm, "screen_state", REAL_ITERM_SCREEN_STATE)
+        for screen, want in [(READY_SCREEN, "ready"), (TRUST_SCREEN, "trust"),
+                             (UNKNOWN_DIALOG_SCREEN, "starting"),
+                             (BORDERED_UNKNOWN_DIALOG, "starting"), ("", "starting")]:
+            with mock.patch.object(iterm, "run_osascript", return_value=_ok(screen)):
+                assert iterm.screen_state("w0t1p0:UUID-1") == want, screen
+        with mock.patch.object(iterm, "run_osascript", return_value=_ok("__RELAY_NO_SESSION__\n")):
+            assert iterm.screen_state("w0t1p0:UUID-1") is None
+
+
+# The bottom of a real executor pane (Claude Code 2.1.296 under tmux, captured read-only from this
+# repo's own executor mid-turn, paths shortened): the input box's TOP edge carries the session's
+# name after its /rename, the prompt row is "❯" + a no-break space, and this build's spinner line
+# has no "esc to interrupt".
+LIVE_2_1_296_SCREEN = (
+    "⏺ Bash(cd /x; tmux capture-pane …)\n"
+    "  ⎿ \xa0Running…\n"
+    "✢ Thundering… (18m 58s · ↓ 41.8k tokens)" + " " * 40 + "\n"
+    + "─" * 160 + " [Exec] relay-spawn-list-fix-131415 ─\n"
+    "❯\xa0" + " " * 60 + "\n"
+    + "─" * 200 + "\n"
+    "  Opus 5.5 (1M context)  …/development/claude-relay  git:main*\n"
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+
+
+class TestInputReady:
+    """trust_prompt.input_ready: POSITIVE evidence of claude's live input box — the one thing that
+    licenses a typed line into an executor whose readiness relay can't otherwise vouch for."""
+    RULE = "─" * 60
+
+    @pytest.mark.parametrize("screen", [
+        READY_SCREEN,                                                       # rounded box, "> "
+        f"Welcome to Claude Code\n\n{'─' * 60}\n> \n{'─' * 60}\n  ? for shortcuts\n",
+        f"{'─' * 60}\n❯ \n{'─' * 60}\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n",
+        f"{'─' * 60}\n> /rename half typed\n  second line\n{'─' * 60}\n",       # holds input
+        "● Reading files…\n✻ Thinking… (12s · esc to interrupt)\n",            # mid-turn
+        LIVE_2_1_296_SCREEN,
+    ], ids=["rounded", "plain", "chevron", "multiline", "working", "live-2.1.296"])
+    def test_ready(self, screen):
+        assert trust_prompt.input_ready(screen) is True
+        assert trust_prompt.launch_state(screen) == "ready"
+
+    @pytest.mark.parametrize("screen", [
+        "", "\n\n", "$ sh /tmp/boot.sh %9\n",                              # not drawn yet
+        UNKNOWN_DIALOG_SCREEN, BORDERED_UNKNOWN_DIALOG,
+        # a box whose first row is a numbered option under a prompt glyph — a selector, not input
+        f"{'─' * 60}\n❯ 1. Yes\n  2. No\n{'─' * 60}\n",
+        # an input box scrolled far above a dialog drawn under it
+        f"{'─' * 60}\n> hi\n{'─' * 60}\n" + "".join(f"row {i}\n" for i in range(12)),
+        # a single rule over a dialog
+        f"{'─' * 60}\n Continue?\n ❯ 1. Yes\n",
+        # a dialog whose top border carries a title, like the renamed input box's does
+        f"{'─' * 30} Allow hooks? {'─' * 30}\n Run this workspace's hooks?\n ❯ 1. Allow\n"
+        f"   2. Deny\n{'─' * 60}\n",
+    ], ids=["blank", "blank-lines", "shell", "selector", "bordered", "box-options",
+            "box-far-up", "one-rule", "titled-dialog"])
+    def test_not_ready(self, screen):
+        assert trust_prompt.input_ready(screen) is False
+        assert trust_prompt.launch_state(screen) == "starting"
+
+    def test_trust_dialog_is_trust_not_ready(self):
+        assert trust_prompt.input_ready(TRUST_SCREEN) is False
+        assert trust_prompt.launch_state(TRUST_SCREEN) == "trust"
 
 
 class TestTmuxWatchPrimitives:
