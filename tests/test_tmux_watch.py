@@ -219,7 +219,7 @@ def _quiet_sweeps(relay, monkeypatch):
     monkeypatch.setattr(relay, "refresh_live_board", lambda *a, **k: None)
     monkeypatch.setattr(relay, "_armed_lead_caller", lambda *a, **k: None)
     monkeypatch.setattr(relay, "_usage_for_session", lambda *a, **k: None)
-    monkeypatch.setattr(relay, "_check_one", lambda sid: dict(relay.read_session(sid)))
+    monkeypatch.setattr(relay, "_check_one", lambda sid, persist=True: dict(relay.read_session(sid)))
 
 
 def test_check_prints_the_screen_line_for_a_tmux_session(relay, screen, monkeypatch, capsys):

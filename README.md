@@ -57,7 +57,7 @@ wakes you when an executor finishes.
 | `relay close` | closes the tab | window may linger (Cmd-W it) |
 | Lead push-wake (`nudge-lead`) | yes | no — Terminal.app can't inject text into a running process; a Terminal-hosted lead degrades to its own at-Stop check + desktop notification |
 
-**tmux** is the backend for Linux / SSH leads and for anyone running `claude` inside tmux. It is selected by `RELAY_TERMINAL=tmux`, by `terminal_app: tmux` in config, or automatically when `$TMUX` is set. Sessions are addressed by pane id, so handles look like `tmux:%N`. Executors appear as windows (or split panes) named by relay in the status bar, and a lead's color is applied through `window-status-style` instead of a tab color. `RELAY_TMUX_SOCKET=<name>` points relay at a named tmux server (`tmux -L <name>`). `relay doctor` shows the selected backend and the tmux version. On Linux relay uses `xdg-open` (for `--open`), `xclip` or `wl-copy` (clipboard) and `notify-send` (the banner fallback) when they are installed; none is required, and without one relay prints the path or text instead.
+**tmux** is the backend for Linux / SSH leads and for anyone running `claude` inside tmux. It is selected by `RELAY_TERMINAL=tmux`, by `terminal_app: tmux` in config, or automatically when `$TMUX` is set. Sessions are addressed by pane id, so handles look like `tmux:%N`. Each executor gets its **own detached tmux session**, named `relay-<session id>` (`relay list --json` gives it as `tmux_session`), so spawning never switches anyone's terminal away from the lead and never drops an executor into an unrelated session; watch one with `tmux attach -t relay-<session id>`, or use `relay focus`, which is the only command that switches your client. On tmux, layout "tab" means this own-session placement. With `--pane` / `executor_layout: "pane"` the executor is instead a detached side-by-side split of the lead's pane (focus stays on the lead). If tmux can't create the session or split, the spawn fails with tmux's error rather than landing somewhere else. `relay close` kills an executor's own session, or only its pane for a split. Executor windows are named by relay, and a lead's color is applied through `window-status-style` instead of a tab color. `RELAY_TMUX_SOCKET=<name>` points relay at a named tmux server (`tmux -L <name>`). `relay doctor` shows the selected backend and the tmux version. On Linux relay uses `xdg-open` (for `--open`), `xclip` or `wl-copy` (clipboard) and `notify-send` (the banner fallback) when they are installed; none is required, and without one relay prints the path or text instead.
 
 **Under tmux** the lead can also see its executors, not just talk to them:
 
@@ -76,7 +76,7 @@ relay tmux-setup --apply   # also apply them to the running tmux server now
 
 `tmux-setup` never edits `~/.tmux.conf`; `--apply` lasts until the tmux server exits, so paste the printed lines to keep them. They are:
 
-- `status-right` runs `relay status-line --tmux`, refreshed every `status-interval 5` seconds. It prints each executor as `name:state`, coloured (yellow busy, green reported, orange stalled, red dead), plus a count. It scopes to the lead whose pane is in the active pane's tmux session, else shows every executor. It reads session files only, with no liveness probe, so the state is the last one `relay list` or `relay check` wrote; on any error it prints nothing.
+- `status-right` runs `relay status-line --tmux`, refreshed every `status-interval 5` seconds. It prints each executor as `name:state`, coloured (yellow busy, green reported, orange stalled, red dead), plus a count. It scopes to the lead whose pane is in the active pane's tmux session, else shows every executor. It reads session files only, with no liveness probe, so the state is the last one `relay check` (or the lead's turn-end) wrote — `relay list` shows fresh state but writes nothing; on any error it prints nothing.
 - `prefix R` opens the session list in a popup. `prefix D` prompts for a session name and opens its staged diff in a popup (this replaces tmux's default `D`, choose-client).
 - The same popups are available from the command line: `relay check <session> --popup` (the report, in `less -R`), `relay diff <session> --popup` (`git diff --cached` in `less -R`, instead of the HTML page) and `relay list --popup`. Outside tmux, `--popup` says it needs tmux and prints the normal output.
 
@@ -87,7 +87,7 @@ tmux -CC new -s work       # start; run claude (and /relay:mode) inside it
 tmux -CC attach -t work    # reattach later, even after closing the window
 ```
 
-What works: spawn (each executor is a tmux window, so an iTerm tab), `relay focus` (`select-window`), `relay send`, `relay close`, auto-wake. What does not: tab colors (relay sets tmux's `window-status-style`, which iTerm ignores in `-CC` mode, so executors do not wear the lead's color) and `relay tidy` (a no-op under tmux). iTerm draws no tmux status line in `-CC` mode, so the status bar strip and the lead's wake banner (a tmux status-line message) are not shown there, and popups are not something to rely on either; use `relay list`, `relay board` and `relay diff` (the HTML page) in the lead's pane instead. The OSC 777 banner tier is not used for tmux leads. `relay doctor` prints an advisory line when it sees iTerm around tmux. The status bar and popups are for a plain terminal attached to tmux, such as a Linux box over SSH.
+What works: spawn (each executor is its own detached tmux session rather than a window in yours: switch to it with `relay focus`, or open it with `tmux -CC attach -t relay-<session id>`), `relay focus` (`switch-client` + `select-window`), `relay send`, `relay close`, auto-wake. What does not: tab colors (relay sets tmux's `window-status-style`, which iTerm ignores in `-CC` mode, so executors do not wear the lead's color) and `relay tidy` (a no-op under tmux). iTerm draws no tmux status line in `-CC` mode, so the status bar strip and the lead's wake banner (a tmux status-line message) are not shown there, and popups are not something to rely on either; use `relay list`, `relay board` and `relay diff` (the HTML page) in the lead's pane instead. The OSC 777 banner tier is not used for tmux leads. `relay doctor` prints an advisory line when it sees iTerm around tmux. The status bar and popups are for a plain terminal attached to tmux, such as a Linux box over SSH.
 
 **Why the lead's own model matters**: this role's value is judgment calls (what to delegate, when
 to reuse a session, whether a report is truly mergeable) — that needs a strong reasoning model, and
@@ -231,7 +231,7 @@ relay stats [--lead SID] [--since DAYS] [--json]   one row per packet ever sent 
 relay doctor [--offline] [--quick]         prove the installed claude CLI still honours relay's launch flags + plumbing; run after every Claude Code update
 relay install-cli [--dir DIR] [--force] [--print]   write a `relay` wrapper on $PATH that survives /plugin update; see Install above
 relay lint <packet.md> [--worktree W] [--model M] [--strict]   advisory packet checks (MCP undeclared, big reading on 200K, no Preconditions, shape hints…)
-/relay:list [--all-leads]                  leads + active executors (closed hidden; --closed shows); TOKENS and LAUNCH (mcp/context/role); parks finished ones
+/relay:list [--all-leads]                  leads + active executors (closed hidden; --closed shows); TOKENS and LAUNCH (mcp/context/role); read-only
                                             other projects' ghost/paused leads collapse to one line; --all-leads shows them
 /relay:close <session_id> [--supersede <new_id>]   (rarely needed — finished executors auto-close)
 relay keep <session_id> [--off]            pin/unpin an executor against auto-close
@@ -331,8 +331,9 @@ alone still means several compactions in):
 ```
 
 Honest limit: `relay status` reads stored state + report-file existence only — no liveness refresh.
-A crashed executor may still read `busy` until the next `relay list`/`relay check`; those commands
-remain the decision surface for whether something actually needs attention.
+A crashed executor may still read `busy` until the next `relay check`; `relay list` and `relay check`
+remain the decision surface for whether something actually needs attention (`list` computes the
+fresh status without writing it — it is read-only, so a poller can call it as often as it likes).
 
 ## The routing gate (friction, not trust)
 
@@ -804,7 +805,7 @@ it alone; `relay keep <sid> --off` releases it` instead of a bare 📌 nobody ca
 handoff, so `relay handoff` names the ones the successor is inheriting (`📌 N pinned executors
 inherited: … — `relay keep <sid> --off` to release`) — on the outgoing lead's console **and** as an
 item in the successor's own handoff copy, which is the only one of the two the successor reads.
-The sweep runs on `relay check`, `relay list`, and every lead turn-end (the Stop hook), scoped to
+The sweep runs on `relay check` and every lead turn-end (the Stop hook) — not on `relay list`, which is read-only — scoped to
 the lead's own executors; the ledger records `auto_closed` (and, right before it, a `landed` event
 when the reason is "landed" — the same fact `relay stats` ROUNDS reads, see below) and `relay list
 --closed` shows `closed (auto)`.
@@ -853,7 +854,7 @@ Closing is parking, not loss: the report is on disk, staged work stays in the wo
 - **Pane layout** (iTerm and tmux): set `"executor_layout": "pane"` (or pass `--pane` at spawn) to open
   executors as split panes inside the lead's own tab instead of separate tabs; `--tab` forces a
   tab for one spawn regardless of config. Falls back to a tab if the lead's session can't be
-  located. Under tmux the pane is a side-by-side split of the lead's pane. `relay focus` selects
+  located (under tmux there is no fallback: a failed split fails the spawn). Under tmux the pane is a detached side-by-side split of the lead's pane. `relay focus` selects
   the exact pane, not just the tab (Terminal.app: always a window).
 - **True adjacent-tab placement** (iTerm only, optional nicety): for `layout="tab"` spawns,
   AppleScript alone can only put a new tab in the lead's window, never truly next to it — install

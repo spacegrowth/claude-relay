@@ -1305,10 +1305,34 @@ class TestTmuxBackend:
         fake.answers["list-panes"] = (1, "", "no server running")
         assert tmux_backend.exists_by_id(self.H) is False
 
+    OWNER_Q = ["display-message", "-p", "-t", "%7", "#{session_id} #{@relay_pane}"]
+
     def test_close_kills_the_pane_by_id(self, fake):
+        # A pane relay didn't create a session for (a split executor in the lead's window, or a
+        # lead in the user's own session): only the pane goes.
+        fake.answers[("display-message", "#{session_id} #{@relay_pane}")] = (0, "$0 \n", "")
         assert tmux_backend.close("[Exec] e1", self.H) is True
         assert tmux_backend.close_by_id(self.H) is True
-        assert fake.calls == [["kill-pane", "-t", "%7"]] * 2
+        assert fake.calls == [self.OWNER_Q, ["kill-pane", "-t", "%7"]] * 2
+
+    def test_close_kills_the_executors_own_session(self, fake):
+        fake.answers[("display-message", "#{session_id} #{@relay_pane}")] = (0, "$4 %7\n", "")
+        assert tmux_backend.close_by_id(self.H) is True
+        assert fake.calls == [self.OWNER_Q, ["kill-session", "-t", "$4"]]
+
+    def test_close_of_a_split_in_a_relay_session_spares_that_session(self, fake):
+        # A split executor off a lead that itself lives in a relay-created session: the session's
+        # owner is the LEAD's pane, so only the executor's pane is killed.
+        fake.answers[("display-message", "#{session_id} #{@relay_pane}")] = (0, "$4 %3\n", "")
+        assert tmux_backend.close_by_id(self.H) is True
+        assert fake.calls == [self.OWNER_Q, ["kill-pane", "-t", "%7"]]
+
+    def test_session_name_by_id(self, fake):
+        fake.answers[("display-message", "#{session_name}")] = (0, "relay-e1\n", "")
+        assert tmux_backend.session_name_by_id(self.H) == "relay-e1"
+        assert tmux_backend.session_name_by_id("twid:4") is None
+        fake.answers[("display-message", "#{session_name}")] = (1, "", "can't find pane")
+        assert tmux_backend.session_name_by_id(self.H) is None
 
     def test_tty_and_title_by_id(self, fake):
         fake.answers[("display-message", "#{pane_tty}")] = (0, "/dev/pts/3\n", "")
@@ -1368,7 +1392,7 @@ class TestTmuxBackend:
 
     # ── spawn ──────────────────────────────────────────────────────────────────────────────────
     def _spawn(self, fake, tmp_path, **kw):
-        fake.answers.setdefault("new-window", (0, "%9\n", ""))
+        fake.answers.setdefault("new-session", (0, "%9\n", ""))
         fake.answers.setdefault(("display-message", "#{window_panes}"), (0, "1\n", ""))
         handle_file = tmp_path / "iterm_id"
         out = tmux_backend.spawn(cwd="/work/tree", prompt="Read the packet", label="[Exec] e1",
@@ -1376,12 +1400,17 @@ class TestTmuxBackend:
                                  session_uuid="u-1", **kw)
         return out, handle_file
 
-    def test_spawn_plain_new_window_and_launch_by_id(self, fake, tmp_path):
+    def test_spawn_own_detached_session_and_launch_by_id(self, fake, tmp_path):
         out, handle_file = self._spawn(fake, tmp_path)
         assert out == {"ok": True, "reason": "ok", "session_id": "tmux:%9", "front_title": None,
                        "trust_prompt": False}
-        assert fake.calls[0] == ["new-window", "-P", "-F", "#{pane_id}", "-n", "[Exec] e1",
-                                 "-c", "/work/tree"]
+        sess = "relay-" + tmp_path.name.replace(".", "-")
+        assert fake.calls[0] == ["new-session", "-d", "-s", sess, "-n", "[Exec] e1",
+                                 "-c", "/work/tree", "-P", "-F", "#{pane_id}"]
+        assert fake.calls[1] == ["set-option", "-t", "%9", "@relay_pane", "%9"]
+        # nothing moves any attached client: no switch/select anywhere in a spawn
+        for sub in ("switch-client", "select-window", "select-pane", "new-window"):
+            assert sub not in fake.subcommands()
         assert handle_file.read_text() == "tmux:%9"
         assert ["rename-window", "-t", "%9", "--", "[Exec] e1"] in fake.calls
         assert ["set-option", "-w", "-t", "%9", "automatic-rename", "off"] in fake.calls
@@ -1411,48 +1440,87 @@ class TestTmuxBackend:
         ]
         assert ("sleep", 1.5) in fake.events   # rename_delay before /rename
 
-    def test_spawn_tab_with_lead_handle_lands_after_the_leads_window(self, fake, tmp_path):
-        fake.answers[("display-message", "#{window_id}")] = (0, "@4\n", "")
+    def test_spawn_tab_with_lead_handle_is_its_own_session_sized_like_the_lead(self, fake,
+                                                                                  tmp_path):
+        fake.answers[("display-message", "#{window_width}x#{window_height}")] = (0, "200x50\n", "")
         out, _ = self._spawn(fake, tmp_path, lead_handle="tmux:%3")
         assert out["ok"]
-        assert fake.calls[0] == ["display-message", "-p", "-t", "%3", "#{window_id}"]
-        assert fake.calls[1] == ["new-window", "-a", "-t", "@4", "-P", "-F", "#{pane_id}",
-                                 "-n", "[Exec] e1", "-c", "/work/tree"]
+        assert fake.calls[0] == ["display-message", "-p", "-t", "%3",
+                                 "#{window_width}x#{window_height}"]
+        sess = "relay-" + tmp_path.name.replace(".", "-")
+        assert fake.calls[1] == ["new-session", "-d", "-s", sess, "-n", "[Exec] e1",
+                                 "-c", "/work/tree", "-x", "200", "-y", "50",
+                                 "-P", "-F", "#{pane_id}"]
+        for sub in ("switch-client", "select-window", "select-pane", "new-window"):
+            assert sub not in fake.subcommands()
 
-    def test_spawn_tab_lead_lookup_miss_degrades_to_plain_new_window(self, fake, tmp_path):
-        fake.answers[("display-message", "#{window_id}")] = (1, "", "can't find pane: %3")
+    def test_spawn_lead_size_lookup_miss_still_creates_the_own_session(self, fake, tmp_path):
+        fake.answers[("display-message", "#{window_width}x#{window_height}")] = (1, "", "no pane")
         out, _ = self._spawn(fake, tmp_path, lead_handle="tmux:%3")
         assert out["ok"]
-        assert fake.calls[1] == ["new-window", "-P", "-F", "#{pane_id}", "-n", "[Exec] e1",
-                                 "-c", "/work/tree"]
+        create = fake.find("new-session")[0]
+        assert create[:2] == ["new-session", "-d"] and "-x" not in create
 
-    def test_spawn_pane_layout_splits_the_leads_pane(self, fake, tmp_path):
+    def test_spawn_session_name_is_relay_sid_and_tmux_safe(self, fake, tmp_path):
+        assert tmux_backend.session_name_for("/s/.relay/my-exec-123/pid") == "relay-my-exec-123"
+        assert tmux_backend.session_name_for("/s/a.b:c/pid") == "relay-a-b-c"
+        d = tmp_path / "exec.v2:x"
+        d.mkdir()
+        tmux_backend.spawn(cwd="/w", prompt="p", label="l", pidfile=str(d / "pid"),
+                           iterm_id_file=str(tmp_path / "id"))
+        assert fake.find("new-session")[0][3] == "relay-exec-v2-x"
+
+    def test_spawn_duplicate_session_name_gets_a_suffix(self, fake, tmp_path):
+        seen = []
+
+        def create(args):
+            seen.append(args[3])
+            return (1, "", f"duplicate session: {args[3]}") if len(seen) < 3 else (0, "%9\n", "")
+        fake.answers["new-session"] = create
+        out, _ = self._spawn(fake, tmp_path)
+        assert out["ok"] and out["session_id"] == "tmux:%9"
+        assert seen[1:] == [seen[0] + "-2", seen[0] + "-3"]
+
+    def test_spawn_new_session_failure_never_falls_back_to_another_session(self, fake, tmp_path):
+        fake.answers["new-session"] = (1, "", "create window failed: fork failed")
+        out, handle_file = self._spawn(fake, tmp_path, lead_handle="tmux:%3")
+        assert out == {"ok": False, "reason": "script-failed", "session_id": None,
+                       "front_title": None, "error": "create window failed: fork failed"}
+        assert fake.subcommands().count("new-session") == 1
+        for sub in ("new-window", "split-window", "send-keys"):
+            assert sub not in fake.subcommands()
+        assert not handle_file.exists()
+
+    def test_spawn_pane_layout_splits_the_leads_pane_detached(self, fake, tmp_path):
         fake.answers["split-window"] = (0, "%11\n", "")
         fake.answers[("display-message", "#{window_panes}")] = (0, "2\n", "")
         out, handle_file = self._spawn(fake, tmp_path, lead_handle="tmux:%3", layout="pane",
                                        tab_color=(1, 2, 3))
         assert out["session_id"] == "tmux:%11" and handle_file.read_text() == "tmux:%11"
-        assert fake.calls[0] == ["split-window", "-h", "-t", "%3", "-P", "-F", "#{pane_id}",
-                                 "-c", "/work/tree"]
-        # shares the lead's window → neither renames nor recolors it
+        assert fake.calls[0] == ["split-window", "-h", "-d", "-t", "%3", "-P", "-F",
+                                 "#{pane_id}", "-c", "/work/tree"]
+        # shares the lead's window → neither renames nor recolors it, nor marks a session as its own
         assert "rename-window" not in fake.subcommands()
         assert not [c for c in fake.find("set-option") if "window-status-style" in c]
+        assert not [c for c in fake.find("set-option") if "@relay_pane" in c]
+        for sub in ("switch-client", "select-window", "select-pane", "new-session"):
+            assert sub not in fake.subcommands()
 
-    def test_spawn_pane_layout_split_failure_degrades_to_new_window(self, fake, tmp_path):
+    def test_spawn_pane_layout_split_failure_fails_the_spawn(self, fake, tmp_path):
         fake.answers["split-window"] = (1, "", "no space for new pane")
         out, _ = self._spawn(fake, tmp_path, lead_handle="tmux:%3", layout="pane")
-        assert out["ok"] and out["session_id"] == "tmux:%9"
-        assert fake.subcommands()[:2] == ["split-window", "new-window"]
+        assert out["ok"] is False and out["reason"] == "script-failed"
+        assert out["error"] == "no space for new pane"
+        assert fake.subcommands() == ["split-window"]
 
-    def test_spawn_pane_layout_without_lead_handle_is_a_plain_window(self, fake, tmp_path):
+    def test_spawn_pane_layout_without_lead_handle_is_its_own_session(self, fake, tmp_path):
         self._spawn(fake, tmp_path, layout="pane")
         assert "split-window" not in fake.subcommands()
-        assert fake.calls[0][0] == "new-window" and "-a" not in fake.calls[0]
+        assert fake.calls[0][:2] == ["new-session", "-d"]
 
     def test_spawn_foreign_lead_handle_is_ignored(self, fake, tmp_path):
         self._spawn(fake, tmp_path, lead_handle="w1t2p0:LEAD-UUID", layout="pane")
-        assert fake.calls[0] == ["new-window", "-P", "-F", "#{pane_id}", "-n", "[Exec] e1",
-                                 "-c", "/work/tree"]
+        assert fake.calls[0][:2] == ["new-session", "-d"] and "-x" not in fake.calls[0]
 
     def test_spawn_tab_color_becomes_window_status_style(self, fake, tmp_path):
         self._spawn(fake, tmp_path, tab_color=(255, 105, 97))
@@ -1461,7 +1529,7 @@ class TestTmuxBackend:
         assert "printf" not in boot           # no iTerm escape — tmux would swallow it anyway
 
     def test_spawn_tmux_failure_is_script_failed_with_stderr(self, fake, tmp_path):
-        fake.answers["new-window"] = (1, "", "no server running on /tmp/tmux-501/default")
+        fake.answers["new-session"] = (1, "", "no server running on /tmp/tmux-501/default")
         out, handle_file = self._spawn(fake, tmp_path)
         assert out == {"ok": False, "reason": "script-failed", "session_id": None,
                        "front_title": None, "error": "no server running on /tmp/tmux-501/default"}
@@ -1541,7 +1609,7 @@ class TestTrustPromptNeverAnswered:
         return [c for c in fake.calls[first:] if c[0] == "send-keys"]
 
     def _spawn(self, fake, tmp_path):
-        fake.answers.setdefault("new-window", (0, "%9\n", ""))
+        fake.answers.setdefault("new-session", (0, "%9\n", ""))
         fake.answers.setdefault(("display-message", "#{window_panes}"), (0, "1\n", ""))
         return tmux_backend.spawn(cwd="/w", prompt="Read the packet", label="[Exec] e1-131415",
                                   pidfile=str(tmp_path / "pid"),

@@ -78,15 +78,24 @@ def test_tmux_backend_against_real_tmux(tmux_server, tmp_path, monkeypatch):
     handle_file = session_dir / "iterm_id"
 
     # --- spawn --------------------------------------------------------------------------------
+    # The fixture's "relay-e2e" session stands in for the lead's: the executor must land in a
+    # detached session of its OWN, sized like the lead's window, leaving the lead's session alone.
+    lead_pane = tmux_backend._tmux(["list-panes", "-t", "relay-e2e", "-F",
+                                    "#{pane_id}"]).stdout.strip()
     res = tmux_backend.spawn(
         cwd=str(tmp_path), prompt=pointer, label="[Exec] e2e-tmux", pidfile=str(pidfile),
         iterm_id_file=str(handle_file), session_uuid="e2e-tmux-fake-conversation",
-        env_prefix=f"export PATH={fakebin}:$PATH && ", tab_color=(1, 2, 3), rename_delay=0.5)
+        env_prefix=f"export PATH={fakebin}:$PATH && ", tab_color=(1, 2, 3), rename_delay=0.5,
+        lead_handle=tmux_backend.handle_for(lead_pane))
     assert res["ok"] is True and res["reason"] == "ok", res
     handle = res["session_id"]
     assert handle.startswith("tmux:%"), handle
     pane = handle[len("tmux:"):]
     try:
+        assert tmux_backend.session_name_by_id(handle) == "relay-session"   # relay-<pidfile dir>
+        assert tmux_backend._display(pane, "#{window_width}x#{window_height}") == "200x50"
+        lead_windows = tmux_backend._tmux(["list-windows", "-t", "relay-e2e"]).stdout
+        assert len(lead_windows.splitlines()) == 1, lead_windows
         assert handle_file.read_text() == handle
         assert _poll(pidfile.exists), "pidfile never appeared — the bootstrap did not run"
         pid = int(pidfile.read_text().strip())
@@ -167,10 +176,12 @@ def test_tmux_backend_against_real_tmux(tmux_server, tmp_path, monkeypatch):
                 assert tmux_backend.title_by_id(h) is None
             assert spy_tmux.call_count == 0, spy_tmux.call_args_list
 
-        # --- close removes the pane ----------------------------------------------------------------
-        # (the stub is a child of the pane's shell; kill-pane takes the pty down with it)
+        # --- close removes the executor's own session (and never the lead's) ---------------------
+        # (the stub is a child of the pane's shell; kill-session takes the pty down with it)
         assert tmux_backend.close_by_id(handle) is True
         assert _poll(lambda: tmux_backend.exists_by_id(handle) is False)
+        sessions = tmux_backend._tmux(["list-sessions", "-F", "#{session_name}"]).stdout.split()
+        assert sessions == ["relay-e2e"], sessions
         assert tmux_backend.is_alive("[Exec] e2e-tmux", handle) is False
         assert tmux_backend.send("x", "gone", handle) is False
     finally:

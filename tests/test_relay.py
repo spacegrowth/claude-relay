@@ -1622,10 +1622,14 @@ class TestNudgeLead:
     scripts/backend.py), so every test here pins the concrete backend module via
     `relay.backend.by_name(...)` instead, exactly like cmd_nudge_lead itself does post-D2/D3."""
 
+    # A recorded pane handle: the readiness gate reads the lead's screen by handle (conftest stubs
+    # iterm.screen_state → "ready"), and a marker without one is refused as unreadable.
+    HANDLE = "w0t0p0:LEAD"
+
     def _lead(self, relay, sid="lead-1", tab_label="[Lead] alpha", state=None, state_since=None,
-              backend="iterm"):
+              backend="iterm", iterm_session=HANDLE):
         relay.lead_guard.write_marker(relay.STATE_ROOT, sid, project="alpha", tab_label=tab_label,
-                                      backend=backend)
+                                      backend=backend, iterm_session=iterm_session)
         if state is not None:
             m = relay.lead_guard.read_marker(relay.STATE_ROOT, sid)
             m["state"] = state
@@ -1637,7 +1641,7 @@ class TestNudgeLead:
         self._lead(relay, state="idle")
         with mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="wake up"))
-        send.assert_called_once_with("[Lead] alpha", "wake up", None, None)
+        send.assert_called_once_with("[Lead] alpha", "wake up", self.HANDLE, None)
 
     def test_no_state_defaults_and_nudges(self, relay):
         self._lead(relay)  # no state stamped at all
@@ -1705,7 +1709,7 @@ class TestNudgeLead:
         with mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
         assert not decoy_calls, "ambient (wrong) backend was used instead of the marker's recorded one"
-        send.assert_called_once_with("[Lead] alpha", "hi", None, None)
+        send.assert_called_once_with("[Lead] alpha", "hi", self.HANDLE, None)
 
     def test_backend_missing_probes_and_sends_via_the_one_with_a_live_tab(self, relay):
         # D3.2: a marker armed before D2 has backend=None — every currently-armed lead on a real
@@ -1715,7 +1719,7 @@ class TestNudgeLead:
              mock.patch.object(relay.backend.by_name("iterm"), "is_alive", return_value=True), \
              mock.patch.object(relay.backend.by_name("iterm"), "send", return_value=True) as send:
             relay.cmd_nudge_lead(SimpleNamespace(lead="lead-1", message="hi"))
-        send.assert_called_once_with("[Lead] alpha", "hi", None, None)
+        send.assert_called_once_with("[Lead] alpha", "hi", self.HANDLE, None)
 
     def test_backend_missing_and_ambiguous_probe_falls_back_to_ambient(self, relay, monkeypatch):
         # Both backends claim a live tab (shouldn't normally happen, but the probe must degrade to
@@ -7369,13 +7373,17 @@ class TestAutoCloseSweep:
         s = relay.read_session("e1")
         assert s["status"] == "superseded" and (relay.STATE_ROOT / "e1" / relay.SEED_FILENAME).exists()
 
-    def test_list_renders_closed_auto_and_pin(self, relay, tmp_path, capsys, monkeypatch):
+    def test_list_never_sweeps_but_renders_what_check_closed(self, relay, tmp_path, capsys,
+                                                             monkeypatch):
+        """`relay list` is read-only: it does not park a finished executor (the sweep closes
+        sessions and ledgers it). `relay check` still sweeps, and list then renders the result —
+        `closed (auto)` for the parked one, the pinned one still `reported`."""
         wt = self._repo(tmp_path)
         self._exec(relay, wt)
         self._exec(relay, wt, sid="pinned", keep=True)
-        # BUG-cli-2 (fixed): the sweep only acts for an armed-lead caller now, scoped to that
-        # lead's own executors — both sessions here are owned by "lead-1" (the default `_exec`
-        # owner, armed via write_marker), so list must run as that lead to see its own auto-close.
+        # BUG-cli-2 (fixed): the sweep only acts for an armed-lead caller, scoped to that lead's own
+        # executors — both sessions here are owned by "lead-1" (the default `_exec` owner, armed via
+        # write_marker), so the commands run as that lead.
         monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "lead-1")
         with mock.patch.object(relay, "_kill_and_wait"), \
              mock.patch.object(relay.iterm, "close", return_value=True), \
@@ -7383,8 +7391,13 @@ class TestAutoCloseSweep:
              mock.patch.object(relay, "_transcript_mb_for", return_value=0.1), \
              mock.patch.object(relay, "session_pid_alive", return_value=False):
             relay.cmd_list(SimpleNamespace(json=False, lead=None, all=True, closed=True))
+            out = capsys.readouterr().out
+            assert "auto-closed" not in out
+            assert relay.read_session("e1")["status"] == "reported"
+            relay.cmd_check(SimpleNamespace(session_id=None, all=True, json=False))
+            assert "auto-closed 'e1' (landed)" in capsys.readouterr().out
+            relay.cmd_list(SimpleNamespace(json=False, lead=None, all=True, closed=True))
         out = capsys.readouterr().out
-        assert "auto-closed 'e1' (landed)" in out
         assert "closed (auto)" in out
         assert "pinned" in out and "reported" in out
 
@@ -9103,7 +9116,7 @@ class TestTmuxUi:
         assert "--popup needs tmux" in out
         assert (relay.packets_dir("e1") / "001-diff.html").exists()
         # check → normal status line follows
-        relay._check_one = lambda sid: relay.read_session(sid)   # no real liveness probe
+        relay._check_one = lambda sid, persist=True: relay.read_session(sid)   # no real liveness probe
         relay.cmd_check(SimpleNamespace(session_id="e1", all=False, json=False, popup=True,
                                         popup_inner=False))
         out = capsys.readouterr().out

@@ -1130,7 +1130,9 @@ class TestNudgeLead:
     def test_a_live_but_uninjectable_tab_is_a_different_failure(self, relay, terms):
         """§9.6a: "A dead tab and a live-but-uninjectable one are DIFFERENT failures and must not
         report the same way" — terminal_app.send is unconditionally False by design."""
-        arm_lead(relay, "lead-1", "webapp", backend="iterm")
+        # A pane handle, so the readiness gate can read the (conftest-stubbed "ready") screen and
+        # let the send through to the backend whose refusal this test is about.
+        arm_lead(relay, "lead-1", "webapp", iterm_session="w0t0p0:LEAD", backend="iterm")
         terms.send_ok = False
         terms.alive = True
         with pytest.raises(SystemExit) as e:

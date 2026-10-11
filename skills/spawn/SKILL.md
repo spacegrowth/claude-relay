@@ -70,6 +70,8 @@ coming soon and don't want auto-close to park it in between (it can always be re
 `--scope <tag>` for the short area tag shown in `/relay:list`. Add `--pane` to open this executor
 as a split pane in your own window instead of a tab (`--tab` to force a tab), overriding the
 `executor_layout` config default; iTerm and tmux, falls back to a tab if your session can't be found.
+On tmux a "tab" is the executor's own detached tmux session (`relay-<session id>`): your terminal
+never switches to it.
 Executors launch with NO MCP servers by default — saves tokens every turn and removes a
 side-effect surface. **If the packet genuinely needs one, declare it IN the packet** with a line
 `MCP: linear` (strict allowlist of servers configured in `~/.claude.json` / the worktree's

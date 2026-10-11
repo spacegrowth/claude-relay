@@ -28,9 +28,11 @@ summed from its transcript — use it to judge whether a territory deserves sonn
 time), and `LAUNCH` is `mcp/context/role` (e.g. `none/200k/A`) — the first place to look when an
 executor "doesn't have" a tool or compacts early.
 
-Running `list` also **auto-closes** finished executors (reported, report already seen by you,
-work landed in the worktree or idle past `auto_close_idle_minutes`) and prints a 🛏 line for each —
-they show as `closed (auto)` under `--closed`, and `/relay:send` brings one back with full context.
+`list` is **read-only**: it shows each executor's fresh status but writes nothing (no ledger
+line, no session file). Finished executors (reported, report already seen by you, work landed in
+the worktree or idle past `auto_close_idle_minutes`) are auto-closed by `relay check` and at your
+turn-end instead — they show as `closed (auto)` under `--closed`, and `/relay:send` brings one back
+with full context.
 A `reported 📌` status is a pinned session (`relay keep`) that auto-close leaves alone; a
 📌 footnote per pinned session names who pinned it and how long ago, with the release command.
 A 🛏 footnote calls out a session that is **not** auto-closed because its `--when-idle` queue

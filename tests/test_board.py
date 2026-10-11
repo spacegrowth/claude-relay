@@ -308,14 +308,15 @@ class TestLiveBoard:
         after = json.loads(json_path.read_text())
         assert after["executors"][0]["status"] == "reported"
 
-    def test_list_and_spawn_also_trigger_the_refresh(self, relay, tmp_path):
-        """The other state-change moments the packet names: `relay list` and `relay spawn`."""
+    def test_spawn_triggers_the_refresh_but_read_only_list_does_not(self, relay, tmp_path):
+        """`relay spawn` is a state-change moment. `relay list` is read-only and is not: a board
+        re-render persists every executor's refreshed status (board_data → _check_one)."""
         _write_lead(relay, tmp_path)
         relay.STATE_ROOT.mkdir(parents=True, exist_ok=True)
         (relay.STATE_ROOT / "board.json").write_text("{}")  # proves live is already active
         with mock.patch.object(relay, "refresh_live_board") as rlb:
             relay.cmd_list(SimpleNamespace(json=False, lead=None, all=True, closed=False))
-        rlb.assert_called_once()
+        rlb.assert_not_called()
 
         with mock.patch.object(relay, "refresh_live_board") as rlb, \
              mock.patch.object(relay.iterm, "spawn", side_effect=lambda **kw: {}), \

@@ -26,7 +26,7 @@ Commands:
   relay route retain "<reason>" --session <session_id>   # open the retain grace window
   relay handoff <handoff.md> [--project NAME] [--model NAME]  # succeed this lead with a pre-armed fresh one
   relay close-predecessor                    # close the outgoing lead's tab after a handoff, on user go
-  relay nudge-lead <lead> "<message>"        # type a message into a LEAD's own tab; always sends
+  relay nudge-lead <lead> "<message>"        # type a message into a LEAD's own tab (busy or idle; never into a dialog)
   relay tidy [--dry-run]                     # re-order the tab bar into [Lead] [Exec…] [Lead 2] [Exec…]
 """
 import argparse
@@ -891,6 +891,51 @@ def session_pid_alive(s):
         if cur and cur != recorded:
             return False
     return True
+
+
+# How far apart a process's `ps lstart` and its pidfile's mtime may be and still count as "this
+# process wrote this pidfile". The bootstrap's `echo $$ > pid` runs within milliseconds of the
+# shell's start (lstart has 1 s resolution); a recycled pid belongs to a process that started long
+# after the file was written, so a generous window still separates the two.
+PIDFILE_START_SLACK_SECONDS = 10
+
+
+def lstart_epoch(text):
+    """Epoch seconds for a `ps -o lstart=` string, or None if it doesn't parse. One parser for both
+    platforms' real outputs: macOS pads the field with trailing blanks ("Sat Oct 10 21:55:45 2026    ")
+    and procps-ng pads a one-digit day with a second space ("Sat Oct  3 19:47:26 2026"); both read
+    as `%a %b %d %H:%M:%S %Y` once runs of whitespace collapse. Local time, like ps prints it — so
+    compare only against values produced in this same process environment (same TZ)."""
+    try:
+        return time.mktime(time.strptime(" ".join(str(text).split()), "%a %b %d %H:%M:%S %Y"))
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
+def _relaunched_pid(session_id, s):
+    """(pid, pid_started) of a claude that a LATER run of this session's own bootstrap started in
+    its tab, or None. Every launch chain writes the pidfile via `echo $$` and then execs claude, but
+    relay reads it once, at spawn/relaunch. Live on the Linux box (2026-10-10, note-b/note-c): both
+    executors' first claude exited at the folder-trust prompt, the bootstrap was re-run by hand in
+    their panes 2m15s later, and relay kept polling the first, dead pid — "process gone, no report;
+    tab still open" every 10 s while the relaunched claude worked and even after it reported.
+
+    Adopted only when the pidfile names a DIFFERENT pid that is alive AND whose process started
+    within PIDFILE_START_SLACK_SECONDS of the file's mtime (the file was written by that very
+    process — a recycled pid started long after). Pure: the caller decides whether to persist."""
+    p = pid_path(session_id)
+    try:
+        pid = int(p.read_text().strip())
+        mtime = p.stat().st_mtime
+    except (OSError, ValueError):
+        return None
+    if pid == s.get("pid") or not pid_alive(pid):
+        return None
+    started = pid_start_time(pid)
+    epoch = lstart_epoch(started) if started else None
+    if epoch is None or abs(epoch - mtime) > PIDFILE_START_SLACK_SECONDS:
+        return None
+    return pid, started
 
 
 def _transcript_stalled(s):
@@ -3188,10 +3233,15 @@ def _mark_report_surfaced(s):
     lead_guard.mark_surfaced(STATE_ROOT, owner_lead, [f"{s['session_id']}:{n}"])
 
 
-def _check_one(session_id):
+def _check_one(session_id, persist=True):
+    """Refresh one executor's status from its real liveness and return the record. `persist=False`
+    is the READ-ONLY form `relay list` uses: the same fresh status is computed in memory, but
+    nothing is written — no session.json, no ledger line, no report_seen/landed stamp, no context
+    banner. Cue polls `relay list --json` every 10 s; a poll must never be what changes state."""
     s = read_session(session_id)
     if not s:
         return {"session_id": session_id, "error": "no such session"}
+    ledger = append_ledger if persist else (lambda *a, **k: None)
 
     # LAUNCH_FAILED is sticky like the other terminal states: it records something the aliveness
     # probes below cannot re-derive (claude never came up, so the pinned conversation id is void).
@@ -3200,6 +3250,16 @@ def _check_one(session_id):
         n = s["current_packet"]
         report = packets_dir(session_id) / f"{n:03d}-report.md"
         proc_alive = session_pid_alive(s)
+        if not proc_alive and not report.exists():
+            # The recorded pid is gone — but the tab may hold a claude started by a later run of the
+            # same bootstrap (see _relaunched_pid). Adopt it; a stall that was only "the first
+            # process died" is over, so the session is busy again.
+            relaunched = _relaunched_pid(session_id, s)
+            if relaunched:
+                s["pid"], s["pid_started"] = relaunched
+                proc_alive = True
+                if s["status"] == "stalled":
+                    s["status"] = "busy"
         # Liveness is PROCESS-primary (recorded pid), NOT tab-title-primary. Claude Code mutates
         # its own iTerm tab title while working (spinner/activity text), so a title-match miss does
         # NOT mean the executor died — treating it as death falsely marked live, idle, and even
@@ -3213,10 +3273,11 @@ def _check_one(session_id):
             # A written report is a completed deliverable → reported, regardless of process/tab
             # state. Log the transition only once, not on every subsequent poll.
             if s["status"] != "reported":
-                append_ledger("reported", session_id=session_id, packet=n)
+                ledger("reported", session_id=session_id, packet=n)
             s["status"] = "reported"
-            record_report_seen(session_id, s, n)
-            record_landed_if_clean(session_id, s, n, "check")
+            if persist:
+                record_report_seen(session_id, s, n)
+                record_landed_if_clean(session_id, s, n, "check")
         elif proc_alive:
             elapsed = _busy_elapsed(s)
             # Lead-found gap (d): a usage/session-limit hit looks identical to an ordinary stall
@@ -3226,7 +3287,7 @@ def _check_one(session_id):
             pause_text = _usage_limit_pause_text(s.get("claude_session"))
             if pause_text:
                 if s["status"] != "paused":
-                    append_ledger("paused", session_id=session_id, packet=n, reason=pause_text)
+                    ledger("paused", session_id=session_id, packet=n, reason=pause_text)
                 s["status"] = "paused"
                 s["pause_text"] = pause_text
             else:
@@ -3246,28 +3307,31 @@ def _check_one(session_id):
                     transcript_age = _transcript_age_seconds(s.get("claude_session"))
                     if transcript_age is None or transcript_age > _stall_threshold_seconds():
                         s["status"] = "stalled"
-                        append_ledger("stalled", session_id=session_id, packet=n, reason=f"busy {int(elapsed/60)}min, no report")
+                        ledger("stalled", session_id=session_id, packet=n, reason=f"busy {int(elapsed/60)}min, no report")
                     # else: transcript still fresh within the threshold → stays busy despite the
                     # long elapsed time (the "busy 3h20m" case row 66 names explicitly).
                 # else: process alive, hasn't reported yet → still busy, no change.
         else:
             # Process is genuinely gone and left no report. Distinguish stalled vs dead by whether
             # the tab is still around to look at (this is the ONLY place the tab-liveness check is
-            # used).
+            # used). Ledgered on the TRANSITION only: an already-stalled session re-polled every
+            # few seconds is not news (the box's ledger had 37 identical lines from one episode).
             if term_backend(s).is_alive(s["tab_label"], s.get("iterm_session"), s.get("pid")):
+                if s["status"] != "stalled":
+                    ledger("stalled", session_id=session_id, packet=n, reason="process gone, no report; tab still open")
                 s["status"] = "stalled"
-                append_ledger("stalled", session_id=session_id, packet=n, reason="process gone, no report; tab still open")
             else:
                 s["status"] = "dead"
-                append_ledger("closed", session_id=session_id, reason="process gone and tab closed")
-        s["updated"] = now()
-        write_session(session_id, s)
+                ledger("closed", session_id=session_id, reason="process gone and tab closed")
+        if persist:
+            s["updated"] = now()
+            write_session(session_id, s)
 
     # Backlog row 57: the early context-warn banner rides this same per-session refresh so every
     # surface (list/check/board/the lead's Stop-hook poller) gets it for free. Gated on the SAME
     # freshly-computed status as the block above (skipped entirely, above, when it was already
     # terminal) — never for a session that just went dead/closed/superseded this very poll.
-    if s.get("status") not in ("dead", "superseded", "closed", LAUNCH_FAILED):
+    if persist and s.get("status") not in ("dead", "superseded", "closed", LAUNCH_FAILED):
         _maybe_warn_ctx_heavy(s)
 
     return s
@@ -4412,7 +4476,8 @@ def refresh_live_board():
     """Rewrite the DEFAULT board.html + board.json in place, IF live mode is active
     (_is_board_live_active) — the no-server-process trick this whole feature rests on: relay
     itself re-renders the page from current on-disk state at every moment state actually changes
-    (list/check/send/spawn, and the lead's Stop hook via `_refresh-board`), so a tab left open
+    (check/send/spawn, and the lead's Stop hook via `_refresh-board` — never `list`, which is
+    read-only), so a tab left open
     sees fresh content within one meta-refresh interval without ever calling out to anything.
     Always renders with sweep=False (see board_data's docstring) — the caller triggering this
     refresh has already run its own correctly-scoped auto-close sweep this turn (or, for the Stop
@@ -5911,9 +5976,12 @@ def cmd_list(args):
     rows = []
     broken_sids = []
     for sid in all_session_ids():
-        # Refresh REAL liveness (same mechanism as `relay check`) — list is the decision-informing
-        # and crash-recovery surface, so a dead/stalled executor must not keep showing stored `busy`.
-        s = _check_one(sid)
+        # REAL liveness (same mechanism as `relay check`) — list is the decision-informing and
+        # crash-recovery surface, so a dead/stalled executor must not keep showing stored `busy`.
+        # Computed READ-ONLY (persist=False): list writes no session file and no ledger line. Cue
+        # polls `list --json` every 10 s over SSH, and each poll used to re-append the same
+        # `stalled` line; recording a transition is `relay check`'s job (and the lead Stop hook's).
+        s = _check_one(sid, persist=False)
         if "error" in s:
             # `all_session_ids()` only yields dirs where session.json EXISTS, so an "error" here
             # (read_session's only failure shape) always means "present but unreadable" — never
@@ -5925,17 +5993,10 @@ def cmd_list(args):
         n = s["current_packet"]
         report = packets_dir(sid) / f"{n:03d}-report.md"
         rows.append({**s, "reported": report.exists()})
-    # Auto-close (lead_guard "auto-close policy") rides the liveness refresh: list is where idle
-    # finished executors are NOTICED, so it's where they get parked. Acted-on rows are re-read so
-    # the table shows them as closed (auto) instead of a stale `reported`.
+    # No auto-close sweep and no live-board rewrite here: both change state (the sweep closes
+    # sessions and ledgers it; the board re-render persists every executor's status), and list is
+    # read-only. The sweep still runs on `relay check` and every lead turn-end (the Stop hook).
     lead_caller = _armed_lead_caller()
-    acted = auto_close_sweep("list", sids=[r["session_id"] for r in rows] if lead_caller else [],
-                              lead_sid=lead_caller)
-    if acted:
-        hit = {a[0] for a in acted}
-        rows = [({**read_session(r["session_id"]), "reported": r["reported"]} if r["session_id"] in hit else r)
-                for r in rows]
-    refresh_live_board()  # `list` is a state-change moment (see refresh_live_board) — no-op unless live
     if not show_all:
         rows = [s for s in rows if s.get("owner_lead") in (None, lead_sid)]
 
@@ -5979,6 +6040,11 @@ def cmd_list(args):
             r["launch"] = lead_guard.launch_cell(r)
             if r.get("status") not in LIST_JSON_NO_PACKET_FIELDS:
                 r.update(_list_packet_fields(r, verifies))
+            # tmux: the session holding this executor's pane (its own detached "relay-<sid>"
+            # unless split into the lead's window), so Cue can `tmux attach -t` exactly it. None
+            # when the pane is gone. Read-only: one display-message, tmux executors only.
+            if str(r.get("iterm_session") or "").startswith("tmux:"):
+                r["tmux_session"] = backend.by_name("tmux").session_name_by_id(r["iterm_session"])
         # Broken executors get the same {"session_id", "broken": true} shape list_leads uses for a
         # broken lead marker — so a scripted consumer (the board included) sees the same truth the
         # human table does, instead of the row just disappearing from --json too.
@@ -6261,7 +6327,6 @@ def cmd_list(args):
         print()
 
     print(c("EXECUTORS", "bold"))
-    _print_auto_closed(acted)
     if not rows and not broken_sids:
         print("(no executor sessions)")
         _print_list_plan(args, lead_caller)
@@ -8577,6 +8642,11 @@ def _send_confirmed(bk, label, prompt, handle, pid, claude_session):
         mid_turn = False
     if mid_turn:
         return True, None  # queued in a busy session's input box; submits at turn end — not a failure
+    # The retry is a bare Enter — a keystroke like any other, so it gets the same readiness gate: a
+    # dialog that came up since the line was typed (a permission prompt, the trust prompt) would be
+    # ANSWERED by it. Not ready → no Enter, reported as not confirmed (check the tab).
+    if _screen_state(bk, handle) not in ("ready", SCREEN_NO_PROBE):
+        return True, False
     bk.press_enter(label, handle, pid)
     append_ledger("submit_retry", session_id=claude_session, label=label, text=(prompt or "")[:80])
     deadline = time.time() + SUBMIT_RETRY_CONFIRM_SECONDS
@@ -8594,10 +8664,11 @@ def _submit_note(confirmed):
 
 def cmd_nudge_lead(args):
     """`relay send` pointed at a LEAD's own tab instead of an executor's (wake-watch design §9) —
-    the push primitive the executor-side escalation hook calls to wake an idle lead. ALWAYS sends,
-    unconditionally — §9.5b spiked this directly: typing into a busy lead is harmless (it queues in
-    the input box and is processed intact at turn-end), so there is no busy/stale guard here any
-    more. The only refusal left is a dead tab.
+    the push primitive the executor-side escalation hook calls to wake an idle lead. Sends whether
+    the lead is busy or idle — §9.5b spiked this directly: typing into a busy lead is harmless (it
+    queues in the input box and is processed intact at turn-end), so there is no busy/stale guard.
+    What it refuses: a dead tab, and a pane that isn't showing Claude's input box (the readiness
+    gate below — a trust prompt, an unknown dialog, a shell, an unreadable screen).
 
     Sends via the marker's OWN recorded backend (`term_backend`), never the caller's ambient guess
     — Defect A, live-reproduced: an executor running under Terminal.app selects the `terminal`
@@ -8618,6 +8689,30 @@ def cmd_nudge_lead(args):
         bk = backend.by_name(recorded) or iterm
     else:
         bk = _probe_backend_for_tab(label, handle) or iterm  # last resort: ambient guess, as before
+    def tab_alive():
+        try:
+            return bool(label) and bool(bk.is_alive(label, handle))
+        except Exception:
+            return False
+
+    # Readiness gate — the same one retitle_tab and the in-place rotation use: type into the lead's
+    # pane only on POSITIVE evidence that Claude's input box is live ("ready", which includes the
+    # busy spinner of a lead mid-turn, where the line queues). A folder-trust prompt, a dialog relay
+    # doesn't recognise, a shell left by a dead claude or an unreadable screen gets NOTHING typed:
+    # the message's Enter would answer the dialog (the trust prompt's default is "No, exit"). Both
+    # backends now refuse here, before any keystroke — tmux_backend.send's own trust check stays as
+    # a backstop, iTerm's send has none. A backend with no screen probe (Terminal.app) never types.
+    state = _screen_state(bk, handle)
+    if state not in ("ready", SCREEN_NO_PROBE):
+        if state is None and not tab_alive():
+            sys.exit(f"no-live-tab: could not find a live tab for lead '{sid}' (label '{label}').")
+        if state == "trust":
+            sys.exit(f"not-ready: lead '{sid}' tab '{label}' is on Claude Code's folder-trust "
+                     f"prompt — relay typed nothing (accepting trust is the owner's call: answer it "
+                     f"in that tab, then nudge again).")
+        sys.exit(f"not-ready: lead '{sid}' tab '{label}': {_screen_state_reason(state)} — relay "
+                 f"typed nothing (a keystroke there could answer a dialog or run as a shell "
+                 f"command). The lead still surfaces reports via its own at-Stop check.")
     confirmed = None
     try:
         ok, confirmed = _send_confirmed(bk, label, args.message, handle, None, sid)
@@ -8629,11 +8724,7 @@ def cmd_nudge_lead(args):
         # text into a running process), so a healthy Terminal-hosted lead would otherwise be reported
         # as "no live tab" — the exact silent-failure/indistinguishable-cause pattern §9.6a exists to
         # kill. Probe liveness to tell them apart before refusing.
-        alive = False
-        try:
-            alive = bool(label) and bk.is_alive(label, handle)
-        except Exception:
-            alive = False
+        alive = tab_alive()
         if alive:
             sys.exit(f"cannot-inject: lead '{sid}' tab '{label}' is ALIVE, but backend "
                      f"'{getattr(bk, 'NAME', '?')}' cannot type into a running process. The push is "
