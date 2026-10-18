@@ -30,6 +30,9 @@ GATES
   Write a partial report naming the blocker and end your turn — never improvise the step, and
   never raise an interactive question for it. The report → lead-wake channel is your only
   escalation path; the human is never the recipient of an executor's question.
+- NO INTERACTIVE QUESTIONS. You cannot ask the lead anything interactively (AskUserQuestion and
+  plan mode are denied — nobody answers your tab). If the packet is ambiguous, pick the most
+  reasonable reading and say so in the report, or stop and report the question as a blocker.
 - STAY IDLE AFTER REPORTING. After you write your report, remain idle — do NOT exit, and do NOT
   commit. The lead may reuse this session for a follow-up packet; relay parks the session itself
   once your work has landed. Closing the tab yourself throws away the reusable context.

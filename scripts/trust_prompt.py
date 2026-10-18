@@ -45,10 +45,38 @@ OPTIONS = (
 # "────…──── [Exec] relay-spawn-list-fix-131415 ─"), so text may sit between the dashes as long
 # as the row starts with a run of them and ends on one.
 _RULE_RE = re.compile(r"^\s*[╭╰]?─{8,}(?:.*─)?[╮╯]?\s*$")
-# The spinner line shown for the whole of a turn — claude is running, so no dialog is blocking it.
-_WORKING_RE = re.compile(r"\besc to interrupt\b", re.IGNORECASE)
 TAIL_ROWS = 30
 
+# THE busy rule — the spinner row Claude Code shows for the whole of a turn, so claude is running
+# and no dialog is blocking it. ONE definition, used here (is_live, input_ready) and by bin/relay's
+# screen classifier (`working`, and the live-dialog test). Two forms:
+#   - older builds: the row ends "(12s · esc to interrupt)" — matched by that phrase, as before;
+#   - Claude Code 2.1.296+ (captured live on 2.1.302) dropped that phrase: the row is a spinner
+#     glyph in column 0, a space, then a one-to-three-word verb ending in "…", then optionally a
+#     parenthetical — "✽ Spinning…", "✶ Elucidating… (10s · ↓ 82 tokens)", "✳ Befuddling… (8s ·
+#     thinking)", "✢ Spinning… (running UserPromptSubmit hooks… 1/2 · 0s)", "· Sprouting… (13s · ↓
+#     81 tokens)". The glyph cycles through · ✢ ✳ ✶ ✻ ✽.
+# What it must NOT match, all seen on the same screens: the done line "✻ Worked for 12s" / "✻ Brewed
+# for 16s · done 2:25 AM" (no "…" right after the verb), a tool's "  ⎿  Running… (5s)" and the
+# footer's "/rc connecting…" (indented, no glyph), and any of these phrases quoted in tool output or
+# prose (indented under "⎿"/"⏺", never in column 0).
+_SPINNER_GLYPHS = "·✢✳✶✻✽"
+_SPINNER_RE = re.compile(r"^[" + _SPINNER_GLYPHS + r"]\s+[A-Za-z][\w'-]*(?: [A-Za-z][\w'-]*){0,2}…"
+                         r"(?=\s|$)")
+_LEGACY_SPINNER_RE = re.compile(r"\besc to interrupt\b", re.IGNORECASE)
+
+
+def is_spinner_row(line):
+    """True when this one screen row is Claude Code's mid-turn spinner, in either form (see
+    _SPINNER_RE). The single busy-detection rule every screen reader in relay shares."""
+    line = line or ""
+    return bool(_SPINNER_RE.match(line) or _LEGACY_SPINNER_RE.search(line))
+
+
+def is_busy(screen, tail_rows=TAIL_ROWS):
+    """True when the spinner (is_spinner_row) is in the bottom `tail_rows` non-blank rows."""
+    raw = [ln for ln in (screen or "").splitlines() if ln.strip()][-tail_rows:]
+    return any(is_spinner_row(ln) for ln in raw)
 # What bin/relay shows when an executor is parked on the dialog (check's screen line, list's note).
 WAITING_TEXT = "waiting for folder trust: answer Claude Code's trust prompt in the executor's tab"
 
@@ -77,7 +105,7 @@ def is_live(screen, tail_rows=TAIL_ROWS):
         return False
     row = max(i for i, s in enumerate(starts) if s <= pos)
     below = raw[row + 1:]
-    if any(_WORKING_RE.search(ln) for ln in below):
+    if any(is_spinner_row(ln) for ln in below):
         return False
     return sum(1 for ln in below if _RULE_RE.match(ln)) < 2
 
@@ -94,8 +122,8 @@ FOOTER_ROWS_MAX = 8
 def input_ready(screen, tail_rows=TAIL_ROWS):
     """POSITIVE evidence that Claude Code's input box is the live thing at the bottom of `screen`,
     so a typed line lands in it and nowhere else. True when either
-      - the working spinner ("esc to interrupt") is in the bottom `tail_rows` non-blank rows (claude
-        is mid-turn: typed text queues in its input box), or
+      - the working spinner (is_spinner_row, either form) is in the bottom `tail_rows` non-blank
+        rows (claude is mid-turn: typed text queues in its input box), or
       - the bottom-most pair of rule lines sits within FOOTER_ROWS_MAX rows of the bottom, the first
         non-empty row between them starts with the prompt glyph ("> " / "❯ ") and no row between
         them is a numbered option.
@@ -104,7 +132,7 @@ def input_ready(screen, tail_rows=TAIL_ROWS):
     and a borderless one has no rule pair at the bottom at all. Absence of a known dialog is
     never treated as readiness."""
     raw = [ln for ln in (screen or "").splitlines() if ln.strip()][-tail_rows:]
-    if any(_WORKING_RE.search(ln) for ln in raw):
+    if is_busy(screen, tail_rows):
         return True
     rules = [i for i, ln in enumerate(raw) if _RULE_RE.match(ln)]
     if len(rules) < 2 or len(raw) - 1 - rules[-1] > FOOTER_ROWS_MAX:

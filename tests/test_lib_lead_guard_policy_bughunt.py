@@ -597,7 +597,8 @@ class TestExecutorAgent:
         assert flags[0] == "--agents" and json.loads(flags[1])
         assert flags[2:4] == ["--agent", lg.EXECUTOR_AGENT_NAME]
         assert flags[4] == "--disallowedTools"
-        assert flags[5] == "Bash(git commit*),Bash(git push*)"
+        assert flags[5] == ("Bash(git commit*),Bash(git push*),"
+                            "AskUserQuestion,EnterPlanMode,ExitPlanMode")
         assert len(flags) == 6
 
     def test_a_missing_or_bodyless_agent_file_degrades_to_no_flags(self, tmp_path):

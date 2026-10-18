@@ -149,14 +149,16 @@ def _announce_and_wake(lg, cfg, sid, lines, surfaced_keys, notify_msg, kind="syn
     # #23: relay's OWN receipt-in-waiting for THIS announce (nonce + transcript offset). The next
     # stop_hook_active run promotes pending only if this claim is outstanding and its wake text
     # actually landed — never on the global flag alone, which any other blocking Stop hook sets.
+    claim = {}
     try:
-        lg.record_announce_claim(STATE_ROOT, sid, kind, transcript_path)
+        claim = lg.record_announce_claim(STATE_ROOT, sid, kind, transcript_path)
     except Exception:
         pass
     sys.stderr.write(
-        # The needle below is what proves delivery later (it reappears verbatim in the lead's
-        # transcript), so it comes FROM lead_guard rather than being spelled out twice.
-        f"🚦 [relay] — review needed: {lg.WAKE_DELIVERY_NEEDLE}:\n"
+        # The header carries THIS claim's `[relay-wake:<hex>]` token, which is what proves delivery
+        # later (it reappears verbatim in the lead's transcript), so lead_guard builds it next to
+        # the check rather than it being spelled out here.
+        lg.wake_header(claim) + "\n"
         + "\n".join(lines)
         + instruction
     )
@@ -310,6 +312,96 @@ def _notify_summary(lines):
     return "new relay activity — review when ready"
 
 
+STUCK_MARKER = "\u26d4"  # ⛔ — an executor parked on a dialog (same no-ANSI rule as CTX_WARN_MARKER)
+
+
+def _stuck_rows(sid):
+    """`relay _stuck-executors --lead <sid> --json` — this lead's in-flight tmux executors with
+    their screen verdicts, from the ONE classifier `relay list` uses (bin/relay `_classify_screen`),
+    shelled out to exactly like `_auto-close-sweep`. None on any failure (so the caller can tell
+    "couldn't look" from "nothing listed"); never raises."""
+    try:
+        r = subprocess.run([RELAY_BIN, "_stuck-executors", "--lead", sid, "--json"],
+                           capture_output=True, text=True, timeout=20)
+        rows = json.loads(r.stdout) if r.returncode == 0 else None
+        return rows if isinstance(rows, list) else None
+    except Exception:
+        return None
+
+
+def _stuck_path(lg, sid):
+    return lg.lead_dir(STATE_ROOT, sid) / "stuck_announced.json"
+
+
+def _stuck_lines(lg, sid, rows):
+    """Wake lines for this lead's executors whose screen says they are parked on a human —
+    `prompt` (a permission/selection dialog), `trust` (folder trust), `crashed` (claude exited) —
+    the `stuck:*` verdicts of `relay list`. An idle lead otherwise never learns of these: there is
+    no report to find, so the poller would sit out its whole poll_seconds while the executor waits.
+
+    Deduped per executor in <lead dir>/stuck_announced.json as "<packet>:<verdict>": a given
+    (executor, packet, verdict) is announced ONCE and re-arms only after a successful read shows
+    that executor's screen has LEFT that verdict (or the executor left flight). A row whose pane
+    couldn't be read (verdict None) or a failed CLI call (`rows` None) changes nothing, so a flaky
+    capture never re-announces. Stamped BEFORE the wake (like the 🟠 ctx-warn claim): the worst
+    case is one stuck line lost to a dropped async wake, never a loop. Fail-open: [] on any error.
+
+    SHORTCUT: stamp-before-wake, no pending/retry for stuck lines — fine while a dropped async wake
+    is rare (lead mid-turn exactly when an executor sticks); ceiling: that stuck event stays silent
+    until the screen leaves the verdict. Upgrade path: route the "<exec>:stuck:<packet>:<verdict>"
+    key through mark_pending/promote_pending like report keys."""
+    if rows is None:
+        return []
+    try:
+        path = _stuck_path(lg, sid)
+        try:
+            seen = json.loads(path.read_text()) if path.exists() else {}
+        except Exception:
+            seen = {}
+        if not isinstance(seen, dict):
+            seen = {}
+        before = dict(seen)
+        listed, lines = set(), []
+        for r in rows:
+            ex, verdict = r.get("session_id"), r.get("verdict")
+            if not ex:
+                continue
+            listed.add(ex)
+            if verdict is None:
+                continue                       # couldn't look → keep whatever we had
+            if not r.get("stuck"):
+                seen.pop(ex, None)             # left the verdict → re-arm
+                continue
+            key = f"{r.get('packet')}:{verdict}"
+            if seen.get(ex) == key:
+                continue                       # already told the lead about this one
+            seen[ex] = key
+            packet = r.get("packet")
+            pk = f" (packet {packet:03d})" if isinstance(packet, int) else ""
+            excerpt = (r.get("excerpt") or "").strip()
+            if verdict == "crashed":
+                way_out = (f"claude exited in its pane — `relay focus {ex}` to look, "
+                           f"`relay resume {ex}` to bring it back")
+            elif verdict == "trust":
+                way_out = f"`relay focus {ex}` to answer the folder-trust prompt"
+            else:
+                way_out = f"`relay focus {ex}` to answer it"
+            lines.append(f"  {STUCK_MARKER} executor '{ex}' is stuck:{verdict}{pk}"
+                         + (f" — {excerpt}" if excerpt else "") + f"\n       {way_out}")
+        for ex in list(seen):
+            if ex not in listed:
+                seen.pop(ex)                   # out of flight → a later re-stick is news again
+        if seen != before:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if seen:
+                path.write_text(json.dumps(seen, indent=2, sort_keys=True))
+            elif path.exists():
+                path.unlink()
+        return lines
+    except Exception:
+        return []
+
+
 def _wake_waiter(lg, sid):
     """Under tmux only: a tmux_backend.WakeWaiter on this lead's `relay-wake-<sid>` channel, so the
     poller's per-tick wait ends the instant an executor's Stop hook signals a report (see
@@ -394,14 +486,21 @@ def main():
         # wakes as delivered. relay_announce_delivered consults RELAY's own announce claim instead:
         # an outstanding claim whose wake text actually reached the transcript. A stop_hook_active
         # run with no outstanding claim is somebody else's continuation and promotes nothing.
-        if payload.get("stop_hook_active"):
-            try:
-                if lg.relay_announce_delivered(STATE_ROOT, sid):
-                    promoted = lg.promote_pending(STATE_ROOT, sid)
-                    if promoted:
-                        lg.append_ledger(STATE_ROOT, "wake_delivered", session_id=sid, keys=promoted)
-            except Exception:
-                pass
+        #
+        # On EVERY Stop, not only stop_hook_active ones (2026-10-15): a turn that an asyncRewake
+        # wake started is a fresh turn, not a hook continuation, so its Stop carries
+        # stop_hook_active=false — gating promotion on the flag left every async-delivered wake
+        # pending, and the sync announce below re-announced it (two wakes per report). A plain Stop
+        # promotes only on transcript evidence of relay's own outstanding claim (evidence_only), so
+        # #23 holds: no relay claim, nothing promoted.
+        try:
+            if lg.relay_announce_delivered(STATE_ROOT, sid,
+                                           evidence_only=not payload.get("stop_hook_active")):
+                promoted = lg.promote_pending(STATE_ROOT, sid)
+                if promoted:
+                    lg.append_ledger(STATE_ROOT, "wake_delivered", session_id=sid, keys=promoted)
+        except Exception:
+            pass
 
         # Synchronous announce of what's ALREADY visible at stop time. #23: this runs on EVERY Stop,
         # including stop_hook_active ones. It used to be skipped there "to avoid a tight re-announce
@@ -505,8 +604,18 @@ def main():
                     # evidence that the wake really landed — never trusted on faith.
                     _announce_and_wake(lg, cfg, sid, rlines, rkeys, _notify_summary(rlines),
                                        kind="async", transcript_path=transcript_path)  # exits 2
-                if not lg.has_inflight_executors(STATE_ROOT, sid):
+                # ONE scan answers both "anything left to wait on?" and "any of it on tmux?" — so a
+                # lead with no tmux executor in flight pays nothing extra per tick.
+                backends = lg.inflight_backends(STATE_ROOT, sid)
+                if not backends:
                     sys.exit(0)  # nothing left of OURS in flight → stop waiting
+                if "tmux" in backends:
+                    # An executor parked on a dialog never reports: read the screens (one CLI call
+                    # per tick, only while a tmux executor is in flight) and wake on a stuck one.
+                    slines = _stuck_lines(lg, sid, _stuck_rows(sid))
+                    if slines:
+                        _announce_and_wake(lg, cfg, sid, slines, [], _notify_summary(slines),
+                                           kind="async", transcript_path=transcript_path)  # exits 2
             sys.exit(0)  # timed out; a later lead turn will re-arm
         finally:
             lg.release_poll_lock(STATE_ROOT, sid)

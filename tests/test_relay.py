@@ -7541,6 +7541,17 @@ class TestExecutorAgentWiring:
                                             name=name, scope=None, skip_perms=None, pane=None))
         return cap
 
+    @staticmethod
+    def _relaunch(relay, **kw):
+        """`_relaunch("a1", …)` against a stub backend; returns the spawn kwargs it passed."""
+        cap = {}
+        bk = SimpleNamespace(spawn=lambda **k: cap.update(k))
+        with mock.patch.object(relay, "term_backend", return_value=bk), mock.patch.object(relay, "auto_trust"), \
+             mock.patch.object(relay, "read_pid", return_value=124), mock.patch.object(relay, "read_iterm_id", return_value=None), \
+             mock.patch.object(relay, "_ensure_tab_label"):
+            relay._relaunch("a1", relay.read_session("a1"), "go", **kw)
+        return cap
+
     def test_spawn_passes_agent_and_short_footer(self, relay, tmp_path):
         cap = self._spawn(relay, tmp_path)
         flags = cap["agent_flags"]
@@ -7554,7 +7565,8 @@ class TestExecutorAgentWiring:
     def test_build_claude_cmd_carries_agent_flags(self, relay, tmp_path):
         cap = self._spawn(relay, tmp_path)
         cmd = relay.iterm.build_claude_cmd("x", model="sonnet", session_uuid="u", agent_flags=cap["agent_flags"])
-        assert "--agent relay-executor" in cmd and "--disallowedTools 'Bash(git commit*),Bash(git push*)'" in cmd
+        assert "--agent relay-executor" in cmd and ("--disallowedTools 'Bash(git commit*),Bash(git push*),"
+                                                    "AskUserQuestion,EnterPlanMode,ExitPlanMode'") in cmd
         assert cmd.rstrip().endswith(" x")                   # prompt still last, not swallowed
 
     def test_build_claude_cmd_labels_executors_for_cue(self, relay, tmp_path):
@@ -7589,13 +7601,27 @@ class TestExecutorAgentWiring:
         s = relay.read_session("a1")
         for agent, expect in (("relay-executor", True), (None, False)):
             s["agent"] = agent; relay.write_session("a1", s)
-            cap = {}
-            bk = SimpleNamespace(spawn=lambda **kw: cap.update(kw))
-            with mock.patch.object(relay, "term_backend", return_value=bk), mock.patch.object(relay, "auto_trust"), \
-                 mock.patch.object(relay, "read_pid", return_value=124), mock.patch.object(relay, "read_iterm_id", return_value=None), \
-                 mock.patch.object(relay, "_ensure_tab_label"):
-                relay._relaunch("a1", relay.read_session("a1"), "go", resume_id="cs")
+            cap = self._relaunch(relay, resume_id="cs")
             assert bool(cap["agent_flags"]) is expect
+
+    def test_every_launch_path_denies_interactive_dialogs(self, relay, tmp_path):
+        """0.5.13 (field, 2026-10-15): an executor that opened AskUserQuestion sat on its "Enter to
+        select" menu forever — nobody answers an executor's tab. spawn (which `send --rotate/
+        --upgrade` also spawn their successor through), restart (fresh session_uuid) and resume
+        (--resume) all carry the dialog denies, inside the ONE comma-joined --disallowedTools
+        argument (it is variadic — a second word would swallow the prompt)."""
+        dialogs = ("AskUserQuestion", "EnterPlanMode", "ExitPlanMode")
+
+        def denies(flags):
+            assert flags.count("--disallowedTools") == 1
+            return flags[flags.index("--disallowedTools") + 1].split(",")
+
+        cap = self._spawn(relay, tmp_path)
+        assert all(t in denies(cap["agent_flags"]) for t in dialogs)
+        assert "Bash(git commit*)" in denies(cap["agent_flags"])
+        for kw in ({"resume_id": "cs"}, {"session_uuid": "u-restart"}):
+            cap = self._relaunch(relay, **kw)
+            assert all(t in denies(cap["agent_flags"]) for t in dialogs), kw
 
     def test_send_footer_follows_session_agent(self, relay, tmp_path):
         self._spawn(relay, tmp_path)

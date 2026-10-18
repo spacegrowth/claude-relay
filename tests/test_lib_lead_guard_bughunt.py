@@ -594,9 +594,9 @@ class TestWakeBookkeeping:
         t.write_text(f'{{"old": "{lg.WAKE_DELIVERY_NEEDLE}"}}\n')   # BEFORE the announce
         lg.record_announce_claim(sr, "L1", "async", transcript_path=t)
         assert lg.relay_announce_delivered(sr, "L1") is False
-        lg.record_announce_claim(sr, "L1", "async", transcript_path=t)
+        claim = lg.record_announce_claim(sr, "L1", "async", transcript_path=t)
         with open(t, "a") as f:
-            f.write(f'{{"new": "{lg.WAKE_DELIVERY_NEEDLE}"}}\n')
+            f.write(json.dumps({"new": lg.wake_header(claim)}) + "\n")
         assert lg.relay_announce_delivered(sr, "L1") is True
 
     def test_the_transcript_scan_is_bounded_to_the_tail(self, sr, tmp_path):

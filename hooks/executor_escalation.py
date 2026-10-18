@@ -6,7 +6,9 @@ scripts/iterm.py's build_claude_cmd). This is wake-watch design §9's replacemen
 watcher (§4): once this executor's report lands and it goes idle, type a message into the owning
 lead's tab ONCE — no grace window, no poll loop, no backoff, no busy check. §9.5b proved injecting
 mid-turn is harmless (text queues in the lead's input box and is processed intact at turn-end), so
-the rule is simply "always send."
+the rule is simply "always send." — unless the lead's OWN wake already holds the report (0.5.13,
+`_lead_poller_handles`: pending/surfaced, or a live tmux poller taking it within a bounded wait),
+when the push would only be a second wake for one report.
 
 Net UNDER the lead's own fast-path check (hooks/stop_lead_watch.py), not a replacement: a healthy
 idle lead surfaces the report at its own next Stop before this hook ever fires. Both paths are kept
@@ -27,6 +29,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 
@@ -156,6 +159,49 @@ def _signal_lead_wake(lg, sid, owner_lead):
         pass
 
 
+# How long a push waits for the owning lead's LIVE tmux poller to take a just-signalled report
+# before typing the nudge itself. The signal ends the poller's wait at once, and its announce
+# stamps the key pending within one report scan (milliseconds), so a few seconds is a wide margin —
+# and only ever spent when a live poller exists (no poller → no wait, the nudge fires at once).
+POLLER_CLAIM_WAIT = 5.0
+POLLER_CLAIM_STEP = 0.25
+
+
+def _lead_has_it(lg, owner_lead, key):
+    """Is this report already in the owning lead's own wake machinery? Surfaced = delivered;
+    pending = announced by the lead's Stop hook and awaiting proof — an undelivered pending key is
+    re-announced by the lead's own next Stop (stop_lead_watch's sync path), so it is handled either
+    way and a typed nudge on top is only a duplicate wake."""
+    return key in lg.load_pending(STATE_ROOT, owner_lead) or key in lg.load_surfaced(STATE_ROOT, owner_lead)
+
+
+def _lead_poller_handles(lg, sid, packet, owner_lead):
+    """True when the owning lead demonstrably has this report without a typed nudge (field,
+    2026-10-15: on tmux `_signal_lead_wake` woke the poller, and THIS hook — deciding before the
+    woken poller had stamped anything — typed "…review it." into the lead on every report, a second
+    wake per report and an unrequested review fork). Checked at once against the lead's
+    pending/surfaced sets; then, ONLY for a tmux executor whose lead has a LIVE poller (poll.lock
+    held, heartbeat fresh), waits up to POLLER_CLAIM_WAIT for that poller's announce to land. No
+    live poller → False immediately: an idle lead with nothing watching is what the nudge is for."""
+    key = f"{sid}:{packet}"
+    try:
+        if _lead_has_it(lg, owner_lead, key):
+            return True
+        if (lg.read_session_json(STATE_ROOT, sid) or {}).get("backend") != "tmux":
+            return False
+        interval = max(1, int(lg.load_config(STATE_ROOT).get("poll_interval", 5)))
+        if lg.poll_lock_state(STATE_ROOT, owner_lead, interval) != "live":
+            return False
+        deadline = time.time() + POLLER_CLAIM_WAIT
+        while time.time() < deadline:
+            time.sleep(POLLER_CLAIM_STEP)
+            if _lead_has_it(lg, owner_lead, key):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -217,6 +263,15 @@ def main():
                                  project=exec_s.get("owner_project"))
                 owner_lead = fallback
                 decision = lg.escalation_decision(STATE_ROOT, sid, n, owner_lead)
+
+        if decision == "send" and _lead_poller_handles(lg, sid, n, owner_lead):
+            # The lead's own Stop hook has it (pending or surfaced, now or within the bounded wait
+            # for its live poller) — the push would only be a duplicate wake. Same terminal mark as
+            # "resolved"; `via` tells the two apart in the ledger.
+            lg.append_ledger(STATE_ROOT, "escalation_resolved", session_id=sid, packet=n,
+                              owner_lead=owner_lead, via="lead-wake")
+            _mark(lg, sid, n, "resolved")
+            sys.exit(0)
 
         if decision == "resolved":
             # The lead's own fast-path already surfaced this — the dedup working, not a dead hook.

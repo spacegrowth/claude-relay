@@ -962,7 +962,8 @@ def _transcript_stalled(s):
 # Claude Code's on-screen chrome for "I am waiting on YOU to choose" — ONE tuple, each entry with
 # where it comes from. A screen reads as `prompt` only when at least TWO distinct entries match in
 # its bottom rows (a real dialog always shows a header + options or options + footer), so one
-# stray phrase in the model's own prose can't flip it.
+# stray phrase in the model's own prose can't flip it — and only in rows with no spinner and no
+# input box below them (_screen_live_prompt_hits), so the same phrases in tool output can't either.
 PROMPT_PATTERNS = (
     # Permission-dialog header: "Do you want to proceed?" (Bash), "Do you want to make this edit to
     # X?" (Edit), "Do you want to create X?" (Write), "Do you want to allow …" (WebFetch/MCP).
@@ -980,16 +981,25 @@ PROMPT_PATTERNS = (
     re.compile(r"\bWould you like to proceed\?"),
     re.compile(r"\bDo you trust the files in this folder\?"),
 )
-# The spinner line Claude Code shows for the whole of a turn: "✻ Thinking… (12s · esc to interrupt)".
-SCREEN_WORKING_RE = re.compile(r"\besc to interrupt\b", re.IGNORECASE)
+# The spinner line Claude Code shows for the whole of a turn — "✻ Thinking… (12s · esc to interrupt)"
+# on older builds, "✶ Elucidating… (10s · ↓ 82 tokens)" on 2.1.296+ (no "esc to interrupt"). ONE
+# rule, owned by scripts/trust_prompt.py (is_spinner_row): a second copy here is how 2.1.302's busy
+# panes came to read `unknown` while trust_prompt's own copy went stale the same way.
+_screen_working = trust_prompt.is_spinner_row
 # `#{pane_current_command}` values that mean claude is gone and the pane's shell is back. A SET of
 # shells, not "anything but claude/node": a native Claude Code install runs as a binary named after
 # its version (e.g. "2.0.14"), which "not claude" would misread as a crash.
 SCREEN_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh", "ash",
                            "login"})
-# The input box's top/bottom border: a plain rule ("────") or a rounded box edge ("╭───╮"/"╰───╯").
-_SCREEN_RULE_RE = re.compile(r"^\s*[╭╰]?─{8,}[╮╯]?\s*$")
+# The input box's top/bottom border: a plain rule ("────") or a rounded box edge ("╭───╮"/"╰───╯"),
+# whose TOP edge carries the session's name once it is renamed ("──── [Exec] x-214926 ─"). ONE
+# pattern, owned by scripts/trust_prompt.py — a second copy here that missed the labelled edge left
+# "unsent" detection dead after every rename.
+_SCREEN_RULE_RE = trust_prompt._RULE_RE
 SCREEN_TAIL_ROWS = 20   # bottom non-blank rows the prompt/working checks look at
+# The verdicts that mean an executor is parked waiting on a human: `relay list` shows them as
+# `stuck:<verdict>` and the lead's poller wakes on them (`_stuck-executors`).
+STUCK_VERDICTS = ("prompt", "trust", "crashed")
 # Statuses whose pane is not worth reading: nothing is running there any more (or never started).
 _SCREEN_SKIP_STATUSES = ("closed", "superseded", "dead", LAUNCH_FAILED)
 
@@ -1017,12 +1027,34 @@ def _screen_input_box(lines):
     return " ".join(rows)
 
 
+def _screen_live_prompt_hits(tail):
+    """(pattern, row index, row) for each PROMPT_PATTERNS match in `tail` that is part of the LIVE
+    bottom of the screen: neither a working spinner nor Claude's input box (two rule lines) below
+    it. A dialog replaces the input box (Claude Code 2.1.302, captured live: a permission dialog or
+    AskUserQuestion list opens under one full-width rule and ends on its footer, with no box and no
+    spinner beneath), so a matched row with the box or the spinner under it is scrollback — tool
+    output, a grep of relay's own source, a quoted dialog — and never counts. The same structural
+    test as trust_prompt.is_live. AskUserQuestion draws a second rule above its "Chat about this"
+    row, which is why ONE rule below is still live and two are needed to mean an input box."""
+    out, rules, spinner = [], 0, False
+    for i in range(len(tail) - 1, -1, -1):
+        ln = tail[i]
+        if not spinner and rules < 2:
+            out.extend((p, i, ln) for p in PROMPT_PATTERNS if p.search(ln))
+        if _SCREEN_RULE_RE.match(ln):
+            rules += 1
+        if _screen_working(ln):
+            spinner = True
+    return sorted(out, key=lambda h: h[1])
+
+
 def _classify_screen(screen, command=None, needles=()):
     """Pure: (verdict, excerpt) for one captured screen. Checked in this order —
       crashed  `command` (the pane's foreground process) is a shell: claude has exited;
       trust    Claude Code's folder-trust dialog is up (scripts/trust_prompt.py): waiting on a human;
-      prompt   ≥2 PROMPT_PATTERNS entries in the bottom rows: a permission/selection dialog waits;
-      working  the "esc to interrupt" spinner is showing: mid-turn;
+      prompt   ≥2 PROMPT_PATTERNS entries in the bottom rows with no spinner and no input box
+               below them (_screen_live_prompt_hits): a permission/selection dialog waits;
+      working  the mid-turn spinner is showing (trust_prompt.is_spinner_row, old or 2.1.302 form);
       unsent   the input box still holds one of `needles` (the last typed packet pointer) and no
                turn is running — the line was typed but never submitted;
       unknown  none of the above (idle at an empty prompt, or chrome this doesn't recognise)."""
@@ -1035,15 +1067,16 @@ def _classify_screen(screen, command=None, needles=()):
         return "crashed", f"[{cmd}] {last}".rstrip()
     if trust_prompt.is_live(screen):
         return "trust", trust_prompt.WAITING_TEXT
-    hits = [(p, ln) for p in PROMPT_PATTERNS for ln in tail if p.search(ln)]
-    if len({p.pattern for p, _ in hits}) >= 2:
-        # The dialog's question when it has one; else the topmost matched row (a selection
-        # list's footer).
+    hits = _screen_live_prompt_hits(tail)
+    if len({p.pattern for p, _, _ in hits}) >= 2:
+        # The dialog's question when it has one (the bottom-most: a quoted question can sit in
+        # the scrollback above a live dialog); else the topmost matched row (a selection list's
+        # footer).
         header = (PROMPT_PATTERNS[0], PROMPT_PATTERNS[5], PROMPT_PATTERNS[6])
-        head = next((ln for p, ln in hits if p in header),
-                    min((ln for _, ln in hits), key=tail.index))
+        head = next((ln for p, _, ln in reversed(hits) if p in header),
+                    min(hits, key=lambda h: h[1])[2])
         return "prompt", _screen_clean(head)
-    working = next((ln for ln in reversed(tail) if SCREEN_WORKING_RE.search(ln)), None)
+    working = next((ln for ln in reversed(tail) if _screen_working(ln)), None)
     if working is not None:
         return "working", _screen_clean(working)
     box = _screen_input_box(lines)
@@ -4924,6 +4957,43 @@ def cmd_auto_close_sweep(args):
         pass
 
 
+def stuck_executors(lead):
+    """[{session_id, packet, verdict, stuck, excerpt}] for every IN-FLIGHT (busy/stalled) TMUX executor
+    `lead` owns — its screen verdict as `relay list` reads it (`_screen_verdict`), or verdict None
+    when the pane couldn't be read. Every in-flight tmux executor is listed, stuck or not, so the
+    caller can tell "left that verdict" (re-arm) from "couldn't look" (keep). Read-only: no sweep,
+    no session writes. Off tmux nothing is captured at all."""
+    out = []
+    for sid in all_session_ids():
+        s = read_session(sid)
+        if not s or s.get("owner_lead") != lead or s.get("status") not in ("busy", "stalled"):
+            continue
+        if getattr(term_backend(s), "NAME", "") != "tmux":
+            continue
+        scr = _screen_verdict(s)
+        verdict = scr["verdict"] if scr else None
+        out.append({"session_id": sid, "packet": s.get("current_packet"), "verdict": verdict,
+                    "stuck": verdict in STUCK_VERDICTS, "excerpt": scr["excerpt"] if scr else ""})
+    return out
+
+
+def cmd_stuck_executors(args):
+    """Internal: the lead Stop hook's background poller (hooks/stop_lead_watch.py) asks this once
+    per tick while a tmux executor is in flight, so an executor parked on a dialog (`stuck:*` in
+    `relay list`) wakes its idle lead — ONE classifier (`_classify_screen`), shelled out to like
+    `_auto-close-sweep`, never copied into the hook. Fail-open: prints [] on any error."""
+    try:
+        rows = stuck_executors(args.lead)
+    except Exception:
+        rows = []
+    if args.json:
+        print(json.dumps(rows))
+        return
+    for r in rows:
+        if r["stuck"]:
+            print(f"{r['session_id']}  stuck:{r['verdict']}  {r['excerpt']}")
+
+
 def _popup_check(args):
     """`check <sid> --popup[-inner]`: the session's current report in a tmux popup (`less -R`).
     Returns True when handled (the caller returns), False to fall through to the normal check."""
@@ -6348,7 +6418,7 @@ def cmd_list(args):
             # tmux only: the pane itself says it's stuck — shown regardless of the transcript
             # stall threshold (a permission prompt is stuck from its first second).
             scr = _screen_verdict(s)
-            if scr and scr["verdict"] in ("prompt", "crashed", "trust"):
+            if scr and scr["verdict"] in STUCK_VERDICTS:
                 st = f"stuck:{scr['verdict']}"
         rendered_statuses.append(st)
     # §6e e1: one transcript-MB reading per executor, computed up front (same memoize-once
@@ -9041,6 +9111,11 @@ def main():
     acs.add_argument("--lead", help="only this lead's executors")
     acs.set_defaults(func=cmd_auto_close_sweep)
 
+    sxp = sub.add_parser("_stuck-executors", help=argparse.SUPPRESS)  # internal: lead poller tick
+    sxp.add_argument("--lead", required=True, help="this lead's executors only")
+    sxp.add_argument("--json", action="store_true")
+    sxp.set_defaults(func=cmd_stuck_executors)
+
     rfb = sub.add_parser("_refresh-board", help=argparse.SUPPRESS)  # internal: lead Stop hook trigger
     rfb.set_defaults(func=cmd_refresh_board)
 
@@ -9331,7 +9406,7 @@ def main():
         "send": ["session_id"], "check": ["session_id"], "status": ["session_id"],
         "close": ["session_id", "supersede", "self_session"], "stop": ["session_id"],
         "retire": ["session_id"], "queue": ["session_id"], "_deliver-queued": ["session_id"],
-        "keep": ["session_id"], "_auto-close-sweep": ["lead"],
+        "keep": ["session_id"], "_auto-close-sweep": ["lead"], "_stuck-executors": ["lead"],
         "adopt": ["session_id"], "route": ["session"], "report": ["session_id"],
         "peek": ["session_id"],
         "auto": ["session"], "tier": ["session"], "plan": ["session", "sid"],

@@ -513,3 +513,137 @@ class TestStopHookHeartbeat:
         after = lg.read_marker(root, "lead-1")
         for k in ("project", "cwd", "iterm_session", "color", "session_id"):
             assert after.get(k) == before.get(k), k
+
+
+class TestPollerWakesOnAStuckExecutor:
+    """0.5.13 (field, 2026-10-15): an executor parked on AskUserQuestion's menu sat in its detached
+    tmux session forever — `relay list` said stuck:prompt, but the idle lead's poller only looked
+    for report files, so nothing woke the lead. The poller now asks `relay _stuck-executors` once
+    per tick (only while a tmux executor is in flight) and wakes ONCE per (executor, packet,
+    verdict), re-arming only after the screen leaves that verdict.
+
+    Driven in-process with `_stuck_rows` (the one CLI call) replaced by a scripted sequence of
+    screens and `time.sleep` stubbed out — no real tmux, no real relay subprocess."""
+
+    PROMPT = {"session_id": "exec-1", "packet": 1, "verdict": "prompt", "stuck": True,
+              "excerpt": "Enter to select · ↑/↓ to navigate"}
+    WORKING = {"session_id": "exec-1", "packet": 1, "verdict": "working", "stuck": False,
+               "excerpt": "✻ Thinking… (esc to interrupt)"}
+
+    def _tick(self, tmp_path, monkeypatch, screens, backend="tmux"):
+        """One lead Stop: arms the poller, which reads `screens` (one list of rows per tick); when
+        they run out the executor leaves flight so an un-woken poller exits 0. Returns
+        (exit code, stderr, number of _stuck_rows calls)."""
+        import io as _io
+        mod = load_stop_module()
+        root = H.state_root(tmp_path)
+        monkeypatch.setattr(mod, "STATE_ROOT", str(root))
+        monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
+        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+        sj = root / "exec-1" / "session.json"
+        s = json.loads(sj.read_text())
+        s["status"] = "busy"
+        sj.write_text(json.dumps(s))
+        queue, calls = list(screens), []
+
+        def leave_flight():
+            s2 = json.loads(sj.read_text())
+            s2["status"] = "idle"
+            sj.write_text(json.dumps(s2))
+
+        def rows(sid):
+            calls.append(sid)
+            if not queue:
+                leave_flight()
+                return []
+            return queue.pop(0)
+
+        ticks = []
+
+        def sleep(_):
+            ticks.append(1)
+            if backend != "tmux" and len(ticks) >= 3:
+                leave_flight()
+
+        monkeypatch.setattr(mod, "_stuck_rows", rows)
+        monkeypatch.setattr(mod.time, "sleep", sleep)
+        err = _io.StringIO()
+        monkeypatch.setattr("sys.stderr", err)
+        monkeypatch.setattr("sys.stdin", _io.StringIO(json.dumps(stop_payload(tmp_path))))
+        with pytest.raises(SystemExit) as ei:
+            mod.main()
+        return ei.value.code, err.getvalue(), len(calls)
+
+    def _setup(self, tmp_path, backend="tmux"):
+        armed(tmp_path, poll_seconds=60, poll_interval=1, auto_close=False, handoff_nudge=False)
+        H.make_executor(tmp_path, report=None, status="busy", backend=backend)
+
+    def test_wakes_once_stays_quiet_while_stuck_and_rewakes_after_it_clears(self, tmp_path,
+                                                                           monkeypatch):
+        self._setup(tmp_path)
+        rc, err, _ = self._tick(tmp_path, monkeypatch, [[self.PROMPT]])
+        assert rc == WAKE
+        assert "exec-1" in err and "stuck:prompt" in err and "packet 001" in err
+        assert "Enter to select" in err and "relay focus exec-1" in err
+        assert lg.load_announce_claim(H.state_root(tmp_path), "lead-1")["kind"] == "async"
+
+        # the lead's next Stop re-arms the poller: still the same dialog → silent
+        rc, err, n = self._tick(tmp_path, monkeypatch, [[self.PROMPT], [self.PROMPT]])
+        assert rc == SILENT and "stuck:" not in err and n == 3
+
+        # the screen leaves the verdict (answered), then sticks again → a fresh wake
+        rc, err, _ = self._tick(tmp_path, monkeypatch, [[self.WORKING], [self.PROMPT]])
+        assert rc == WAKE and "stuck:prompt" in err
+
+    def _row(self, shown, tmp_path):
+        """The row `relay _stuck-executors` builds for a pane showing `shown`, from relay's REAL
+        classifier (bin/relay `_classify_screen` + STUCK_VERDICTS), not a hand-written verdict."""
+        from test_relay import load_relay_module
+        relay = load_relay_module(tmp_path / "relay-state")
+        verdict, excerpt = relay._classify_screen(shown, "2.1.302", ())
+        return {"session_id": "exec-1", "packet": 1, "verdict": verdict,
+                "stuck": verdict in relay.STUCK_VERDICTS, "excerpt": excerpt}
+
+    def test_a_busy_screen_showing_dialog_phrases_never_wakes(self, tmp_path, monkeypatch):
+        """0.5.13 field incident (2026-10-17): a busy executor's grep output of PROMPT_PATTERNS'
+        comment woke the idle lead twice with stuck:prompt — the second time after the text
+        scrolled out and back. Phrases with the spinner or the input box below them never count."""
+        from test_tmux_watch import (BUSY_UNDER_PHRASES, BUSY_UNDER_PHRASES_2_1_302,
+                                     IDLE_UNDER_PHRASES, REAL_BASH_DIALOG_UNDER_PHRASES)
+        self._setup(tmp_path)
+        busy, newer, idle = (self._row(x, tmp_path) for x in (
+            BUSY_UNDER_PHRASES, BUSY_UNDER_PHRASES_2_1_302, IDLE_UNDER_PHRASES))
+        assert not any(r["stuck"] for r in (busy, newer, idle))
+        rc, err, n = self._tick(tmp_path, monkeypatch, [[busy], [newer], [idle], [busy]])
+        assert rc == SILENT and "stuck:" not in err and n == 5
+        # …while a real dialog under the same quoted phrases still wakes the lead
+        rc, err, _ = self._tick(tmp_path, monkeypatch, [[self._row(REAL_BASH_DIALOG_UNDER_PHRASES,
+                                                                       tmp_path)]])
+        assert rc == WAKE and "stuck:prompt" in err and "Do you want to proceed?" in err
+
+    def test_an_unreadable_screen_or_failed_call_never_rearms(self, tmp_path, monkeypatch):
+        self._setup(tmp_path)
+        assert self._tick(tmp_path, monkeypatch, [[self.PROMPT]])[0] == WAKE
+        blind = dict(self.PROMPT, verdict=None, stuck=False, excerpt="")
+        rc, err, _ = self._tick(tmp_path, monkeypatch, [[blind], None, [self.PROMPT]])
+        assert rc == SILENT, "a flaky capture between two identical stuck screens is not news"
+
+    def test_a_new_packet_on_the_same_dialog_is_news(self, tmp_path, monkeypatch):
+        self._setup(tmp_path)
+        assert self._tick(tmp_path, monkeypatch, [[self.PROMPT]])[0] == WAKE
+        rc, err, _ = self._tick(tmp_path, monkeypatch, [[dict(self.PROMPT, packet=2)]])
+        assert rc == WAKE and "packet 002" in err
+
+    def test_crashed_and_trust_name_their_way_out(self, tmp_path, monkeypatch):
+        self._setup(tmp_path)
+        crashed = dict(self.PROMPT, verdict="crashed", excerpt="[zsh] $")
+        rc, err, _ = self._tick(tmp_path, monkeypatch, [[crashed]])
+        assert rc == WAKE and "stuck:crashed" in err and "relay resume exec-1" in err
+        trust = dict(self.PROMPT, verdict="trust", excerpt="waiting for folder trust")
+        rc, err, _ = self._tick(tmp_path, monkeypatch, [[trust]])
+        assert rc == WAKE and "stuck:trust" in err and "folder-trust" in err
+
+    def test_a_non_tmux_executor_costs_no_screen_read(self, tmp_path, monkeypatch):
+        self._setup(tmp_path, backend="iterm")
+        rc, err, n = self._tick(tmp_path, monkeypatch, [[self.PROMPT]], backend="iterm")
+        assert rc == SILENT and n == 0, "off tmux the poller never shells out for screens"

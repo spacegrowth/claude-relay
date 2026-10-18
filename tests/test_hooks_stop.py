@@ -18,6 +18,7 @@ Run: pytest tests/test_hooks_stop.py -q
 """
 import json
 import os
+import re
 import sys
 
 import pytest
@@ -621,10 +622,10 @@ class TestStopHookTwoPhaseStamp:
         transcript = tmp_path / "t.jsonl"
         transcript.write_text("older entry\n")
         H.make_executor(tmp_path, status="reported")
-        assert drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript)),
-                   tmp_path).returncode == WAKE
-        with open(transcript, "a") as f:            # the wake reached the lead's transcript
-            f.write(json.dumps({"type": "user", "text": lg.WAKE_DELIVERY_NEEDLE}) + "\n")
+        first = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript)), tmp_path)
+        assert first.returncode == WAKE
+        with open(transcript, "a") as f:            # the wake (its stderr, verbatim) reached the lead
+            f.write(json.dumps({"type": "user", "text": first.stderr}) + "\n")
         run = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript),
                                      stop_hook_active=True), tmp_path)
         assert run.returncode == SILENT
@@ -667,6 +668,201 @@ class TestStopHookTwoPhaseStamp:
         lg.mark_surfaced(root, "lead-1", ["exec-1:1"])
         assert lg.load_pending(root, "lead-1") == {}
         assert drv(STOP, stop_payload(tmp_path), tmp_path).returncode == SILENT
+
+
+class TestStopHookPromotesAfterAnAsyncRewakeTurn:
+    """0.5.13 (field, 2026-10-15 — packets 004/005 each woke the lead twice, 3–4 s apart): a turn an
+    asyncRewake wake STARTS is a fresh turn, not a stop-hook continuation, so its Stop arrives with
+    stop_hook_active=false. Promotion used to run only under that flag, so an async-delivered wake
+    stayed pending and the sync path re-announced it. Now a plain Stop promotes on transcript
+    evidence of relay's OWN outstanding claim — and, the #23 property, on nothing else."""
+
+    def _async_announce(self, root, transcript):
+        """The poller's announce: key pending + an "async" claim at the transcript's current end."""
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        return lg.record_announce_claim(root, "lead-1", "async", str(transcript))
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_plain_stop_with_the_token_after_the_claim_promotes_and_stays_quiet(self, drv,
+                                                                                   tmp_path):
+        root = armed(tmp_path)
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("older entry\n")
+        H.make_executor(tmp_path, status="reported")
+        claim = self._async_announce(root, transcript)
+        with open(transcript, "a") as f:            # the async wake started this turn
+            f.write(json.dumps({"type": "user", "text": lg.wake_header(claim)}) + "\n")
+        run = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript),
+                                     stop_hook_active=False), tmp_path)
+        assert run.returncode == SILENT, "an already-delivered wake must not be re-announced"
+        assert lg.load_surfaced(root, "lead-1") == {"exec-1:1"}
+        assert lg.load_pending(root, "lead-1") == {}
+        assert lg.load_announce_claim(root, "lead-1") == {}   # the claim answered this Stop
+        delivered = [r for r in H.ledger(tmp_path) if r["event"] == "wake_delivered"]
+        assert delivered and delivered[-1]["keys"] == ["exec-1:1"]
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_plain_stop_with_no_claim_promotes_nothing(self, drv, tmp_path):
+        """#23: even with relay's wake text in the transcript, no outstanding claim means this Stop
+        is not relay's to certify — pending stays, the report is re-announced."""
+        root = armed(tmp_path)
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text(json.dumps({"text": lg.WAKE_DELIVERY_NEEDLE}) + "\n")
+        H.make_executor(tmp_path, status="reported")
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        run = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript)), tmp_path)
+        assert run.returncode == WAKE
+        assert lg.load_surfaced(root, "lead-1") == set()
+        assert lg.load_pending(root, "lead-1")["exec-1:1"]["announces"] == 2
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_plain_stop_never_trusts_a_claim_on_faith(self, drv, tmp_path):
+        """No transcript to check → a plain Stop cannot prove anything, even for a "sync" claim
+        (only a stop_hook_active continuation trusts that) — and the unproven claim is left for
+        the continuation it belongs to."""
+        root = armed(tmp_path)
+        H.make_executor(tmp_path, status="reported")
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        lg.record_announce_claim(root, "lead-1", "sync", None)
+        assert lg.relay_announce_delivered(root, "lead-1", evidence_only=True) is False
+        assert lg.load_announce_claim(root, "lead-1")["kind"] == "sync"
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert run.returncode == WAKE
+        assert lg.load_surfaced(root, "lead-1") == set()
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_plain_stop_without_the_needle_re_announces(self, drv, tmp_path):
+        """A dropped async wake (lead was mid-turn) left no text: the plain Stop that ends that turn
+        must retry, exactly as before."""
+        root = armed(tmp_path)
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("older entry\n")
+        H.make_executor(tmp_path, status="reported")
+        self._async_announce(root, transcript)
+        run = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript)), tmp_path)
+        assert run.returncode == WAKE
+        assert lg.load_surfaced(root, "lead-1") == set()
+
+
+class TestWakeProofIsTheClaimsOwnToken:
+    """0.5.13 review finding: delivery used to be proven by the bare phrase "new activity while you
+    were idle" past the claim offset, on ANY Stop. A lead turn whose OWN output contains that phrase
+    (grepping relay's source, quoting a past wake, reading a report that mentions it) then stamped a
+    dropped wake surfaced, and it was never re-announced. Each claim now carries a random
+    `[relay-wake:<hex>]` token printed in the wake header, and only THAT token proves delivery."""
+
+    def _announce(self, root, transcript):
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        return lg.record_announce_claim(root, "lead-1", "async", str(transcript))
+
+    def _setup(self, tmp_path):
+        root = armed(tmp_path)
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("older entry\n")
+        H.make_executor(tmp_path, status="reported")
+        return root, transcript
+
+    @staticmethod
+    def _lead_says(transcript, text):
+        with open(transcript, "a") as f:
+            f.write(json.dumps({"type": "assistant", "text": text}) + "\n")
+
+    def test_the_wake_header_carries_the_claims_token(self, tmp_path):
+        root, transcript = self._setup(tmp_path)
+        a, b = self._announce(root, transcript), self._announce(root, transcript)
+        assert a["token"] != b["token"]
+        assert re.fullmatch(r"\[relay-wake:[0-9a-f]{12}\]", a["token"])
+        assert lg.wake_header(a).startswith(
+            "\U0001f6a6 [relay] — review needed: %s:" % lg.WAKE_DELIVERY_NEEDLE)
+        assert lg.wake_header(a).endswith(a["token"])
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_the_hooks_wake_text_carries_its_claims_token(self, drv, tmp_path):
+        root = armed(tmp_path)
+        H.make_executor(tmp_path, status="reported")
+        run = drv(STOP, stop_payload(tmp_path), tmp_path)
+        assert run.returncode == WAKE
+        token = lg.load_announce_claim(root, "lead-1")["token"]
+        assert run.stderr.splitlines()[0].endswith(token)
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_the_bare_needle_in_lead_output_proves_nothing(self, drv, tmp_path):
+        root, transcript = self._setup(tmp_path)
+        self._announce(root, transcript)
+        self._lead_says(transcript, 'grep -n "%s" hooks/stop_lead_watch.py\n'
+                        '\U0001f6a6 [relay] — review needed: %s:'
+                        % (lg.WAKE_DELIVERY_NEEDLE, lg.WAKE_DELIVERY_NEEDLE))
+        run = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript),
+                                     stop_hook_active=False), tmp_path)
+        assert run.returncode == WAKE, "a dropped wake must be re-announced"
+        assert lg.load_surfaced(root, "lead-1") == set()
+        assert lg.load_pending(root, "lead-1")["exec-1:1"]["announces"] == 2
+        assert not [r for r in H.ledger(tmp_path) if r["event"] == "wake_delivered"]
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_the_claims_token_proves_delivery_and_is_not_re_announced(self, drv, tmp_path):
+        root, transcript = self._setup(tmp_path)
+        claim = self._announce(root, transcript)
+        self._lead_says(transcript, lg.wake_header(claim))
+        run = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript),
+                                     stop_hook_active=False), tmp_path)
+        assert run.returncode == SILENT
+        assert lg.load_surfaced(root, "lead-1") == {"exec-1:1"}
+        assert lg.load_pending(root, "lead-1") == {}
+        assert drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript)),
+                   tmp_path).returncode == SILENT
+
+    @pytest.mark.parametrize("hook_active", [False, True], ids=["plain", "stop_hook_active"])
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_an_older_claims_token_does_not_prove_the_current_claim(self, drv, hook_active,
+                                                                    tmp_path):
+        root, transcript = self._setup(tmp_path)
+        older = lg.record_announce_claim(root, "lead-1", "async", str(transcript))
+        self._announce(root, transcript)                   # a later announce: the current claim
+        self._lead_says(transcript, "quoting the earlier wake: " + lg.wake_header(older))
+        run = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript),
+                                     stop_hook_active=hook_active), tmp_path)
+        assert run.returncode == WAKE
+        assert lg.load_surfaced(root, "lead-1") == set()
+        assert not [r for r in H.ledger(tmp_path) if r["event"] == "wake_delivered"]
+
+    def _legacy_claim(self, root, transcript):
+        """A claim exactly as 0.5.12 wrote it: a nonce that never reached the wake text, no token."""
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])
+        lg._announce_claim_path(root, "lead-1").write_text(json.dumps({
+            "kind": "async", "at": 0, "nonce": "1700000000000-123",
+            "transcript": str(transcript), "offset": transcript.stat().st_size}))
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_legacy_claim_is_not_promoted_by_a_plain_stop(self, drv, tmp_path):
+        root, transcript = self._setup(tmp_path)
+        self._legacy_claim(root, transcript)
+        self._lead_says(transcript, "\U0001f6a6 [relay] — review needed: %s:"
+                        % lg.WAKE_DELIVERY_NEEDLE)
+        run = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript),
+                                     stop_hook_active=False), tmp_path)
+        assert run.returncode == WAKE
+        assert lg.load_surfaced(root, "lead-1") == set()
+
+    @pytest.mark.parametrize("drv", DRIVERS, ids=DRIVER_IDS)
+    def test_a_legacy_claim_keeps_the_old_rule_on_a_stop_hook_continuation(self, drv, tmp_path):
+        root, transcript = self._setup(tmp_path)
+        self._legacy_claim(root, transcript)
+        self._lead_says(transcript, "\U0001f6a6 [relay] — review needed: %s:"
+                        % lg.WAKE_DELIVERY_NEEDLE)
+        run = drv(STOP, stop_payload(tmp_path, transcript_path=str(transcript),
+                                     stop_hook_active=True), tmp_path)
+        assert run.returncode == SILENT
+        assert lg.load_surfaced(root, "lead-1") == {"exec-1:1"}
+        assert lg.load_pending(root, "lead-1") == {}
+
+    def test_unit_bare_needle_never_proves_a_tokened_claim(self, tmp_path):
+        root, transcript = self._setup(tmp_path)
+        for evidence_only in (True, False):
+            self._announce(root, transcript)
+            self._lead_says(transcript, lg.WAKE_DELIVERY_NEEDLE)
+            assert lg.relay_announce_delivered(root, "lead-1",
+                                               evidence_only=evidence_only) is False
 
 
 # =================================================================================================

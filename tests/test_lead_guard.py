@@ -850,16 +850,19 @@ class TestEscalationRearmOnUnconfirmedPush:
         assert rc == 0 and "nudge-lead" not in calls
         assert lg.load_escalation(root, "exec-r")["1"]["confirmed"] is True
 
-    def test_a_pending_only_announce_does_not_count_as_handled(self, tmp_path, hook_mod,
-                                                               monkeypatch):
-        # a lead-side announce that was never proven delivered must NOT silence the executor's
-        # push — that combination is exactly how §13's report reached nobody
+    def test_a_pending_announce_counts_as_handled(self, tmp_path, hook_mod, monkeypatch):
+        # 0.5.13 (was test_a_pending_only_announce_does_not_count_as_handled): §13 reached nobody
+        # because the lead's announce was stamped SURFACED before delivery, so nothing retried.
+        # Since #22's two-phase stamp a PENDING key is re-announced by the lead's own next Stop
+        # until proven (or capped), so the lead's machinery still owns it — a typed nudge on top
+        # is a second wake for one report (field, 2026-10-15: every packet woke the lead twice).
         root = tmp_path / ".relay-tasks"
         self._executor(root)
         self._run(hook_mod, root, monkeypatch)
         lg.mark_pending(root, "lead-1", ["exec-r:1"])
         rc, calls = self._run(hook_mod, root, monkeypatch)
-        assert rc == 0 and "nudge-lead" in calls
+        assert rc == 0 and "nudge-lead" not in calls
+        assert lg.load_escalation(root, "exec-r")["1"]["status"] == "resolved"
 
     def test_a_legacy_entry_is_never_resurrected(self, tmp_path, hook_mod, monkeypatch):
         # entries written before this fix carry no `confirmed` field → treated as confirmed
@@ -2020,16 +2023,16 @@ class TestAnnounceClaim:
 
     def test_wake_text_in_the_transcript_proves_delivery(self, root, tmp_path):
         t = self._transcript(tmp_path, '{"type":"user","message":"old turn"}\n')
-        lg.record_announce_claim(root, "lead-1", "async", str(t))
+        claim = lg.record_announce_claim(root, "lead-1", "async", str(t))
         # what a DELIVERED wake really looks like: the hook's stderr, verbatim, JSON-escaped emoji
         t.write_text(t.read_text() + json.dumps(
-            {"type": "user", "message": {"role": "user", "content":
-             "\U0001f6a6 [relay] — review needed: " + lg.WAKE_DELIVERY_NEEDLE + ":"}}) + "\n")
+            {"type": "user", "message": {"role": "user", "content": lg.wake_header(claim)}}) + "\n")
         assert lg.relay_announce_delivered(root, "lead-1") is True
 
     def test_the_needle_is_ascii(self):
         # transcripts are JSON: the 🚦 is escaped to 🚦, so the proof must not depend on it
         assert lg.WAKE_DELIVERY_NEEDLE.isascii()
+        assert lg.record_announce_claim(None, "lead-1", "sync")["token"].isascii()
 
     def test_an_older_wake_before_the_offset_does_not_count(self, root, tmp_path):
         t = self._transcript(tmp_path, "a previous wake: " + lg.WAKE_DELIVERY_NEEDLE + "\n")
@@ -2038,8 +2041,8 @@ class TestAnnounceClaim:
 
     def test_claim_is_one_shot(self, root, tmp_path):
         t = self._transcript(tmp_path)
-        lg.record_announce_claim(root, "lead-1", "sync", str(t))
-        t.write_text(lg.WAKE_DELIVERY_NEEDLE)
+        claim = lg.record_announce_claim(root, "lead-1", "sync", str(t))
+        t.write_text(lg.wake_header(claim))
         assert lg.relay_announce_delivered(root, "lead-1") is True
         assert lg.relay_announce_delivered(root, "lead-1") is False  # consumed — one continuation
         assert lg.load_announce_claim(root, "lead-1") == {}
@@ -2072,8 +2075,8 @@ class TestAnnounceClaim:
 
     def test_rotated_shorter_transcript_still_scans(self, root, tmp_path):
         t = self._transcript(tmp_path, "x" * 500)
-        lg.record_announce_claim(root, "lead-1", "async", str(t))    # offset 500
-        t.write_text(lg.WAKE_DELIVERY_NEEDLE)                        # rotated: now shorter
+        claim = lg.record_announce_claim(root, "lead-1", "async", str(t))    # offset 500
+        t.write_text(lg.wake_header(claim))                                  # rotated: now shorter
         assert lg.relay_announce_delivered(root, "lead-1") is True   # offset > size → scan the tail
 
 
@@ -4507,7 +4510,8 @@ class TestExecutorAgent:
     def test_flags_shape(self):
         flags = lg.executor_agent_flags(REPO_ROOT)
         assert flags[0] == "--agents" and flags[2:4] == ["--agent", "relay-executor"]
-        assert flags[4] == "--disallowedTools" and flags[5] == "Bash(git commit*),Bash(git push*)"
+        assert flags[4] == "--disallowedTools" and flags[5] == (
+            "Bash(git commit*),Bash(git push*),AskUserQuestion,EnterPlanMode,ExitPlanMode")
         assert json.loads(flags[1])["relay-executor"]["disallowedTools"] == ["Agent"]
 
     def test_missing_agent_file_means_no_flags(self, tmp_path):

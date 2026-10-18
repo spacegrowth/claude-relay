@@ -18,6 +18,7 @@ Design notes:
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -1844,6 +1845,15 @@ def rotation_marker_valid(rm, predecessor=None, now_ts=None):
 # continuation → treat it as an ordinary Stop. The needle is deliberately ASCII: transcripts are
 # JSON and escape the 🚦 as 🚦.
 WAKE_DELIVERY_NEEDLE = "new activity while you were idle"
+# 0.5.13 (review of the evidence-only promotion): the bare needle above is ordinary English that a
+# lead turn can produce on its own — grepping relay's source, quoting an earlier wake, reading a
+# report that mentions it — and on a plain Stop that would "prove" a wake that was actually dropped.
+# So every claim now carries its own random token, printed in the wake header as
+# `[relay-wake:<hex>]`, and delivery is proven by THAT token past the claim's offset. Nobody types
+# or quotes a fresh 12-hex token by accident, and an older claim's token (quoted from a previous
+# wake) never matches the current one. A claim without a token (written by 0.5.12) keeps the old
+# bare-needle rule, and only on a stop_hook_active continuation (see relay_announce_delivered).
+WAKE_TOKEN_FMT = "[relay-wake:{}]"
 _TRANSCRIPT_SCAN_MAX = 4 * 1024 * 1024  # never read more than this much transcript tail
 
 
@@ -1873,8 +1883,10 @@ def record_announce_claim(state_root, lead_sid, kind, transcript_path=None):
     """Stamp relay's receipt-in-waiting for an announce that is firing right now. `kind` is "sync"
     (announced while answering a live Stop event) or "async" (the background poller's late exit-2,
     the one the harness can drop). Records where the transcript ENDS at this moment, so the later
-    delivery check only ever matches text written after this announce."""
-    claim = {"kind": kind, "at": time.time(), "nonce": f"{int(time.time() * 1000)}-{os.getpid()}",
+    delivery check only ever matches text written after this announce. The returned claim's
+    `token` must go into the wake text the lead receives (wake_header) — it is the delivery proof."""
+    nonce = secrets.token_hex(6)
+    claim = {"kind": kind, "at": time.time(), "nonce": nonce, "token": WAKE_TOKEN_FMT.format(nonce),
              "transcript": str(transcript_path or ""), "offset": 0}
     try:
         if transcript_path:
@@ -1888,6 +1900,20 @@ def record_announce_claim(state_root, lead_sid, kind, transcript_path=None):
     except Exception:
         pass
     return claim
+
+
+def wake_header(claim):
+    """The first line of a wake as the lead receives it: the marker, the needle and THIS claim's
+    token. The token is what relay_announce_delivered looks for, so it is built here, next to the
+    check, rather than spelled out in the hook."""
+    token = (claim or {}).get("token") or ""
+    return f"\U0001f6a6 [relay] — review needed: {WAKE_DELIVERY_NEEDLE}:" + (f" {token}" if token else "")
+
+
+def _delivery_needle(claim):
+    """What proves THIS claim's wake landed: its own token, or — for a token-less claim written by
+    0.5.12 — the bare needle (accepted only on a stop_hook_active continuation)."""
+    return (claim or {}).get("token") or WAKE_DELIVERY_NEEDLE
 
 
 def _transcript_has(path, offset, needle):
@@ -1907,7 +1933,7 @@ def _transcript_has(path, offset, needle):
         return False
 
 
-def relay_announce_delivered(state_root, lead_sid):
+def relay_announce_delivered(state_root, lead_sid, evidence_only=False):
     """Did RELAY's own announce cause this stop_hook_active continuation? One-shot: the claim is
     consumed either way (a claim answers exactly one continuation; a retry writes a fresh one).
 
@@ -1915,14 +1941,36 @@ def relay_announce_delivered(state_root, lead_sid):
     offset it recorded. When the claim has no transcript to check against (no transcript_path in the
     payload — chiefly the test harness), a "sync" claim is still trusted: that announce answered a
     live Stop event the harness was waiting on. An unprovable "async" claim reads as NOT delivered,
-    which merely costs a retry (capped) — the safe side of the incident."""
+    which merely costs a retry (capped) — the safe side of the incident.
+
+    `evidence_only=True` is the form for a Stop that is NOT a stop-hook continuation — above all
+    the end of a turn an asyncRewake wake STARTED: Claude Code runs that as a fresh turn, so its
+    Stop arrives with stop_hook_active false (field, 2026-10-15: every async wake was followed 3–4 s
+    later by a duplicate sync re-announce of the same report, because promotion only ever ran on
+    stop_hook_active). Here ONLY transcript evidence counts (no trust-the-sync-claim fallback), and
+    the claim is consumed only when it proves delivery — an unproven one is left for the
+    continuation or retry it belongs to. No claim → False, same #23 property as below: a Stop relay
+    did not cause can never stamp a wake delivered.
+
+    The evidence is the claim's own `[relay-wake:<hex>]` token (wake_header), never the bare
+    needle, which ordinary lead output can contain. A token-less claim (0.5.12) cannot be proven
+    by evidence alone: evidence_only returns False for it and leaves it for a stop_hook_active
+    continuation, which keeps the old bare-needle check."""
     claim = load_announce_claim(state_root, lead_sid)
+    if evidence_only:
+        token = (claim or {}).get("token")
+        path = (claim or {}).get("transcript")
+        if token and path and os.path.exists(path) and _transcript_has(path, claim.get("offset", 0),
+                                                                       token):
+            clear_announce_claim(state_root, lead_sid)
+            return True
+        return False
     clear_announce_claim(state_root, lead_sid)
     if not claim:
         return False  # some OTHER Stop hook continued this session — not relay's re-run
     path = claim.get("transcript")
     if path and os.path.exists(path):
-        return _transcript_has(path, claim.get("offset", 0), WAKE_DELIVERY_NEEDLE)
+        return _transcript_has(path, claim.get("offset", 0), _delivery_needle(claim))
     return claim.get("kind") == "sync"
 
 
@@ -2267,10 +2315,20 @@ def has_inflight_executors(state_root, owner_lead=None):
     When `owner_lead` is given, ONLY executors this lead owns (`executor's owner_lead == owner_lead`)
     count — so a lead never idles waiting on another lead's executor OR an unowned (bare/legacy)
     one. The default `owner_lead=None` is the global, pre-ownership behavior (counts all)."""
+    return bool(inflight_backends(state_root, owner_lead, first_only=True))
+
+
+def inflight_backends(state_root, owner_lead=None, first_only=False):
+    """The set of terminal backends ("tmux", "iterm", … — "" for a pre-backend record) of the
+    executors `has_inflight_executors` counts as in flight; empty when none are. The lead's poller
+    reads this ONCE per tick for both of its questions — "anything left to wait on?" and "is any of
+    it on tmux, whose screen can be read for a stuck dialog?" — so a non-tmux lead pays nothing
+    extra per tick. `first_only` stops at the first match (has_inflight_executors' yes/no)."""
+    found = set()
     try:
         root = Path(state_root)
         if not root.exists():
-            return False
+            return found
         for d in root.iterdir():
             sj = d / "session.json"
             if not sj.exists():
@@ -2281,12 +2339,14 @@ def has_inflight_executors(state_root, owner_lead=None):
                     continue
                 if owner_lead is not None and s.get("owner_lead") != owner_lead:
                     continue  # busy, but not THIS lead's (another lead's, or unowned) → not ours
-                return True
+                found.add(s.get("backend") or "")
+                if first_only:
+                    return found
             except Exception:
                 continue
     except Exception:
         pass
-    return False
+    return found
 
 
 def _pid_alive(pid):
@@ -2608,6 +2668,11 @@ def escalation_decision(state_root, exec_sid, packet, owner_lead):
 EXECUTOR_AGENT_NAME = "relay-executor"
 EXECUTOR_AGENT_FILE = "executor.md"
 EXECUTOR_DENIED_BASH = ("Bash(git commit*)", "Bash(git push*)")
+# Interactive dialogs an executor must never open: nobody answers an executor's tab, so a menu
+# (AskUserQuestion's "Enter to select", plan mode's approval prompt) parks it forever with no
+# report and no wake — seen live on tmux 2026-10-15. Denied at the CLI for the same reason as the
+# git denies: it is the rule that holds under --dangerously-skip-permissions.
+EXECUTOR_DENIED_TOOLS = ("AskUserQuestion", "EnterPlanMode", "ExitPlanMode")
 
 
 def parse_agent_file(text):
@@ -2651,14 +2716,16 @@ def load_executor_agent(plugin_root):
 
 def executor_agent_flags(plugin_root):
     """The `claude` argv words that give an executor its role: `--agents <json> --agent
-    relay-executor --disallowedTools "Bash(git commit*),Bash(git push*)"` — or [] when the agent
-    file is missing. The denies are ONE comma-joined argument on purpose: `--disallowedTools` is
-    variadic and would otherwise swallow the prompt positional that follows it."""
+    relay-executor --disallowedTools "Bash(git commit*),Bash(git push*),AskUserQuestion,…"` — or []
+    when the agent file is missing. The denies are ONE comma-joined argument on purpose:
+    `--disallowedTools` is variadic and would otherwise swallow the prompt positional that follows
+    it. Every executor launch (spawn — incl. send --rotate/--upgrade — restart, resume, the
+    follow-up-send relaunch) builds its argv here, so they all carry the same denies."""
     agents = load_executor_agent(plugin_root)
     if not agents:
         return []
     return ["--agents", json.dumps(agents, separators=(",", ":")), "--agent", EXECUTOR_AGENT_NAME,
-            "--disallowedTools", ",".join(EXECUTOR_DENIED_BASH)]
+            "--disallowedTools", ",".join(EXECUTOR_DENIED_BASH + EXECUTOR_DENIED_TOOLS)]
 
 
 # ---- auto-close policy -------------------------------------------------------------------------

@@ -61,7 +61,8 @@ wakes you when an executor finishes.
 
 **Under tmux** the lead can also see its executors, not just talk to them:
 
-- **Screen reads.** `relay check <sid>` adds a line `screen: <verdict> — <excerpt>`, read from the pane itself: `prompt` (a permission or selection dialog is waiting), `crashed` (claude exited and the pane is back at a shell), `unsent` (the packet pointer is still sitting in the input box), `working`, or `unknown`. `relay list` shows `stuck:prompt` / `stuck:crashed` in STATUS as soon as the screen says so, without waiting for the 45-minute stall threshold. `relay peek <sid> [--lines N]` prints the pane's current screen.
+- **Screen reads.** `relay check <sid>` adds a line `screen: <verdict> — <excerpt>`, read from the pane itself: `prompt` (a permission or selection dialog is waiting), `crashed` (claude exited and the pane is back at a shell), `unsent` (the packet pointer is still sitting in the input box), `working`, or `unknown`. `relay list` shows `stuck:prompt` / `stuck:crashed` in STATUS as soon as the screen says so, without waiting for the 45-minute stall threshold. `relay peek <sid> [--lines N]` prints the pane's current screen. `unsent` also works after a rename, when the input box's top border carries the session name (0.5.13). `working` reads the mid-turn spinner of current Claude Code as well as older builds: since 2.1.296 its row no longer says "esc to interrupt", and a busy pane had read `unknown` (0.5.13).
+- **Stuck wake (0.5.13).** While an idle lead's poller waits, each tick it also reads its in-flight tmux executors' screens (one `relay _stuck-executors` call, only while a tmux executor is in flight) and wakes the lead when one is `stuck:prompt`, `stuck:trust` or `stuck:crashed`. The wake line names the executor, the verdict, the screen excerpt and the way out (`relay focus <sid>` to answer it). Each (executor, packet, verdict) is announced once, and again only after that executor's screen has left the verdict. A screen reads `prompt` only when the dialog is the live bottom of the pane, with no input box and no spinner below it, so dialog phrases in tool output (a grep, a diff, quoted text) above the input box never count.
 - **Instant wake.** The lead's background poller waits on `tmux wait-for relay-wake-<lead>` instead of sleeping, and an executor's Stop hook signals that channel when its report is in, so the lead wakes immediately instead of on the next 5-second tick. A timeout is just the next tick, and any tmux error falls back to the plain sleep.
 - **Pane transcripts.** Each executor pane is piped (`pipe-pane`) into `<session dir>/pane.log`, which rotates to `pane.log.1` past 20 MB (checked at spawn and send). `relay peek <sid> --log` prints its tail. Set `tmux_pane_log: false` to turn it off.
 
@@ -553,6 +554,15 @@ reports how many the current lead has racked up in the last 24 hours.
 nudge-lead`, internal plumbing). Once its report lands and it goes idle, it fires once: it types
 into the lead's tab if the lead hasn't already surfaced the report, or notifies you directly if the
 owning lead is gone (crashed/closed/pruned). A net under the lead's own poller, not a replacement.
+Since 0.5.13 it also stands down when the lead's own wake already holds the report (announced and
+awaiting proof, or surfaced). On tmux, when the lead's poller is alive, it first waits up to a few
+seconds for that poller to take the report it just signalled. Before this, every tmux report woke
+the lead twice: once from the poller and once from the typed nudge. A wake that started a turn of
+its own (an asyncRewake) is now also recognised as delivered at that turn's end, so the lead's next
+Stop doesn't announce the same report again. The proof is the `[relay-wake:<hex>]` token at the end
+of the wake's first line, which is fresh for every announce. The bare phrase "new activity while you
+were idle" in the lead's own output (a grep of relay's source, a quoted old wake) proves nothing,
+and neither does an older wake's token.
 
 A report is announced once: when the owning lead picks it up — `relay check`, `relay diff`,
 `relay close`, or `relay verify` (so `/relay:review`'s fork, which runs verify first, counts) — it
@@ -916,10 +926,15 @@ Every executor is launched as a Claude Code **agent** (`agents/executor.md`, pas
 `--agents … --agent relay-executor`, so it works whether relay is installed or loaded via
 `--plugin-dir`). The standing GATES and REPORT FORMAT live in its system prompt — never compacted
 away, re-applied on every resume/restart — so the packet only carries the task plus the per-packet
-report path, self-diff command and closing line. Two things become *enforced* rather than asked:
-the `Agent` tool is removed (an executor can never spawn sub-agents), and `git commit` / `git push`
+report path, self-diff command and closing line. Three things become *enforced* rather than asked:
+the `Agent` tool is removed (an executor can never spawn sub-agents), `git commit` / `git push`
 are denied at the CLI (`--disallowedTools`, which holds even under `--dangerously-skip-permissions`
-— verified live, `tests/test_e2e_agent.py`). Sessions spawned before the agent existed keep
+— verified live, `tests/test_e2e_agent.py`), and so are the interactive dialogs —
+`AskUserQuestion`, `EnterPlanMode`, `ExitPlanMode` (0.5.13). Nobody answers an executor's tab, so
+a menu like AskUserQuestion's "Enter to select" used to park it forever with no report; an
+executor now picks the most reasonable reading and says so in its report, or reports the question
+as a blocker. Every launch (spawn, `send --rotate/--upgrade`, restart, resume) carries the same
+denies. Sessions spawned before the agent existed keep
 getting the full GATES footer in their packets. The denies are prefix rules (`git commit…`,
 `git push…`) — a guard against the ordinary mistake, not a sandbox; `git -C <dir> commit` would
 slip past, and the staged-diff review is still where anything lands or doesn't. There is no lead agent on purpose: leads arm

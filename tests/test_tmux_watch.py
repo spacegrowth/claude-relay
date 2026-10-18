@@ -161,6 +161,388 @@ def test_unsent_needs_the_current_packets_pointer(relay):
     assert "007-packet.md" in relay._screen_needles(s)
 
 
+# Claude Code 2.1.x after a rename: the input box's TOP rule carries the session name, which the
+# old bin/relay-only rule pattern (`^\s*[╭╰]?─{8,}[╮╯]?\s*$`) did not match — no box found, so a
+# typed-but-unsubmitted pointer read "unknown" and `unsent` detection was dead after every rename.
+UNSENT_LABELLED = """\
+⏺ Done. Idle, awaiting the lead's review.
+
+──────────────────────────────────────────────────────────── [Exec] bye-file-214926 ─
+❯ Task — GOAL: fix the thing. Read and follow the work packet at
+  /Users/v/.relay-tasks/e/packets/002-packet.md — it contains your task, GATES, and REPORT FORMAT.
+────────────────────────────────────────────────────────────────────────────────────
+  ? for shortcuts
+"""
+
+
+def test_unsent_under_a_labelled_border(relay):
+    verdict, excerpt = relay._classify_screen(UNSENT_LABELLED, "node", NEEDLES)
+    assert verdict == "unsent", (verdict, excerpt)
+    assert "Task — GOAL: fix the thing." in excerpt
+    assert relay._SCREEN_RULE_RE is relay.trust_prompt._RULE_RE   # ONE pattern, not two
+
+
+# ── 0.5.13: dialog phrases SHOWN on a screen are not a dialog (field, 2026-10-17) ─────────────────
+# A busy ops executor's pane showed `grep` output of bin/relay's PROMPT_PATTERNS comment ("Do you
+# want to create X?" (Write), "Do you want to allow …"). `prompt` was checked on phrases alone,
+# before `working`, so the idle lead was woken twice with "stuck:prompt". The fixtures below are
+# trimmed from screens captured live from Claude Code 2.1.302 on a private tmux server (paths
+# shortened, the status line kept): a real dialog REPLACES the input box — it opens under one
+# full-width rule and ends on its footer, with no input box and no spinner beneath it.
+
+# The incident: busy (spinner) with the grep output, two+ PROMPT_PATTERNS phrases, above it.
+BUSY_UNDER_PHRASES = """\
+⏺ Bash(grep -n -A3 "PROMPT_PATTERNS = (" bin/relay)
+  ⎿  966:PROMPT_PATTERNS = (
+     967-    # Permission-dialog header: "Do you want to proceed?" (Bash), "Do you want to make this edit to
+     968-    # X?" (Edit), "Do you want to create X?" (Write), "Do you want to allow …" (WebFetch/MCP).
+     969-    re.compile(r"\\bDo you want to\\b"),
+     970-    # The dialog's numbered first option: "❯ 1. Yes"
+     971-    # its "No" option: "3. No, and tell Claude what to do differently (esc)"
+     972-    # footer: "Esc to cancel · Tab to add additional instructions", "Enter to select · ↑/↓"
+
+✻ Pondering… (42s · ↑ 1.3k tokens · esc to interrupt)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+# Same, with the 2.1.302 spinner as captured live — it no longer says "esc to interrupt", so only
+# the input box below the phrases tells them apart from a dialog.
+BUSY_UNDER_PHRASES_2_1_302 = """\
+⏺ LINE-A Do you want to proceed?
+  LINE-B 1. Yes
+  LINE-C 2. No, and tell Claude (esc)
+  LINE-D Esc to cancel
+
+⏺ Bash(python3 -c 'import time; time.sleep(40)')
+  ⎿  Running… (30s)
+     (ctrl+b ctrl+b (twice) to run in background)
+
+· Mulling… (32s · ↓ 157 tokens)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5  .../development/claude-relay  git:main*  ctx:5%
+  ⏸ manual mode on
+"""
+
+# Idle (no spinner): the same phrases in the scrollback above an empty input box.
+IDLE_UNDER_PHRASES = """\
+⏺ LINE-A Do you want to proceed?
+  LINE-B 1. Yes
+  LINE-C 2. No, and tell Claude (esc)
+  LINE-D Esc to cancel · Enter to select
+
+⏺ Done.
+
+✻ Worked for 2s · done 1:59 AM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5  .../development/claude-relay  git:main*  ctx:5%
+  ⏸ manual mode on
+"""
+
+# A real Bash permission dialog, 2.1.302 — and the same phrases quoted in the scrollback above it.
+REAL_BASH_DIALOG_UNDER_PHRASES = """\
+⏺ LINE-A Do you want to proceed?
+  LINE-B 1. Yes
+  LINE-C 2. No, and tell Claude (esc)
+  LINE-D Esc to cancel
+
+⏺ Bash(python3 -c 'import time; time.sleep(40)')
+  ⎿  Waiting…
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ python3 -c 'import time; time.sleep(40)'
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Wait 40 seconds
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for python3 commands in /Users/v/development/claude-relay
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+ Esc to cancel · Tab to amend
+"""
+
+REAL_WRITE_DIALOG = """\
+❯ Use the Write tool to create the file /tmp/s/probe-written.txt containing the word hi.
+
+⏺ Write(/tmp/s/probe-written.txt)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Create file
+ /tmp/s/probe-written.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  1 hi
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create probe-written.txt?
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this
+      session (shift+tab)
+   3. No
+ Esc to cancel · Tab to amend
+"""
+
+# AskUserQuestion, 2.1.302: note the SECOND rule above "Chat about this" — one rule below the
+# options must still read as live, so only TWO rules below a row mean an input box.
+REAL_ASK_USER_QUESTION = """\
+❯ Use the AskUserQuestion tool to ask me one question: which color do I prefer, red or blue.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Color
+Which color do you prefer, red or blue?
+❯ 1. Blue
+     Blue as your preferred color
+  2. Red
+     Red as your preferred color
+  3. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+# /model, 2.1.302 (packet 003 item 3: informational): its footer carries ONE pattern only.
+REAL_MODEL_MENU = """\
+  ❯ 5.  Haiku 5.5 ✔            Fastest for quick answers
+    6.  Haiku 4.5              Fastest for quick answers
+     … +3 models
+
+  ◐ Medium effort (default) ←/→ to adjust
+
+  Enter to set as default · s to use this session only · Esc to cancel
+"""
+
+
+@pytest.mark.parametrize("screen,verdict,excerpt_has", [
+    (BUSY_UNDER_PHRASES, "working", "esc to interrupt"),
+    (BUSY_UNDER_PHRASES_2_1_302, "working", "Mulling…"),   # read `unknown` before the shared busy rule
+    (IDLE_UNDER_PHRASES, "unknown", ""),
+    (REAL_BASH_DIALOG_UNDER_PHRASES, "prompt", "Do you want to proceed?"),
+    (REAL_WRITE_DIALOG, "prompt", "Do you want to create probe-written.txt?"),
+    (REAL_ASK_USER_QUESTION, "prompt", "Enter to select"),
+    (REAL_MODEL_MENU, "unknown", ""),
+], ids=["busy-under-phrases", "busy-under-phrases-2.1.302-spinner", "idle-under-phrases",
+        "real-bash-dialog-under-phrases", "real-write-dialog", "real-ask-user-question",
+        "real-model-menu"])
+def test_only_a_dialog_at_the_live_bottom_is_a_prompt(relay, screen, verdict, excerpt_has):
+    got, excerpt = relay._classify_screen(screen, "2.1.302", NEEDLES)
+    assert got == verdict, (got, excerpt)
+    assert excerpt_has in excerpt
+
+
+def test_the_excerpt_is_the_live_dialogs_question_not_a_quoted_one(relay):
+    _, excerpt = relay._classify_screen(REAL_BASH_DIALOG_UNDER_PHRASES, "2.1.302", NEEDLES)
+    assert "LINE-A" not in excerpt and excerpt == "Do you want to proceed?"
+
+
+def test_stuck_executors_does_not_flag_a_busy_pane_showing_dialog_phrases(relay, screen, capsys):
+    _tmux_session(relay, "exec-1", owner_lead="lead-1")
+    for shown in (BUSY_UNDER_PHRASES, BUSY_UNDER_PHRASES_2_1_302, IDLE_UNDER_PHRASES):
+        screen["screen"] = shown
+        relay.cmd_stuck_executors(SimpleNamespace(lead="lead-1", json=True))
+        row = json.loads(capsys.readouterr().out)[0]
+        assert row["stuck"] is False and row["verdict"] != "prompt", row
+    screen["screen"] = REAL_BASH_DIALOG_UNDER_PHRASES
+    relay.cmd_stuck_executors(SimpleNamespace(lead="lead-1", json=True))
+    assert json.loads(capsys.readouterr().out)[0]["verdict"] == "prompt"
+
+
+# ── 0.5.13: a busy 2.1.302 pane reads `working` again (field, 2026-10-18) ───────────────────────
+# Claude Code 2.1.296+ dropped "esc to interrupt" from its spinner row, so a busy pane read
+# `unknown`. The fixtures below are trimmed from screens captured live from Claude Code 2.1.302
+# (`claude --model haiku`, a private `tmux -L relay-probe-busy-*` server, 120x45, paths shortened):
+# thinking, streaming, a running tool, the first second after launch, and idle before and after a
+# turn. The spinner row is a glyph in column 0 (· ✢ ✳ ✶ ✻ ✽), a verb ending in "…" and an optional
+# parenthetical; the done line ("✻ Worked for 1s · done 2:26 AM") has no "…" after its verb.
+
+BUSY_2_1_302_THINKING = """\
+❯ Write a 600-word essay about lighthouses. Plain prose, no tools.
+
+✳ Befuddling… (12s · still thinking)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5  .../development/claude-relay  git:main*  sid:9e4b0a49
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+BUSY_2_1_302_STREAMING = """\
+❯ Write a 600-word essay about lighthouses. Plain prose, no tools.
+
+⏺ Lighthouses are among the oldest and most stubbornly useful structures people have built. Their job is
+  simple to state and hard to do well: stand at the edge of land, show a light, and tell passing ships
+
+✳ Befuddling… (13s · ↓ 2.1k tokens · thought for 12s)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5  .../development/claude-relay  git:main*  sid:9e4b0a49                                 /rc
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+# A running tool: the tool's own "⎿  Running… (5s)" row (indented, no glyph) and a Tip row between
+# the spinner and the input box.
+BUSY_2_1_302_TOOL = """\
+✻ Brewed for 16s · done 2:25 AM
+
+❯ Run exactly this Bash command and nothing else: sleep 20
+
+⏺ Bash(sleep 20)
+  ⎿  Running… (5s)
+     (ctrl+b ctrl+b (twice) to run in background)
+
+✢ Sprouting… (7s · ↓ 81 tokens)
+  ⎿  Tip: Run /install-github-app to tag @claude right from your Github issues and PRs
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5  .../development/claude-relay  git:main*  sid:9e4b0a49  ctx:5%                       /rc
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+# The first second after a launch with a prompt (what a spawned executor shows): the spinner with
+# no parenthetical at all, and the footer's "/rc connecting…" (indented, no glyph).
+BUSY_2_1_302_BARE = """\
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   ~/development/claude-relay
+
+❯ Run the Bash command sleep 12, then reply with exactly: done
+
+✽ Spinning…
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents                     ◐ medium · /effort
+                                                                                      /rc connecting…
+"""
+
+BUSY_2_1_302_HOOKS = BUSY_2_1_302_BARE.replace(
+    "✽ Spinning…", "✢ Spinning… (running UserPromptSubmit hooks… 1/2 · 0s)")
+
+IDLE_2_1_302_START = """\
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   ~/development/claude-relay
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "create a util logging.py that..."
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5  .../development/claude-relay  git:main*  sid:9e4b0a49                 ◐ medium · /effort
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents                                    /rc
+"""
+
+IDLE_2_1_302_AFTER_TURN = """\
+✻ Cooked for 22s · done 2:26 AM
+
+❯ Think hard about whether 1000003 is prime, then answer in one word.
+
+⏺ Prime
+
+✻ Worked for 1s · done 2:26 AM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5  .../development/claude-relay  git:main*  sid:9e4b0a49  ctx:5%
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+IDLE_2_1_302_AFTER_TOOL = """\
+⏺ Bash(sleep 20)
+  ⎿  Running… (No output)
+
+⏺ The command sleep 20 ran and finished with no output.
+
+✻ Cooked for 22s · done 2:26 AM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5  .../development/claude-relay  git:main*  sid:9e4b0a49  ctx:5%                       /rc
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+BUSY_2_1_302 = {"thinking": BUSY_2_1_302_THINKING, "streaming": BUSY_2_1_302_STREAMING,
+                "tool": BUSY_2_1_302_TOOL, "bare": BUSY_2_1_302_BARE, "hooks": BUSY_2_1_302_HOOKS,
+                "busy-under-phrases": BUSY_UNDER_PHRASES_2_1_302}
+IDLE_2_1_302 = {"start": IDLE_2_1_302_START, "after-turn": IDLE_2_1_302_AFTER_TURN,
+                "after-tool": IDLE_2_1_302_AFTER_TOOL, "idle-under-phrases": IDLE_UNDER_PHRASES}
+
+
+@pytest.mark.parametrize("name", list(BUSY_2_1_302))
+def test_a_busy_2_1_302_pane_reads_working(relay, name):
+    screen = BUSY_2_1_302[name]
+    verdict, excerpt = relay._classify_screen(screen, "2.1.302", NEEDLES)
+    assert verdict == "working", (verdict, excerpt)
+    assert excerpt.endswith(")") or excerpt.endswith("…")   # the spinner row itself is the excerpt
+    assert relay.trust_prompt.is_busy(screen) is True
+    assert relay.trust_prompt.is_live(screen) is False
+
+
+@pytest.mark.parametrize("name", list(IDLE_2_1_302))
+def test_an_idle_2_1_302_pane_is_not_working_and_its_input_box_is_ready(relay, name):
+    screen = IDLE_2_1_302[name]
+    verdict, excerpt = relay._classify_screen(screen, "2.1.302", NEEDLES)
+    assert verdict == "unknown", (verdict, excerpt)
+    assert relay.trust_prompt.is_busy(screen) is False
+    assert relay.trust_prompt.input_ready(screen) is True
+    assert relay.trust_prompt.launch_state(screen) == "ready"
+
+
+@pytest.mark.parametrize("row", [
+    "✻ Thinking… (12s · esc to interrupt)",                       # older builds
+    "✻ Pondering… (42s · ↑ 1.3k tokens · esc to interrupt)",
+    "✽ Spinning…",                                                 # 2.1.302, as captured
+    "✽ Spinning…" + " " * 40,                                      # tmux pads rows with spaces
+    "✢ Spinning… (running UserPromptSubmit hooks… 1/2 · 0s)",
+    "✳ Befuddling… (8s · thinking)",
+    "· Sprouting… (13s · ↓ 81 tokens)",
+    "✢ Thundering… (18m 58s · ↓ 41.8k tokens)",                    # 2.1.296 (test_backends)
+    "✶ Reticulating splines… (3s)",                                # a two-word custom verb
+])
+def test_spinner_rows_old_and_new(relay, row):
+    assert relay.trust_prompt.is_spinner_row(row) is True
+    assert relay._screen_working is relay.trust_prompt.is_spinner_row   # ONE rule, not two
+
+
+@pytest.mark.parametrize("row", [
+    "✻ Worked for 12s",                                            # the done line
+    "✻ Worked for 1s · done 2:26 AM",
+    "✻ Brewed for 16s · done 2:25 AM",
+    "✻ Cogitated for 15s · done 2:25…",                            # even if truncated with "…"
+    "  ⎿  Running… (5s)",                                          # a tool's own progress row
+    "                                       /rc connecting…",      # status-line chrome
+    "     ✻ Thinking… (12s)",                                      # quoted in tool output
+    "  ✶ Elucidating… (10s · ↓ 82 tokens)",                        # quoted in assistant prose
+    "⏺ Spinning… is what the spinner says",                        # an assistant line
+    "❯ ✽ Spinning…",                                               # a submitted user line
+    "✻ 3 files…",                                                  # not a verb
+    "",
+])
+def test_rows_that_are_not_the_spinner(relay, row):
+    assert relay.trust_prompt.is_spinner_row(row) is False
+
+
+def test_stuck_executors_reports_a_busy_2_1_302_pane_as_working(relay, screen, capsys):
+    _tmux_session(relay, "exec-1", owner_lead="lead-1")
+    for shown in BUSY_2_1_302.values():
+        screen["screen"] = shown
+        relay.cmd_stuck_executors(SimpleNamespace(lead="lead-1", json=True))
+        row = json.loads(capsys.readouterr().out)[0]
+        assert row["verdict"] == "working" and row["stuck"] is False, row
+
+
 # ── _screen_verdict: tmux only ────────────────────────────────────────────────────────────────────
 
 def _tmux_session(relay, sid="exec-1", status="busy", **extra):
@@ -508,3 +890,37 @@ def test_send_checks_the_pane_log_before_typing(relay, tmp_path, monkeypatch):
     with mock.patch.object(relay.iterm, "is_alive", return_value=True):
         relay.cmd_send(SimpleNamespace(session_id=sid, packet=str(packet)))
     assert order[:2] == [("log", sid, "w0t0p0:OLD"), ("send",)]
+
+
+# ── relay _stuck-executors: the lead poller's one screen read per tick ──────────────────────────
+
+def test_stuck_executors_lists_only_this_leads_in_flight_tmux_executors(relay, screen, capsys):
+    _tmux_session(relay, "exec-1", owner_lead="lead-1")
+    _tmux_session(relay, "exec-2", owner_lead="lead-2")                       # another lead's
+    _tmux_session(relay, "exec-3", owner_lead="lead-1", backend="iterm",
+                  iterm_session="w0t0p0:x")                                   # not tmux
+    _tmux_session(relay, "exec-4", owner_lead="lead-1", status="reported")    # not in flight
+    relay.cmd_stuck_executors(SimpleNamespace(lead="lead-1", json=True))
+    rows = json.loads(capsys.readouterr().out)
+    assert rows == [{"session_id": "exec-1", "packet": 2, "verdict": "prompt", "stuck": True,
+                     "excerpt": "Do you want to proceed?"}]
+    assert [c for c in screen["calls"] if c[0] == "capture"] == [("capture", "tmux:%3", 40)]
+
+
+def test_stuck_executors_reports_a_working_or_unreadable_pane_as_not_stuck(relay, screen, capsys):
+    _tmux_session(relay, "exec-1", owner_lead="lead-1")
+    screen["screen"] = WORKING
+    relay.cmd_stuck_executors(SimpleNamespace(lead="lead-1", json=True))
+    assert json.loads(capsys.readouterr().out)[0]["stuck"] is False
+    screen["screen"] = None                                  # pane gone → "couldn't look"
+    relay.cmd_stuck_executors(SimpleNamespace(lead="lead-1", json=True))
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["verdict"] is None and row["stuck"] is False
+
+
+def test_stuck_executors_is_a_real_hidden_subcommand(tmp_path):
+    import subprocess
+    r = subprocess.run([str(TESTS.parent / "bin" / "relay"), "_stuck-executors", "--lead", "lead-1",
+                        "--json"], capture_output=True, text=True, timeout=30,
+                       env=dict(os.environ, HOME=str(tmp_path)))
+    assert r.returncode == 0 and json.loads(r.stdout) == []

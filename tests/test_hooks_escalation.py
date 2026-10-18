@@ -588,8 +588,13 @@ class TestDuplicateBannerDedup:
         esc_calls = self._escalate(tmp_path, monkeypatch)
         assert self._notifier_calls(esc_calls) == [], \
             "the wake already claimed this report — the escalation push must stay quiet"
-        assert any(c[1] == "nudge-lead" for c in esc_calls), \
-            "the dedupe is banner-only — the text push itself still happens"
+        # 0.5.13: the wake left this report PENDING in the lead's own machinery (re-announced by
+        # the lead's next Stop if it never landed), so the typed push would only be a second wake
+        # for the same report — it stays quiet too, not just its banner (was: "the dedupe is
+        # banner-only — the text push itself still happens", the field's two-wakes-per-report).
+        assert not any(c[1] == "nudge-lead" for c in esc_calls), \
+            "the lead's wake already holds this report — no nudge typed on top of it"
+        assert lg.load_escalation(H.state_root(tmp_path), "exec-1")["1"]["status"] == "resolved"
 
     def test_escalation_first_then_wake_stays_quiet(self, tmp_path, monkeypatch):
         H.arm_lead(tmp_path, "lead-1", project="webapp")
@@ -603,3 +608,97 @@ class TestDuplicateBannerDedup:
                                                 # DESKTOP banner is deduped, not the wake itself
         assert self._notifier_calls(H.stub_calls(tmp_path / "stub-calls.log")) == [], \
             "the escalation push already claimed this report — the wake's banner must stay quiet"
+
+
+class TestEscalationDefersToTheLeadsOwnWake:
+    """0.5.13 (field, 2026-10-15 — 11 lead wakes for 5 reports): on tmux the hook signals the lead's
+    poller and then decided "send" before the woken poller had stamped anything, so EVERY report
+    got the poller's wake AND a typed "…review it." nudge. The push now stands down when the lead's
+    own machinery holds the key (pending or surfaced), and — tmux executor, LIVE poller — waits a
+    bounded moment for that poller to take it; with no poller alive it still pushes at once."""
+
+    def _run(self, tmp_path, monkeypatch, calls, wait=None):
+        mod = load_escalation_module()
+        root = H.state_root(tmp_path)
+        real_run = mod.subprocess.run
+        monkeypatch.setattr(mod, "STATE_ROOT", str(root))
+        monkeypatch.setattr("sys.argv", [ESCALATE, "exec-1"])
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("RELAY_NO_NOTIFY", "1")
+        monkeypatch.setattr(mod, "_signal_lead_wake", lambda *a: calls.append(["signal"]))  # no real tmux
+        if wait is not None:
+            monkeypatch.setattr(mod, "POLLER_CLAIM_WAIT", wait)
+
+        def fake_run(cmd, **kw):
+            if len(cmd) > 1 and cmd[1] == "nudge-lead":
+                calls.append(list(cmd))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return real_run(cmd, **kw)
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "x"})))
+        with pytest.raises(SystemExit) as ei:
+            mod.main()
+        return ei.value.code
+
+    @staticmethod
+    def _nudges(calls):
+        return [c for c in calls if c[0] != "signal" and c[1] == "nudge-lead"]
+
+    def test_a_key_already_pending_in_the_lead_is_not_nudged(self, tmp_path, monkeypatch):
+        root = H.arm_lead(tmp_path, "lead-1")
+        H.make_executor(tmp_path, owner_lead="lead-1", backend="tmux")
+        lg.mark_pending(root, "lead-1", ["exec-1:1"])   # the poller's announce is out
+        calls = []
+        assert self._run(tmp_path, monkeypatch, calls) == 0
+        assert self._nudges(calls) == []
+        assert lg.load_escalation(root, "exec-1")["1"]["status"] == "resolved"
+        ev = [e for e in H.ledger(tmp_path) if e.get("event") == "escalation_resolved"]
+        assert ev and ev[-1].get("via") == "lead-wake"
+
+    def test_a_live_poller_that_claims_within_the_wait_is_not_nudged(self, tmp_path, monkeypatch):
+        import threading
+        import time as _t
+        root = H.arm_lead(tmp_path, "lead-1")
+        H.make_executor(tmp_path, owner_lead="lead-1", backend="tmux")
+        assert lg.acquire_poll_lock(root, "lead-1")      # this (live) process is "the poller"
+
+        def poller_announces():
+            _t.sleep(0.6)
+            lg.mark_pending(root, "lead-1", ["exec-1:1"])
+
+        t = threading.Thread(target=poller_announces, daemon=True)
+        t.start()
+        calls = []
+        t0 = _t.time()
+        try:
+            assert self._run(tmp_path, monkeypatch, calls) == 0
+        finally:
+            lg.release_poll_lock(root, "lead-1")
+        t.join(timeout=5)
+        assert self._nudges(calls) == [], "the woken poller took it — no second wake typed in"
+        assert _t.time() - t0 < 5, "returned as soon as the poller's stamp showed up"
+        assert lg.load_escalation(root, "exec-1")["1"]["status"] == "resolved"
+
+    def test_a_live_poller_that_never_claims_falls_back_to_the_nudge(self, tmp_path, monkeypatch):
+        root = H.arm_lead(tmp_path, "lead-1")
+        H.make_executor(tmp_path, owner_lead="lead-1", backend="tmux")
+        assert lg.acquire_poll_lock(root, "lead-1")
+        calls = []
+        try:
+            assert self._run(tmp_path, monkeypatch, calls, wait=0.5) == 0
+        finally:
+            lg.release_poll_lock(root, "lead-1")
+        assert len(self._nudges(calls)) == 1          # bounded: the wait ends, the net still fires
+        assert lg.load_escalation(root, "exec-1")["1"]["status"] == "sent"
+
+    def test_no_poller_alive_means_the_nudge_fires_at_once(self, tmp_path, monkeypatch):
+        import time as _t
+        H.arm_lead(tmp_path, "lead-1")
+        H.make_executor(tmp_path, owner_lead="lead-1", backend="tmux")
+        calls = []
+        t0 = _t.time()
+        assert self._run(tmp_path, monkeypatch, calls, wait=30) == 0
+        assert _t.time() - t0 < 15, "no live poller → no wait at all"
+        assert len(self._nudges(calls)) == 1
+        assert self._nudges(calls)[0][1:3] == ["nudge-lead", "lead-1"]
