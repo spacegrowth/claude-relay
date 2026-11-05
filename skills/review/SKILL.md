@@ -62,17 +62,21 @@ repo. Open the hunks inline yourself only when a finding names a sign-off-gated 
 specifically, `hooks/`, `lib/lead_guard.py`, ledger formats) AND the change there is more than a
 guard clause or a rename — a second look at those hunks, never a blanket re-read of the diff.
 
-**Then, if you're clearing an autonomous auto-commit (#16 phase 2):** save the fork's returned
-findings block to a file and pass it as the condition-5 attestation artifact, not a bare flag:
+**Then, in every mode, record the review:** save the fork's returned findings block to a file and
+pass it to `verify`, so the review is on record (Cue and other viewers show "reviewed" and the
+findings from it):
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/relay verify $session_id --for-autocommit --in-plan --diff-reviewed --findings <path-you-saved-the-findings-to>
+${CLAUDE_PLUGIN_ROOT}/bin/relay verify $session_id --diff-reviewed --findings <path-you-saved-the-findings-to>
 ```
 
-`verify` copies that file to the session's `packets/<NNN>-review.md`, ledgers `report_reviewed`
-with its path and finding count, and treats it as condition 5 — a durable record of what the fork
-actually found, not just a boolean saying "reviewed: yes". (Bare `--diff-reviewed` without
-`--findings` still works for the rarer inline-read path above; the ledger then just says `inline`.)
+`verify` copies that file to the session's `packets/<NNN>-review.md` and ledgers `report_reviewed`
+with its path and finding count — a durable record of what the fork actually found, not just a
+boolean saying "reviewed: yes". (Bare `--diff-reviewed` without `--findings` still works for the
+rarer inline-read path above; the ledger then just says `inline`.)
+
+**If you're clearing an autonomous auto-commit (#16 phase 2),** add `--for-autocommit --in-plan` to
+that same call: the findings file then also serves as the condition-5 attestation artifact.
 
 In manual (non-autonomous) mode there's no gate to clear — read the findings, decide, then commit
 or send a fix-list packet exactly as you would have after reading the diff yourself.
