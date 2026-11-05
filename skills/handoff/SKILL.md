@@ -17,6 +17,9 @@ your own predecessor's doc had (relay warns if one goes missing — see the lint
 on every queue item name an EXECUTOR to do it (or write "delegate this") — never phrase box/deploy/
 ops work as this lead's own to pick up (§10's `[ops-not-lead-work]` incident: a dropped marker plus
 ops phrased as the lead's task is exactly how a successor drifted into implementation).
+Don't copy the status-list format (the "Where we are" ✓/○ block) or an "end every reply with the list" rule
+into the note: Cue carries the switch over to the successor itself, and a copied rule makes it write the list with
+the switch off.
 
 **Then run:**
 
